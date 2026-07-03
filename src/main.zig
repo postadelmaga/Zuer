@@ -40,7 +40,9 @@ fn mapInput(event: *const zicro.input.InputEvent) ?ActionOrPrompt {
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
-    const io = init.io;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     state_mod.global_gpa = gpa;
 
     // 1. Handle command line arguments
@@ -55,7 +57,11 @@ pub fn main(init: std.process.Init) !void {
 
     // 3. Initialize Zicro App
     var app = try zicro.App.init(gpa, io);
-    defer app.deinit();
+    defer {
+        var report = app.shutdownAndJoin();
+        report.deinit();
+        app.deinit();
+    }
 
     // Create the latest-wins data plane channel for decoded files
     const tx, const rx = try zicro.media.latest(Decoded, gpa, io);
@@ -157,8 +163,4 @@ pub fn main(init: std.process.Init) !void {
         // Throttle loop to prevent 100% CPU usage
         std.Io.sleep(io, std.Io.Duration.fromMilliseconds(15), .awake) catch {};
     }
-
-    // 9. Shutdown and cleanup Zicro app modules
-    var report = app.shutdownAndJoin();
-    defer report.deinit();
 }
