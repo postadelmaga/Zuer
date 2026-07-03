@@ -28,6 +28,9 @@ const KEY_2: u32 = 3;
 const KEY_3: u32 = 4;
 const KEY_4: u32 = 5;
 const KEY_5: u32 = 6;
+const KEY_C: u32 = 46;
+const KEY_LEFTCTRL: u32 = 29;
+const KEY_RIGHTCTRL: u32 = 97;
 
 // Il testo viene ri-rasterizzato al pointsize scalato: oltre questi limiti la
 // resa degrada (corpo minuscolo) o esplode in memoria (immagini enormi).
@@ -359,6 +362,8 @@ const GuiAppState = struct {
     sel_selecting: *bool,
     sel_a: *[2]i32,
     sel_b: *[2]i32,
+    // Stato del tasto Ctrl (per Ctrl+C = copia negli appunti).
+    ctrl_down: *bool,
 
     fn loadFile(self: *GuiAppState, new_path: []const u8) !void {
         // 1. Decodifica il nuovo file (fuori dal lock: non tocca stato condiviso)
@@ -525,8 +530,23 @@ fn scrollTo(app_state: *GuiAppState, y: f32) void {
 fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) void {
     const app_state: *GuiAppState = @ptrCast(@alignCast(user orelse return));
     const pressed = (state == 1);
+    if (key == KEY_LEFTCTRL or key == KEY_RIGHTCTRL) {
+        app_state.ctrl_down.* = pressed;
+        return;
+    }
     if (pressed) {
         const is_text = app_state.is_text.*;
+        // Ctrl+C: copia la selezione negli appunti.
+        if (key == KEY_C and app_state.ctrl_down.* and is_text) {
+            app_state.mutex.lockUncancelable(app_state.io);
+            const sel = buildSelectedText(app_state, app_state.gpa);
+            app_state.mutex.unlock(app_state.io);
+            if (sel) |txt| {
+                clipboardCopy(txt);
+                app_state.gpa.free(txt);
+            }
+            return;
+        }
         if (key == KEY_ESC) {
             win.close();
         } else if (is_text and (key == KEY_UP or key == KEY_DOWN)) {
@@ -854,6 +874,102 @@ fn renderWorker(
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
+// Copia negli appunti tramite `wl-copy` (wl-clipboard): niente supporto
+// clipboard Wayland in zrame da estendere. Il testo va sullo stdin del figlio.
+extern "c" fn pipe(fds: *[2]c_int) c_int;
+extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
+extern "c" fn close(fd: c_int) c_int;
+extern "c" fn waitpid(pid: c_int, status: ?*c_int, options: c_int) c_int;
+extern "c" fn posix_spawnp(pid: *c_int, file: [*:0]const u8, file_actions: ?*const anyopaque, attrp: ?*const anyopaque, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) c_int;
+extern "c" fn posix_spawn_file_actions_init(fa: *anyopaque) c_int;
+extern "c" fn posix_spawn_file_actions_destroy(fa: *anyopaque) c_int;
+extern "c" fn posix_spawn_file_actions_adddup2(fa: *anyopaque, fd: c_int, newfd: c_int) c_int;
+extern "c" fn posix_spawn_file_actions_addclose(fa: *anyopaque, fd: c_int) c_int;
+extern "c" var environ: [*:null]const ?[*:0]const u8;
+
+/// Offset di byte del `col`-esimo codepoint in una riga UTF-8 (o fine stringa).
+fn byteAtCol(s: []const u8, col: i32) usize {
+    if (col <= 0) return 0;
+    var n: i32 = 0;
+    var i: usize = 0;
+    while (i < s.len and n < col) {
+        const seq = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        i += @min(@as(usize, seq), s.len - i);
+        n += 1;
+    }
+    return i;
+}
+
+/// Costruisce il testo selezionato (righe unite da '\n'). Con `state.mutex`
+/// acquisito. Ritorna null se non c'è selezione; il chiamante libera il buffer.
+fn buildSelectedText(state: *GuiAppState, gpa: std.mem.Allocator) ?[]u8 {
+    if (!state.sel_active.*) return null;
+    const lines = state.text_lines.items;
+    if (lines.len == 0) return null;
+    var a = state.sel_a.*;
+    var b = state.sel_b.*;
+    if (a[0] > b[0] or (a[0] == b[0] and a[1] > b[1])) {
+        const t = a;
+        a = b;
+        b = t;
+    }
+    if (a[0] == b[0] and a[1] == b[1]) return null;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    const nrows: i32 = @intCast(lines.len);
+    var row: i32 = std.math.clamp(a[0], 0, nrows - 1);
+    while (row <= b[0] and row < nrows) : (row += 1) {
+        const line = lines[@intCast(row)];
+        const llen = cpLen(line);
+        const c0 = std.math.clamp(if (row == a[0]) a[1] else 0, 0, llen);
+        const c1 = std.math.clamp(if (row == b[0]) b[1] else llen, 0, llen);
+        const bs = byteAtCol(line, c0);
+        const be = byteAtCol(line, c1);
+        if (be > bs) out.appendSlice(gpa, line[bs..be]) catch return null;
+        if (row < b[0]) out.append(gpa, '\n') catch return null;
+    }
+    return out.toOwnedSlice(gpa) catch null;
+}
+
+/// Invia `text` a `wl-copy` (stdin) per metterlo negli appunti Wayland.
+fn clipboardCopy(text: []const u8) void {
+    if (text.len == 0) return;
+    var fds: [2]c_int = undefined;
+    if (pipe(&fds) != 0) return;
+    const rfd = fds[0];
+    const wfd = fds[1];
+
+    var fa: [256]u8 align(16) = undefined;
+    if (posix_spawn_file_actions_init(&fa) != 0) {
+        _ = close(rfd);
+        _ = close(wfd);
+        return;
+    }
+    defer _ = posix_spawn_file_actions_destroy(&fa);
+    _ = posix_spawn_file_actions_adddup2(&fa, rfd, 0); // stdin del figlio ← lettura pipe
+    _ = posix_spawn_file_actions_addclose(&fa, wfd);
+
+    const wlcopy: [*:0]const u8 = "wl-copy";
+    var argv = [_:null]?[*:0]const u8{wlcopy};
+    var pid: c_int = 0;
+    const rc = posix_spawnp(&pid, wlcopy, &fa, null, &argv, environ);
+    _ = close(rfd);
+    if (rc != 0) {
+        _ = close(wfd);
+        return;
+    }
+    var off: usize = 0;
+    while (off < text.len) {
+        const n = write(wfd, text.ptr + off, text.len - off);
+        if (n <= 0) break;
+        off += @intCast(n);
+    }
+    _ = close(wfd); // EOF: wl-copy acquisisce la selezione e passa in background
+    var status: c_int = 0;
+    _ = waitpid(pid, &status, 0);
+}
+
 /// Dimensione iniziale della finestra. Per le immagini il frame si adatta al
 /// contenuto (l'immagine lo riempie per intero), con un tetto a ~metà schermo:
 /// zrame non espone la geometria dell'output, quindi il tetto è ZUER_MAX_WIN
@@ -966,6 +1082,7 @@ pub fn main(init: std.process.Init) !void {
     var sel_selecting = false;
     var sel_a: [2]i32 = .{ 0, 0 };
     var sel_b: [2]i32 = .{ 0, 0 };
+    var ctrl_down = false;
 
     var gui_state = GuiAppState{
         .gpa = gpa,
@@ -1007,6 +1124,7 @@ pub fn main(init: std.process.Init) !void {
         .sel_selecting = &sel_selecting,
         .sel_a = &sel_a,
         .sel_b = &sel_b,
+        .ctrl_down = &ctrl_down,
     };
     defer {
         gpa.free(gui_state.current_file_path);
