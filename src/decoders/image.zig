@@ -18,8 +18,9 @@ extern fn stbi_failure_reason() ?[*:0]const u8;
 
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
-pub fn decode(path: []const u8, io: std.Io, file_bytes: []const u8, filename: []const u8, allocator: std.mem.Allocator) Decoded {
-    _ = io; // i subprocess ora usano decoder.runCapture (fork/exec diretti)
+pub fn decode(path: []const u8, file_bytes: []const u8, filename: []const u8, allocator: std.mem.Allocator) Decoded {
+    // I subprocess (SVG/ImageMagick) usano decoder.runCapture (fork/exec diretti),
+    // quindi qui non serve l'io dell'host.
     var max_dim: usize = 160;
     if (getenv("ZUER_GUI")) |val| {
         if (std.mem.eql(u8, std.mem.span(val), "1")) {
@@ -208,12 +209,12 @@ export fn zuer_decode(
     io_ptr: *const anyopaque,
     allocator_ptr: *const anyopaque,
 ) callconv(.c) decoder.DecodedC {
-    const io = @as(*const std.Io, @ptrCast(@alignCast(io_ptr))).*;
+    _ = io_ptr; // i subprocess usano fork/exec diretti, non l'io dell'host
     const allocator = @as(*const std.mem.Allocator, @ptrCast(@alignCast(allocator_ptr))).*;
     const path_slice = path.toSlice();
     const content_slice = content.toSlice();
     const filename = std.fs.path.basename(path_slice);
-    const decoded = decode(path_slice, io, content_slice, filename, allocator);
+    const decoded = decode(path_slice, content_slice, filename, allocator);
     // decode() non conserva i byte del file (stb copia i pixel nel buffer
     // ridimensionato, ImageMagick rilegge dal path): vanno liberati qui o
     // trapelano a ogni immagine.

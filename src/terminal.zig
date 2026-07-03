@@ -1,6 +1,5 @@
 const std = @import("std");
 const zicro = @import("zicro");
-const Key = zicro.input.Key;
 const InputEvent = zicro.input.InputEvent;
 
 pub const Terminal = struct {

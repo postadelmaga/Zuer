@@ -5,7 +5,6 @@ const AppState = state_mod.AppState;
 const decoder_mod = @import("decoder.zig");
 const Decoded = decoder_mod.Decoded;
 const CsvData = decoder_mod.CsvData;
-const MeshData = decoder_mod.MeshData;
 const loader_mod = @import("loader.zig");
 const LoadedFile = loader_mod.LoadedFile;
 const gpu_mod = @import("gpu_renderer.zig");

@@ -1,6 +1,5 @@
 const std = @import("std");
 const decoder = @import("decoder");
-const MarkdownData = decoder.MarkdownData;
 const Decoded = decoder.Decoded;
 const DecodedC = decoder.DecodedC;
 

@@ -6,9 +6,8 @@
 //! quando il driver lo permette, altrimenti copiato una volta sola.
 //!
 //! Due presentazioni sopra lo stesso core:
-//!  - TUI: `render()` + `readback()` → pixel RGBA in un buffer host-visible;
-//!  - zuer-gui: `render()` e poi blit dell'immagine color (già in layout
-//!    TRANSFER_SRC) sulla swapchain, tramite `colorImage()`.
+//!  - TUI: `render()` → pixel RGBA in un buffer host-visible (readback);
+//!  - zuer-gui: `renderToImage()` lascia il frame pronto, presentato da zrame.
 
 const std = @import("std");
 
@@ -834,10 +833,6 @@ pub const Renderer = struct {
     mesh_imported: bool = false,
 
     // Texture immagine (per zuer-gui: blit diretto sulla swapchain)
-    tex_image: VkImage = VK_NULL,
-    tex_mem: VkDeviceMemory = VK_NULL,
-    tex_width: u32 = 0,
-    tex_height: u32 = 0,
 
     // Pipeline testo (atlante glifi su GPU), inizializzata pigramente.
     text_ready: bool = false,
@@ -981,7 +976,6 @@ pub const Renderer = struct {
     pub fn deinit(self: *Renderer) void {
         _ = vkDeviceWaitIdle(self.device);
         self.releaseMesh();
-        self.releaseTexture();
         self.destroyTextPipe();
         self.destroyTarget();
         vkDestroyPipeline(self.device, self.pipeline, null);
@@ -993,87 +987,6 @@ pub const Renderer = struct {
         vkDestroyCommandPool(self.device, self.cmd_pool, null);
         vkDestroyDevice(self.device, null);
         vkDestroyInstance(self.instance, null);
-    }
-
-    /// Handle dell'immagine color dopo `render()`: layout TRANSFER_SRC_OPTIMAL,
-    /// pronto per blit su swapchain (zuer-gui).
-    pub fn colorImage(self: *const Renderer) VkImage {
-        return self.color_image;
-    }
-
-    /// Carica una bitmap RGBA come texture device-local, lasciata in layout
-    /// TRANSFER_SRC_OPTIMAL: zuer-gui la blitta direttamente sulla swapchain.
-    pub fn setTexture(self: *Renderer, rgba: []const u8, width: u32, height: u32) !void {
-        self.releaseTexture();
-        if (width == 0 or height == 0 or rgba.len < @as(usize, width) * height * 4) return error.BadTexture;
-
-        // Staging buffer host-visible usa-e-getta.
-        var staging: VkBuffer = VK_NULL;
-        try check(vkCreateBuffer(self.device, &.{ .size = rgba.len, .usage = BUFFER_USAGE_TRANSFER_SRC }, null, &staging));
-        defer vkDestroyBuffer(self.device, staging, null);
-        var req: VkMemoryRequirements = undefined;
-        vkGetBufferMemoryRequirements(self.device, staging, &req);
-        const mem_type = self.findMemoryType(req.memoryTypeBits, MEM_HOST_VISIBLE | MEM_HOST_COHERENT) orelse return error.NoMemoryType;
-        var staging_mem: VkDeviceMemory = VK_NULL;
-        try check(vkAllocateMemory(self.device, &.{ .allocationSize = req.size, .memoryTypeIndex = mem_type }, null, &staging_mem));
-        defer vkFreeMemory(self.device, staging_mem, null);
-        try check(vkBindBufferMemory(self.device, staging, staging_mem, 0));
-        var mapped: *anyopaque = undefined;
-        try check(vkMapMemory(self.device, staging_mem, 0, rgba.len, 0, &mapped));
-        const dst: [*]u8 = @ptrCast(mapped);
-        @memcpy(dst[0..rgba.len], rgba);
-
-        const tex = try self.createImage(width, height, FORMAT_R8G8B8A8_UNORM, IMAGE_USAGE_TRANSFER_SRC | IMAGE_USAGE_TRANSFER_DST, ASPECT_COLOR, false);
-        errdefer self.destroyImage(tex);
-
-        // Copia one-shot: UNDEFINED → TRANSFER_DST → copy → TRANSFER_SRC.
-        try check(vkBeginCommandBuffer(self.cmd, &.{}));
-        const range = VkImageSubresourceRange{ .aspectMask = ASPECT_COLOR };
-        vkCmdPipelineBarrier(self.cmd, STAGE_TOP, STAGE_TRANSFER, 0, 0, null, 0, null, 1, &[_]VkImageMemoryBarrier{.{
-            .srcAccessMask = 0,
-            .dstAccessMask = ACCESS_TRANSFER_WRITE,
-            .oldLayout = IMAGE_LAYOUT_UNDEFINED,
-            .newLayout = IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            .image = tex.image,
-            .subresourceRange = range,
-        }});
-        vkCmdCopyBufferToImage(self.cmd, staging, tex.image, IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &[_]VkBufferImageCopy{.{
-            .imageSubresource = .{ .aspectMask = ASPECT_COLOR },
-            .imageExtent = .{ .width = width, .height = height, .depth = 1 },
-        }});
-        vkCmdPipelineBarrier(self.cmd, STAGE_TRANSFER, STAGE_TRANSFER, 0, 0, null, 0, null, 1, &[_]VkImageMemoryBarrier{.{
-            .srcAccessMask = ACCESS_TRANSFER_WRITE,
-            .dstAccessMask = ACCESS_TRANSFER_READ,
-            .oldLayout = IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            .newLayout = IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            .image = tex.image,
-            .subresourceRange = range,
-        }});
-        try check(vkEndCommandBuffer(self.cmd));
-        try check(vkQueueSubmit(self.queue, 1, &[_]VkSubmitInfo{.{ .pCommandBuffers = @ptrCast(&self.cmd) }}, self.fence));
-        // Prima il check del wait: resettare una fence ancora in-flight è UB.
-        try check(vkWaitForFences(self.device, 1, @ptrCast(&self.fence), 1, 2 * std.time.ns_per_s));
-        try check(vkResetFences(self.device, 1, @ptrCast(&self.fence)));
-
-        self.tex_image = tex.image;
-        self.tex_mem = tex.mem;
-        self.tex_width = width;
-        self.tex_height = height;
-    }
-
-    pub fn texture(self: *const Renderer) struct { image: VkImage, width: u32, height: u32 } {
-        return .{ .image = self.tex_image, .width = self.tex_width, .height = self.tex_height };
-    }
-
-    pub fn releaseTexture(self: *Renderer) void {
-        if (self.tex_image == VK_NULL) return;
-        _ = vkDeviceWaitIdle(self.device);
-        vkDestroyImage(self.device, self.tex_image, null);
-        vkFreeMemory(self.device, self.tex_mem, null);
-        self.tex_image = VK_NULL;
-        self.tex_mem = VK_NULL;
-        self.tex_width = 0;
-        self.tex_height = 0;
     }
 
     /// Carica la geometria (layout: vertici f32x3 compatti, poi indici u32 —

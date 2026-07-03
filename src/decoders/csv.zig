@@ -1,6 +1,5 @@
 const std = @import("std");
 const decoder = @import("decoder");
-const CsvData = decoder.CsvData;
 const Decoded = decoder.Decoded;
 
 pub fn decode(bytes: []const u8, delimiter: u8, allocator: std.mem.Allocator) Decoded {
