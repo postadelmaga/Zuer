@@ -34,6 +34,54 @@ const KEY_5: u32 = 6;
 const text_zoom_min: f32 = 0.4;
 const text_zoom_max: f32 = 6.0;
 const scroll_step: f32 = 60.0;
+const scrollbar_w: u32 = 14; // larghezza della scrollbar del testo (px)
+const scroll_ease: f32 = 0.35; // frazione di avvicinamento a scroll_target per frame
+
+/// Geometria del cursore (thumb) della scrollbar verticale: altezza ∝ frazione
+/// visibile, posizione ∝ scorrimento. `off_y` è l'offset di scroll già clampato.
+fn scrollbarThumb(H: u32, src_h: u32, off_y: u32) struct { y: u32, h: u32 } {
+    if (src_h <= H) return .{ .y = 0, .h = H };
+    const max_scroll = src_h - H;
+    const min_h: u32 = 32;
+    const prop: u64 = @as(u64, H) * H / src_h;
+    const th: u32 = @min(H, @as(u32, @intCast(@max(@as(u64, min_h), prop))));
+    const travel = H - th;
+    const y: u32 = if (max_scroll > 0) @intCast(@as(u64, off_y) * travel / max_scroll) else 0;
+    return .{ .y = y, .h = th };
+}
+
+/// Alpha-blend src-over di un colore sul pixel RGBA in `buf[idx..]`.
+fn blendPixel(buf: []u8, idx: usize, r: u8, g: u8, b: u8, a: u8) void {
+    const af: u32 = a;
+    const inv: u32 = 255 - af;
+    buf[idx + 0] = @intCast((@as(u32, r) * af + @as(u32, buf[idx + 0]) * inv) / 255);
+    buf[idx + 1] = @intCast((@as(u32, g) * af + @as(u32, buf[idx + 1]) * inv) / 255);
+    buf[idx + 2] = @intCast((@as(u32, b) * af + @as(u32, buf[idx + 2]) * inv) / 255);
+    buf[idx + 3] = @max(buf[idx + 3], a);
+}
+
+/// Disegna la scrollbar verticale (traccia + cursore) sul bordo destro. Appare
+/// solo quando il contenuto è più alto della viewport.
+fn drawScrollbar(buf: []u8, W: u32, H: u32, src_h: u32, off_y: u32) void {
+    if (src_h <= H or W < scrollbar_w) return;
+    const x0 = W - scrollbar_w;
+    const t = scrollbarThumb(H, src_h, off_y);
+    var py: u32 = 0;
+    while (py < H) : (py += 1) {
+        const on_thumb = py >= t.y and py < t.y + t.h;
+        var px: u32 = x0;
+        while (px < W) : (px += 1) {
+            const idx = (py * W + px) * 4;
+            if (px == x0) {
+                blendPixel(buf, idx, 90, 96, 112, 60); // sottile bordo interno
+            } else if (on_thumb) {
+                blendPixel(buf, idx, 150, 158, 178, 240);
+            } else {
+                blendPixel(buf, idx, 32, 34, 44, 90);
+            }
+        }
+    }
+}
 
 /// Modalità documento per i contenuti testuali: l'immagine è già rasterizzata
 /// alla larghezza della finestra, quindi si blitta 1:1 (nessun ricampionamento
@@ -84,6 +132,8 @@ fn composeTextFrame(
             }
         }
     }
+
+    drawScrollbar(composited_rgba, W, H, src_h, off_y);
 }
 
 fn composeFrame(
@@ -207,6 +257,11 @@ const GuiAppState = struct {
     pan_x: *f32,
     pan_y: *f32,
     scroll_y: *f32,
+    // Posizione di scroll desiderata: la rotella/i tasti la muovono, il worker
+    // fa scorrere scroll_y verso di essa con easing (scroll fluido).
+    scroll_target: *f32,
+    // Trascinamento del cursore della scrollbar (mappa mouse.y → posizione).
+    scrollbar_drag: *bool,
     last_x: *f32,
     last_y: *f32,
 
@@ -276,6 +331,7 @@ const GuiAppState = struct {
         self.pan_x.* = 0.0;
         self.pan_y.* = 0.0;
         self.scroll_y.* = 0.0;
+        self.scroll_target.* = 0.0;
         self.load_seq.* +%= 1;
         self.file_changed.* = true;
     }
@@ -350,9 +406,21 @@ fn applyZoom(app_state: *GuiAppState, factor: f32) void {
 fn scrollText(app_state: *GuiAppState, delta: f32) void {
     app_state.mutex.lockUncancelable(app_state.io);
     defer app_state.mutex.unlock(app_state.io);
-    // Il limite superiore dipende dall'altezza rasterizzata, nota al worker:
-    // qui basta impedire i valori negativi, il clamp finale è nel compose.
-    app_state.scroll_y.* = @max(app_state.scroll_y.* + delta, 0);
+    // Muove la meta di scroll: il worker vi fa scorrere scroll_y con easing
+    // (scroll fluido). Il limite superiore dipende dall'altezza rasterizzata,
+    // nota al worker; qui basta impedire i valori negativi.
+    app_state.scroll_target.* = @max(app_state.scroll_target.* + delta, 0);
+    app_state.file_changed.* = true;
+}
+
+/// Scroll immediato (senza easing) a una posizione assoluta: per il
+/// trascinamento del documento e della scrollbar, dove serve reattività 1:1.
+fn scrollTo(app_state: *GuiAppState, y: f32) void {
+    app_state.mutex.lockUncancelable(app_state.io);
+    defer app_state.mutex.unlock(app_state.io);
+    const yy = @max(y, 0);
+    app_state.scroll_y.* = yy;
+    app_state.scroll_target.* = yy;
     app_state.file_changed.* = true;
 }
 
@@ -409,26 +477,54 @@ fn scrollCallback(win: *zrame.Window, axis: u32, value: i32, user: ?*anyopaque) 
     }
 }
 
+/// Mappa la coordinata verticale del mouse sulla scrollbar in una posizione di
+/// scroll assoluta (cursore centrato sotto il puntatore) e vi salta immediato.
+fn scrollFromBar(app_state: *GuiAppState, H: u32, src_h: u32, mouse_y: f32) void {
+    if (src_h <= H) return;
+    const t = scrollbarThumb(H, src_h, 0);
+    const travel: f32 = if (H > t.h) @floatFromInt(H - t.h) else 1;
+    const max_scroll: f32 = @floatFromInt(src_h - H);
+    var ty = mouse_y - @as(f32, @floatFromInt(t.h)) / 2.0;
+    ty = std.math.clamp(ty, 0, travel);
+    scrollTo(app_state, ty / travel * max_scroll);
+}
+
 fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopaque) void {
-    _ = win;
     const app_state: *GuiAppState = @ptrCast(@alignCast(user orelse return));
     switch (event) {
         .button => |btn| {
             // 0x110 = BTN_LEFT (click sinistro), 0x111 = BTN_RIGHT (click destro)
             if (btn.button == 0x110 or btn.button == 0x111) {
-                app_state.dragging.* = (btn.state == 1);
+                const down = (btn.state == 1);
+                // Click sinistro sulla scrollbar del testo → trascinamento cursore.
+                if (down and btn.button == 0x110 and app_state.is_text.*) {
+                    const W = win.panel_w;
+                    const H = win.panel_h;
+                    const src_h = app_state.static_h.*;
+                    if (W >= scrollbar_w and src_h > H and
+                        app_state.last_x.* >= @as(f32, @floatFromInt(W - scrollbar_w)))
+                    {
+                        app_state.scrollbar_drag.* = true;
+                        scrollFromBar(app_state, H, src_h, app_state.last_y.*);
+                        return;
+                    }
+                }
+                if (!down) app_state.scrollbar_drag.* = false;
+                app_state.dragging.* = down;
             }
         },
         .motion => |mot| {
-            if (app_state.dragging.*) {
+            if (app_state.scrollbar_drag.*) {
+                scrollFromBar(app_state, win.panel_h, app_state.static_h.*, mot.y);
+            } else if (app_state.dragging.*) {
                 const dx = mot.x - app_state.last_x.*;
                 const dy = mot.y - app_state.last_y.*;
                 if (app_state.is_mesh.*) {
                     app_state.yaw.* += dx * 0.01;
                     app_state.pitch.* += dy * 0.01;
                 } else if (app_state.is_text.*) {
-                    // Trascinare il documento verso il basso torna indietro
-                    scrollText(app_state, -dy);
+                    // Trascinare il documento verso il basso torna indietro (1:1).
+                    scrollTo(app_state, app_state.scroll_y.* - dy);
                 } else {
                     app_state.mutex.lockUncancelable(app_state.io);
                     app_state.pan_x.* += dx;
@@ -538,6 +634,7 @@ fn renderWorker(
 
         const size_changed = (cur_w != last_w or cur_h != last_h);
         var need_render = size_changed or state.file_changed.* or state.is_mesh.*;
+        var text_animating = false;
 
         if (state.is_text.*) {
             // (Ri)compone il testo quando cambiano larghezza finestra, zoom o
@@ -551,12 +648,22 @@ fn renderWorker(
                 last_seq = state.load_seq.*;
                 need_render = true;
             }
-            // Clamp dello scroll ora che l'altezza del documento è nota
+            // Clamp della meta di scroll ora che l'altezza del documento è nota,
+            // poi easing di scroll_y verso di essa (scroll fluido).
             const max_scroll: f32 = if (state.static_h.* > cur_h)
                 @floatFromInt(state.static_h.* - cur_h)
             else
                 0;
-            if (state.scroll_y.* > max_scroll) state.scroll_y.* = max_scroll;
+            state.scroll_target.* = std.math.clamp(state.scroll_target.*, 0, max_scroll);
+            const diff = state.scroll_target.* - state.scroll_y.*;
+            if (@abs(diff) > 0.5) {
+                state.scroll_y.* += diff * scroll_ease;
+                need_render = true;
+                text_animating = true;
+            } else {
+                state.scroll_y.* = state.scroll_target.*;
+            }
+            state.scroll_y.* = std.math.clamp(state.scroll_y.*, 0, max_scroll);
         }
 
         if (need_render) {
@@ -591,7 +698,9 @@ fn renderWorker(
         const is_mesh = state.is_mesh.*;
         state.mutex.unlock(state.io);
 
-        if (is_mesh) {
+        // 60 Hz per mesh (rotazione continua) e durante l'animazione dello
+        // scroll testo; 20 Hz a riposo.
+        if (is_mesh or text_animating) {
             _ = pacer_60.tick();
         } else {
             _ = pacer_20.tick();
@@ -703,6 +812,8 @@ pub fn main(init: std.process.Init) !void {
     var pan_x: f32 = 0;
     var pan_y: f32 = 0;
     var scroll_y: f32 = 0;
+    var scroll_target: f32 = 0;
+    var scrollbar_drag = false;
     var dragging = false;
     var last_x: f32 = 0;
     var last_y: f32 = 0;
@@ -737,6 +848,8 @@ pub fn main(init: std.process.Init) !void {
         .pan_x = &pan_x,
         .pan_y = &pan_y,
         .scroll_y = &scroll_y,
+        .scroll_target = &scroll_target,
+        .scrollbar_drag = &scrollbar_drag,
         .last_x = &last_x,
         .last_y = &last_y,
     };
