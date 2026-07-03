@@ -459,6 +459,7 @@ extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 extern "c" fn pipe(fds: *[2]c_int) c_int;
 extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
 extern "c" fn close(fd: c_int) c_int;
+extern "c" fn open(path: [*:0]const u8, flags: c_int) c_int;
 extern "c" fn waitpid(pid: c_int, status: ?*c_int, options: c_int) c_int;
 // posix_spawn: fork+exec+ricerca PATH in modo sicuro anche in processi
 // multi-thread (niente malloc nel figlio forkato → niente deadlock, a
@@ -531,6 +532,29 @@ pub fn runCapture(allocator: std.mem.Allocator, argv: []const []const u8) !RunRe
     // WIFEXITED / WEXITSTATUS espansi a mano (glibc): byte basso = segnale.
     const code: u8 = if ((status & 0x7f) == 0) @intCast((status >> 8) & 0xff) else 1;
     return .{ .stdout = try out.toOwnedSlice(allocator), .exit_code = code };
+}
+
+/// Legge un intero file con open/read/close libc (niente `std.Io`): come
+/// runCapture, evita che l'io dell'host — usato dentro un plugin `.so` sul
+/// thread worker del loader — si blocchi. Il chiamante possiede il buffer.
+pub fn readFileLibc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    const fd = open(path_z.ptr, 0); // O_RDONLY
+    if (fd < 0) return error.OpenFailed;
+    defer _ = close(fd);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var buf: [65536]u8 = undefined;
+    while (out.items.len < max_bytes) {
+        const n = read(fd, &buf, buf.len);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) break;
+        try out.appendSlice(allocator, buf[0..@intCast(n)]);
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 /// Budget di dimensione file di default, proporzionale alla memoria disponibile:
