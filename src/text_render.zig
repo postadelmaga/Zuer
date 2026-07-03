@@ -1,239 +1,128 @@
-//! Rasterizza contenuti testuali (text, markdown, tabelle CSV) in immagini RGB
-//! usando ImageMagick per una resa tipografica anti-alias ad alta definizione
-//! (con DejaVu Sans per markdown, e Hack per CSV e codice — lo stesso monospace
-//! di default di egui, per parità visiva con viewer).
+//! Rende contenuti testuali (testo, codice, markdown, tabelle CSV) in immagini
+//! RGB usando un motore di glifi nativo (stb_truetype + font Hack embeddati, vedi
+//! `glyph.zig`): i glifi sono rasterizzati alla dimensione esatta dei pixel e
+//! composti direttamente nel buffer, senza processi esterni (niente ImageMagick).
+//! È la stessa tecnica di egui/viewer (glyph raster → composizione), quindi la
+//! resa combacia con il viewer di riferimento.
 
 const std = @import("std");
 const decoder_mod = @import("decoder.zig");
+const glyph = @import("glyph.zig");
+const Rgb = glyph.Rgb;
 
 pub const max_table_col: usize = 40;
 
-// Margini tipografici del documento rasterizzato (aggiunti con -border,
-// quindi già compresi nella larghezza finale richiesta).
-const pad_x: usize = 20;
-const pad_y: usize = 14;
+// Margini tipografici del documento (bordo attorno al testo).
+const pad_x: i32 = 20;
+const pad_y: i32 = 14;
 
-// Colori base del documento, allineati al tema di viewer (egui dark:
-// `extreme_bg_color` = rgb(16,17,21) per lo sfondo dell'editor di testo, e il
-// grigio chiaro del corpo dopo l'armonizzazione dei colori).
-const col_bg = "#101115";
-const col_fg = "#cdcdcd";
+// Palette allineata a quella di viewer (funzione `harmonize`): sfondo scuro
+// dell'editor egui, corpo grigio chiaro, accenti desaturati.
+const bg = Rgb.fromHex("#101115"); // viewer: extreme_bg_color rgb(16,17,21)
+const fg = Rgb.fromHex("#cdcdcd"); // corpo del testo
+const c_line_no = Rgb.fromHex("#606060"); // numeri di riga (viewer: gray 96)
+const c_keyword = Rgb.fromHex("#96aaeb"); // keyword (viewer: rgb 150,170,235)
+const c_string = Rgb.fromHex("#9ebc96"); // stringhe (viewer: rgb 158,188,150)
+const c_comment = Rgb.fromHex("#707070"); // commenti (viewer: gray 112)
+const c_md_code = Rgb.fromHex("#9ece6a"); // codice inline/blocchi markdown
+const c_md_link = Rgb.fromHex("#7aa2f7"); // link markdown
 
-/// Parametri di rasterizzazione: larghezza in pixel dell'immagine prodotta
-/// (idealmente la larghezza della finestra, per una resa 1:1 nitida) e corpo
-/// del carattere (scalato dallo zoom del chiamante).
+/// Parametri di resa: larghezza in pixel dell'immagine prodotta (idealmente la
+/// larghezza della finestra) e corpo del carattere (scalato dallo zoom del
+/// chiamante). L'altezza è determinata dal contenuto.
 pub const RenderOpts = struct {
     width: usize = 1024,
     pointsize: usize = 15,
 };
 
-/// Oltre questa dimensione il file viene mostrato in modalità plain-text
-/// veloce (niente numeri di riga né colori): il markup Pango di un sorgente
-/// enorme costerebbe più della sua utilità.
+/// Oltre questa dimensione il file è mostrato in modalità plain (niente numeri
+/// di riga né colori): l'evidenziazione di un sorgente enorme non ripaga.
 const max_rich_bytes: usize = 2 * 1024 * 1024;
 
-/// Rasterizza un contenuto decodificato testuale in un'immagine RGB.
+/// Altezza in pixel del carattere a partire dal corpo in punti, alla densità 96
+/// dpi storicamente usata dal renderer (96/72 px per punto).
+fn pxHeight(pointsize: usize) f32 {
+    return @as(f32, @floatFromInt(pointsize)) * 96.0 / 72.0;
+}
+
+/// Un tratto di testo omogeneo (stesso colore e stile) su una riga visiva.
+const Run = struct {
+    text: []const u8,
+    color: Rgb,
+    style: glyph.Style = .regular,
+};
+
+const Row = []const Run;
+
+/// Rende un contenuto decodificato testuale in un'immagine RGB. `io` non è più
+/// necessario (nessun processo esterno) ma resta nella firma per i chiamanti.
 pub fn render(gpa: std.mem.Allocator, io: std.Io, decoded: *const decoder_mod.Decoded, name: []const u8, opts: RenderOpts) !decoder_mod.ImageData {
+    _ = io;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var raster = try glyph.Raster.init(gpa, pxHeight(opts.pointsize));
+    defer raster.deinit();
+
+    var rows: std.ArrayList(Row) = .empty;
+
     switch (decoded.*) {
         .text => |t| {
-            // File di testo/codice: documento tipografico con numeri di riga
-            // e syntax highlighting leggero. Le schede informative
-            // (media, archivi) non hanno un'estensione testuale e restano pulite.
-            if (t.len <= max_rich_bytes and isCodeLike(name)) {
-                if (buildCodeDocument(gpa, t, name, opts)) |doc| {
-                    defer gpa.free(doc);
-                    return renderText(gpa, io, doc, name, true, true, opts);
-                } else |_| {}
-            }
-            return renderText(gpa, io, t, name, true, false, opts);
-        },
-        .markdown => |m| {
-            // Il markdown viene convertito in markup Pango: la resa torna
-            // formattata (header, grassetto, codice…) mantenendo il percorso
-            // veloce plain-text per tutto il resto.
-            const pango = try mdToPango(gpa, m.content);
-            defer gpa.free(pango);
-            return renderText(gpa, io, pango, name, false, true, opts);
+            const rich = t.len <= max_rich_bytes and isCodeLike(name);
+            const lang: ?Lang = if (rich) langFor(extOf(name)) else null;
+            try layoutCode(arena, &rows, &raster, t, opts, rich, lang);
         },
         .csv => |c| {
-            const table = try formatTable(gpa, c);
-            defer gpa.free(table);
-            return renderText(gpa, io, table, name, true, false, opts);
+            const table = try formatTable(arena, c);
+            try layoutCode(arena, &rows, &raster, table, opts, false, null);
+        },
+        .markdown => |m| {
+            try layoutMarkdown(arena, &rows, &raster, m.content, opts);
         },
         else => return error.UnsupportedContent,
     }
+
+    return paint(gpa, &raster, rows.items, name, opts);
 }
 
-const TimeVal = extern struct {
-    tv_sec: c_long,
-    tv_usec: c_long,
-};
-extern fn gettimeofday(tv: *TimeVal, tz: ?*anyopaque) c_int;
+// --- Composizione dell'immagine ---------------------------------------------
 
-fn getMicroseconds() u64 {
-    var tv: TimeVal = undefined;
-    _ = gettimeofday(&tv, null);
-    return @intCast(tv.tv_sec * 1_000_000 + tv.tv_usec);
-}
+/// Dipinge le righe visive in un buffer RGB: sfondo pieno, poi i glifi di ogni
+/// run fusi sopra secondo la loro copertura. Griglia monospazio (una colonna per
+/// codepoint), altezza determinata dal numero di righe.
+fn paint(gpa: std.mem.Allocator, raster: *glyph.Raster, rows: []const Row, name: []const u8, opts: RenderOpts) !decoder_mod.ImageData {
+    const line_h = raster.lineHeight();
+    const advance = raster.advance;
+    const width: usize = @max(opts.width, 2 * @as(usize, @intCast(pad_x)) + 1);
+    const n_rows: usize = @max(rows.len, 1);
+    const height: usize = @as(usize, @intCast(2 * pad_y)) + n_rows * @as(usize, @intCast(line_h));
 
-extern fn fopen(filename: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
-extern fn getpid() c_int;
-extern fn fclose(stream: ?*anyopaque) c_int;
-extern fn fwrite(ptr: [*]const u8, size: usize, nmemb: usize, stream: ?*anyopaque) usize;
-extern fn unlink(filename: [*:0]const u8) c_int;
+    const pixels = try gpa.alloc(u8, width * height * 3);
+    errdefer gpa.free(pixels);
+    fillBackground(pixels, bg);
 
-fn renderText(gpa: std.mem.Allocator, io: std.Io, content: []const u8, name: []const u8, is_mono: bool, markup: bool, opts: RenderOpts) !decoder_mod.ImageData {
-    const us = getMicroseconds();
-    var tmp_filename: [64]u8 = undefined;
-    const tmp_path = try std.fmt.bufPrint(&tmp_filename, "/tmp/zuer_txt_{d}_{d}.txt", .{ getpid(), us });
-    tmp_filename[tmp_path.len] = 0;
-
-    const path_c = @as([*:0]const u8, @ptrCast(tmp_path.ptr));
-    // "x" (C11): fallisce se il percorso esiste già, quindi un symlink
-    // pre-creato in /tmp non può dirottare la scrittura.
-    const file_ptr = fopen(path_c, "wbx") orelse return error.CreateFileFailed;
-    const written = fwrite(content.ptr, 1, content.len, file_ptr);
-    const close_res = fclose(file_ptr);
-    if (written < content.len or close_res != 0) {
-        _ = unlink(path_c);
-        return error.WriteFileFailed;
-    }
-    defer _ = unlink(path_c);
-
-    // Parità con viewer: egui usa Hack come monospace di default. Per il markdown
-    // (non-mono) resta un sans proporzionale.
-    const font_name = if (is_mono) "Hack" else "DejaVu-Sans";
-    const pango_path = try std.fmt.allocPrint(gpa, "pango:@{s}", .{tmp_path});
-    defer gpa.free(pango_path);
-
-    const markup_def = if (markup) "pango:markup=true" else "pango:markup=false";
-    const border_arg = std.fmt.comptimePrint("{d}x{d}", .{ pad_x, pad_y });
-    var size_arg_buf: [24]u8 = undefined;
-    const size_arg = try std.fmt.bufPrint(&size_arg_buf, "{d}x", .{opts.width -| 2 * pad_x});
-    var pointsize_buf: [16]u8 = undefined;
-    const pointsize_arg = try std.fmt.bufPrint(&pointsize_buf, "{d}", .{opts.pointsize});
-
-    // 1. Rileva le dimensioni finali dell'immagine tipografica generata da ImageMagick
-    const size_result = try std.process.run(gpa, io, .{
-        .argv = &.{
-            "convert",
-            "-depth",
-            "8",
-            "-density",
-            "96",
-            "-background",
-            col_bg,
-            "-fill",
-            col_fg,
-            "-define",
-            "pango:align=left",
-            "-define",
-            "pango:wrap=word-char",
-            "-define",
-            markup_def,
-            "-size",
-            size_arg,
-            "-font",
-            font_name,
-            "-pointsize",
-            pointsize_arg,
-            pango_path,
-            "-bordercolor",
-            col_bg,
-            "-border",
-            border_arg,
-            "-format",
-            "%w %h",
-            "info:",
-        },
-    });
-    defer gpa.free(size_result.stdout);
-    defer gpa.free(size_result.stderr);
-
-    switch (size_result.term) {
-        .exited => |code| {
-            if (code != 0) return error.ConvertSizeFailed;
-        },
-        else => return error.ConvertSizeFailed,
-    }
-
-    var size_tokens = std.mem.tokenizeAny(u8, size_result.stdout, " \n\r\t");
-    const w_str = size_tokens.next() orelse return error.InvalidImageMetadata;
-    const h_str = size_tokens.next() orelse return error.InvalidImageMetadata;
-
-    const width = try std.fmt.parseInt(usize, w_str, 10);
-    const height = try std.fmt.parseInt(usize, h_str, 10);
-
-    if (width == 0 or height == 0) return error.EmptyResizedImage;
-
-    // 2. Renderizza il testo direttamente a stdout come stream di pixel RGB grezzi
-    const convert_result = try std.process.run(gpa, io, .{
-        .argv = &.{
-            "convert",
-            "-depth",
-            "8",
-            "-density",
-            "96",
-            "-background",
-            col_bg,
-            "-fill",
-            col_fg,
-            "-define",
-            "pango:align=left",
-            "-define",
-            "pango:wrap=word-char",
-            "-define",
-            markup_def,
-            "-size",
-            size_arg,
-            "-font",
-            font_name,
-            "-pointsize",
-            pointsize_arg,
-            pango_path,
-            "-bordercolor",
-            col_bg,
-            "-border",
-            border_arg,
-            "rgb:-",
-        },
-    });
-    errdefer gpa.free(convert_result.stdout);
-    defer gpa.free(convert_result.stderr);
-
-    switch (convert_result.term) {
-        .exited => |code| {
-            if (code != 0) {
-                gpa.free(convert_result.stdout);
-                return error.ConvertRenderFailed;
+    const w_i: i32 = @intCast(width);
+    const h_i: i32 = @intCast(height);
+    for (rows, 0..) |row, r| {
+        const baseline = pad_y + @as(i32, @intCast(r)) * line_h + raster.ascent;
+        var col: i32 = 0;
+        for (row) |run| {
+            var i: usize = 0;
+            while (i < run.text.len) {
+                const seq = std.unicode.utf8ByteSequenceLength(run.text[i]) catch 1;
+                const end = @min(i + seq, run.text.len);
+                const cp: u32 = std.unicode.utf8Decode(run.text[i..end]) catch run.text[i];
+                const pen_x = pad_x + col * advance;
+                try raster.drawCodepoint(pixels, w_i, h_i, pen_x, baseline, run.style, cp, run.color);
+                col += 1;
+                i = end;
             }
-        },
-        else => {
-            gpa.free(convert_result.stdout);
-            return error.ConvertRenderFailed;
-        },
-    }
-
-    const expected_bytes = width * height * 3;
-    if (convert_result.stdout.len < expected_bytes) {
-        gpa.free(convert_result.stdout);
-        return error.IncompleteImagePixels;
+        }
     }
 
     const name_dup = try gpa.dupe(u8, name);
-    errdefer gpa.free(name_dup);
-
-    // La slice dei pixel deve coincidere con l'allocazione: liberarne una
-    // porzione corromperebbe l'allocator. Se convert emette byte extra si
-    // copia la parte utile e si libera l'originale.
-    const pixels = if (convert_result.stdout.len == expected_bytes)
-        convert_result.stdout
-    else blk: {
-        const exact = try gpa.dupe(u8, convert_result.stdout[0..expected_bytes]);
-        gpa.free(convert_result.stdout);
-        break :blk exact;
-    };
-
     return .{
         .width = width,
         .height = height,
@@ -242,18 +131,336 @@ fn renderText(gpa: std.mem.Allocator, io: std.Io, content: []const u8, name: []c
     };
 }
 
-// --- Documento codice: gutter, wrap e highlighting ---------------------------
+fn fillBackground(pixels: []u8, color: Rgb) void {
+    var i: usize = 0;
+    while (i + 3 <= pixels.len) : (i += 3) {
+        pixels[i + 0] = color.r;
+        pixels[i + 1] = color.g;
+        pixels[i + 2] = color.b;
+    }
+}
 
-// Palette allineata a quella di viewer (funzione `harmonize`): numeri di riga
-// grigio spento, keyword blu desaturato, stringhe verde salvia, commenti grigi.
-const col_line_no = "#606060"; // viewer: Color32::from_gray(96)
-const col_keyword = "#96aaeb"; // viewer: rgb(150,170,235)
-const col_string = "#9ebc96"; // viewer: rgb(158,188,150)
-const col_comment = "#707070"; // viewer: from_gray(112)
+/// Colonne di testo disponibili alla larghezza richiesta (al netto dei margini).
+fn totalColumns(raster: *const glyph.Raster, opts: RenderOpts) usize {
+    const inner: i32 = @as(i32, @intCast(opts.width)) - 2 * pad_x;
+    if (raster.advance <= 0 or inner <= 0) return 24;
+    return @intCast(@max(@divTrunc(inner, raster.advance), 24));
+}
 
-/// Avanzamento medio di Hack in px per punto: ~0.602 em, alla densità di 96 dpi
-/// fissata nelle invocazioni di convert (96/72 px per pt).
-const mono_advance_px_per_pt: f32 = 0.602 * 96.0 / 72.0;
+// --- Documento testo/codice: gutter, wrap ed evidenziazione ------------------
+
+/// Costruisce le righe visive di un documento testuale. Con `gutter` attivo
+/// aggiunge i numeri di riga (allineati a destra, senza righello — come viewer);
+/// con `lang` non nullo evidenzia keyword/stringhe/commenti. Il testo va a capo
+/// per colonne, con rientro allineato al gutter sulle continuazioni.
+fn layoutCode(arena: std.mem.Allocator, rows: *std.ArrayList(Row), raster: *glyph.Raster, text: []const u8, opts: RenderOpts, gutter: bool, lang: ?Lang) !void {
+    const total_cols = totalColumns(raster, opts);
+
+    var total_lines: usize = 1;
+    for (text) |ch| {
+        if (ch == '\n') total_lines += 1;
+    }
+    var digits: usize = 1;
+    var n = total_lines;
+    while (n >= 10) : (n /= 10) digits += 1;
+    if (digits < 3) digits = 3;
+
+    const gutter_cols: usize = if (gutter) digits + 2 else 0;
+    const code_cols = if (total_cols > gutter_cols + 16) total_cols - gutter_cols else 16;
+
+    var line_no: usize = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw_line| {
+        line_no += 1;
+        const line_trimmed = std.mem.trimEnd(u8, raw_line, "\r");
+        // I tab spostano l'allineamento a colonne: li espandiamo a spazi.
+        const line = try expandTabs(arena, line_trimmed);
+
+        var start: usize = 0;
+        var first = true;
+        while (true) {
+            const end = sliceByColumns(line, start, code_cols);
+            const chunk = line[start..end];
+
+            var run_list: std.ArrayList(Run) = .empty;
+            if (gutter) {
+                const g = if (first)
+                    try gutterNumber(arena, line_no, digits)
+                else
+                    try blankGutter(arena, gutter_cols);
+                try run_list.append(arena, .{ .text = g, .color = c_line_no });
+            }
+            if (lang) |l| {
+                try tokenize(arena, &run_list, chunk, l);
+            } else if (chunk.len > 0) {
+                try run_list.append(arena, .{ .text = chunk, .color = fg });
+            }
+            try rows.append(arena, try run_list.toOwnedSlice(arena));
+
+            first = false;
+            start = end;
+            if (start >= line.len) break;
+        }
+    }
+}
+
+/// Numero di riga allineato a destra su `digits` cifre, seguito da due spazi.
+fn gutterNumber(arena: std.mem.Allocator, line_no: usize, digits: usize) ![]u8 {
+    const buf = try arena.alloc(u8, digits + 2);
+    @memset(buf, ' ');
+    var v = line_no;
+    var i = digits;
+    if (v == 0) {
+        buf[digits - 1] = '0';
+    } else {
+        while (v > 0) : (v /= 10) {
+            i -= 1;
+            buf[i] = '0' + @as(u8, @intCast(v % 10));
+        }
+    }
+    return buf;
+}
+
+fn blankGutter(arena: std.mem.Allocator, cols: usize) ![]u8 {
+    const buf = try arena.alloc(u8, cols);
+    @memset(buf, ' ');
+    return buf;
+}
+
+/// Evidenziazione leggera di un segmento in run colorati: commenti di riga,
+/// stringhe tra apici e keyword. Il resto è testo neutro. I run puntano dentro
+/// `chunk` (memoria dell'arena, viva fino alla composizione).
+fn tokenize(arena: std.mem.Allocator, runs: *std.ArrayList(Run), chunk: []const u8, lang: Lang) !void {
+    var i: usize = 0;
+    var plain_start: usize = 0;
+
+    while (i < chunk.len) {
+        // Commento di riga: colora fino a fine segmento.
+        var is_comment = false;
+        for (lang.line_comments) |prefix| {
+            if (std.mem.startsWith(u8, chunk[i..], prefix)) {
+                is_comment = true;
+                break;
+            }
+        }
+        if (is_comment) {
+            try flushPlain(arena, runs, chunk, plain_start, i);
+            try runs.append(arena, .{ .text = chunk[i..], .color = c_comment });
+            return;
+        }
+
+        const c = chunk[i];
+
+        // Stringhe tra apici (best effort, senza multilinea).
+        if (c == '"' or c == '\'' or c == '`') {
+            try flushPlain(arena, runs, chunk, plain_start, i);
+            var end = i + 1;
+            while (end < chunk.len) : (end += 1) {
+                if (chunk[end] == '\\') {
+                    end += 1;
+                    continue;
+                }
+                if (chunk[end] == c) break;
+            }
+            const stop = @min(end + 1, chunk.len);
+            try runs.append(arena, .{ .text = chunk[i..stop], .color = c_string });
+            i = stop;
+            plain_start = i;
+            continue;
+        }
+
+        // Identificatori: keyword colorate (grassetto), il resto resta neutro.
+        if (std.ascii.isAlphabetic(c) or c == '_') {
+            var end = i + 1;
+            while (end < chunk.len and (std.ascii.isAlphanumeric(chunk[end]) or chunk[end] == '_')) end += 1;
+            const word = chunk[i..end];
+            var is_kw = false;
+            for (lang.keywords) |kw| {
+                if (std.mem.eql(u8, word, kw)) {
+                    is_kw = true;
+                    break;
+                }
+            }
+            if (is_kw) {
+                try flushPlain(arena, runs, chunk, plain_start, i);
+                try runs.append(arena, .{ .text = word, .color = c_keyword, .style = .bold });
+                plain_start = end;
+            }
+            i = end;
+            continue;
+        }
+
+        i += 1;
+    }
+    try flushPlain(arena, runs, chunk, plain_start, chunk.len);
+}
+
+fn flushPlain(arena: std.mem.Allocator, runs: *std.ArrayList(Run), chunk: []const u8, from: usize, to: usize) !void {
+    if (to > from) try runs.append(arena, .{ .text = chunk[from..to], .color = fg });
+}
+
+// --- Markdown: header, grassetto, corsivo, codice, liste ---------------------
+
+/// Costruisce le righe visive del markdown. Header in grassetto, blocchi e
+/// codice inline in verde, grassetto/corsivo, liste puntate e link. Le righe
+/// logiche vanno a capo per colonne conservando lo stile dei run.
+fn layoutMarkdown(arena: std.mem.Allocator, rows: *std.ArrayList(Row), raster: *glyph.Raster, md: []const u8, opts: RenderOpts) !void {
+    const total_cols = totalColumns(raster, opts);
+    var in_fence = false;
+    var lines = std.mem.splitScalar(u8, md, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trimEnd(u8, raw_line, "\r");
+        const trimmed = std.mem.trimStart(u8, line, " \t");
+
+        var line_runs: std.ArrayList(Run) = .empty;
+
+        if (std.mem.startsWith(u8, trimmed, "```")) {
+            in_fence = !in_fence;
+            continue;
+        }
+        if (in_fence) {
+            try line_runs.append(arena, .{ .text = try arena.dupe(u8, line), .color = c_md_code });
+            try wrapRuns(arena, rows, line_runs.items, total_cols);
+            continue;
+        }
+
+        // Header: da # a ####, in grassetto (stessa griglia monospazio).
+        var level: usize = 0;
+        while (level < trimmed.len and level < 4 and trimmed[level] == '#') level += 1;
+        if (level > 0 and level < trimmed.len and trimmed[level] == ' ') {
+            try mdInline(arena, &line_runs, trimmed[level + 1 ..], .bold, fg);
+            try wrapRuns(arena, rows, line_runs.items, total_cols);
+            continue;
+        }
+
+        // Liste puntate, conservando l'indentazione.
+        if (std.mem.startsWith(u8, trimmed, "- ") or std.mem.startsWith(u8, trimmed, "* ")) {
+            const indent = try blankGutter(arena, line.len - trimmed.len);
+            try line_runs.append(arena, .{ .text = indent, .color = fg });
+            try line_runs.append(arena, .{ .text = "• ", .color = fg });
+            try mdInline(arena, &line_runs, trimmed[2..], .regular, fg);
+            try wrapRuns(arena, rows, line_runs.items, total_cols);
+            continue;
+        }
+
+        try mdInline(arena, &line_runs, line, .regular, fg);
+        try wrapRuns(arena, rows, line_runs.items, total_cols);
+    }
+}
+
+/// Analizza lo stile inline (`codice`, **grassetto**, *corsivo*, [testo](url)) e
+/// accoda run. `base_style` è lo stile di fondo (grassetto per gli header).
+fn mdInline(arena: std.mem.Allocator, runs: *std.ArrayList(Run), text: []const u8, base_style: glyph.Style, base_color: Rgb) !void {
+    var i: usize = 0;
+    var plain_start: usize = 0;
+    const flush = struct {
+        fn f(a: std.mem.Allocator, rs: *std.ArrayList(Run), t: []const u8, from: usize, to: usize, st: glyph.Style, col: Rgb) !void {
+            if (to > from) try rs.append(a, .{ .text = t[from..to], .color = col, .style = st });
+        }
+    }.f;
+
+    while (i < text.len) {
+        const c = text[i];
+        if (c == '`') {
+            if (std.mem.indexOfScalarPos(u8, text, i + 1, '`')) |end| {
+                try flush(arena, runs, text, plain_start, i, base_style, base_color);
+                try runs.append(arena, .{ .text = text[i + 1 .. end], .color = c_md_code });
+                i = end + 1;
+                plain_start = i;
+                continue;
+            }
+        } else if (c == '*' and i + 1 < text.len and text[i + 1] == '*') {
+            if (std.mem.indexOfPos(u8, text, i + 2, "**")) |end| {
+                try flush(arena, runs, text, plain_start, i, base_style, base_color);
+                try runs.append(arena, .{ .text = text[i + 2 .. end], .color = base_color, .style = .bold });
+                i = end + 2;
+                plain_start = i;
+                continue;
+            }
+        } else if (c == '*') {
+            if (std.mem.indexOfScalarPos(u8, text, i + 1, '*')) |end| {
+                if (end > i + 1) {
+                    try flush(arena, runs, text, plain_start, i, base_style, base_color);
+                    try runs.append(arena, .{ .text = text[i + 1 .. end], .color = base_color, .style = .italic });
+                    i = end + 1;
+                    plain_start = i;
+                    continue;
+                }
+            }
+        } else if (c == '[') {
+            if (std.mem.indexOfScalarPos(u8, text, i + 1, ']')) |close| {
+                if (close + 1 < text.len and text[close + 1] == '(') {
+                    if (std.mem.indexOfScalarPos(u8, text, close + 2, ')')) |paren| {
+                        try flush(arena, runs, text, plain_start, i, base_style, base_color);
+                        try runs.append(arena, .{ .text = text[i + 1 .. close], .color = c_md_link });
+                        i = paren + 1;
+                        plain_start = i;
+                        continue;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    try flush(arena, runs, text, plain_start, text.len, base_style, base_color);
+}
+
+/// Manda a capo una riga logica (lista di run) in righe visive larghe al più
+/// `max_cols` colonne, spezzando i run e conservandone colore e stile.
+fn wrapRuns(arena: std.mem.Allocator, rows: *std.ArrayList(Row), line_runs: []const Run, max_cols: usize) !void {
+    var cur: std.ArrayList(Run) = .empty;
+    var col: usize = 0;
+
+    for (line_runs) |run| {
+        var seg_start: usize = 0;
+        var i: usize = 0;
+        while (i < run.text.len) {
+            const seq = std.unicode.utf8ByteSequenceLength(run.text[i]) catch 1;
+            const end = @min(i + seq, run.text.len);
+            col += 1;
+            i = end;
+            if (col >= max_cols) {
+                try cur.append(arena, .{ .text = run.text[seg_start..i], .color = run.color, .style = run.style });
+                try rows.append(arena, try cur.toOwnedSlice(arena));
+                cur = .empty;
+                col = 0;
+                seg_start = i;
+            }
+        }
+        if (i > seg_start) {
+            try cur.append(arena, .{ .text = run.text[seg_start..i], .color = run.color, .style = run.style });
+        }
+    }
+    // Riga finale (anche vuota, per preservare le righe bianche del sorgente).
+    try rows.append(arena, try cur.toOwnedSlice(arena));
+}
+
+// --- Tabelle / helper --------------------------------------------------------
+
+fn expandTabs(arena: std.mem.Allocator, line: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (line) |c| {
+        if (c == '\t') {
+            try out.appendSlice(arena, "    ");
+        } else {
+            try out.append(arena, c);
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// Fine del segmento che copre al più `cols` codepoint da `start`, senza
+/// spezzare le sequenze UTF-8.
+fn sliceByColumns(line: []const u8, start: usize, cols: usize) usize {
+    var i = start;
+    var count: usize = 0;
+    while (i < line.len and count < cols) {
+        const len = std.unicode.utf8ByteSequenceLength(line[i]) catch 1;
+        i = @min(i + len, line.len);
+        count += 1;
+    }
+    return i;
+}
 
 const Lang = struct {
     line_comments: []const []const u8,
@@ -295,7 +502,7 @@ fn langFor(ext: []const u8) Lang {
             if (std.ascii.eqlIgnoreCase(ext, e)) return case.lang;
         }
     }
-    // Testo generico: niente keyword, niente commenti — restano gutter e wrap
+    // Testo generico: niente keyword, niente commenti — restano gutter e wrap.
     return .{ .line_comments = &no_comment, .keywords = &kw_none };
 }
 
@@ -306,8 +513,8 @@ fn extOf(name: []const u8) []const u8 {
     return "";
 }
 
-/// Il documento con gutter ha senso per testo e codice aperti da file; le
-/// schede informative sintetiche (media, archivi) non passano di qui.
+/// Il documento con gutter ha senso per testo e codice aperti da file; le schede
+/// informative sintetiche (media, archivi) non passano di qui.
 fn isCodeLike(name: []const u8) bool {
     const ext = extOf(name);
     if (ext.len == 0) return true; // file senza estensione: quasi sempre testo
@@ -318,300 +525,12 @@ fn isCodeLike(name: []const u8) bool {
     return false;
 }
 
-/// Costruisce il markup Pango del documento: numeri di riga in colonna
-/// (allineati a destra, colore attenuato), righello verticale, contenuto
-/// evidenziato e a-capo manuale con rientro allineato al gutter.
-fn buildCodeDocument(gpa: std.mem.Allocator, text: []const u8, name: []const u8, opts: RenderOpts) ![]u8 {
-    const lang = langFor(extOf(name));
-
-    // Colonne disponibili alla larghezza richiesta (al netto dei margini)
-    const inner_px: f32 = @floatFromInt(opts.width -| 2 * pad_x);
-    const px_per_char = @as(f32, @floatFromInt(opts.pointsize)) * mono_advance_px_per_pt;
-    const total_cols: usize = @intFromFloat(@max(inner_px / px_per_char, 24));
-
-    var total_lines: usize = 1;
-    for (text) |c| {
-        if (c == '\n') total_lines += 1;
-    }
-    var digits: usize = 1;
-    var n = total_lines;
-    while (n >= 10) : (n /= 10) digits += 1;
-    if (digits < 3) digits = 3;
-
-    // Gutter: numeri (digits) + 2 spazi, senza righello verticale (viewer non
-    // ne ha: numeri a destra, poi uno spazio prima del codice).
-    const gutter_cols = digits + 2;
-    const code_cols = if (total_cols > gutter_cols + 16) total_cols - gutter_cols else 16;
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    const w = &out.writer;
-
-    var line_no: usize = 0;
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |raw_line| {
-        line_no += 1;
-        const line_trimmed = std.mem.trimEnd(u8, raw_line, "\r");
-
-        // I tab spostano i tab-stop di Pango e romperebbero il gutter
-        const line = try expandTabs(gpa, line_trimmed);
-        defer gpa.free(line);
-
-        var start: usize = 0;
-        var first = true;
-        while (true) {
-            const end = sliceByColumns(line, start, code_cols);
-            const chunk = line[start..end];
-
-            if (first) {
-                try w.print("<span foreground=\"{s}\">", .{col_line_no});
-                var d: usize = countDigits(line_no);
-                while (d < digits) : (d += 1) try w.writeByte(' ');
-                try w.print("{d}</span>  ", .{line_no});
-            } else {
-                // Riga di continuazione: gutter vuoto largo quanto numeri + 2 spazi
-                var d: usize = 0;
-                while (d < gutter_cols) : (d += 1) try w.writeByte(' ');
-            }
-            try highlightChunk(w, chunk, lang);
-            try w.writeByte('\n');
-
-            first = false;
-            start = end;
-            if (start >= line.len) break;
-        }
-    }
-
-    return out.toOwnedSlice();
-}
-
-fn countDigits(v: usize) usize {
-    var d: usize = 1;
-    var n = v;
-    while (n >= 10) : (n /= 10) d += 1;
-    return d;
-}
-
-fn expandTabs(gpa: std.mem.Allocator, line: []const u8) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    for (line) |c| {
-        if (c == '\t') {
-            try out.writer.writeAll("    ");
-        } else {
-            try out.writer.writeByte(c);
-        }
-    }
-    return out.toOwnedSlice();
-}
-
-/// Fine del segmento che copre al massimo `cols` codepoint da `start`,
-/// senza spezzare le sequenze UTF-8.
-fn sliceByColumns(line: []const u8, start: usize, cols: usize) usize {
-    var i = start;
-    var count: usize = 0;
-    while (i < line.len and count < cols) {
-        const len = std.unicode.utf8ByteSequenceLength(line[i]) catch 1;
-        i = @min(i + len, line.len);
-        count += 1;
-    }
-    return i;
-}
-
-/// Evidenziazione leggera di un segmento: commenti di riga, stringhe e
-/// keyword. Tutto il resto è testo neutro, sempre escapato.
-fn highlightChunk(w: *std.Io.Writer, chunk: []const u8, lang: Lang) !void {
-    var i: usize = 0;
-    while (i < chunk.len) {
-        const c = chunk[i];
-
-        // Commento di riga: colora fino a fine segmento
-        var is_comment = false;
-        for (lang.line_comments) |prefix| {
-            if (std.mem.startsWith(u8, chunk[i..], prefix)) {
-                is_comment = true;
-                break;
-            }
-        }
-        if (is_comment) {
-            try w.print("<span foreground=\"{s}\">", .{col_comment});
-            try writeEscaped(w, chunk[i..]);
-            try w.writeAll("</span>");
-            return;
-        }
-
-        // Stringhe tra apici (senza escape multilinea: best effort)
-        if (c == '"' or c == '\'' or c == '`') {
-            var end = i + 1;
-            while (end < chunk.len) : (end += 1) {
-                if (chunk[end] == '\\') {
-                    end += 1;
-                    continue;
-                }
-                if (chunk[end] == c) break;
-            }
-            const stop = @min(end + 1, chunk.len);
-            try w.print("<span foreground=\"{s}\">", .{col_string});
-            try writeEscaped(w, chunk[i..stop]);
-            try w.writeAll("</span>");
-            i = stop;
-            continue;
-        }
-
-        // Identificatori: keyword colorate, il resto neutro
-        if (std.ascii.isAlphabetic(c) or c == '_') {
-            var end = i + 1;
-            while (end < chunk.len and (std.ascii.isAlphanumeric(chunk[end]) or chunk[end] == '_')) end += 1;
-            const word = chunk[i..end];
-            var is_kw = false;
-            for (lang.keywords) |kw| {
-                if (std.mem.eql(u8, word, kw)) {
-                    is_kw = true;
-                    break;
-                }
-            }
-            if (is_kw) {
-                try w.print("<span foreground=\"{s}\" weight=\"600\">", .{col_keyword});
-                try writeEscaped(w, word);
-                try w.writeAll("</span>");
-            } else {
-                try writeEscaped(w, word);
-            }
-            i = end;
-            continue;
-        }
-
-        try writeEscapedByte(w, c);
-        i += 1;
-    }
-}
-
-/// Converte un sottoinsieme di Markdown in markup Pango: header, grassetto,
-/// corsivo, codice inline, blocchi recintati, liste puntate e link. Il testo
-/// viene sempre escapato, quindi qualsiasi input è sicuro per il parser Pango.
-fn mdToPango(gpa: std.mem.Allocator, md: []const u8) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    const w = &out.writer;
-
-    var in_fence = false;
-    var lines = std.mem.splitScalar(u8, md, '\n');
-    while (lines.next()) |raw_line| {
-        const line = std.mem.trimEnd(u8, raw_line, "\r");
-        const trimmed = std.mem.trimStart(u8, line, " \t");
-
-        if (std.mem.startsWith(u8, trimmed, "```")) {
-            in_fence = !in_fence;
-            continue;
-        }
-        if (in_fence) {
-            try w.writeAll("<span font_family=\"monospace\" foreground=\"#9ece6a\">");
-            try writeEscaped(w, line);
-            try w.writeAll("</span>\n");
-            continue;
-        }
-
-        // Header: da # a ####, corpo decrescente
-        var level: usize = 0;
-        while (level < trimmed.len and level < 4 and trimmed[level] == '#') level += 1;
-        if (level > 0 and level < trimmed.len and trimmed[level] == ' ') {
-            const size = switch (level) {
-                1 => "xx-large",
-                2 => "x-large",
-                else => "large",
-            };
-            try w.print("<span weight=\"bold\" size=\"{s}\">", .{size});
-            try writeInline(w, trimmed[level + 1 ..]);
-            try w.writeAll("</span>\n");
-            continue;
-        }
-
-        // Liste puntate, conservando l'indentazione
-        if (std.mem.startsWith(u8, trimmed, "- ") or std.mem.startsWith(u8, trimmed, "* ")) {
-            try w.splatByteAll(' ', line.len - trimmed.len);
-            try w.writeAll("• ");
-            try writeInline(w, trimmed[2..]);
-            try w.writeAll("\n");
-            continue;
-        }
-
-        try writeInline(w, line);
-        try w.writeAll("\n");
-    }
-
-    return out.toOwnedSlice();
-}
-
-/// Markup inline: `codice`, **grassetto**, *corsivo* e [testo](url).
-/// I marcatori senza chiusura vengono emessi letteralmente.
-fn writeInline(w: *std.Io.Writer, text: []const u8) !void {
-    var i: usize = 0;
-    while (i < text.len) {
-        const c = text[i];
-        if (c == '`') {
-            if (std.mem.indexOfScalarPos(u8, text, i + 1, '`')) |end| {
-                try w.writeAll("<span font_family=\"monospace\" foreground=\"#9ece6a\">");
-                try writeEscaped(w, text[i + 1 .. end]);
-                try w.writeAll("</span>");
-                i = end + 1;
-                continue;
-            }
-        } else if (c == '*' and i + 1 < text.len and text[i + 1] == '*') {
-            if (std.mem.indexOfPos(u8, text, i + 2, "**")) |end| {
-                try w.writeAll("<b>");
-                try writeEscaped(w, text[i + 2 .. end]);
-                try w.writeAll("</b>");
-                i = end + 2;
-                continue;
-            }
-        } else if (c == '*') {
-            if (std.mem.indexOfScalarPos(u8, text, i + 1, '*')) |end| {
-                if (end > i + 1) {
-                    try w.writeAll("<i>");
-                    try writeEscaped(w, text[i + 1 .. end]);
-                    try w.writeAll("</i>");
-                    i = end + 1;
-                    continue;
-                }
-            }
-        } else if (c == '[') {
-            if (std.mem.indexOfScalarPos(u8, text, i + 1, ']')) |close| {
-                if (close + 1 < text.len and text[close + 1] == '(') {
-                    if (std.mem.indexOfScalarPos(u8, text, close + 2, ')')) |paren| {
-                        try w.writeAll("<span foreground=\"#7aa2f7\" underline=\"single\">");
-                        try writeEscaped(w, text[i + 1 .. close]);
-                        try w.writeAll("</span>");
-                        i = paren + 1;
-                        continue;
-                    }
-                }
-            }
-        }
-        try writeEscapedByte(w, c);
-        i += 1;
-    }
-}
-
-fn writeEscaped(w: *std.Io.Writer, text: []const u8) !void {
-    for (text) |c| try writeEscapedByte(w, c);
-}
-
-fn writeEscapedByte(w: *std.Io.Writer, c: u8) !void {
-    switch (c) {
-        '&' => try w.writeAll("&amp;"),
-        '<' => try w.writeAll("&lt;"),
-        '>' => try w.writeAll("&gt;"),
-        else => try w.writeByte(c),
-    }
-}
-
 /// Formatta una tabella CSV come testo monospazio con colonne allineate.
-fn formatTable(gpa: std.mem.Allocator, c: decoder_mod.CsvData) ![]u8 {
+fn formatTable(arena: std.mem.Allocator, c: decoder_mod.CsvData) ![]u8 {
     const ncols = c.headers.len;
-    if (ncols == 0) return gpa.dupe(u8, "(tabella vuota)");
+    if (ncols == 0) return arena.dupe(u8, "(tabella vuota)");
 
-    const widths = try gpa.alloc(usize, ncols);
-    defer gpa.free(widths);
+    const widths = try arena.alloc(usize, ncols);
     for (c.headers, 0..) |h, i| widths[i] = @min(h.len, max_table_col);
     for (c.rows) |row| {
         for (row, 0..) |cell_text, i| {
@@ -620,31 +539,27 @@ fn formatTable(gpa: std.mem.Allocator, c: decoder_mod.CsvData) ![]u8 {
         }
     }
 
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    const w = &out.writer;
-
-    try writeTableRow(w, c.headers, widths);
+    var out: std.ArrayList(u8) = .empty;
+    try writeTableRow(arena, &out, c.headers, widths);
     for (widths, 0..) |wd, i| {
-        try w.splatByteAll('-', wd);
-        if (i + 1 < ncols) try w.writeAll("  ");
+        try out.appendNTimes(arena, '-', wd);
+        if (i + 1 < ncols) try out.appendSlice(arena, "  ");
     }
-    try w.writeAll("\n");
+    try out.append(arena, '\n');
     for (c.rows) |row| {
-        try writeTableRow(w, row, widths);
+        try writeTableRow(arena, &out, row, widths);
     }
-
-    return out.toOwnedSlice();
+    return out.toOwnedSlice(arena);
 }
 
-fn writeTableRow(w: *std.Io.Writer, cells: []const []const u8, widths: []const usize) !void {
+fn writeTableRow(arena: std.mem.Allocator, out: *std.ArrayList(u8), cells: []const []const u8, widths: []const usize) !void {
     for (widths, 0..) |wd, i| {
         const cell = if (i < cells.len) cells[i] else "";
         const shown = cell[0..@min(cell.len, wd)];
-        try w.writeAll(shown);
+        try out.appendSlice(arena, shown);
         if (i + 1 < widths.len) {
-            try w.splatByteAll(' ', wd - shown.len + 2);
+            try out.appendNTimes(arena, ' ', wd - shown.len + 2);
         }
     }
-    try w.writeAll("\n");
+    try out.append(arena, '\n');
 }

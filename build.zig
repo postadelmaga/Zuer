@@ -62,8 +62,27 @@ pub fn build(b: *std.Build) void {
     gui_exe.root_module.addAnonymousImport("mesh_frag_spv", .{ .root_source_file = frag_spv });
     gui_exe.root_module.linkSystemLibrary("vulkan", .{});
     gui_exe.root_module.linkSystemLibrary("wayland-client", .{});
+    // Motore di testo nativo: stb_truetype rasterizza i glifi Hack (embeddati),
+    // sostituendo ImageMagick/Pango. -fno-sanitize=undefined come per stb_image.
+    addStbTruetype(b, gui_exe.root_module);
 
     b.installArtifact(gui_exe);
+
+    // Tool di sviluppo: rasterizza un file col percorso reale di text_render e
+    // ne scrive il PPM, per verificare la resa headless (zig build raster-debug).
+    const raster_dbg = b.addExecutable(.{
+        .name = "raster-debug",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/raster_debug.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    addStbTruetype(b, raster_dbg.root_module);
+    const raster_dbg_run = b.addRunArtifact(raster_dbg);
+    if (b.args) |args| raster_dbg_run.addArgs(args);
+    b.step("raster-debug", "Rasterizza un file su PPM (stdout)").dependOn(&raster_dbg_run.step);
 
     const decoder_mod = b.createModule(.{
         .root_source_file = b.path("src/decoder.zig"),
@@ -107,4 +126,13 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run zuer");
     run_step.dependOn(&run_cmd.step);
+}
+
+/// Compila stb_truetype nel modulo e ne espone gli header a @cImport.
+fn addStbTruetype(b: *std.Build, mod: *std.Build.Module) void {
+    mod.addIncludePath(b.path("vendor/stb"));
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/stb/stb_truetype_impl.c"),
+        .flags = &.{ "-O2", "-fno-sanitize=undefined" },
+    });
 }

@@ -504,9 +504,9 @@ fn renderWorker(
         var need_render = size_changed or state.file_changed.* or state.is_mesh.*;
 
         if (state.is_text.*) {
-            // (Ri)rasterizza quando cambiano larghezza finestra, zoom o file.
-            // Un solo tentativo per cambio di parametri: un errore persistente
-            // (ImageMagick assente) non deve rilanciare convert a 20 Hz.
+            // (Ri)compone il testo quando cambiano larghezza finestra, zoom o
+            // file: un solo tentativo per cambio di parametri (evita di ripetere
+            // il layout a 20 Hz se qualcosa fallisce in modo persistente).
             const tz = std.math.clamp(zoom.*, text_zoom_min, text_zoom_max);
             if (last_text_w != cur_w or last_text_zoom != tz or last_seq != state.load_seq.*) {
                 rasterizeText(state, cur_w, tz);
