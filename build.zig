@@ -169,6 +169,24 @@ pub fn build(b: *std.Build) void {
     const decode_run = b.addRunArtifact(decode_dbg);
     if (b.args) |args| decode_run.addArgs(args);
     b.step("decode-test", "Decodifica un file e stampa il risultato").dependOn(&decode_run.step);
+
+    // Tool di sviluppo: itera i frame di un video col motore player.zig (libav).
+    const player_dbg = b.addExecutable(.{
+        .name = "player-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/player_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    player_dbg.root_module.linkSystemLibrary("libavformat", .{});
+    player_dbg.root_module.linkSystemLibrary("libavcodec", .{});
+    player_dbg.root_module.linkSystemLibrary("libavutil", .{});
+    player_dbg.root_module.linkSystemLibrary("libswscale", .{});
+    const player_run = b.addRunArtifact(player_dbg);
+    if (b.args) |args| player_run.addArgs(args);
+    b.step("player-test", "Itera i frame video di un file (libav)").dependOn(&player_run.step);
 }
 
 /// Compila stb_truetype nel modulo e ne espone gli header a @cImport.
