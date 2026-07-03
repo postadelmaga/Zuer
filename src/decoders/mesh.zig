@@ -1,6 +1,5 @@
 const std = @import("std");
 const decoder = @import("decoder");
-const MeshData = decoder.MeshData;
 const Face = decoder.Face;
 const Decoded = decoder.Decoded;
 

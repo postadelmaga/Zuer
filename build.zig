@@ -136,6 +136,14 @@ pub fn build(b: *std.Build) void {
                 .flags = &.{ "-O2", "-fno-sanitize=undefined" },
             });
         }
+        // Il plugin media decodifica video/audio nativamente con libav (ffmpeg):
+        // primo frame come poster, e in prospettiva riproduzione completa.
+        if (comptime std.mem.eql(u8, name, "media")) {
+            lib.root_module.linkSystemLibrary("libavformat", .{});
+            lib.root_module.linkSystemLibrary("libavcodec", .{});
+            lib.root_module.linkSystemLibrary("libavutil", .{});
+            lib.root_module.linkSystemLibrary("libswscale", .{});
+        }
         b.installArtifact(lib);
     }
 
@@ -147,6 +155,38 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run zuer");
     run_step.dependOn(&run_cmd.step);
+
+    // Tool di sviluppo: chiama decoder.decode() su un file e stampa il risultato.
+    const decode_dbg = b.addExecutable(.{
+        .name = "decode-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/decode_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const decode_run = b.addRunArtifact(decode_dbg);
+    if (b.args) |args| decode_run.addArgs(args);
+    b.step("decode-test", "Decodifica un file e stampa il risultato").dependOn(&decode_run.step);
+
+    // Tool di sviluppo: itera i frame di un video col motore player.zig (libav).
+    const player_dbg = b.addExecutable(.{
+        .name = "player-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/player_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    player_dbg.root_module.linkSystemLibrary("libavformat", .{});
+    player_dbg.root_module.linkSystemLibrary("libavcodec", .{});
+    player_dbg.root_module.linkSystemLibrary("libavutil", .{});
+    player_dbg.root_module.linkSystemLibrary("libswscale", .{});
+    const player_run = b.addRunArtifact(player_dbg);
+    if (b.args) |args| player_run.addArgs(args);
+    b.step("player-test", "Itera i frame video di un file (libav)").dependOn(&player_run.step);
 }
 
 /// Compila stb_truetype nel modulo e ne espone gli header a @cImport.

@@ -73,6 +73,40 @@ pub fn render(gpa: std.mem.Allocator, io: std.Io, decoded: *const decoder_mod.De
     return paint(gpa, &raster, rows.items, name, opts);
 }
 
+/// Metriche della griglia monospazio dell'ultima rasterizzazione, per mappare
+/// coordinate pixel ↔ (riga, colonna) — usate da selezione e hit-testing.
+pub const Metrics = struct {
+    advance: i32,
+    line_h: i32,
+    pad_x: i32,
+    pad_y: i32,
+};
+
+/// Come `render`, ma raccoglie anche il testo semplice di ogni riga visiva
+/// (per selezione/copia, allocato con `gpa` in `out_lines`) e le metriche della
+/// griglia. Il chiamante possiede e libera le stringhe in `out_lines`.
+pub fn renderDoc(gpa: std.mem.Allocator, decoded: *const decoder_mod.Decoded, name: []const u8, opts: RenderOpts, out_lines: *std.ArrayList([]const u8), out_metrics: *Metrics) !decoder_mod.ImageData {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var raster = try glyph.Raster.init(gpa, pxHeight(opts.pointsize));
+    defer raster.deinit();
+
+    var rows: std.ArrayList(Row) = .empty;
+    try buildRows(arena, &rows, &raster, decoded, name, opts);
+
+    for (rows.items) |row| {
+        var line: std.ArrayList(u8) = .empty;
+        errdefer line.deinit(gpa);
+        for (row) |run| try line.appendSlice(gpa, run.text);
+        try out_lines.append(gpa, try line.toOwnedSlice(gpa));
+    }
+    out_metrics.* = .{ .advance = raster.advance, .line_h = raster.lineHeight(), .pad_x = pad_x, .pad_y = pad_y };
+
+    return paint(gpa, &raster, rows.items, name, opts);
+}
+
 /// Costruisce le righe visive (run posizionati) del contenuto decodificato.
 /// Condiviso dal percorso CPU (composizione diretta) e da quello GPU (quad).
 fn buildRows(arena: std.mem.Allocator, rows: *std.ArrayList(Row), raster: *glyph.Raster, decoded: *const decoder_mod.Decoded, name: []const u8, opts: RenderOpts) !void {

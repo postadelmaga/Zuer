@@ -15,20 +15,30 @@ const page_gap = 8;
 const gap_color = [3]u8{ 0x30, 0x30, 0x38 };
 
 pub fn decode(path: []const u8, io: std.Io, filename: []const u8, allocator: std.mem.Allocator) Decoded {
-    // In GUI si rasterizza ad alta risoluzione e più pagine; nel terminale
-    // l'immagine viene comunque ridotta, quindi bastano meno pixel.
-    var dpi: []const u8 = "70";
+    _ = io; // subprocess e letture file usano libc diretto (decoder.*), non l'io host
+    // DPI alto anche nel terminale: con kitty l'immagine viaggia a piena
+    // risoluzione e il terminale la scala, quindi più pixel = testo nitido
+    // (a 70 DPI risultava sfocato su schermi grandi). La GUI, che consente lo
+    // zoom, va ancora più su. Sovrascrivibile con ZUER_PDF_DPI.
+    var dpi: []const u8 = "150";
     var max_pages: usize = 4;
     if (getenv("ZUER_GUI")) |val| {
         if (std.mem.eql(u8, std.mem.span(val), "1")) {
-            dpi = "120";
+            dpi = "200";
             max_pages = 12;
         }
     }
+    if (getenv("ZUER_PDF_DPI")) |val| {
+        const s = std.mem.span(val);
+        // Solo cifre, per non passare argomenti arbitrari a pdftoppm.
+        if (s.len > 0 and s.len <= 4 and std.mem.indexOfNone(u8, s, "0123456789") == null) {
+            dpi = s;
+        }
+    }
 
-    return decodeInner(path, io, filename, dpi, max_pages, allocator) catch |err| {
+    return decodeInner(path, filename, dpi, max_pages, allocator) catch |err| {
         const hint = switch (err) {
-            error.FileNotFound => "pdftoppm/pdfinfo non trovati: installa poppler-utils",
+            error.CommandNotFound => "pdftoppm/pdfinfo non trovati: installa poppler-utils",
             else => @errorName(err),
         };
         const msg = std.fmt.allocPrint(allocator, "Errore rendering PDF: {s}", .{hint}) catch "Errore PDF";
@@ -36,17 +46,11 @@ pub fn decode(path: []const u8, io: std.Io, filename: []const u8, allocator: std
     };
 }
 
-fn decodeInner(path: []const u8, io: std.Io, filename: []const u8, dpi: []const u8, max_pages: usize, allocator: std.mem.Allocator) !Decoded {
+fn decodeInner(path: []const u8, filename: []const u8, dpi: []const u8, max_pages: usize, allocator: std.mem.Allocator) !Decoded {
     // 1. Numero di pagine dal sommario di pdfinfo
-    const info = try std.process.run(allocator, io, .{
-        .argv = &.{ "pdfinfo", path },
-    });
-    defer allocator.free(info.stdout);
-    defer allocator.free(info.stderr);
-    switch (info.term) {
-        .exited => |code| if (code != 0) return error.PdfInfoFailed,
-        else => return error.PdfInfoFailed,
-    }
+    var info = try decoder.runCapture(allocator, &.{ "pdfinfo", path });
+    defer info.deinit(allocator);
+    if (info.exit_code != 0) return error.PdfInfoFailed;
 
     var total_pages: usize = 1;
     var lines = std.mem.splitScalar(u8, info.stdout, '\n');
@@ -73,15 +77,9 @@ fn decodeInner(path: []const u8, io: std.Io, filename: []const u8, dpi: []const 
     var last_buf: [16]u8 = undefined;
     const last_str = try std.fmt.bufPrint(&last_buf, "{d}", .{pages});
 
-    const run_result = try std.process.run(allocator, io, .{
-        .argv = &.{ "pdftoppm", "-f", "1", "-l", last_str, "-r", dpi, path, prefix },
-    });
-    defer allocator.free(run_result.stdout);
-    defer allocator.free(run_result.stderr);
-    switch (run_result.term) {
-        .exited => |code| if (code != 0) return error.PdfToPpmFailed,
-        else => return error.PdfToPpmFailed,
-    }
+    var run_result = try decoder.runCapture(allocator, &.{ "pdftoppm", "-f", "1", "-l", last_str, "-r", dpi, path, prefix });
+    defer run_result.deinit(allocator);
+    if (run_result.exit_code != 0) return error.PdfToPpmFailed;
 
     // 3. Lettura delle pagine generate. pdftoppm azzeropadda il numero di
     // pagina in modo dipendente dalla versione/documento: si provano le
@@ -94,7 +92,7 @@ fn decodeInner(path: []const u8, io: std.Io, filename: []const u8, dpi: []const 
 
     var page: usize = 1;
     while (page <= pages) : (page += 1) {
-        const bytes = readPageFile(prefix, page, io, allocator) orelse continue;
+        const bytes = readPageFile(prefix, page, allocator) orelse continue;
         defer allocator.free(bytes);
         const ppm = parsePpm(bytes, allocator) catch continue;
         ppm_pages.append(allocator, ppm) catch {
@@ -147,7 +145,7 @@ fn decodeInner(path: []const u8, io: std.Io, filename: []const u8, dpi: []const 
     } };
 }
 
-fn readPageFile(prefix: []const u8, page: usize, io: std.Io, allocator: std.mem.Allocator) ?[]u8 {
+fn readPageFile(prefix: []const u8, page: usize, allocator: std.mem.Allocator) ?[]u8 {
     var pad: usize = 1;
     while (pad <= 6) : (pad += 1) {
         var path_buf: [96]u8 = undefined;
@@ -161,8 +159,9 @@ fn readPageFile(prefix: []const u8, page: usize, io: std.Io, allocator: std.mem.
         fbs.print("{s}.ppm", .{digits}) catch return null;
         const candidate = fbs.buffered();
 
-        const limit = std.Io.Limit.limited(256 * 1024 * 1024);
-        if (std.Io.Dir.cwd().readFileAlloc(io, candidate, allocator, limit)) |bytes| {
+        // Lettura via libc (non std.Io): dentro il plugin, sul thread worker,
+        // l'io dell'host si blocca — come per std.process.run.
+        if (decoder.readFileLibc(allocator, candidate, 256 * 1024 * 1024)) |bytes| {
             deleteFile(candidate);
             return bytes;
         } else |_| {}

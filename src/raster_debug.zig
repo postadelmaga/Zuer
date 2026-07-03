@@ -1,7 +1,7 @@
-//! Tool di sviluppo (non fa parte della build): rende un file col percorso reale
-//! di text_render e ne scrive il PPM su stdout, per verificare la resa senza
-//! aprire finestre. Con l'argomento `gpu` usa la pipeline ad atlante su GPU
-//! (Soluzione B) invece del motore CPU (Soluzione A), per confrontarle.
+//! Tool di sviluppo (step `raster-debug` in build.zig): rende un file col
+//! percorso reale di text_render e ne scrive il PPM su stdout, per verificare la
+//! resa senza aprire finestre. Con l'argomento `gpu` usa la pipeline ad atlante
+//! su GPU (Soluzione B) invece del motore CPU (Soluzione A), per confrontarle.
 //! Uso: zig build raster-debug -- <file> [text|md] [cpu|gpu] > out.ppm
 
 const std = @import("std");

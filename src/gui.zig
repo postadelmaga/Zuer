@@ -28,16 +28,83 @@ const KEY_2: u32 = 3;
 const KEY_3: u32 = 4;
 const KEY_4: u32 = 5;
 const KEY_5: u32 = 6;
+const KEY_C: u32 = 46;
+const KEY_LEFTCTRL: u32 = 29;
+const KEY_RIGHTCTRL: u32 = 97;
 
 // Il testo viene ri-rasterizzato al pointsize scalato: oltre questi limiti la
 // resa degrada (corpo minuscolo) o esplode in memoria (immagini enormi).
 const text_zoom_min: f32 = 0.4;
 const text_zoom_max: f32 = 6.0;
 const scroll_step: f32 = 60.0;
+const scrollbar_w: u32 = 14; // larghezza della scrollbar del testo (px)
+const scroll_ease: f32 = 0.35; // frazione di avvicinamento a scroll_target per frame
+
+/// Geometria del cursore (thumb) della scrollbar verticale: altezza ∝ frazione
+/// visibile, posizione ∝ scorrimento. `off_y` è l'offset di scroll già clampato.
+fn scrollbarThumb(H: u32, src_h: u32, off_y: u32) struct { y: u32, h: u32 } {
+    if (src_h <= H) return .{ .y = 0, .h = H };
+    const max_scroll = src_h - H;
+    const min_h: u32 = 32;
+    const prop: u64 = @as(u64, H) * H / src_h;
+    const th: u32 = @min(H, @as(u32, @intCast(@max(@as(u64, min_h), prop))));
+    const travel = H - th;
+    const y: u32 = if (max_scroll > 0) @intCast(@as(u64, off_y) * travel / max_scroll) else 0;
+    return .{ .y = y, .h = th };
+}
+
+/// Alpha-blend src-over di un colore sul pixel RGBA in `buf[idx..]`.
+fn blendPixel(buf: []u8, idx: usize, r: u8, g: u8, b: u8, a: u8) void {
+    const af: u32 = a;
+    const inv: u32 = 255 - af;
+    buf[idx + 0] = @intCast((@as(u32, r) * af + @as(u32, buf[idx + 0]) * inv) / 255);
+    buf[idx + 1] = @intCast((@as(u32, g) * af + @as(u32, buf[idx + 1]) * inv) / 255);
+    buf[idx + 2] = @intCast((@as(u32, b) * af + @as(u32, buf[idx + 2]) * inv) / 255);
+    buf[idx + 3] = @max(buf[idx + 3], a);
+}
+
+/// Disegna la scrollbar verticale (traccia + cursore) sul bordo destro. Appare
+/// solo quando il contenuto è più alto della viewport.
+fn drawScrollbar(buf: []u8, W: u32, H: u32, src_h: u32, off_y: u32) void {
+    if (src_h <= H or W < scrollbar_w) return;
+    const x0 = W - scrollbar_w;
+    const t = scrollbarThumb(H, src_h, off_y);
+    var py: u32 = 0;
+    while (py < H) : (py += 1) {
+        const on_thumb = py >= t.y and py < t.y + t.h;
+        var px: u32 = x0;
+        while (px < W) : (px += 1) {
+            const idx = (py * W + px) * 4;
+            if (px == x0) {
+                blendPixel(buf, idx, 90, 96, 112, 60); // sottile bordo interno
+            } else if (on_thumb) {
+                blendPixel(buf, idx, 150, 158, 178, 240);
+            } else {
+                blendPixel(buf, idx, 32, 34, 44, 90);
+            }
+        }
+    }
+}
 
 /// Modalità documento per i contenuti testuali: l'immagine è già rasterizzata
 /// alla larghezza della finestra, quindi si blitta 1:1 (nessun ricampionamento
 /// che sfocherebbe il testo), ancorata in alto, con scorrimento verticale.
+/// Geometria del blit del testo nella finestra: offset di scroll (clampato) e
+/// centratura orizzontale. Condivisa da compose, selezione e scrollbar per non
+/// divergere.
+const BlitGeom = struct { off_y: u32, x_dst: u32, x_src: u32, copy_w: u32 };
+fn textBlitGeom(W: u32, H: u32, src_w: u32, src_h: u32, scroll_y: f32) BlitGeom {
+    const max_scroll: u32 = if (src_h > H) src_h - H else 0;
+    return .{
+        .off_y = @min(@as(u32, @intFromFloat(@max(scroll_y, 0))), max_scroll),
+        // Se una rasterizzazione è in ritardo su un resize l'immagine può essere
+        // più stretta o più larga della finestra: si centra senza scalare.
+        .x_dst = if (src_w < W) (W - src_w) / 2 else 0,
+        .x_src = if (src_w > W) (src_w - W) / 2 else 0,
+        .copy_w = @min(src_w, W),
+    };
+}
+
 fn composeTextFrame(
     composited_rgba: []u8,
     W: u32,
@@ -47,13 +114,11 @@ fn composeTextFrame(
     src_h: u32,
     scroll_y: f32,
 ) void {
-    const max_scroll: u32 = if (src_h > H) src_h - H else 0;
-    const off_y: u32 = @min(@as(u32, @intFromFloat(@max(scroll_y, 0))), max_scroll);
-    // Se una rasterizzazione è in ritardo su un resize l'immagine può essere
-    // più stretta o più larga della finestra: si centra senza scalare.
-    const x_dst: u32 = if (src_w < W) (W - src_w) / 2 else 0;
-    const x_src: u32 = if (src_w > W) (src_w - W) / 2 else 0;
-    const copy_w = @min(src_w, W);
+    const geom = textBlitGeom(W, H, src_w, src_h, scroll_y);
+    const off_y = geom.off_y;
+    const x_dst = geom.x_dst;
+    const x_src = geom.x_src;
+    const copy_w = geom.copy_w;
 
     var py: u32 = 0;
     while (py < H) : (py += 1) {
@@ -84,6 +149,79 @@ fn composeTextFrame(
             }
         }
     }
+}
+
+const sel_color = [3]u8{ 70, 110, 190 };
+const sel_alpha: u8 = 96;
+
+/// Numero di codepoint (= colonne monospazio) in una riga UTF-8.
+fn cpLen(s: []const u8) i32 {
+    var n: i32 = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        const seq = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        i += @min(@as(usize, seq), s.len - i);
+        n += 1;
+    }
+    return n;
+}
+
+/// Evidenzia la selezione (stream: dalla colonna d'ancora, righe intere in
+/// mezzo, fino all'estremo) con rettangoli translucidi sulla griglia monospazio.
+fn drawTextSelection(buf: []u8, W: u32, H: u32, src_w: u32, src_h: u32, scroll_y: f32, m: text_render.Metrics, lines: []const []const u8, a_in: [2]i32, b_in: [2]i32) void {
+    if (lines.len == 0 or m.advance <= 0 or m.line_h <= 0) return;
+    const geom = textBlitGeom(W, H, src_w, src_h, scroll_y);
+    var a = a_in;
+    var b = b_in;
+    if (a[0] > b[0] or (a[0] == b[0] and a[1] > b[1])) {
+        const t = a;
+        a = b;
+        b = t;
+    }
+    const nrows: i32 = @intCast(lines.len);
+    const Wi: i32 = @intCast(W);
+    const Hi: i32 = @intCast(H);
+    const dx: i32 = @as(i32, @intCast(geom.x_dst)) - @as(i32, @intCast(geom.x_src));
+    var row: i32 = @max(a[0], 0);
+    while (row <= b[0] and row < nrows) : (row += 1) {
+        const llen = cpLen(lines[@intCast(row)]);
+        var c0: i32 = if (row == a[0]) a[1] else 0;
+        var c1: i32 = if (row == b[0]) b[1] else llen;
+        c0 = std.math.clamp(c0, 0, llen);
+        c1 = std.math.clamp(c1, 0, llen);
+        if (c1 <= c0) continue;
+        const x0 = m.pad_x + c0 * m.advance + dx;
+        const x1 = m.pad_x + c1 * m.advance + dx;
+        const y0 = m.pad_y + row * m.line_h - @as(i32, @intCast(geom.off_y));
+        const xa: u32 = @intCast(std.math.clamp(x0, 0, Wi));
+        const xb: u32 = @intCast(std.math.clamp(x1, 0, Wi));
+        const ya: u32 = @intCast(std.math.clamp(y0, 0, Hi));
+        const yb: u32 = @intCast(std.math.clamp(y0 + m.line_h, 0, Hi));
+        var py = ya;
+        while (py < yb) : (py += 1) {
+            var px = xa;
+            while (px < xb) : (px += 1) {
+                blendPixel(buf, (py * W + px) * 4, sel_color[0], sel_color[1], sel_color[2], sel_alpha);
+            }
+        }
+    }
+}
+
+/// Mappa una coordinata finestra in (riga, colonna) sulla griglia del testo,
+/// clampata al documento. Da chiamare con `state.mutex` acquisito.
+fn textHit(state: *GuiAppState, W: u32, H: u32, mx: f32, my: f32) [2]i32 {
+    const m = state.text_metrics.*;
+    const geom = textBlitGeom(W, H, state.static_w.*, state.static_h.*, state.scroll_y.*);
+    const sx = @as(i32, @intFromFloat(mx)) - @as(i32, @intCast(geom.x_dst)) + @as(i32, @intCast(geom.x_src));
+    const sy = @as(i32, @intFromFloat(my)) + @as(i32, @intCast(geom.off_y));
+    const nrows: i32 = @intCast(state.text_lines.items.len);
+    var row: i32 = if (m.line_h > 0) @divFloor(sy - m.pad_y, m.line_h) else 0;
+    row = std.math.clamp(row, 0, @max(nrows - 1, 0));
+    const llen: i32 = if (nrows > 0) cpLen(state.text_lines.items[@intCast(row)]) else 0;
+    // Arrotonda alla colonna più vicina (mezza cella) per un aggancio naturale.
+    var col: i32 = if (m.advance > 0) @divFloor(sx - m.pad_x + @divTrunc(m.advance, 2), m.advance) else 0;
+    col = std.math.clamp(col, 0, llen);
+    return .{ row, col };
 }
 
 fn composeFrame(
@@ -207,8 +345,25 @@ const GuiAppState = struct {
     pan_x: *f32,
     pan_y: *f32,
     scroll_y: *f32,
+    // Posizione di scroll desiderata: la rotella/i tasti la muovono, il worker
+    // fa scorrere scroll_y verso di essa con easing (scroll fluido).
+    scroll_target: *f32,
+    // Trascinamento del cursore della scrollbar (mappa mouse.y → posizione).
+    scrollbar_drag: *bool,
     last_x: *f32,
     last_y: *f32,
+
+    // Selezione testo (solo percorso CPU): testo semplice per riga visiva e
+    // metriche della griglia monospazio per l'hit-testing; ancora/estremo della
+    // selezione in coordinate (riga, colonna).
+    text_lines: *std.ArrayList([]const u8),
+    text_metrics: *text_render.Metrics,
+    sel_active: *bool,
+    sel_selecting: *bool,
+    sel_a: *[2]i32,
+    sel_b: *[2]i32,
+    // Stato del tasto Ctrl (per Ctrl+C = copia negli appunti).
+    ctrl_down: *bool,
 
     fn loadFile(self: *GuiAppState, new_path: []const u8) !void {
         // 1. Decodifica il nuovo file (fuori dal lock: non tocca stato condiviso)
@@ -276,6 +431,10 @@ const GuiAppState = struct {
         self.pan_x.* = 0.0;
         self.pan_y.* = 0.0;
         self.scroll_y.* = 0.0;
+        self.scroll_target.* = 0.0;
+        freeTextLines(self);
+        self.sel_active.* = false;
+        self.sel_selecting.* = false;
         self.load_seq.* +%= 1;
         self.file_changed.* = true;
     }
@@ -350,17 +509,44 @@ fn applyZoom(app_state: *GuiAppState, factor: f32) void {
 fn scrollText(app_state: *GuiAppState, delta: f32) void {
     app_state.mutex.lockUncancelable(app_state.io);
     defer app_state.mutex.unlock(app_state.io);
-    // Il limite superiore dipende dall'altezza rasterizzata, nota al worker:
-    // qui basta impedire i valori negativi, il clamp finale è nel compose.
-    app_state.scroll_y.* = @max(app_state.scroll_y.* + delta, 0);
+    // Muove la meta di scroll: il worker vi fa scorrere scroll_y con easing
+    // (scroll fluido). Il limite superiore dipende dall'altezza rasterizzata,
+    // nota al worker; qui basta impedire i valori negativi.
+    app_state.scroll_target.* = @max(app_state.scroll_target.* + delta, 0);
+    app_state.file_changed.* = true;
+}
+
+/// Scroll immediato (senza easing) a una posizione assoluta: per il
+/// trascinamento del documento e della scrollbar, dove serve reattività 1:1.
+fn scrollTo(app_state: *GuiAppState, y: f32) void {
+    app_state.mutex.lockUncancelable(app_state.io);
+    defer app_state.mutex.unlock(app_state.io);
+    const yy = @max(y, 0);
+    app_state.scroll_y.* = yy;
+    app_state.scroll_target.* = yy;
     app_state.file_changed.* = true;
 }
 
 fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) void {
     const app_state: *GuiAppState = @ptrCast(@alignCast(user orelse return));
     const pressed = (state == 1);
+    if (key == KEY_LEFTCTRL or key == KEY_RIGHTCTRL) {
+        app_state.ctrl_down.* = pressed;
+        return;
+    }
     if (pressed) {
         const is_text = app_state.is_text.*;
+        // Ctrl+C: copia la selezione negli appunti.
+        if (key == KEY_C and app_state.ctrl_down.* and is_text) {
+            app_state.mutex.lockUncancelable(app_state.io);
+            const sel = buildSelectedText(app_state, app_state.gpa);
+            app_state.mutex.unlock(app_state.io);
+            if (sel) |txt| {
+                clipboardCopy(txt);
+                app_state.gpa.free(txt);
+            }
+            return;
+        }
         if (key == KEY_ESC) {
             win.close();
         } else if (is_text and (key == KEY_UP or key == KEY_DOWN)) {
@@ -409,26 +595,83 @@ fn scrollCallback(win: *zrame.Window, axis: u32, value: i32, user: ?*anyopaque) 
     }
 }
 
+/// Mappa la coordinata verticale del mouse sulla scrollbar in una posizione di
+/// scroll assoluta (cursore centrato sotto il puntatore) e vi salta immediato.
+fn scrollFromBar(app_state: *GuiAppState, H: u32, src_h: u32, mouse_y: f32) void {
+    if (src_h <= H) return;
+    const t = scrollbarThumb(H, src_h, 0);
+    const travel: f32 = if (H > t.h) @floatFromInt(H - t.h) else 1;
+    const max_scroll: f32 = @floatFromInt(src_h - H);
+    var ty = mouse_y - @as(f32, @floatFromInt(t.h)) / 2.0;
+    ty = std.math.clamp(ty, 0, travel);
+    scrollTo(app_state, ty / travel * max_scroll);
+}
+
 fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopaque) void {
-    _ = win;
     const app_state: *GuiAppState = @ptrCast(@alignCast(user orelse return));
     switch (event) {
         .button => |btn| {
             // 0x110 = BTN_LEFT (click sinistro), 0x111 = BTN_RIGHT (click destro)
-            if (btn.button == 0x110 or btn.button == 0x111) {
-                app_state.dragging.* = (btn.state == 1);
+            if (btn.button != 0x110 and btn.button != 0x111) return;
+            const down = (btn.state == 1);
+            if (!down) {
+                app_state.mutex.lockUncancelable(app_state.io);
+                app_state.scrollbar_drag.* = false;
+                app_state.sel_selecting.* = false;
+                // Click senza trascinamento (ancora == estremo) → deseleziona.
+                if (app_state.sel_a.*[0] == app_state.sel_b.*[0] and app_state.sel_a.*[1] == app_state.sel_b.*[1]) {
+                    app_state.sel_active.* = false;
+                    app_state.file_changed.* = true;
+                }
+                app_state.dragging.* = false;
+                app_state.mutex.unlock(app_state.io);
+                return;
             }
+            // Pressione sinistra sul testo: scrollbar oppure avvio selezione.
+            if (btn.button == 0x110 and app_state.is_text.*) {
+                const W = win.panel_w;
+                const H = win.panel_h;
+                const src_h = app_state.static_h.*;
+                if (W >= scrollbar_w and src_h > H and
+                    app_state.last_x.* >= @as(f32, @floatFromInt(W - scrollbar_w)))
+                {
+                    app_state.scrollbar_drag.* = true;
+                    scrollFromBar(app_state, H, src_h, app_state.last_y.*);
+                    return;
+                }
+                app_state.mutex.lockUncancelable(app_state.io);
+                if (app_state.text_lines.items.len > 0) {
+                    const hit = textHit(app_state, W, H, app_state.last_x.*, app_state.last_y.*);
+                    app_state.sel_a.* = hit;
+                    app_state.sel_b.* = hit;
+                    app_state.sel_active.* = true;
+                    app_state.sel_selecting.* = true;
+                    app_state.file_changed.* = true;
+                    app_state.mutex.unlock(app_state.io);
+                    return;
+                }
+                app_state.mutex.unlock(app_state.io);
+            }
+            app_state.dragging.* = down;
         },
         .motion => |mot| {
-            if (app_state.dragging.*) {
+            if (app_state.scrollbar_drag.*) {
+                scrollFromBar(app_state, win.panel_h, app_state.static_h.*, mot.y);
+            } else if (app_state.sel_selecting.*) {
+                app_state.mutex.lockUncancelable(app_state.io);
+                app_state.sel_b.* = textHit(app_state, win.panel_w, win.panel_h, mot.x, mot.y);
+                app_state.file_changed.* = true;
+                app_state.mutex.unlock(app_state.io);
+            } else if (app_state.dragging.*) {
                 const dx = mot.x - app_state.last_x.*;
                 const dy = mot.y - app_state.last_y.*;
                 if (app_state.is_mesh.*) {
                     app_state.yaw.* += dx * 0.01;
                     app_state.pitch.* += dy * 0.01;
                 } else if (app_state.is_text.*) {
-                    // Trascinare il documento verso il basso torna indietro
-                    scrollText(app_state, -dy);
+                    // Fallback (testo senza righe selezionabili, es. percorso GPU):
+                    // il trascinamento scorre il documento.
+                    scrollTo(app_state, app_state.scroll_y.* - dy);
                 } else {
                     app_state.mutex.lockUncancelable(app_state.io);
                     app_state.pan_x.* += dx;
@@ -441,6 +684,12 @@ fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopaque)
             app_state.last_y.* = mot.y;
         },
     }
+}
+
+/// Libera il testo per-riga trattenuto per la selezione.
+fn freeTextLines(state: *GuiAppState) void {
+    for (state.text_lines.items) |l| state.gpa.free(l);
+    state.text_lines.clearRetainingCapacity();
 }
 
 /// Rasterizza il contenuto testuale corrente alla larghezza richiesta e al
@@ -456,7 +705,13 @@ fn rasterizeText(state: *GuiAppState, width: u32, text_zoom: f32) void {
         return;
     }
 
-    var img = text_render.render(state.gpa, state.io, state.decoded, name, opts) catch |err| {
+    // La geometria (wrapping) cambia con larghezza/zoom: la vecchia selezione
+    // non è più valida.
+    freeTextLines(state);
+    state.sel_active.* = false;
+    state.sel_selecting.* = false;
+
+    var img = text_render.renderDoc(state.gpa, state.decoded, name, opts, state.text_lines, state.text_metrics) catch |err| {
         std.debug.print("Impossibile rasterizzare il testo: {s}\n", .{@errorName(err)});
         return;
     };
@@ -538,6 +793,7 @@ fn renderWorker(
 
         const size_changed = (cur_w != last_w or cur_h != last_h);
         var need_render = size_changed or state.file_changed.* or state.is_mesh.*;
+        var text_animating = false;
 
         if (state.is_text.*) {
             // (Ri)compone il testo quando cambiano larghezza finestra, zoom o
@@ -551,12 +807,22 @@ fn renderWorker(
                 last_seq = state.load_seq.*;
                 need_render = true;
             }
-            // Clamp dello scroll ora che l'altezza del documento è nota
+            // Clamp della meta di scroll ora che l'altezza del documento è nota,
+            // poi easing di scroll_y verso di essa (scroll fluido).
             const max_scroll: f32 = if (state.static_h.* > cur_h)
                 @floatFromInt(state.static_h.* - cur_h)
             else
                 0;
-            if (state.scroll_y.* > max_scroll) state.scroll_y.* = max_scroll;
+            state.scroll_target.* = std.math.clamp(state.scroll_target.*, 0, max_scroll);
+            const diff = state.scroll_target.* - state.scroll_y.*;
+            if (@abs(diff) > 0.5) {
+                state.scroll_y.* += diff * scroll_ease;
+                need_render = true;
+                text_animating = true;
+            } else {
+                state.scroll_y.* = state.scroll_target.*;
+            }
+            state.scroll_y.* = std.math.clamp(state.scroll_y.*, 0, max_scroll);
         }
 
         if (need_render) {
@@ -581,6 +847,10 @@ fn renderWorker(
                 composeFrame(composited_rgba.*, cur_w, cur_h, mesh_rgba, cur_w, cur_h, false, 1.0, 0.0, 0.0);
             } else if (state.is_text.*) {
                 composeTextFrame(composited_rgba.*, cur_w, cur_h, state.static_rgba.*, state.static_w.*, state.static_h.*, state.scroll_y.*);
+                if (state.sel_active.*) {
+                    drawTextSelection(composited_rgba.*, cur_w, cur_h, state.static_w.*, state.static_h.*, state.scroll_y.*, state.text_metrics.*, state.text_lines.items, state.sel_a.*, state.sel_b.*);
+                }
+                drawScrollbar(composited_rgba.*, cur_w, cur_h, state.static_h.*, textBlitGeom(cur_w, cur_h, state.static_w.*, state.static_h.*, state.scroll_y.*).off_y);
             } else {
                 composeFrame(composited_rgba.*, cur_w, cur_h, state.static_rgba.*, state.static_w.*, state.static_h.*, false, zoom.*, state.pan_x.*, state.pan_y.*);
             }
@@ -591,7 +861,9 @@ fn renderWorker(
         const is_mesh = state.is_mesh.*;
         state.mutex.unlock(state.io);
 
-        if (is_mesh) {
+        // 60 Hz per mesh (rotazione continua) e durante l'animazione dello
+        // scroll testo; 20 Hz a riposo.
+        if (is_mesh or text_animating) {
             _ = pacer_60.tick();
         } else {
             _ = pacer_20.tick();
@@ -601,6 +873,102 @@ fn renderWorker(
 
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+// Copia negli appunti tramite `wl-copy` (wl-clipboard): niente supporto
+// clipboard Wayland in zrame da estendere. Il testo va sullo stdin del figlio.
+extern "c" fn pipe(fds: *[2]c_int) c_int;
+extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
+extern "c" fn close(fd: c_int) c_int;
+extern "c" fn waitpid(pid: c_int, status: ?*c_int, options: c_int) c_int;
+extern "c" fn posix_spawnp(pid: *c_int, file: [*:0]const u8, file_actions: ?*const anyopaque, attrp: ?*const anyopaque, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) c_int;
+extern "c" fn posix_spawn_file_actions_init(fa: *anyopaque) c_int;
+extern "c" fn posix_spawn_file_actions_destroy(fa: *anyopaque) c_int;
+extern "c" fn posix_spawn_file_actions_adddup2(fa: *anyopaque, fd: c_int, newfd: c_int) c_int;
+extern "c" fn posix_spawn_file_actions_addclose(fa: *anyopaque, fd: c_int) c_int;
+extern "c" var environ: [*:null]const ?[*:0]const u8;
+
+/// Offset di byte del `col`-esimo codepoint in una riga UTF-8 (o fine stringa).
+fn byteAtCol(s: []const u8, col: i32) usize {
+    if (col <= 0) return 0;
+    var n: i32 = 0;
+    var i: usize = 0;
+    while (i < s.len and n < col) {
+        const seq = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        i += @min(@as(usize, seq), s.len - i);
+        n += 1;
+    }
+    return i;
+}
+
+/// Costruisce il testo selezionato (righe unite da '\n'). Con `state.mutex`
+/// acquisito. Ritorna null se non c'è selezione; il chiamante libera il buffer.
+fn buildSelectedText(state: *GuiAppState, gpa: std.mem.Allocator) ?[]u8 {
+    if (!state.sel_active.*) return null;
+    const lines = state.text_lines.items;
+    if (lines.len == 0) return null;
+    var a = state.sel_a.*;
+    var b = state.sel_b.*;
+    if (a[0] > b[0] or (a[0] == b[0] and a[1] > b[1])) {
+        const t = a;
+        a = b;
+        b = t;
+    }
+    if (a[0] == b[0] and a[1] == b[1]) return null;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    const nrows: i32 = @intCast(lines.len);
+    var row: i32 = std.math.clamp(a[0], 0, nrows - 1);
+    while (row <= b[0] and row < nrows) : (row += 1) {
+        const line = lines[@intCast(row)];
+        const llen = cpLen(line);
+        const c0 = std.math.clamp(if (row == a[0]) a[1] else 0, 0, llen);
+        const c1 = std.math.clamp(if (row == b[0]) b[1] else llen, 0, llen);
+        const bs = byteAtCol(line, c0);
+        const be = byteAtCol(line, c1);
+        if (be > bs) out.appendSlice(gpa, line[bs..be]) catch return null;
+        if (row < b[0]) out.append(gpa, '\n') catch return null;
+    }
+    return out.toOwnedSlice(gpa) catch null;
+}
+
+/// Invia `text` a `wl-copy` (stdin) per metterlo negli appunti Wayland.
+fn clipboardCopy(text: []const u8) void {
+    if (text.len == 0) return;
+    var fds: [2]c_int = undefined;
+    if (pipe(&fds) != 0) return;
+    const rfd = fds[0];
+    const wfd = fds[1];
+
+    var fa: [256]u8 align(16) = undefined;
+    if (posix_spawn_file_actions_init(&fa) != 0) {
+        _ = close(rfd);
+        _ = close(wfd);
+        return;
+    }
+    defer _ = posix_spawn_file_actions_destroy(&fa);
+    _ = posix_spawn_file_actions_adddup2(&fa, rfd, 0); // stdin del figlio ← lettura pipe
+    _ = posix_spawn_file_actions_addclose(&fa, wfd);
+
+    const wlcopy: [*:0]const u8 = "wl-copy";
+    var argv = [_:null]?[*:0]const u8{wlcopy};
+    var pid: c_int = 0;
+    const rc = posix_spawnp(&pid, wlcopy, &fa, null, &argv, environ);
+    _ = close(rfd);
+    if (rc != 0) {
+        _ = close(wfd);
+        return;
+    }
+    var off: usize = 0;
+    while (off < text.len) {
+        const n = write(wfd, text.ptr + off, text.len - off);
+        if (n <= 0) break;
+        off += @intCast(n);
+    }
+    _ = close(wfd); // EOF: wl-copy acquisisce la selezione e passa in background
+    var status: c_int = 0;
+    _ = waitpid(pid, &status, 0);
+}
 
 /// Dimensione iniziale della finestra. Per le immagini il frame si adatta al
 /// contenuto (l'immagine lo riempie per intero), con un tetto a ~metà schermo:
@@ -703,9 +1071,18 @@ pub fn main(init: std.process.Init) !void {
     var pan_x: f32 = 0;
     var pan_y: f32 = 0;
     var scroll_y: f32 = 0;
+    var scroll_target: f32 = 0;
+    var scrollbar_drag = false;
     var dragging = false;
     var last_x: f32 = 0;
     var last_y: f32 = 0;
+    var text_lines: std.ArrayList([]const u8) = .empty;
+    var text_metrics: text_render.Metrics = .{ .advance = 1, .line_h = 1, .pad_x = 20, .pad_y = 14 };
+    var sel_active = false;
+    var sel_selecting = false;
+    var sel_a: [2]i32 = .{ 0, 0 };
+    var sel_b: [2]i32 = .{ 0, 0 };
+    var ctrl_down = false;
 
     var gui_state = GuiAppState{
         .gpa = gpa,
@@ -737,13 +1114,24 @@ pub fn main(init: std.process.Init) !void {
         .pan_x = &pan_x,
         .pan_y = &pan_y,
         .scroll_y = &scroll_y,
+        .scroll_target = &scroll_target,
+        .scrollbar_drag = &scrollbar_drag,
         .last_x = &last_x,
         .last_y = &last_y,
+        .text_lines = &text_lines,
+        .text_metrics = &text_metrics,
+        .sel_active = &sel_active,
+        .sel_selecting = &sel_selecting,
+        .sel_a = &sel_a,
+        .sel_b = &sel_b,
+        .ctrl_down = &ctrl_down,
     };
     defer {
         gpa.free(gui_state.current_file_path);
         for (gui_state.file_list.items) |f| gpa.free(f);
         gui_state.file_list.deinit(gpa);
+        for (text_lines.items) |l| gpa.free(l);
+        text_lines.deinit(gpa);
     }
     try gui_state.initFileList();
 
