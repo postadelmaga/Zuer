@@ -26,6 +26,14 @@ pub fn decode(path: []const u8, io: std.Io, file_bytes: []const u8, filename: []
         }
     }
 
+    // SVG: prima librsvg (rendering di qualità, gestisce anche .svgz),
+    // poi il fallback ImageMagick come per gli altri formati non-stb.
+    if (hasSvgExtension(filename)) {
+        if (decodeWithRsvg(path, io, filename, max_dim, allocator)) |img| {
+            return .{ .image = img };
+        } else |_| {}
+    }
+
     if (decodeNative(file_bytes, filename, max_dim, allocator)) |img| {
         return .{ .image = img };
     } else |native_err| {
@@ -46,6 +54,42 @@ pub fn decode(path: []const u8, io: std.Io, file_bytes: []const u8, filename: []
             return .{ .err = msg };
         }
     }
+}
+
+fn hasSvgExtension(filename: []const u8) bool {
+    inline for (.{ ".svg", ".svgz" }) |ext| {
+        if (filename.len >= ext.len) {
+            const tail = filename[filename.len - ext.len ..];
+            var eq = true;
+            for (tail, ext) |a, b| {
+                if (std.ascii.toLower(a) != b) eq = false;
+            }
+            if (eq) return true;
+        }
+    }
+    return false;
+}
+
+/// Rasterizza l'SVG con librsvg in un PNG in memoria (adattato al box
+/// max_dim×max_dim), poi lo decodifica con stb come qualsiasi altro PNG.
+fn decodeWithRsvg(path: []const u8, io: std.Io, filename: []const u8, max_dim: usize, allocator: std.mem.Allocator) !ImageData {
+    var dim_buf: [16]u8 = undefined;
+    const dim_str = try std.fmt.bufPrint(&dim_buf, "{d}", .{max_dim});
+
+    const result = try std.process.run(allocator, io, .{
+        // Sfondo esplicito: stb scarta l'alpha e il trasparente diverrebbe nero
+        .argv = &.{ "rsvg-convert", "--width", dim_str, "--height", dim_str, "--keep-aspect-ratio", "--format", "png", "--background-color", "#101018", path },
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| if (code != 0) return error.RsvgFailed,
+        else => return error.RsvgFailed,
+    }
+    if (result.stdout.len == 0) return error.RsvgFailed;
+
+    return decodeNative(result.stdout, filename, max_dim, allocator);
 }
 
 fn decodeNative(file_bytes: []const u8, filename: []const u8, max_dim: usize, allocator: std.mem.Allocator) !ImageData {

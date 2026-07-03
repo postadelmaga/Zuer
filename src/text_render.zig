@@ -7,6 +7,11 @@ const decoder_mod = @import("decoder.zig");
 
 pub const max_table_col: usize = 40;
 
+// Margini tipografici del documento rasterizzato (aggiunti con -border,
+// quindi già compresi nella larghezza finale richiesta).
+const pad_x: usize = 20;
+const pad_y: usize = 14;
+
 /// Parametri di rasterizzazione: larghezza in pixel dell'immagine prodotta
 /// (idealmente la larghezza della finestra, per una resa 1:1 nitida) e corpo
 /// del carattere (scalato dallo zoom del chiamante).
@@ -15,10 +20,26 @@ pub const RenderOpts = struct {
     pointsize: usize = 15,
 };
 
+/// Oltre questa dimensione il file viene mostrato in modalità plain-text
+/// veloce (niente numeri di riga né colori): il markup Pango di un sorgente
+/// enorme costerebbe più della sua utilità.
+const max_rich_bytes: usize = 2 * 1024 * 1024;
+
 /// Rasterizza un contenuto decodificato testuale in un'immagine RGB.
 pub fn render(gpa: std.mem.Allocator, io: std.Io, decoded: *const decoder_mod.Decoded, name: []const u8, opts: RenderOpts) !decoder_mod.ImageData {
     switch (decoded.*) {
-        .text => |t| return renderText(gpa, io, t, name, true, false, opts),
+        .text => |t| {
+            // File di testo/codice: documento tipografico con numeri di riga,
+            // righello e syntax highlighting leggero. Le schede informative
+            // (media, archivi) non hanno un'estensione testuale e restano pulite.
+            if (t.len <= max_rich_bytes and isCodeLike(name)) {
+                if (buildCodeDocument(gpa, t, name, opts)) |doc| {
+                    defer gpa.free(doc);
+                    return renderText(gpa, io, doc, name, true, true, opts);
+                } else |_| {}
+            }
+            return renderText(gpa, io, t, name, true, false, opts);
+        },
         .markdown => |m| {
             // Il markdown viene convertito in markup Pango: la resa torna
             // formattata (header, grassetto, codice…) mantenendo il percorso
@@ -77,8 +98,9 @@ fn renderText(gpa: std.mem.Allocator, io: std.Io, content: []const u8, name: []c
     defer gpa.free(pango_path);
 
     const markup_def = if (markup) "pango:markup=true" else "pango:markup=false";
+    const border_arg = std.fmt.comptimePrint("{d}x{d}", .{ pad_x, pad_y });
     var size_arg_buf: [24]u8 = undefined;
-    const size_arg = try std.fmt.bufPrint(&size_arg_buf, "{d}x", .{opts.width});
+    const size_arg = try std.fmt.bufPrint(&size_arg_buf, "{d}x", .{opts.width -| 2 * pad_x});
     var pointsize_buf: [16]u8 = undefined;
     const pointsize_arg = try std.fmt.bufPrint(&pointsize_buf, "{d}", .{opts.pointsize});
 
@@ -88,10 +110,16 @@ fn renderText(gpa: std.mem.Allocator, io: std.Io, content: []const u8, name: []c
             "convert",
             "-depth",
             "8",
+            "-density",
+            "96",
             "-background",
             "#080810",
             "-fill",
             "#e6e6e6",
+            "-define",
+            "pango:align=left",
+            "-define",
+            "pango:wrap=word-char",
             "-define",
             markup_def,
             "-size",
@@ -100,9 +128,11 @@ fn renderText(gpa: std.mem.Allocator, io: std.Io, content: []const u8, name: []c
             font_name,
             "-pointsize",
             pointsize_arg,
-            "-gravity",
-            "NorthWest",
             pango_path,
+            "-bordercolor",
+            "#080810",
+            "-border",
+            border_arg,
             "-format",
             "%w %h",
             "info:",
@@ -133,10 +163,16 @@ fn renderText(gpa: std.mem.Allocator, io: std.Io, content: []const u8, name: []c
             "convert",
             "-depth",
             "8",
+            "-density",
+            "96",
             "-background",
             "#080810",
             "-fill",
             "#e6e6e6",
+            "-define",
+            "pango:align=left",
+            "-define",
+            "pango:wrap=word-char",
             "-define",
             markup_def,
             "-size",
@@ -145,9 +181,11 @@ fn renderText(gpa: std.mem.Allocator, io: std.Io, content: []const u8, name: []c
             font_name,
             "-pointsize",
             pointsize_arg,
-            "-gravity",
-            "NorthWest",
             pango_path,
+            "-bordercolor",
+            "#080810",
+            "-border",
+            border_arg,
             "rgb:-",
         },
     });
@@ -193,6 +231,248 @@ fn renderText(gpa: std.mem.Allocator, io: std.Io, content: []const u8, name: []c
         .pixels = pixels,
         .name = name_dup,
     };
+}
+
+// --- Documento codice: gutter, wrap e highlighting ---------------------------
+
+// Palette sobria, armonizzata con lo sfondo #080810 (stessa filosofia di viewer:
+// identificatori quasi neutri, accenti desaturati).
+const col_line_no = "#565664";
+const col_rule = "#32323e";
+const col_keyword = "#96aae1";
+const col_string = "#9ebe96";
+const col_comment = "#6c6c76";
+
+/// Avanzamento medio di DejaVu Sans Mono in px per punto: 0.602 em, alla
+/// densità di 96 dpi fissata nelle invocazioni di convert (96/72 px per pt).
+const mono_advance_px_per_pt: f32 = 0.615 * 96.0 / 72.0;
+
+const Lang = struct {
+    line_comments: []const []const u8,
+    keywords: []const []const u8,
+};
+
+const kw_zig = [_][]const u8{ "fn", "pub", "const", "var", "if", "else", "while", "for", "return", "try", "catch", "defer", "errdefer", "struct", "enum", "union", "switch", "break", "continue", "orelse", "and", "or", "comptime", "test", "export", "extern", "inline", "null", "undefined", "true", "false", "error", "anyerror", "unreachable", "usingnamespace" };
+const kw_rust = [_][]const u8{ "fn", "pub", "let", "mut", "const", "if", "else", "while", "for", "loop", "return", "match", "struct", "enum", "impl", "trait", "use", "mod", "crate", "self", "super", "where", "async", "await", "move", "ref", "dyn", "true", "false", "in", "as", "break", "continue", "static", "type", "unsafe", "extern" };
+const kw_c = [_][]const u8{ "if", "else", "while", "for", "return", "struct", "enum", "union", "typedef", "static", "const", "void", "int", "char", "long", "short", "unsigned", "signed", "float", "double", "sizeof", "switch", "case", "break", "continue", "default", "do", "goto", "extern", "inline", "volatile", "class", "public", "private", "protected", "template", "typename", "namespace", "using", "new", "delete", "virtual", "override", "nullptr", "true", "false", "auto", "this", "bool" };
+const kw_py = [_][]const u8{ "def", "class", "if", "elif", "else", "while", "for", "return", "import", "from", "as", "with", "try", "except", "finally", "raise", "pass", "break", "continue", "lambda", "global", "nonlocal", "yield", "async", "await", "in", "is", "not", "and", "or", "None", "True", "False", "del", "assert", "match", "case" };
+const kw_js = [_][]const u8{ "function", "const", "let", "var", "if", "else", "while", "for", "return", "class", "extends", "import", "from", "export", "default", "new", "this", "typeof", "instanceof", "try", "catch", "finally", "throw", "async", "await", "yield", "switch", "case", "break", "continue", "delete", "in", "of", "null", "undefined", "true", "false", "interface", "type", "enum", "implements", "readonly", "static" };
+const kw_go = [_][]const u8{ "func", "package", "import", "var", "const", "if", "else", "for", "range", "return", "struct", "interface", "map", "chan", "go", "defer", "select", "switch", "case", "break", "continue", "type", "nil", "true", "false", "fallthrough", "goto" };
+const kw_sh = [_][]const u8{ "if", "then", "else", "elif", "fi", "for", "while", "do", "done", "case", "esac", "function", "local", "return", "echo", "export", "in", "read", "exit", "set" };
+const kw_lua = [_][]const u8{ "function", "local", "if", "then", "else", "elseif", "end", "while", "for", "do", "return", "nil", "true", "false", "and", "or", "not", "repeat", "until", "break", "in" };
+const kw_sql = [_][]const u8{ "select", "from", "where", "insert", "update", "delete", "join", "left", "right", "inner", "outer", "group", "by", "order", "having", "limit", "create", "table", "drop", "alter", "index", "as", "and", "or", "not", "null", "into", "values", "set", "on", "distinct", "union" };
+const kw_none = [_][]const u8{};
+
+const slash_comment = [_][]const u8{"//"};
+const hash_comment = [_][]const u8{"#"};
+const dash_comment = [_][]const u8{"--"};
+const semi_comment = [_][]const u8{";"};
+const no_comment = [_][]const u8{};
+
+fn langFor(ext: []const u8) Lang {
+    const Case = struct { exts: []const []const u8, lang: Lang };
+    const table = [_]Case{
+        .{ .exts = &.{"zig"}, .lang = .{ .line_comments = &slash_comment, .keywords = &kw_zig } },
+        .{ .exts = &.{"rs"}, .lang = .{ .line_comments = &slash_comment, .keywords = &kw_rust } },
+        .{ .exts = &.{ "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "java", "cs", "kt", "kts", "swift", "scala", "dart", "proto" }, .lang = .{ .line_comments = &slash_comment, .keywords = &kw_c } },
+        .{ .exts = &.{ "py", "pyi", "rb", "toml", "yaml", "yml", "cfg", "conf", "properties", "gitignore", "gitattributes", "editorconfig", "dockerfile", "mk", "make", "cmake", "r", "jl", "nim", "ex", "exs" }, .lang = .{ .line_comments = &hash_comment, .keywords = &kw_py } },
+        .{ .exts = &.{ "js", "mjs", "cjs", "jsx", "ts", "tsx", "php", "go" }, .lang = .{ .line_comments = &slash_comment, .keywords = &kw_js } },
+        .{ .exts = &.{"go"}, .lang = .{ .line_comments = &slash_comment, .keywords = &kw_go } },
+        .{ .exts = &.{ "sh", "bash", "zsh", "fish", "ps1", "env" }, .lang = .{ .line_comments = &hash_comment, .keywords = &kw_sh } },
+        .{ .exts = &.{ "lua", "sql", "hs" }, .lang = .{ .line_comments = &dash_comment, .keywords = &kw_lua } },
+        .{ .exts = &.{ "ini", "asm", "s" }, .lang = .{ .line_comments = &semi_comment, .keywords = &kw_none } },
+    };
+    for (table) |case| {
+        for (case.exts) |e| {
+            if (std.ascii.eqlIgnoreCase(ext, e)) return case.lang;
+        }
+    }
+    // Testo generico: niente keyword, niente commenti — restano gutter e wrap
+    return .{ .line_comments = &no_comment, .keywords = &kw_none };
+}
+
+fn extOf(name: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| {
+        return name[dot + 1 ..];
+    }
+    return "";
+}
+
+/// Il documento con gutter ha senso per testo e codice aperti da file; le
+/// schede informative sintetiche (media, archivi) non passano di qui.
+fn isCodeLike(name: []const u8) bool {
+    const ext = extOf(name);
+    if (ext.len == 0) return true; // file senza estensione: quasi sempre testo
+    const text_exts = [_][]const u8{ "txt", "text", "log", "nfo", "rst", "adoc", "asciidoc", "org", "tex", "bib", "srt", "vtt", "diff", "patch", "json", "jsonl", "ndjson", "yaml", "yml", "toml", "ini", "cfg", "conf", "properties", "env", "plist", "editorconfig", "gitignore", "gitattributes", "lock", "xml", "html", "htm", "xhtml", "css", "scss", "sass", "less", "sh", "bash", "zsh", "fish", "ps1", "bat", "cmd", "mk", "make", "cmake", "gradle", "dockerfile", "rs", "py", "pyi", "js", "mjs", "cjs", "jsx", "ts", "tsx", "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "cs", "java", "kt", "kts", "go", "rb", "php", "swift", "scala", "lua", "pl", "pm", "r", "sql", "dart", "ex", "exs", "erl", "hrl", "hs", "clj", "cljs", "vim", "asm", "s", "zig", "jl", "nim", "proto", "graphql", "gql" };
+    for (text_exts) |e| {
+        if (std.ascii.eqlIgnoreCase(ext, e)) return true;
+    }
+    return false;
+}
+
+/// Costruisce il markup Pango del documento: numeri di riga in colonna
+/// (allineati a destra, colore attenuato), righello verticale, contenuto
+/// evidenziato e a-capo manuale con rientro allineato al gutter.
+fn buildCodeDocument(gpa: std.mem.Allocator, text: []const u8, name: []const u8, opts: RenderOpts) ![]u8 {
+    const lang = langFor(extOf(name));
+
+    // Colonne disponibili alla larghezza richiesta (al netto dei margini)
+    const inner_px: f32 = @floatFromInt(opts.width -| 2 * pad_x);
+    const px_per_char = @as(f32, @floatFromInt(opts.pointsize)) * mono_advance_px_per_pt;
+    const total_cols: usize = @intFromFloat(@max(inner_px / px_per_char, 24));
+
+    var total_lines: usize = 1;
+    for (text) |c| {
+        if (c == '\n') total_lines += 1;
+    }
+    var digits: usize = 1;
+    var n = total_lines;
+    while (n >= 10) : (n /= 10) digits += 1;
+    if (digits < 3) digits = 3;
+
+    const code_cols = if (total_cols > digits + 3 + 16) total_cols - digits - 3 else 16;
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    const w = &out.writer;
+
+    var line_no: usize = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw_line| {
+        line_no += 1;
+        const line_trimmed = std.mem.trimEnd(u8, raw_line, "\r");
+
+        // I tab spostano i tab-stop di Pango e romperebbero il gutter
+        const line = try expandTabs(gpa, line_trimmed);
+        defer gpa.free(line);
+
+        var start: usize = 0;
+        var first = true;
+        while (true) {
+            const end = sliceByColumns(line, start, code_cols);
+            const chunk = line[start..end];
+
+            if (first) {
+                try w.print("<span foreground=\"{s}\">", .{col_line_no});
+                var d: usize = countDigits(line_no);
+                while (d < digits) : (d += 1) try w.writeByte(' ');
+                try w.print("{d}</span> <span foreground=\"{s}\">│</span> ", .{ line_no, col_rule });
+            } else {
+                var d: usize = 0;
+                while (d < digits + 1) : (d += 1) try w.writeByte(' ');
+                try w.print("<span foreground=\"{s}\">│</span> ", .{col_rule});
+            }
+            try highlightChunk(w, chunk, lang);
+            try w.writeByte('\n');
+
+            first = false;
+            start = end;
+            if (start >= line.len) break;
+        }
+    }
+
+    return out.toOwnedSlice();
+}
+
+fn countDigits(v: usize) usize {
+    var d: usize = 1;
+    var n = v;
+    while (n >= 10) : (n /= 10) d += 1;
+    return d;
+}
+
+fn expandTabs(gpa: std.mem.Allocator, line: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    for (line) |c| {
+        if (c == '\t') {
+            try out.writer.writeAll("    ");
+        } else {
+            try out.writer.writeByte(c);
+        }
+    }
+    return out.toOwnedSlice();
+}
+
+/// Fine del segmento che copre al massimo `cols` codepoint da `start`,
+/// senza spezzare le sequenze UTF-8.
+fn sliceByColumns(line: []const u8, start: usize, cols: usize) usize {
+    var i = start;
+    var count: usize = 0;
+    while (i < line.len and count < cols) {
+        const len = std.unicode.utf8ByteSequenceLength(line[i]) catch 1;
+        i = @min(i + len, line.len);
+        count += 1;
+    }
+    return i;
+}
+
+/// Evidenziazione leggera di un segmento: commenti di riga, stringhe e
+/// keyword. Tutto il resto è testo neutro, sempre escapato.
+fn highlightChunk(w: *std.Io.Writer, chunk: []const u8, lang: Lang) !void {
+    var i: usize = 0;
+    while (i < chunk.len) {
+        const c = chunk[i];
+
+        // Commento di riga: colora fino a fine segmento
+        var is_comment = false;
+        for (lang.line_comments) |prefix| {
+            if (std.mem.startsWith(u8, chunk[i..], prefix)) {
+                is_comment = true;
+                break;
+            }
+        }
+        if (is_comment) {
+            try w.print("<span foreground=\"{s}\">", .{col_comment});
+            try writeEscaped(w, chunk[i..]);
+            try w.writeAll("</span>");
+            return;
+        }
+
+        // Stringhe tra apici (senza escape multilinea: best effort)
+        if (c == '"' or c == '\'' or c == '`') {
+            var end = i + 1;
+            while (end < chunk.len) : (end += 1) {
+                if (chunk[end] == '\\') {
+                    end += 1;
+                    continue;
+                }
+                if (chunk[end] == c) break;
+            }
+            const stop = @min(end + 1, chunk.len);
+            try w.print("<span foreground=\"{s}\">", .{col_string});
+            try writeEscaped(w, chunk[i..stop]);
+            try w.writeAll("</span>");
+            i = stop;
+            continue;
+        }
+
+        // Identificatori: keyword colorate, il resto neutro
+        if (std.ascii.isAlphabetic(c) or c == '_') {
+            var end = i + 1;
+            while (end < chunk.len and (std.ascii.isAlphanumeric(chunk[end]) or chunk[end] == '_')) end += 1;
+            const word = chunk[i..end];
+            var is_kw = false;
+            for (lang.keywords) |kw| {
+                if (std.mem.eql(u8, word, kw)) {
+                    is_kw = true;
+                    break;
+                }
+            }
+            if (is_kw) {
+                try w.print("<span foreground=\"{s}\" weight=\"600\">", .{col_keyword});
+                try writeEscaped(w, word);
+                try w.writeAll("</span>");
+            } else {
+                try writeEscaped(w, word);
+            }
+            i = end;
+            continue;
+        }
+
+        try writeEscapedByte(w, c);
+        i += 1;
+    }
 }
 
 /// Converte un sottoinsieme di Markdown in markup Pango: header, grassetto,

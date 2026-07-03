@@ -564,6 +564,32 @@ fn renderWorker(
 }
 
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+/// Dimensione iniziale della finestra. Per le immagini il frame si adatta al
+/// contenuto (l'immagine lo riempie per intero), con un tetto a ~metà schermo:
+/// zrame non espone la geometria dell'output, quindi il tetto è ZUER_MAX_WIN
+/// (formato "LxA") oppure 1600x900.
+fn initialWindowSize(is_image: bool, img_w: u32, img_h: u32) struct { w: u32, h: u32 } {
+    if (!is_image or img_w == 0 or img_h == 0) return .{ .w = 1280, .h = 720 };
+
+    var max_w: u32 = 1600;
+    var max_h: u32 = 900;
+    if (getenv("ZUER_MAX_WIN")) |val| {
+        const s = std.mem.span(val);
+        if (std.mem.indexOfScalar(u8, s, 'x')) |sep| {
+            max_w = std.fmt.parseInt(u32, s[0..sep], 10) catch max_w;
+            max_h = std.fmt.parseInt(u32, s[sep + 1 ..], 10) catch max_h;
+        }
+    }
+
+    const fw: f32 = @floatFromInt(img_w);
+    const fh: f32 = @floatFromInt(img_h);
+    const scale = @min(1.0, @min(@as(f32, @floatFromInt(max_w)) / fw, @as(f32, @floatFromInt(max_h)) / fh));
+    const w: u32 = @intFromFloat(@round(fw * scale));
+    const h: u32 = @intFromFloat(@round(fh * scale));
+    return .{ .w = @max(w, 320), .h = @max(h, 200) };
+}
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -684,11 +710,12 @@ pub fn main(init: std.process.Init) !void {
     var composited_rgba: []u8 = &.{};
     defer gpa.free(composited_rgba);
 
+    const win_size = initialWindowSize(decoded == .image, static_w, static_h);
     const win = try zrame.Window.init(gpa, .{
         .title = "zuer-gui",
         .app_id = "it.zuer.gui",
-        .width = 1280,
-        .height = 720,
+        .width = win_size.w,
+        .height = win_size.h,
         .on_key = keyCallback,
         .on_scroll = scrollCallback,
         .on_mouse = mouseCallback,
