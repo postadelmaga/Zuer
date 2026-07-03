@@ -1,10 +1,15 @@
 const std = @import("std");
 const decoder = @import("decoder");
+const player = @import("player.zig");
 const Decoded = decoder.Decoded;
 
-/// Anteprima nativa per file audio/video: legge solo gli header (nessuna
-/// decodifica dei sample, nessun processo esterno) ed emette una scheda testuale.
-pub fn decode(bytes: []const u8, filename: []const u8, allocator: std.mem.Allocator) Decoded {
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+/// Anteprima nativa per file audio/video. Gli header vengono comunque letti
+/// (scheda testuale con formato/durata/…); per i video si decodifica anche il
+/// primo frame con libav e lo si mostra come poster — primo tassello del player
+/// nativo. Nessun processo esterno.
+pub fn decode(path: []const u8, bytes: []const u8, filename: []const u8, allocator: std.mem.Allocator) Decoded {
     defer allocator.free(bytes);
 
     const info: MediaInfo = sniff(bytes) orelse {
@@ -12,7 +17,29 @@ pub fn decode(bytes: []const u8, filename: []const u8, allocator: std.mem.Alloca
         return .{ .err = msg };
     };
 
+    if (info.kind == .video) {
+        if (posterFrame(path, filename, allocator)) |img| {
+            return .{ .image = img };
+        } else |_| {} // libav non disponibile o frame illeggibile → scheda testuale
+    }
+
     return .{ .text = render(info, filename, bytes.len, allocator) };
+}
+
+/// Primo frame video come immagine RGB, dimensionato in base al contesto (GUI
+/// ad alta risoluzione, terminale ridotto).
+fn posterFrame(path: []const u8, filename: []const u8, allocator: std.mem.Allocator) !decoder.ImageData {
+    var max_dim: usize = 160;
+    if (getenv("ZUER_GUI")) |v| {
+        if (std.mem.eql(u8, std.mem.span(v), "1")) max_dim = 1280;
+    }
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    const frame = try player.firstVideoFrame(path_z.ptr, max_dim, allocator);
+    errdefer allocator.free(frame.pixels);
+    const name = try allocator.dupe(u8, filename);
+    return .{ .width = frame.width, .height = frame.height, .pixels = frame.pixels, .name = name };
 }
 
 const MediaInfo = struct {
@@ -358,7 +385,7 @@ export fn zuer_decode(
     const allocator = @as(*const std.mem.Allocator, @ptrCast(@alignCast(allocator_ptr))).*;
     const filename = std.fs.path.basename(path.toSlice());
 
-    const decoded = decode(content.toSlice(), filename, allocator);
+    const decoded = decode(path.toSlice(), content.toSlice(), filename, allocator);
     return decoded.toDecodedC(allocator) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "error";
         return .{

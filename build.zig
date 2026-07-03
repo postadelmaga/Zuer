@@ -136,6 +136,14 @@ pub fn build(b: *std.Build) void {
                 .flags = &.{ "-O2", "-fno-sanitize=undefined" },
             });
         }
+        // Il plugin media decodifica video/audio nativamente con libav (ffmpeg):
+        // primo frame come poster, e in prospettiva riproduzione completa.
+        if (comptime std.mem.eql(u8, name, "media")) {
+            lib.root_module.linkSystemLibrary("libavformat", .{});
+            lib.root_module.linkSystemLibrary("libavcodec", .{});
+            lib.root_module.linkSystemLibrary("libavutil", .{});
+            lib.root_module.linkSystemLibrary("libswscale", .{});
+        }
         b.installArtifact(lib);
     }
 
