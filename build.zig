@@ -26,6 +26,17 @@ pub fn build(b: *std.Build) void {
     frag_cmd.addArg("-o");
     const frag_spv = frag_cmd.addOutputFileArg("mesh.frag.spv");
 
+    // Shader della pipeline testo (atlante glifi su GPU).
+    const tvert_cmd = b.addSystemCommand(&.{"glslc"});
+    tvert_cmd.addFileArg(b.path("src/shaders/text.vert"));
+    tvert_cmd.addArg("-o");
+    const text_vert_spv = tvert_cmd.addOutputFileArg("text.vert.spv");
+
+    const tfrag_cmd = b.addSystemCommand(&.{"glslc"});
+    tfrag_cmd.addFileArg(b.path("src/shaders/text.frag"));
+    tfrag_cmd.addArg("-o");
+    const text_frag_spv = tfrag_cmd.addOutputFileArg("text.frag.spv");
+
     const exe = b.addExecutable(.{
         .name = "zuer",
         .root_module = b.createModule(.{
@@ -42,6 +53,8 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("zicro", dep_zicro.module("zicro"));
     exe.root_module.addAnonymousImport("mesh_vert_spv", .{ .root_source_file = vert_spv });
     exe.root_module.addAnonymousImport("mesh_frag_spv", .{ .root_source_file = frag_spv });
+    exe.root_module.addAnonymousImport("text_vert_spv", .{ .root_source_file = text_vert_spv });
+    exe.root_module.addAnonymousImport("text_frag_spv", .{ .root_source_file = text_frag_spv });
     exe.root_module.linkSystemLibrary("vulkan", .{});
 
     b.installArtifact(exe);
@@ -60,6 +73,8 @@ pub fn build(b: *std.Build) void {
     gui_exe.root_module.addImport("zrame", dep_zrame.module("zrame"));
     gui_exe.root_module.addAnonymousImport("mesh_vert_spv", .{ .root_source_file = vert_spv });
     gui_exe.root_module.addAnonymousImport("mesh_frag_spv", .{ .root_source_file = frag_spv });
+    gui_exe.root_module.addAnonymousImport("text_vert_spv", .{ .root_source_file = text_vert_spv });
+    gui_exe.root_module.addAnonymousImport("text_frag_spv", .{ .root_source_file = text_frag_spv });
     gui_exe.root_module.linkSystemLibrary("vulkan", .{});
     gui_exe.root_module.linkSystemLibrary("wayland-client", .{});
     // Motore di testo nativo: stb_truetype rasterizza i glifi Hack (embeddati),
@@ -80,6 +95,12 @@ pub fn build(b: *std.Build) void {
         }),
     });
     addStbTruetype(b, raster_dbg.root_module);
+    // Anche il percorso GPU (gpu_renderer + shader) per confrontare CPU vs atlante.
+    raster_dbg.root_module.addAnonymousImport("mesh_vert_spv", .{ .root_source_file = vert_spv });
+    raster_dbg.root_module.addAnonymousImport("mesh_frag_spv", .{ .root_source_file = frag_spv });
+    raster_dbg.root_module.addAnonymousImport("text_vert_spv", .{ .root_source_file = text_vert_spv });
+    raster_dbg.root_module.addAnonymousImport("text_frag_spv", .{ .root_source_file = text_frag_spv });
+    raster_dbg.root_module.linkSystemLibrary("vulkan", .{});
     const raster_dbg_run = b.addRunArtifact(raster_dbg);
     if (b.args) |args| raster_dbg_run.addArgs(args);
     b.step("raster-debug", "Rasterizza un file su PPM (stdout)").dependOn(&raster_dbg_run.step);

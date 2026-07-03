@@ -105,7 +105,7 @@ pub const Raster = struct {
         return self.ascent - self.descent + self.line_gap;
     }
 
-    fn getGlyph(self: *Raster, style: Style, cp: u32) !*const Glyph {
+    pub fn getGlyph(self: *Raster, style: Style, cp: u32) !*const Glyph {
         const key = CacheKey{ .style = style, .cp = cp };
         if (self.cache.getPtr(key)) |g| return g;
 
@@ -163,6 +163,100 @@ pub const Raster = struct {
         }
     }
 };
+
+/// Posizione e metriche di un glifo dentro l'atlante (coordinate in pixel).
+pub const AtlasGlyph = struct {
+    ax: u32,
+    ay: u32,
+    w: u32,
+    h: u32,
+    xoff: i32,
+    yoff: i32,
+};
+
+/// Atlante di glifi a canale singolo (copertura): tutti i glifi rasterizzati
+/// impacchettati in una bitmap, per il percorso GPU (una texture, un quad per
+/// glifo). Costruito dai glifi già in cache nel `Raster`.
+pub const Atlas = struct {
+    gpa: std.mem.Allocator,
+    pixels: []u8, // copertura 0..255, w*h
+    w: usize,
+    h: usize,
+    map: std.AutoHashMapUnmanaged(CacheKey, AtlasGlyph),
+
+    pub fn deinit(self: *Atlas) void {
+        self.gpa.free(self.pixels);
+        self.map.deinit(self.gpa);
+    }
+
+    pub fn get(self: *const Atlas, style: Style, cp: u32) ?AtlasGlyph {
+        return self.map.get(.{ .style = style, .cp = cp });
+    }
+};
+
+/// Impacchetta tutti i glifi attualmente in cache nel `Raster` in un atlante
+/// (packer a scaffali). Larghezza fissa, altezza cresce con gli scaffali.
+pub fn buildAtlas(raster: *Raster) !Atlas {
+    const gpa = raster.gpa;
+    const atlas_w: usize = 1024;
+    const pad: usize = 1;
+
+    var map: std.AutoHashMapUnmanaged(CacheKey, AtlasGlyph) = .empty;
+    errdefer map.deinit(gpa);
+
+    // Passo 1: posizioni a scaffali, calcola l'altezza necessaria.
+    var x: usize = pad;
+    var y: usize = pad;
+    var shelf_h: usize = 0;
+    var it = raster.cache.iterator();
+    while (it.next()) |e| {
+        const g = e.value_ptr.*;
+        const gw: usize = @intCast(@max(g.w, 0));
+        const gh: usize = @intCast(@max(g.h, 0));
+        if (g.bitmap.len == 0 or gw == 0 or gh == 0) {
+            try map.put(gpa, e.key_ptr.*, .{ .ax = 0, .ay = 0, .w = 0, .h = 0, .xoff = g.xoff, .yoff = g.yoff });
+            continue;
+        }
+        if (x + gw + pad > atlas_w) {
+            x = pad;
+            y += shelf_h + pad;
+            shelf_h = 0;
+        }
+        try map.put(gpa, e.key_ptr.*, .{
+            .ax = @intCast(x),
+            .ay = @intCast(y),
+            .w = @intCast(gw),
+            .h = @intCast(gh),
+            .xoff = g.xoff,
+            .yoff = g.yoff,
+        });
+        x += gw + pad;
+        shelf_h = @max(shelf_h, gh);
+    }
+    const atlas_h: usize = y + shelf_h + pad;
+
+    const pixels = try gpa.alloc(u8, atlas_w * atlas_h);
+    errdefer gpa.free(pixels);
+    @memset(pixels, 0);
+
+    // Passo 2: copia le coperture dei glifi nelle posizioni assegnate.
+    var it2 = raster.cache.iterator();
+    while (it2.next()) |e| {
+        const g = e.value_ptr.*;
+        if (g.bitmap.len == 0) continue;
+        const ag = map.get(e.key_ptr.*).?;
+        const gw: usize = ag.w;
+        const gh: usize = ag.h;
+        var row: usize = 0;
+        while (row < gh) : (row += 1) {
+            const src = g.bitmap[row * gw .. row * gw + gw];
+            const dst_off = (ag.ay + row) * atlas_w + ag.ax;
+            @memcpy(pixels[dst_off .. dst_off + gw], src);
+        }
+    }
+
+    return .{ .gpa = gpa, .pixels = pixels, .w = atlas_w, .h = atlas_h, .map = map };
+}
 
 /// out = out*(1-a) + color*a, con a = cov/255, per canale RGB.
 fn blend(dst: []u8, color: Rgb, cov: u8) void {

@@ -16,10 +16,11 @@ pub const max_table_col: usize = 40;
 const pad_x: i32 = 20;
 const pad_y: i32 = 14;
 
-// Palette allineata a quella di viewer (funzione `harmonize`): sfondo scuro
-// dell'editor egui, corpo grigio chiaro, accenti desaturati.
-const bg = Rgb.fromHex("#101115"); // viewer: extreme_bg_color rgb(16,17,21)
-const fg = Rgb.fromHex("#cdcdcd"); // corpo del testo
+// Palette: primo piano allineato a viewer (funzione `harmonize`); lo sfondo
+// resta #080810 perché il compositore della GUI lo rende trasparente (effetto
+// vetro della finestra, vedi composeFrame) — sotto vetro il valore non si vede.
+const bg = Rgb.fromHex("#080810"); // key di trasparenza del compositore (8,8,16)
+const fg = Rgb.fromHex("#cdcdcd"); // corpo del testo (viewer: ~gray 205)
 const c_line_no = Rgb.fromHex("#606060"); // numeri di riga (viewer: gray 96)
 const c_keyword = Rgb.fromHex("#96aaeb"); // keyword (viewer: rgb 150,170,235)
 const c_string = Rgb.fromHex("#9ebc96"); // stringhe (viewer: rgb 158,188,150)
@@ -67,24 +68,151 @@ pub fn render(gpa: std.mem.Allocator, io: std.Io, decoded: *const decoder_mod.De
     defer raster.deinit();
 
     var rows: std.ArrayList(Row) = .empty;
+    try buildRows(arena, &rows, &raster, decoded, name, opts);
 
+    return paint(gpa, &raster, rows.items, name, opts);
+}
+
+/// Costruisce le righe visive (run posizionati) del contenuto decodificato.
+/// Condiviso dal percorso CPU (composizione diretta) e da quello GPU (quad).
+fn buildRows(arena: std.mem.Allocator, rows: *std.ArrayList(Row), raster: *glyph.Raster, decoded: *const decoder_mod.Decoded, name: []const u8, opts: RenderOpts) !void {
     switch (decoded.*) {
         .text => |t| {
             const rich = t.len <= max_rich_bytes and isCodeLike(name);
             const lang: ?Lang = if (rich) langFor(extOf(name)) else null;
-            try layoutCode(arena, &rows, &raster, t, opts, rich, lang);
+            try layoutCode(arena, rows, raster, t, opts, rich, lang);
         },
         .csv => |c| {
             const table = try formatTable(arena, c);
-            try layoutCode(arena, &rows, &raster, table, opts, false, null);
+            try layoutCode(arena, rows, raster, table, opts, false, null);
         },
         .markdown => |m| {
-            try layoutMarkdown(arena, &rows, &raster, m.content, opts);
+            try layoutMarkdown(arena, rows, raster, m.content, opts);
         },
         else => return error.UnsupportedContent,
     }
+}
 
-    return paint(gpa, &raster, rows.items, name, opts);
+// --- Percorso GPU: atlante + quad texturati ---------------------------------
+
+/// Vertice per la pipeline testo: posizione schermo (px), UV nell'atlante e
+/// colore. Corrisponde a `src/shaders/text.vert`.
+pub const Vertex = extern struct {
+    x: f32,
+    y: f32,
+    u: f32,
+    v: f32,
+    r: f32,
+    g: f32,
+    b: f32,
+};
+
+/// Geometria del testo per la GPU: due triangoli per glifo, l'atlante da caricare
+/// come texture, e le dimensioni finali dell'immagine.
+pub const TextMesh = struct {
+    vertices: []Vertex,
+    atlas: glyph.Atlas,
+    width: usize,
+    height: usize,
+
+    pub fn deinit(self: *TextMesh, gpa: std.mem.Allocator) void {
+        gpa.free(self.vertices);
+        self.atlas.deinit();
+    }
+};
+
+/// Colore di sfondo del documento come clear color RGBA normalizzato.
+pub const clear_bg = [4]f32{
+    @as(f32, @floatFromInt(bg.r)) / 255.0,
+    @as(f32, @floatFromInt(bg.g)) / 255.0,
+    @as(f32, @floatFromInt(bg.b)) / 255.0,
+    1.0,
+};
+
+/// Costruisce la geometria dei quad glifo per il rendering su GPU: stesso layout
+/// del percorso CPU, ma emette vertici texturati anziché comporre i pixel.
+pub fn buildTextMesh(gpa: std.mem.Allocator, decoded: *const decoder_mod.Decoded, name: []const u8, opts: RenderOpts) !TextMesh {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var raster = try glyph.Raster.init(gpa, pxHeight(opts.pointsize));
+    defer raster.deinit();
+
+    var rows: std.ArrayList(Row) = .empty;
+    try buildRows(arena, &rows, &raster, decoded, name, opts);
+
+    // Assicura che tutti i glifi usati siano in cache prima di impacchettarli.
+    for (rows.items) |row| {
+        for (row) |run| {
+            var i: usize = 0;
+            while (i < run.text.len) {
+                const seq = std.unicode.utf8ByteSequenceLength(run.text[i]) catch 1;
+                const end = @min(i + seq, run.text.len);
+                const cp: u32 = std.unicode.utf8Decode(run.text[i..end]) catch run.text[i];
+                _ = try raster.getGlyph(run.style, cp);
+                i = end;
+            }
+        }
+    }
+
+    var atlas = try glyph.buildAtlas(&raster);
+    errdefer atlas.deinit();
+
+    const line_h = raster.lineHeight();
+    const advance = raster.advance;
+    const width: usize = @max(opts.width, 2 * @as(usize, @intCast(pad_x)) + 1);
+    const n_rows: usize = @max(rows.items.len, 1);
+    const height: usize = @as(usize, @intCast(2 * pad_y)) + n_rows * @as(usize, @intCast(line_h));
+
+    const aw: f32 = @floatFromInt(atlas.w);
+    const ah: f32 = @floatFromInt(atlas.h);
+
+    var verts: std.ArrayList(Vertex) = .empty;
+    errdefer verts.deinit(gpa);
+
+    for (rows.items, 0..) |row, r| {
+        const baseline = pad_y + @as(i32, @intCast(r)) * line_h + raster.ascent;
+        var col: i32 = 0;
+        for (row) |run| {
+            const cr: f32 = @as(f32, @floatFromInt(run.color.r)) / 255.0;
+            const cg: f32 = @as(f32, @floatFromInt(run.color.g)) / 255.0;
+            const cb: f32 = @as(f32, @floatFromInt(run.color.b)) / 255.0;
+            var i: usize = 0;
+            while (i < run.text.len) {
+                const seq = std.unicode.utf8ByteSequenceLength(run.text[i]) catch 1;
+                const end = @min(i + seq, run.text.len);
+                const cp: u32 = std.unicode.utf8Decode(run.text[i..end]) catch run.text[i];
+                i = end;
+                const pen_x = pad_x + col * advance;
+                col += 1;
+                const ag = atlas.get(run.style, cp) orelse continue;
+                if (ag.w == 0 or ag.h == 0) continue;
+
+                const x0: f32 = @floatFromInt(pen_x + ag.xoff);
+                const y0: f32 = @floatFromInt(baseline + ag.yoff);
+                const x1 = x0 + @as(f32, @floatFromInt(ag.w));
+                const y1 = y0 + @as(f32, @floatFromInt(ag.h));
+                const su0: f32 = @as(f32, @floatFromInt(ag.ax)) / aw;
+                const sv0: f32 = @as(f32, @floatFromInt(ag.ay)) / ah;
+                const su1: f32 = @as(f32, @floatFromInt(ag.ax + ag.w)) / aw;
+                const sv1: f32 = @as(f32, @floatFromInt(ag.ay + ag.h)) / ah;
+
+                const tl = Vertex{ .x = x0, .y = y0, .u = su0, .v = sv0, .r = cr, .g = cg, .b = cb };
+                const tr = Vertex{ .x = x1, .y = y0, .u = su1, .v = sv0, .r = cr, .g = cg, .b = cb };
+                const bl = Vertex{ .x = x0, .y = y1, .u = su0, .v = sv1, .r = cr, .g = cg, .b = cb };
+                const br = Vertex{ .x = x1, .y = y1, .u = su1, .v = sv1, .r = cr, .g = cg, .b = cb };
+                try verts.appendSlice(gpa, &.{ tl, tr, bl, tr, br, bl });
+            }
+        }
+    }
+
+    return .{
+        .vertices = try verts.toOwnedSlice(gpa),
+        .atlas = atlas,
+        .width = width,
+        .height = height,
+    };
 }
 
 // --- Composizione dell'immagine ---------------------------------------------

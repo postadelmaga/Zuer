@@ -182,6 +182,9 @@ const GuiAppState = struct {
     decoded: *decoder_mod.Decoded,
     stage_opt: *?loader_mod.GpuStage,
     renderer: *gpu.Renderer,
+    // Motore di resa testo: false = CPU (composizione diretta), true = atlante
+    // GPU (ZUER_TEXT_ENGINE=gpu). Stessa resa, percorso diverso.
+    text_gpu: bool,
 
     // Variabili di stato rendering
     is_mesh: *bool,
@@ -445,13 +448,15 @@ fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopaque)
 /// Da chiamare con `state.mutex` già acquisito.
 fn rasterizeText(state: *GuiAppState, width: u32, text_zoom: f32) void {
     const pointsize: usize = @intFromFloat(@round(15.0 * text_zoom));
-    var img = text_render.render(
-        state.gpa,
-        state.io,
-        state.decoded,
-        std.fs.path.basename(state.current_file_path),
-        .{ .width = @max(width, 64), .pointsize = @max(pointsize, 6) },
-    ) catch |err| {
+    const opts = text_render.RenderOpts{ .width = @max(width, 64), .pointsize = @max(pointsize, 6) };
+    const name = std.fs.path.basename(state.current_file_path);
+
+    if (state.text_gpu) {
+        rasterizeTextGpu(state, name, opts);
+        return;
+    }
+
+    var img = text_render.render(state.gpa, state.io, state.decoded, name, opts) catch |err| {
         std.debug.print("Impossibile rasterizzare il testo: {s}\n", .{@errorName(err)});
         return;
     };
@@ -471,6 +476,37 @@ fn rasterizeText(state: *GuiAppState, width: u32, text_zoom: f32) void {
     state.static_rgba.* = rgba;
     state.static_w.* = w;
     state.static_h.* = h;
+}
+
+/// Percorso GPU (Soluzione B): costruisce i quad glifo + atlante e li renderizza
+/// con la pipeline testo Vulkan, poi copia i pixel RGBA nel buffer statico.
+fn rasterizeTextGpu(state: *GuiAppState, name: []const u8, opts: text_render.RenderOpts) void {
+    var mesh = text_render.buildTextMesh(state.gpa, state.decoded, name, opts) catch |err| {
+        std.debug.print("Impossibile costruire i quad del testo: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer mesh.deinit(state.gpa);
+
+    const rgba_src = state.renderer.renderText(
+        std.mem.sliceAsBytes(mesh.vertices),
+        @intCast(mesh.vertices.len),
+        mesh.atlas.pixels,
+        @intCast(mesh.atlas.w),
+        @intCast(mesh.atlas.h),
+        @intCast(mesh.width),
+        @intCast(mesh.height),
+        text_render.clear_bg,
+    ) catch |err| {
+        std.debug.print("Render testo GPU fallito: {s}\n", .{@errorName(err)});
+        return;
+    };
+
+    // Il readback è riusato dalla chiamata successiva: copiane una proprietà.
+    const rgba = state.gpa.dupe(u8, rgba_src) catch return;
+    state.gpa.free(state.static_rgba.*);
+    state.static_rgba.* = rgba;
+    state.static_w.* = @intCast(mesh.width);
+    state.static_h.* = @intCast(mesh.height);
 }
 
 fn renderWorker(
@@ -681,6 +717,10 @@ pub fn main(init: std.process.Init) !void {
         .decoded = &decoded,
         .stage_opt = &stage_opt,
         .renderer = &renderer,
+        .text_gpu = text_gpu: {
+            if (getenv("ZUER_TEXT_ENGINE")) |v| break :text_gpu std.mem.eql(u8, std.mem.span(v), "gpu");
+            break :text_gpu false;
+        },
         .is_mesh = &is_mesh,
         .is_text = &is_text,
         .file_changed = &file_changed,

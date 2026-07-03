@@ -674,6 +674,124 @@ pub const InitOptions = struct {
     device_extensions: []const [*:0]const u8 = &.{},
 };
 
+// ---------------------------------------------------------------------------
+// Binding aggiuntivi per la pipeline testo (atlante glifi campionabile).
+// ---------------------------------------------------------------------------
+
+const ST_SAMPLER_CREATE_INFO: VkStructureType = 31;
+const ST_DESCRIPTOR_SET_LAYOUT_CREATE_INFO: VkStructureType = 32;
+const ST_DESCRIPTOR_POOL_CREATE_INFO: VkStructureType = 33;
+const ST_DESCRIPTOR_SET_ALLOCATE_INFO: VkStructureType = 34;
+const ST_WRITE_DESCRIPTOR_SET: VkStructureType = 35;
+
+const FORMAT_R8_UNORM: u32 = 9;
+const FORMAT_R32G32_SFLOAT: u32 = 103;
+const IMAGE_USAGE_SAMPLED: u32 = 0x4;
+const IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL: u32 = 5;
+const DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: u32 = 1;
+const BLEND_FACTOR_SRC_ALPHA: u32 = 6;
+const BLEND_FACTOR_ONE_MINUS_SRC_ALPHA: u32 = 7;
+const ACCESS_SHADER_READ: u32 = 0x20;
+const STAGE_FRAGMENT_SHADER: u32 = 0x80;
+const COLOR_WRITE_RGB: u32 = 0x7;
+
+const VkSampler = u64;
+const VkDescriptorSetLayout = u64;
+const VkDescriptorPool = u64;
+const VkDescriptorSet = u64;
+
+const VkSamplerCreateInfo = extern struct {
+    sType: VkStructureType = ST_SAMPLER_CREATE_INFO,
+    pNext: ?*const anyopaque = null,
+    flags: u32 = 0,
+    magFilter: u32 = 1, // LINEAR
+    minFilter: u32 = 1,
+    mipmapMode: u32 = 0, // NEAREST
+    addressModeU: u32 = 2, // CLAMP_TO_EDGE
+    addressModeV: u32 = 2,
+    addressModeW: u32 = 2,
+    mipLodBias: f32 = 0,
+    anisotropyEnable: u32 = 0,
+    maxAnisotropy: f32 = 1,
+    compareEnable: u32 = 0,
+    compareOp: u32 = 0,
+    minLod: f32 = 0,
+    maxLod: f32 = 0,
+    borderColor: u32 = 0,
+    unnormalizedCoordinates: u32 = 0,
+};
+
+const VkDescriptorSetLayoutBinding = extern struct {
+    binding: u32,
+    descriptorType: u32,
+    descriptorCount: u32,
+    stageFlags: u32,
+    pImmutableSamplers: ?*const anyopaque = null,
+};
+
+const VkDescriptorSetLayoutCreateInfo = extern struct {
+    sType: VkStructureType = ST_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+    pNext: ?*const anyopaque = null,
+    flags: u32 = 0,
+    bindingCount: u32,
+    pBindings: [*]const VkDescriptorSetLayoutBinding,
+};
+
+const VkDescriptorPoolSize = extern struct { type: u32, descriptorCount: u32 };
+
+const VkDescriptorPoolCreateInfo = extern struct {
+    sType: VkStructureType = ST_DESCRIPTOR_POOL_CREATE_INFO,
+    pNext: ?*const anyopaque = null,
+    flags: u32 = 0,
+    maxSets: u32,
+    poolSizeCount: u32,
+    pPoolSizes: [*]const VkDescriptorPoolSize,
+};
+
+const VkDescriptorSetAllocateInfo = extern struct {
+    sType: VkStructureType = ST_DESCRIPTOR_SET_ALLOCATE_INFO,
+    pNext: ?*const anyopaque = null,
+    descriptorPool: VkDescriptorPool,
+    descriptorSetCount: u32 = 1,
+    pSetLayouts: [*]const VkDescriptorSetLayout,
+};
+
+const VkDescriptorImageInfo = extern struct {
+    sampler: VkSampler,
+    imageView: VkImageView,
+    imageLayout: u32,
+};
+
+const VkWriteDescriptorSet = extern struct {
+    sType: VkStructureType = ST_WRITE_DESCRIPTOR_SET,
+    pNext: ?*const anyopaque = null,
+    dstSet: VkDescriptorSet,
+    dstBinding: u32,
+    dstArrayElement: u32 = 0,
+    descriptorCount: u32 = 1,
+    descriptorType: u32,
+    pImageInfo: ?*const VkDescriptorImageInfo = null,
+    pBufferInfo: ?*const anyopaque = null,
+    pTexelBufferView: ?*const anyopaque = null,
+};
+
+extern "vulkan" fn vkCreateSampler(VkDevice, *const VkSamplerCreateInfo, ?*const anyopaque, *VkSampler) VkResult;
+extern "vulkan" fn vkDestroySampler(VkDevice, VkSampler, ?*const anyopaque) void;
+extern "vulkan" fn vkCreateDescriptorSetLayout(VkDevice, *const VkDescriptorSetLayoutCreateInfo, ?*const anyopaque, *VkDescriptorSetLayout) VkResult;
+extern "vulkan" fn vkDestroyDescriptorSetLayout(VkDevice, VkDescriptorSetLayout, ?*const anyopaque) void;
+extern "vulkan" fn vkCreateDescriptorPool(VkDevice, *const VkDescriptorPoolCreateInfo, ?*const anyopaque, *VkDescriptorPool) VkResult;
+extern "vulkan" fn vkDestroyDescriptorPool(VkDevice, VkDescriptorPool, ?*const anyopaque) void;
+extern "vulkan" fn vkAllocateDescriptorSets(VkDevice, *const VkDescriptorSetAllocateInfo, *VkDescriptorSet) VkResult;
+extern "vulkan" fn vkUpdateDescriptorSets(VkDevice, u32, [*]const VkWriteDescriptorSet, u32, ?*const anyopaque) void;
+extern "vulkan" fn vkCmdBindDescriptorSets(VkCommandBuffer, u32, VkPipelineLayout, u32, u32, [*]const VkDescriptorSet, u32, ?*const u32) void;
+extern "vulkan" fn vkCmdDraw(VkCommandBuffer, u32, u32, u32, u32) void;
+
+const text_vert_spv = @embedFile("text_vert_spv");
+const text_frag_spv = @embedFile("text_frag_spv");
+
+/// Push constant della pipeline testo: dimensione del viewport in pixel.
+const TextPush = extern struct { viewport: [2]f32 };
+
 pub const Renderer = struct {
     gpa: std.mem.Allocator,
     instance: VkInstance,
@@ -720,6 +838,24 @@ pub const Renderer = struct {
     tex_mem: VkDeviceMemory = VK_NULL,
     tex_width: u32 = 0,
     tex_height: u32 = 0,
+
+    // Pipeline testo (atlante glifi su GPU), inizializzata pigramente.
+    text_ready: bool = false,
+    text_sampler: VkSampler = VK_NULL,
+    text_dsl: VkDescriptorSetLayout = VK_NULL,
+    text_dpool: VkDescriptorPool = VK_NULL,
+    text_dset: VkDescriptorSet = VK_NULL,
+    text_pipeline_layout: VkPipelineLayout = VK_NULL,
+    text_pipeline: VkPipeline = VK_NULL,
+    text_vert_module: VkShaderModule = VK_NULL,
+    text_frag_module: VkShaderModule = VK_NULL,
+    text_atlas: ImageBundle = .{ .image = VK_NULL, .mem = VK_NULL, .view = VK_NULL },
+    text_atlas_w: u32 = 0,
+    text_atlas_h: u32 = 0,
+    text_vbuf: VkBuffer = VK_NULL,
+    text_vmem: VkDeviceMemory = VK_NULL,
+    text_vbuf_cap: u64 = 0,
+    text_vptr: ?[*]u8 = null,
 
     pub fn init(gpa: std.mem.Allocator, opts: InitOptions) !Renderer {
         const app_info = VkApplicationInfo{
@@ -846,6 +982,7 @@ pub const Renderer = struct {
         _ = vkDeviceWaitIdle(self.device);
         self.releaseMesh();
         self.releaseTexture();
+        self.destroyTextPipe();
         self.destroyTarget();
         vkDestroyPipeline(self.device, self.pipeline, null);
         vkDestroyPipelineLayout(self.device, self.pipeline_layout, null);
@@ -1237,6 +1374,226 @@ pub const Renderer = struct {
         }
         return null;
     }
+
+    // --- Pipeline testo (atlante glifi su GPU) ----------------------------
+
+    /// Crea (una sola volta) sampler, descriptor set, layout e pipeline del
+    /// testo. Riusa il render pass mesh (color+depth) con depth-test spento.
+    fn ensureTextPipe(self: *Renderer) !void {
+        if (self.text_ready) return;
+
+        try check(vkCreateSampler(self.device, &.{}, null, &self.text_sampler));
+
+        const binding = VkDescriptorSetLayoutBinding{
+            .binding = 0,
+            .descriptorType = DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = SHADER_STAGE_FRAGMENT,
+        };
+        try check(vkCreateDescriptorSetLayout(self.device, &.{
+            .bindingCount = 1,
+            .pBindings = @ptrCast(&binding),
+        }, null, &self.text_dsl));
+
+        const pool_size = VkDescriptorPoolSize{ .type = DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1 };
+        try check(vkCreateDescriptorPool(self.device, &.{
+            .maxSets = 1,
+            .poolSizeCount = 1,
+            .pPoolSizes = @ptrCast(&pool_size),
+        }, null, &self.text_dpool));
+        try check(vkAllocateDescriptorSets(self.device, &.{
+            .descriptorPool = self.text_dpool,
+            .pSetLayouts = @ptrCast(&self.text_dsl),
+        }, &self.text_dset));
+
+        const push = VkPushConstantRange{ .stageFlags = SHADER_STAGE_VERTEX, .offset = 0, .size = @sizeOf(TextPush) };
+        try check(vkCreatePipelineLayout(self.device, &.{
+            .setLayoutCount = 1,
+            .pSetLayouts = @ptrCast(&self.text_dsl),
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = @ptrCast(&push),
+        }, null, &self.text_pipeline_layout));
+
+        self.text_vert_module = try createShaderModule(self.gpa, self.device, text_vert_spv);
+        self.text_frag_module = try createShaderModule(self.gpa, self.device, text_frag_spv);
+        self.text_pipeline = try createTextPipeline(self.device, self.render_pass, self.text_pipeline_layout, self.text_vert_module, self.text_frag_module);
+
+        self.text_ready = true;
+    }
+
+    /// (Ri)carica l'atlante di copertura come texture campionabile e aggiorna il
+    /// descriptor set. Ricrea la texture ad ogni chiamata (una per documento).
+    fn uploadAtlas(self: *Renderer, pixels: []const u8, w: u32, h: u32) !void {
+        if (w == 0 or h == 0 or pixels.len < @as(usize, w) * h) return error.BadAtlas;
+
+        if (self.text_atlas.image != VK_NULL) {
+            self.destroyImage(self.text_atlas);
+            self.text_atlas = .{ .image = VK_NULL, .mem = VK_NULL, .view = VK_NULL };
+        }
+
+        const atlas = try self.createImage(w, h, FORMAT_R8_UNORM, IMAGE_USAGE_SAMPLED | IMAGE_USAGE_TRANSFER_DST, ASPECT_COLOR, true);
+        errdefer self.destroyImage(atlas);
+
+        const size: u64 = @as(u64, w) * h;
+        var staging: VkBuffer = VK_NULL;
+        try check(vkCreateBuffer(self.device, &.{ .size = size, .usage = BUFFER_USAGE_TRANSFER_SRC }, null, &staging));
+        defer vkDestroyBuffer(self.device, staging, null);
+        var req: VkMemoryRequirements = undefined;
+        vkGetBufferMemoryRequirements(self.device, staging, &req);
+        const mt = self.findMemoryType(req.memoryTypeBits, MEM_HOST_VISIBLE | MEM_HOST_COHERENT) orelse return error.NoMemoryType;
+        var smem: VkDeviceMemory = VK_NULL;
+        try check(vkAllocateMemory(self.device, &.{ .allocationSize = req.size, .memoryTypeIndex = mt }, null, &smem));
+        defer vkFreeMemory(self.device, smem, null);
+        try check(vkBindBufferMemory(self.device, staging, smem, 0));
+        var mapped: *anyopaque = undefined;
+        try check(vkMapMemory(self.device, smem, 0, size, 0, &mapped));
+        const dst: [*]u8 = @ptrCast(mapped);
+        @memcpy(dst[0..@intCast(size)], pixels[0..@intCast(size)]);
+
+        try check(vkBeginCommandBuffer(self.cmd, &.{}));
+        const to_dst = [_]VkImageMemoryBarrier{.{
+            .srcAccessMask = 0,
+            .dstAccessMask = ACCESS_TRANSFER_WRITE,
+            .oldLayout = IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .image = atlas.image,
+            .subresourceRange = .{ .aspectMask = ASPECT_COLOR },
+        }};
+        vkCmdPipelineBarrier(self.cmd, STAGE_TOP, STAGE_TRANSFER, 0, 0, null, 0, null, 1, &to_dst);
+        vkCmdCopyBufferToImage(self.cmd, staging, atlas.image, IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &[_]VkBufferImageCopy{.{
+            .imageSubresource = .{ .aspectMask = ASPECT_COLOR },
+            .imageExtent = .{ .width = w, .height = h, .depth = 1 },
+        }});
+        const to_read = [_]VkImageMemoryBarrier{.{
+            .srcAccessMask = ACCESS_TRANSFER_WRITE,
+            .dstAccessMask = ACCESS_SHADER_READ,
+            .oldLayout = IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .newLayout = IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .image = atlas.image,
+            .subresourceRange = .{ .aspectMask = ASPECT_COLOR },
+        }};
+        vkCmdPipelineBarrier(self.cmd, STAGE_TRANSFER, STAGE_FRAGMENT_SHADER, 0, 0, null, 0, null, 1, &to_read);
+        try check(vkEndCommandBuffer(self.cmd));
+        try check(vkQueueSubmit(self.queue, 1, &[_]VkSubmitInfo{.{ .pCommandBuffers = @ptrCast(&self.cmd) }}, self.fence));
+        try check(vkWaitForFences(self.device, 1, @ptrCast(&self.fence), 1, 2 * std.time.ns_per_s));
+        try check(vkResetFences(self.device, 1, @ptrCast(&self.fence)));
+
+        const img_info = VkDescriptorImageInfo{
+            .sampler = self.text_sampler,
+            .imageView = atlas.view,
+            .imageLayout = IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        const write = [_]VkWriteDescriptorSet{.{
+            .dstSet = self.text_dset,
+            .dstBinding = 0,
+            .descriptorType = DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &img_info,
+        }};
+        vkUpdateDescriptorSets(self.device, 1, &write, 0, null);
+
+        self.text_atlas = atlas;
+        self.text_atlas_w = w;
+        self.text_atlas_h = h;
+    }
+
+    /// Assicura un vertex buffer host-visible capace di contenere i vertici e vi
+    /// copia i dati (host-coherent, niente flush).
+    fn ensureTextVertexBuffer(self: *Renderer, bytes: []const u8) !void {
+        const need: u64 = @max(bytes.len, 4);
+        if (self.text_vbuf == VK_NULL or self.text_vbuf_cap < need) {
+            if (self.text_vbuf != VK_NULL) {
+                vkDestroyBuffer(self.device, self.text_vbuf, null);
+                vkFreeMemory(self.device, self.text_vmem, null);
+                self.text_vbuf = VK_NULL;
+            }
+            var buf: VkBuffer = VK_NULL;
+            try check(vkCreateBuffer(self.device, &.{ .size = need, .usage = BUFFER_USAGE_VERTEX }, null, &buf));
+            errdefer vkDestroyBuffer(self.device, buf, null);
+            var req: VkMemoryRequirements = undefined;
+            vkGetBufferMemoryRequirements(self.device, buf, &req);
+            const mt = self.findMemoryType(req.memoryTypeBits, MEM_HOST_VISIBLE | MEM_HOST_COHERENT) orelse return error.NoMemoryType;
+            var mem: VkDeviceMemory = VK_NULL;
+            try check(vkAllocateMemory(self.device, &.{ .allocationSize = req.size, .memoryTypeIndex = mt }, null, &mem));
+            errdefer vkFreeMemory(self.device, mem, null);
+            try check(vkBindBufferMemory(self.device, buf, mem, 0));
+            var mapped: *anyopaque = undefined;
+            try check(vkMapMemory(self.device, mem, 0, need, 0, &mapped));
+            self.text_vbuf = buf;
+            self.text_vmem = mem;
+            self.text_vbuf_cap = need;
+            self.text_vptr = @ptrCast(mapped);
+        }
+        if (bytes.len > 0) @memcpy(self.text_vptr.?[0..bytes.len], bytes);
+    }
+
+    /// Renderizza il testo (quad texturati dall'atlante) in un'immagine RGBA.
+    /// `vertex_bytes` = vertici (pos+uv+colore, stride 28); `clear` = sfondo.
+    /// Ritorna i pixel RGBA letti (validi fino alla chiamata successiva).
+    pub fn renderText(self: *Renderer, vertex_bytes: []const u8, vertex_count: u32, atlas_pixels: []const u8, atlas_w: u32, atlas_h: u32, out_w: u32, out_h: u32, clear: [4]f32) ![]const u8 {
+        if (out_w == 0 or out_h == 0) return error.EmptyTarget;
+        try self.ensureTextPipe();
+        try self.uploadAtlas(atlas_pixels, atlas_w, atlas_h);
+        try self.ensureTextVertexBuffer(vertex_bytes);
+        try self.ensureTarget(out_w, out_h);
+
+        try check(vkBeginCommandBuffer(self.cmd, &.{}));
+        const clears = [_]VkClearValue{
+            .{ .color = clear },
+            .{ .depth_stencil = .{ .depth = 1.0, .stencil = 0 } },
+        };
+        vkCmdBeginRenderPass(self.cmd, &.{
+            .renderPass = self.render_pass,
+            .framebuffer = self.framebuffer,
+            .renderArea = .{ .offset = .{ .x = 0, .y = 0 }, .extent = .{ .width = out_w, .height = out_h } },
+            .clearValueCount = clears.len,
+            .pClearValues = &clears,
+        }, 0);
+
+        vkCmdBindPipeline(self.cmd, 0, self.text_pipeline);
+        vkCmdSetViewport(self.cmd, 0, 1, &[_]VkViewport{.{ .x = 0, .y = 0, .width = @floatFromInt(out_w), .height = @floatFromInt(out_h) }});
+        vkCmdSetScissor(self.cmd, 0, 1, &[_]VkRect2D{.{ .offset = .{ .x = 0, .y = 0 }, .extent = .{ .width = out_w, .height = out_h } }});
+        const push = TextPush{ .viewport = .{ @floatFromInt(out_w), @floatFromInt(out_h) } };
+        vkCmdPushConstants(self.cmd, self.text_pipeline_layout, SHADER_STAGE_VERTEX, 0, @sizeOf(TextPush), &push);
+        vkCmdBindDescriptorSets(self.cmd, 0, self.text_pipeline_layout, 0, 1, &[_]VkDescriptorSet{self.text_dset}, 0, null);
+        vkCmdBindVertexBuffers(self.cmd, 0, 1, &[_]VkBuffer{self.text_vbuf}, &[_]u64{0});
+        if (vertex_count > 0) vkCmdDraw(self.cmd, vertex_count, 1, 0, 0);
+        vkCmdEndRenderPass(self.cmd);
+
+        vkCmdCopyImageToBuffer(self.cmd, self.color_image, IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, self.readback_buf, 1, &[_]VkBufferImageCopy{.{
+            .imageSubresource = .{ .aspectMask = ASPECT_COLOR },
+            .imageExtent = .{ .width = out_w, .height = out_h, .depth = 1 },
+        }});
+        const host_barrier = [_]VkBufferMemoryBarrier{.{
+            .srcAccessMask = ACCESS_TRANSFER_WRITE,
+            .dstAccessMask = ACCESS_HOST_READ,
+            .buffer = self.readback_buf,
+            .size = @as(u64, out_w) * out_h * 4,
+        }};
+        vkCmdPipelineBarrier(self.cmd, STAGE_TRANSFER, STAGE_HOST, 0, 0, null, 1, &host_barrier, 0, null);
+
+        try check(vkEndCommandBuffer(self.cmd));
+        try check(vkQueueSubmit(self.queue, 1, &[_]VkSubmitInfo{.{ .pCommandBuffers = @ptrCast(&self.cmd) }}, self.fence));
+        try check(vkWaitForFences(self.device, 1, @ptrCast(&self.fence), 1, 2 * std.time.ns_per_s));
+        try check(vkResetFences(self.device, 1, @ptrCast(&self.fence)));
+
+        return self.readback_ptr.?[0 .. @as(usize, out_w) * out_h * 4];
+    }
+
+    fn destroyTextPipe(self: *Renderer) void {
+        if (self.text_vbuf != VK_NULL) {
+            vkDestroyBuffer(self.device, self.text_vbuf, null);
+            vkFreeMemory(self.device, self.text_vmem, null);
+        }
+        if (self.text_atlas.image != VK_NULL) self.destroyImage(self.text_atlas);
+        if (!self.text_ready) return;
+        vkDestroyPipeline(self.device, self.text_pipeline, null);
+        vkDestroyPipelineLayout(self.device, self.text_pipeline_layout, null);
+        vkDestroyShaderModule(self.device, self.text_vert_module, null);
+        vkDestroyShaderModule(self.device, self.text_frag_module, null);
+        vkDestroyDescriptorPool(self.device, self.text_dpool, null);
+        vkDestroyDescriptorSetLayout(self.device, self.text_dsl, null);
+        vkDestroySampler(self.device, self.text_sampler, null);
+    }
 };
 
 fn deviceHasExtension(gpa: std.mem.Allocator, pd: VkPhysicalDevice, name: []const u8) bool {
@@ -1338,6 +1695,68 @@ fn createPipeline(device: VkDevice, render_pass: VkRenderPass, layout: VkPipelin
     const multisample = VkPipelineMultisampleStateCreateInfo{};
     const depth_stencil = VkPipelineDepthStencilStateCreateInfo{};
     const blend_attachment = VkPipelineColorBlendAttachmentState{};
+    const color_blend = VkPipelineColorBlendStateCreateInfo{ .pAttachments = &blend_attachment };
+    const dynamic_states = [_]u32{ 0, 1 }; // VIEWPORT, SCISSOR
+    const dynamic = VkPipelineDynamicStateCreateInfo{
+        .dynamicStateCount = dynamic_states.len,
+        .pDynamicStates = &dynamic_states,
+    };
+
+    const info = VkGraphicsPipelineCreateInfo{
+        .pStages = &stages,
+        .pVertexInputState = &vertex_input,
+        .pInputAssemblyState = &input_assembly,
+        .pViewportState = &viewport_state,
+        .pRasterizationState = &rasterization,
+        .pMultisampleState = &multisample,
+        .pDepthStencilState = &depth_stencil,
+        .pColorBlendState = &color_blend,
+        .pDynamicState = &dynamic,
+        .layout = layout,
+        .renderPass = render_pass,
+    };
+    var pipeline: VkPipeline = VK_NULL;
+    try check(vkCreateGraphicsPipelines(device, VK_NULL, 1, @ptrCast(&info), null, @ptrCast(&pipeline)));
+    return pipeline;
+}
+
+/// Pipeline del testo: vertici pos(vec2)+uv(vec2)+colore(vec3), alpha blending
+/// sopra lo sfondo, depth-test disattivato. Condivide il render pass mesh.
+fn createTextPipeline(device: VkDevice, render_pass: VkRenderPass, layout: VkPipelineLayout, vert: VkShaderModule, frag: VkShaderModule) !VkPipeline {
+    const stages = [_]VkPipelineShaderStageCreateInfo{
+        .{ .stage = SHADER_STAGE_VERTEX, .module = vert },
+        .{ .stage = SHADER_STAGE_FRAGMENT, .module = frag },
+    };
+    const binding = VkVertexInputBindingDescription{ .binding = 0, .stride = 28 };
+    const attrs = [_]VkVertexInputAttributeDescription{
+        .{ .location = 0, .binding = 0, .format = FORMAT_R32G32_SFLOAT, .offset = 0 },
+        .{ .location = 1, .binding = 0, .format = FORMAT_R32G32_SFLOAT, .offset = 8 },
+        .{ .location = 2, .binding = 0, .format = FORMAT_R32G32B32_SFLOAT, .offset = 16 },
+    };
+    const vertex_input = VkPipelineVertexInputStateCreateInfo{
+        .vertexBindingDescriptionCount = 1,
+        .pVertexBindingDescriptions = @ptrCast(&binding),
+        .vertexAttributeDescriptionCount = attrs.len,
+        .pVertexAttributeDescriptions = &attrs,
+    };
+    const input_assembly = VkPipelineInputAssemblyStateCreateInfo{};
+    const viewport_state = VkPipelineViewportStateCreateInfo{};
+    const rasterization = VkPipelineRasterizationStateCreateInfo{};
+    const multisample = VkPipelineMultisampleStateCreateInfo{};
+    // Depth-test spento: il testo è 2D, ordinato dalla CPU.
+    const depth_stencil = VkPipelineDepthStencilStateCreateInfo{ .depthTestEnable = 0, .depthWriteEnable = 0 };
+    // Alpha blending: colore del glifo sopra lo sfondo secondo la copertura.
+    // colorWriteMask solo RGB → l'alpha resta quello di clear (opaco).
+    const blend_attachment = VkPipelineColorBlendAttachmentState{
+        .blendEnable = 1,
+        .srcColorBlendFactor = BLEND_FACTOR_SRC_ALPHA,
+        .dstColorBlendFactor = BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .colorBlendOp = 0, // ADD
+        .srcAlphaBlendFactor = 0, // ZERO
+        .dstAlphaBlendFactor = 1, // ONE
+        .alphaBlendOp = 0,
+        .colorWriteMask = COLOR_WRITE_RGB,
+    };
     const color_blend = VkPipelineColorBlendStateCreateInfo{ .pAttachments = &blend_attachment };
     const dynamic_states = [_]u32{ 0, 1 }; // VIEWPORT, SCISSOR
     const dynamic = VkPipelineDynamicStateCreateInfo{
