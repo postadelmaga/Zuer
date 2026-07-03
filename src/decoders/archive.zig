@@ -209,3 +209,9 @@ export fn zuer_decode(
         };
     };
 }
+
+const extensions = "zip,jar,apk,cbz,epub,xpi,whl";
+
+export fn zuer_extensions() callconv(.c) decoder.SliceC {
+    return decoder.SliceC.fromSlice(extensions);
+}

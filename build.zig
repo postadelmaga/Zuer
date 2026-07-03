@@ -72,7 +72,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // Compile decoders as shared library plugins
-    inline for (.{ "text", "csv", "markdown", "mesh", "image", "glb", "archive", "media" }) |name| {
+    inline for (.{ "text", "csv", "markdown", "mesh", "image", "glb", "archive", "media", "pdf", "office" }) |name| {
         const lib = b.addLibrary(.{
             .name = "decoder_" ++ name,
             .linkage = .dynamic,

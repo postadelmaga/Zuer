@@ -152,7 +152,7 @@ fn decodeWithImageMagick(path: []const u8, io: std.Io, filename: []const u8, max
     const resize_str = try std.fmt.bufPrint(&resize_buf, "{d}x{d}", .{ width, height });
 
     const convert_result = try std.process.run(allocator, io, .{
-        .argv = &.{ "convert", path, "-resize", resize_str, "rgb:-" },
+        .argv = &.{ "convert", path, "-depth", "8", "-resize", resize_str, "rgb:-" },
     });
     errdefer allocator.free(convert_result.stdout);
     defer allocator.free(convert_result.stderr);
@@ -179,10 +179,20 @@ fn decodeWithImageMagick(path: []const u8, io: std.Io, filename: []const u8, max
     const name = try allocator.dupe(u8, filename);
     errdefer allocator.free(name);
 
+    // Vale quanto in text_render: mai liberare una slice diversa
+    // dall'allocazione originale.
+    const pixels = if (convert_result.stdout.len == expected_bytes)
+        convert_result.stdout
+    else blk: {
+        const exact = try allocator.dupe(u8, convert_result.stdout[0..expected_bytes]);
+        allocator.free(convert_result.stdout);
+        break :blk exact;
+    };
+
     return .{
         .width = width,
         .height = height,
-        .pixels = convert_result.stdout[0..expected_bytes],
+        .pixels = pixels,
         .name = name,
     };
 }
@@ -210,4 +220,13 @@ export fn zuer_decode(
             .payload = .{ .err = decoder.SliceC.fromSlice(msg) },
         };
     };
+}
+
+// stb_image copre nativamente PNG/JPEG/GIF/BMP/TGA/PSD/HDR/PIC/PNM; i formati
+// vettoriali o non coperti (SVG, WebP, TIFF, ICO, AVIF) passano dal fallback
+// ImageMagick già presente in decode().
+const extensions = "png,jpg,jpeg,gif,bmp,tga,psd,hdr,pic,pnm,pbm,pgm,ppm,svg,svgz,webp,tif,tiff,ico,avif";
+
+export fn zuer_extensions() callconv(.c) decoder.SliceC {
+    return decoder.SliceC.fromSlice(extensions);
 }

@@ -348,3 +348,9 @@ export fn zuer_decode(
         };
     };
 }
+
+const extensions = "mp3,wav,flac,ogg,oga,ogv,opus,m4a,mp4,m4v,mov,mkv,webm,avi";
+
+export fn zuer_extensions() callconv(.c) decoder.SliceC {
+    return decoder.SliceC.fromSlice(extensions);
+}

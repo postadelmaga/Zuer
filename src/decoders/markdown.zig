@@ -32,3 +32,9 @@ export fn zuer_decode(
         };
     };
 }
+
+const extensions = "md,markdown";
+
+export fn zuer_extensions() callconv(.c) decoder.SliceC {
+    return decoder.SliceC.fromSlice(extensions);
+}
