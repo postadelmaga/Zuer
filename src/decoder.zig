@@ -455,8 +455,61 @@ fn findPluginByExtension(ext: []const u8) ?*const LoadedPlugin {
     return null;
 }
 
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+/// Budget di dimensione file di default, proporzionale alla memoria disponibile:
+/// metà di MemAvailable (il file viene letto in RAM e il decoder vi alloca sopra).
+/// Fallback a 128 MB se /proc/meminfo non è leggibile.
+fn defaultMaxSize(io: std.Io, allocator: std.mem.Allocator) usize {
+    const fallback: usize = 128 * 1024 * 1024;
+    const data = std.Io.Dir.cwd().readFileAlloc(io, "/proc/meminfo", allocator, std.Io.Limit.limited(64 * 1024)) catch return fallback;
+    defer allocator.free(data);
+    const key = "MemAvailable:";
+    const start = std.mem.indexOf(u8, data, key) orelse return fallback;
+    var tokens = std.mem.tokenizeAny(u8, data[start + key.len ..], " \t\n");
+    const num = tokens.next() orelse return fallback;
+    const kb = std.fmt.parseInt(usize, num, 10) catch return fallback;
+    return (kb * 1024) / 2;
+}
+
+/// Riconosce i formati immagine comuni dai byte magici, per instradare al plugin
+/// immagini i file con estensione errata o assente (quando nessun plugin è
+/// stato risolto per estensione nel registro).
+fn guessImageFormat(bytes: []const u8) bool {
+    if (bytes.len >= 4) {
+        if (std.mem.eql(u8, bytes[0..4], &.{ 0x89, 0x50, 0x4E, 0x47 })) return true; // PNG
+        if (std.mem.eql(u8, bytes[0..4], "GIF8")) return true; // GIF
+        if (bytes[0] == 'B' and bytes[1] == 'M') return true; // BMP
+    }
+    if (bytes.len >= 3) {
+        if (std.mem.eql(u8, bytes[0..3], &.{ 0xFF, 0xD8, 0xFF })) return true; // JPEG
+    }
+    if (bytes.len >= 12) {
+        if (std.mem.eql(u8, bytes[0..4], "RIFF") and std.mem.eql(u8, bytes[8..12], "WEBP")) return true; // WebP
+    }
+    return false;
+}
+
 pub fn decode(path: []const u8, io: std.Io, allocator: std.mem.Allocator) Decoded {
-    const max_size = 128 * 1024 * 1024;
+    // Limite di dimensione proporzionale alla memoria disponibile; ZUER_MAX_MB lo
+    // forza a un valore assoluto. Pre-check via stat per rifiutare i file troppo
+    // grandi prima di allocarli.
+    var max_size: usize = defaultMaxSize(io, allocator);
+    if (getenv("ZUER_MAX_MB")) |val| {
+        if (std.fmt.parseInt(usize, std.mem.span(val), 10)) |mb| {
+            max_size = mb * 1024 * 1024;
+        } else |_| {}
+    }
+
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| {
+        const msg = std.fmt.allocPrint(allocator, "Impossibile ottenere informazioni sul file: {s} ({s})", .{ path, @errorName(err) }) catch "";
+        return .{ .err = msg };
+    };
+    if (stat.size > max_size) {
+        const msg = std.fmt.allocPrint(allocator, "File troppo grande: {d} MB (limite {d} MB, ~metà della memoria disponibile).\nIl caricamento rischierebbe di esaurire la memoria.", .{ stat.size / (1024 * 1024), max_size / (1024 * 1024) }) catch "";
+        return .{ .err = msg };
+    }
+
     const limit = std.Io.Limit.limited(max_size);
     const content = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, limit) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "Impossibile aprire o leggere il file: {s} ({s})", .{ path, @errorName(err) }) catch "";
@@ -465,14 +518,16 @@ pub fn decode(path: []const u8, io: std.Io, allocator: std.mem.Allocator) Decode
     errdefer allocator.free(content);
 
     // Risolve il decoder dal registro: prima per estensione dichiarata dai
-    // plugin stessi, poi col plugin "text" come fallback universale.
+    // plugin stessi, poi immagine per byte magici, infine "text" come fallback.
     const ext = getExtension(path);
 
     while (!plugin_cache_mutex.tryLock()) {
         std.Thread.yield() catch {};
     }
     ensureRegistryLocked(io, allocator);
-    const plugin = findPluginByExtension(ext) orelse findPluginByName("text");
+    var plugin = findPluginByExtension(ext);
+    if (plugin == null and guessImageFormat(content)) plugin = findPluginByName("image");
+    if (plugin == null) plugin = findPluginByName("text");
     const decode_fn: ?DecodeFn = if (plugin) |p| p.decode_fn else null;
     plugin_cache_mutex.unlock();
 
