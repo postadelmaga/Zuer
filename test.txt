@@ -1,0 +1,4 @@
+Ciao! Questo è un file di testo di test per zuer.
+È scritto in Zig 0.16.0.
+Basato sul micro-kernel Zicro.
+Filtro in tempo reale e virtualizzazione funzionano perfettamente!

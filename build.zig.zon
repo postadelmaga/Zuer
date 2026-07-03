@@ -1,0 +1,17 @@
+.{
+    .name = .zuer,
+    .version = "0.1.0",
+    .fingerprint = 0xd17dbaadbb923cce,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .zicro = .{
+            .path = "../Zicro",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+    },
+}
