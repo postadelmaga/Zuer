@@ -86,6 +86,22 @@ fn drawScrollbar(buf: []u8, W: u32, H: u32, src_h: u32, off_y: u32) void {
 /// Modalità documento per i contenuti testuali: l'immagine è già rasterizzata
 /// alla larghezza della finestra, quindi si blitta 1:1 (nessun ricampionamento
 /// che sfocherebbe il testo), ancorata in alto, con scorrimento verticale.
+/// Geometria del blit del testo nella finestra: offset di scroll (clampato) e
+/// centratura orizzontale. Condivisa da compose, selezione e scrollbar per non
+/// divergere.
+const BlitGeom = struct { off_y: u32, x_dst: u32, x_src: u32, copy_w: u32 };
+fn textBlitGeom(W: u32, H: u32, src_w: u32, src_h: u32, scroll_y: f32) BlitGeom {
+    const max_scroll: u32 = if (src_h > H) src_h - H else 0;
+    return .{
+        .off_y = @min(@as(u32, @intFromFloat(@max(scroll_y, 0))), max_scroll),
+        // Se una rasterizzazione è in ritardo su un resize l'immagine può essere
+        // più stretta o più larga della finestra: si centra senza scalare.
+        .x_dst = if (src_w < W) (W - src_w) / 2 else 0,
+        .x_src = if (src_w > W) (src_w - W) / 2 else 0,
+        .copy_w = @min(src_w, W),
+    };
+}
+
 fn composeTextFrame(
     composited_rgba: []u8,
     W: u32,
@@ -95,13 +111,11 @@ fn composeTextFrame(
     src_h: u32,
     scroll_y: f32,
 ) void {
-    const max_scroll: u32 = if (src_h > H) src_h - H else 0;
-    const off_y: u32 = @min(@as(u32, @intFromFloat(@max(scroll_y, 0))), max_scroll);
-    // Se una rasterizzazione è in ritardo su un resize l'immagine può essere
-    // più stretta o più larga della finestra: si centra senza scalare.
-    const x_dst: u32 = if (src_w < W) (W - src_w) / 2 else 0;
-    const x_src: u32 = if (src_w > W) (src_w - W) / 2 else 0;
-    const copy_w = @min(src_w, W);
+    const geom = textBlitGeom(W, H, src_w, src_h, scroll_y);
+    const off_y = geom.off_y;
+    const x_dst = geom.x_dst;
+    const x_src = geom.x_src;
+    const copy_w = geom.copy_w;
 
     var py: u32 = 0;
     while (py < H) : (py += 1) {
@@ -132,8 +146,79 @@ fn composeTextFrame(
             }
         }
     }
+}
 
-    drawScrollbar(composited_rgba, W, H, src_h, off_y);
+const sel_color = [3]u8{ 70, 110, 190 };
+const sel_alpha: u8 = 96;
+
+/// Numero di codepoint (= colonne monospazio) in una riga UTF-8.
+fn cpLen(s: []const u8) i32 {
+    var n: i32 = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        const seq = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        i += @min(@as(usize, seq), s.len - i);
+        n += 1;
+    }
+    return n;
+}
+
+/// Evidenzia la selezione (stream: dalla colonna d'ancora, righe intere in
+/// mezzo, fino all'estremo) con rettangoli translucidi sulla griglia monospazio.
+fn drawTextSelection(buf: []u8, W: u32, H: u32, src_w: u32, src_h: u32, scroll_y: f32, m: text_render.Metrics, lines: []const []const u8, a_in: [2]i32, b_in: [2]i32) void {
+    if (lines.len == 0 or m.advance <= 0 or m.line_h <= 0) return;
+    const geom = textBlitGeom(W, H, src_w, src_h, scroll_y);
+    var a = a_in;
+    var b = b_in;
+    if (a[0] > b[0] or (a[0] == b[0] and a[1] > b[1])) {
+        const t = a;
+        a = b;
+        b = t;
+    }
+    const nrows: i32 = @intCast(lines.len);
+    const Wi: i32 = @intCast(W);
+    const Hi: i32 = @intCast(H);
+    const dx: i32 = @as(i32, @intCast(geom.x_dst)) - @as(i32, @intCast(geom.x_src));
+    var row: i32 = @max(a[0], 0);
+    while (row <= b[0] and row < nrows) : (row += 1) {
+        const llen = cpLen(lines[@intCast(row)]);
+        var c0: i32 = if (row == a[0]) a[1] else 0;
+        var c1: i32 = if (row == b[0]) b[1] else llen;
+        c0 = std.math.clamp(c0, 0, llen);
+        c1 = std.math.clamp(c1, 0, llen);
+        if (c1 <= c0) continue;
+        const x0 = m.pad_x + c0 * m.advance + dx;
+        const x1 = m.pad_x + c1 * m.advance + dx;
+        const y0 = m.pad_y + row * m.line_h - @as(i32, @intCast(geom.off_y));
+        const xa: u32 = @intCast(std.math.clamp(x0, 0, Wi));
+        const xb: u32 = @intCast(std.math.clamp(x1, 0, Wi));
+        const ya: u32 = @intCast(std.math.clamp(y0, 0, Hi));
+        const yb: u32 = @intCast(std.math.clamp(y0 + m.line_h, 0, Hi));
+        var py = ya;
+        while (py < yb) : (py += 1) {
+            var px = xa;
+            while (px < xb) : (px += 1) {
+                blendPixel(buf, (py * W + px) * 4, sel_color[0], sel_color[1], sel_color[2], sel_alpha);
+            }
+        }
+    }
+}
+
+/// Mappa una coordinata finestra in (riga, colonna) sulla griglia del testo,
+/// clampata al documento. Da chiamare con `state.mutex` acquisito.
+fn textHit(state: *GuiAppState, W: u32, H: u32, mx: f32, my: f32) [2]i32 {
+    const m = state.text_metrics.*;
+    const geom = textBlitGeom(W, H, state.static_w.*, state.static_h.*, state.scroll_y.*);
+    const sx = @as(i32, @intFromFloat(mx)) - @as(i32, @intCast(geom.x_dst)) + @as(i32, @intCast(geom.x_src));
+    const sy = @as(i32, @intFromFloat(my)) + @as(i32, @intCast(geom.off_y));
+    const nrows: i32 = @intCast(state.text_lines.items.len);
+    var row: i32 = if (m.line_h > 0) @divFloor(sy - m.pad_y, m.line_h) else 0;
+    row = std.math.clamp(row, 0, @max(nrows - 1, 0));
+    const llen: i32 = if (nrows > 0) cpLen(state.text_lines.items[@intCast(row)]) else 0;
+    // Arrotonda alla colonna più vicina (mezza cella) per un aggancio naturale.
+    var col: i32 = if (m.advance > 0) @divFloor(sx - m.pad_x + @divTrunc(m.advance, 2), m.advance) else 0;
+    col = std.math.clamp(col, 0, llen);
+    return .{ row, col };
 }
 
 fn composeFrame(
@@ -265,6 +350,16 @@ const GuiAppState = struct {
     last_x: *f32,
     last_y: *f32,
 
+    // Selezione testo (solo percorso CPU): testo semplice per riga visiva e
+    // metriche della griglia monospazio per l'hit-testing; ancora/estremo della
+    // selezione in coordinate (riga, colonna).
+    text_lines: *std.ArrayList([]const u8),
+    text_metrics: *text_render.Metrics,
+    sel_active: *bool,
+    sel_selecting: *bool,
+    sel_a: *[2]i32,
+    sel_b: *[2]i32,
+
     fn loadFile(self: *GuiAppState, new_path: []const u8) !void {
         // 1. Decodifica il nuovo file (fuori dal lock: non tocca stato condiviso)
         var new_decoded = decoder_mod.decode(new_path, self.io, self.gpa);
@@ -332,6 +427,9 @@ const GuiAppState = struct {
         self.pan_y.* = 0.0;
         self.scroll_y.* = 0.0;
         self.scroll_target.* = 0.0;
+        freeTextLines(self);
+        self.sel_active.* = false;
+        self.sel_selecting.* = false;
         self.load_seq.* +%= 1;
         self.file_changed.* = true;
     }
@@ -494,28 +592,56 @@ fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopaque)
     switch (event) {
         .button => |btn| {
             // 0x110 = BTN_LEFT (click sinistro), 0x111 = BTN_RIGHT (click destro)
-            if (btn.button == 0x110 or btn.button == 0x111) {
-                const down = (btn.state == 1);
-                // Click sinistro sulla scrollbar del testo → trascinamento cursore.
-                if (down and btn.button == 0x110 and app_state.is_text.*) {
-                    const W = win.panel_w;
-                    const H = win.panel_h;
-                    const src_h = app_state.static_h.*;
-                    if (W >= scrollbar_w and src_h > H and
-                        app_state.last_x.* >= @as(f32, @floatFromInt(W - scrollbar_w)))
-                    {
-                        app_state.scrollbar_drag.* = true;
-                        scrollFromBar(app_state, H, src_h, app_state.last_y.*);
-                        return;
-                    }
+            if (btn.button != 0x110 and btn.button != 0x111) return;
+            const down = (btn.state == 1);
+            if (!down) {
+                app_state.mutex.lockUncancelable(app_state.io);
+                app_state.scrollbar_drag.* = false;
+                app_state.sel_selecting.* = false;
+                // Click senza trascinamento (ancora == estremo) → deseleziona.
+                if (app_state.sel_a.*[0] == app_state.sel_b.*[0] and app_state.sel_a.*[1] == app_state.sel_b.*[1]) {
+                    app_state.sel_active.* = false;
+                    app_state.file_changed.* = true;
                 }
-                if (!down) app_state.scrollbar_drag.* = false;
-                app_state.dragging.* = down;
+                app_state.dragging.* = false;
+                app_state.mutex.unlock(app_state.io);
+                return;
             }
+            // Pressione sinistra sul testo: scrollbar oppure avvio selezione.
+            if (btn.button == 0x110 and app_state.is_text.*) {
+                const W = win.panel_w;
+                const H = win.panel_h;
+                const src_h = app_state.static_h.*;
+                if (W >= scrollbar_w and src_h > H and
+                    app_state.last_x.* >= @as(f32, @floatFromInt(W - scrollbar_w)))
+                {
+                    app_state.scrollbar_drag.* = true;
+                    scrollFromBar(app_state, H, src_h, app_state.last_y.*);
+                    return;
+                }
+                app_state.mutex.lockUncancelable(app_state.io);
+                if (app_state.text_lines.items.len > 0) {
+                    const hit = textHit(app_state, W, H, app_state.last_x.*, app_state.last_y.*);
+                    app_state.sel_a.* = hit;
+                    app_state.sel_b.* = hit;
+                    app_state.sel_active.* = true;
+                    app_state.sel_selecting.* = true;
+                    app_state.file_changed.* = true;
+                    app_state.mutex.unlock(app_state.io);
+                    return;
+                }
+                app_state.mutex.unlock(app_state.io);
+            }
+            app_state.dragging.* = down;
         },
         .motion => |mot| {
             if (app_state.scrollbar_drag.*) {
                 scrollFromBar(app_state, win.panel_h, app_state.static_h.*, mot.y);
+            } else if (app_state.sel_selecting.*) {
+                app_state.mutex.lockUncancelable(app_state.io);
+                app_state.sel_b.* = textHit(app_state, win.panel_w, win.panel_h, mot.x, mot.y);
+                app_state.file_changed.* = true;
+                app_state.mutex.unlock(app_state.io);
             } else if (app_state.dragging.*) {
                 const dx = mot.x - app_state.last_x.*;
                 const dy = mot.y - app_state.last_y.*;
@@ -523,7 +649,8 @@ fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopaque)
                     app_state.yaw.* += dx * 0.01;
                     app_state.pitch.* += dy * 0.01;
                 } else if (app_state.is_text.*) {
-                    // Trascinare il documento verso il basso torna indietro (1:1).
+                    // Fallback (testo senza righe selezionabili, es. percorso GPU):
+                    // il trascinamento scorre il documento.
                     scrollTo(app_state, app_state.scroll_y.* - dy);
                 } else {
                     app_state.mutex.lockUncancelable(app_state.io);
@@ -539,6 +666,12 @@ fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopaque)
     }
 }
 
+/// Libera il testo per-riga trattenuto per la selezione.
+fn freeTextLines(state: *GuiAppState) void {
+    for (state.text_lines.items) |l| state.gpa.free(l);
+    state.text_lines.clearRetainingCapacity();
+}
+
 /// Rasterizza il contenuto testuale corrente alla larghezza richiesta e al
 /// corpo scalato dallo zoom, sostituendo il buffer statico RGBA.
 /// Da chiamare con `state.mutex` già acquisito.
@@ -552,7 +685,13 @@ fn rasterizeText(state: *GuiAppState, width: u32, text_zoom: f32) void {
         return;
     }
 
-    var img = text_render.render(state.gpa, state.io, state.decoded, name, opts) catch |err| {
+    // La geometria (wrapping) cambia con larghezza/zoom: la vecchia selezione
+    // non è più valida.
+    freeTextLines(state);
+    state.sel_active.* = false;
+    state.sel_selecting.* = false;
+
+    var img = text_render.renderDoc(state.gpa, state.decoded, name, opts, state.text_lines, state.text_metrics) catch |err| {
         std.debug.print("Impossibile rasterizzare il testo: {s}\n", .{@errorName(err)});
         return;
     };
@@ -688,6 +827,10 @@ fn renderWorker(
                 composeFrame(composited_rgba.*, cur_w, cur_h, mesh_rgba, cur_w, cur_h, false, 1.0, 0.0, 0.0);
             } else if (state.is_text.*) {
                 composeTextFrame(composited_rgba.*, cur_w, cur_h, state.static_rgba.*, state.static_w.*, state.static_h.*, state.scroll_y.*);
+                if (state.sel_active.*) {
+                    drawTextSelection(composited_rgba.*, cur_w, cur_h, state.static_w.*, state.static_h.*, state.scroll_y.*, state.text_metrics.*, state.text_lines.items, state.sel_a.*, state.sel_b.*);
+                }
+                drawScrollbar(composited_rgba.*, cur_w, cur_h, state.static_h.*, textBlitGeom(cur_w, cur_h, state.static_w.*, state.static_h.*, state.scroll_y.*).off_y);
             } else {
                 composeFrame(composited_rgba.*, cur_w, cur_h, state.static_rgba.*, state.static_w.*, state.static_h.*, false, zoom.*, state.pan_x.*, state.pan_y.*);
             }
@@ -817,6 +960,12 @@ pub fn main(init: std.process.Init) !void {
     var dragging = false;
     var last_x: f32 = 0;
     var last_y: f32 = 0;
+    var text_lines: std.ArrayList([]const u8) = .empty;
+    var text_metrics: text_render.Metrics = .{ .advance = 1, .line_h = 1, .pad_x = 20, .pad_y = 14 };
+    var sel_active = false;
+    var sel_selecting = false;
+    var sel_a: [2]i32 = .{ 0, 0 };
+    var sel_b: [2]i32 = .{ 0, 0 };
 
     var gui_state = GuiAppState{
         .gpa = gpa,
@@ -852,11 +1001,19 @@ pub fn main(init: std.process.Init) !void {
         .scrollbar_drag = &scrollbar_drag,
         .last_x = &last_x,
         .last_y = &last_y,
+        .text_lines = &text_lines,
+        .text_metrics = &text_metrics,
+        .sel_active = &sel_active,
+        .sel_selecting = &sel_selecting,
+        .sel_a = &sel_a,
+        .sel_b = &sel_b,
     };
     defer {
         gpa.free(gui_state.current_file_path);
         for (gui_state.file_list.items) |f| gpa.free(f);
         gui_state.file_list.deinit(gpa);
+        for (text_lines.items) |l| gpa.free(l);
+        text_lines.deinit(gpa);
     }
     try gui_state.initFileList();
 
