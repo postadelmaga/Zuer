@@ -1,6 +1,7 @@
 //! Rasterizza contenuti testuali (text, markdown, tabelle CSV) in immagini RGB
 //! usando ImageMagick per una resa tipografica anti-alias ad alta definizione
-//! (con DejaVu Sans per markdown, e DejaVu Sans Mono per CSV e codice).
+//! (con DejaVu Sans per markdown, e Hack per CSV e codice — lo stesso monospace
+//! di default di egui, per parità visiva con viewer).
 
 const std = @import("std");
 const decoder_mod = @import("decoder.zig");
@@ -11,6 +12,12 @@ pub const max_table_col: usize = 40;
 // quindi già compresi nella larghezza finale richiesta).
 const pad_x: usize = 20;
 const pad_y: usize = 14;
+
+// Colori base del documento, allineati al tema di viewer (egui dark:
+// `extreme_bg_color` = rgb(16,17,21) per lo sfondo dell'editor di testo, e il
+// grigio chiaro del corpo dopo l'armonizzazione dei colori).
+const col_bg = "#101115";
+const col_fg = "#cdcdcd";
 
 /// Parametri di rasterizzazione: larghezza in pixel dell'immagine prodotta
 /// (idealmente la larghezza della finestra, per una resa 1:1 nitida) e corpo
@@ -29,8 +36,8 @@ const max_rich_bytes: usize = 2 * 1024 * 1024;
 pub fn render(gpa: std.mem.Allocator, io: std.Io, decoded: *const decoder_mod.Decoded, name: []const u8, opts: RenderOpts) !decoder_mod.ImageData {
     switch (decoded.*) {
         .text => |t| {
-            // File di testo/codice: documento tipografico con numeri di riga,
-            // righello e syntax highlighting leggero. Le schede informative
+            // File di testo/codice: documento tipografico con numeri di riga
+            // e syntax highlighting leggero. Le schede informative
             // (media, archivi) non hanno un'estensione testuale e restano pulite.
             if (t.len <= max_rich_bytes and isCodeLike(name)) {
                 if (buildCodeDocument(gpa, t, name, opts)) |doc| {
@@ -93,7 +100,9 @@ fn renderText(gpa: std.mem.Allocator, io: std.Io, content: []const u8, name: []c
     }
     defer _ = unlink(path_c);
 
-    const font_name = if (is_mono) "DejaVu-Sans-Mono" else "DejaVu-Sans";
+    // Parità con viewer: egui usa Hack come monospace di default. Per il markdown
+    // (non-mono) resta un sans proporzionale.
+    const font_name = if (is_mono) "Hack" else "DejaVu-Sans";
     const pango_path = try std.fmt.allocPrint(gpa, "pango:@{s}", .{tmp_path});
     defer gpa.free(pango_path);
 
@@ -113,9 +122,9 @@ fn renderText(gpa: std.mem.Allocator, io: std.Io, content: []const u8, name: []c
             "-density",
             "96",
             "-background",
-            "#080810",
+            col_bg,
             "-fill",
-            "#e6e6e6",
+            col_fg,
             "-define",
             "pango:align=left",
             "-define",
@@ -130,7 +139,7 @@ fn renderText(gpa: std.mem.Allocator, io: std.Io, content: []const u8, name: []c
             pointsize_arg,
             pango_path,
             "-bordercolor",
-            "#080810",
+            col_bg,
             "-border",
             border_arg,
             "-format",
@@ -166,9 +175,9 @@ fn renderText(gpa: std.mem.Allocator, io: std.Io, content: []const u8, name: []c
             "-density",
             "96",
             "-background",
-            "#080810",
+            col_bg,
             "-fill",
-            "#e6e6e6",
+            col_fg,
             "-define",
             "pango:align=left",
             "-define",
@@ -183,7 +192,7 @@ fn renderText(gpa: std.mem.Allocator, io: std.Io, content: []const u8, name: []c
             pointsize_arg,
             pango_path,
             "-bordercolor",
-            "#080810",
+            col_bg,
             "-border",
             border_arg,
             "rgb:-",
@@ -235,17 +244,16 @@ fn renderText(gpa: std.mem.Allocator, io: std.Io, content: []const u8, name: []c
 
 // --- Documento codice: gutter, wrap e highlighting ---------------------------
 
-// Palette sobria, armonizzata con lo sfondo #080810 (stessa filosofia di viewer:
-// identificatori quasi neutri, accenti desaturati).
-const col_line_no = "#565664";
-const col_rule = "#32323e";
-const col_keyword = "#96aae1";
-const col_string = "#9ebe96";
-const col_comment = "#6c6c76";
+// Palette allineata a quella di viewer (funzione `harmonize`): numeri di riga
+// grigio spento, keyword blu desaturato, stringhe verde salvia, commenti grigi.
+const col_line_no = "#606060"; // viewer: Color32::from_gray(96)
+const col_keyword = "#96aaeb"; // viewer: rgb(150,170,235)
+const col_string = "#9ebc96"; // viewer: rgb(158,188,150)
+const col_comment = "#707070"; // viewer: from_gray(112)
 
-/// Avanzamento medio di DejaVu Sans Mono in px per punto: 0.602 em, alla
-/// densità di 96 dpi fissata nelle invocazioni di convert (96/72 px per pt).
-const mono_advance_px_per_pt: f32 = 0.615 * 96.0 / 72.0;
+/// Avanzamento medio di Hack in px per punto: ~0.602 em, alla densità di 96 dpi
+/// fissata nelle invocazioni di convert (96/72 px per pt).
+const mono_advance_px_per_pt: f32 = 0.602 * 96.0 / 72.0;
 
 const Lang = struct {
     line_comments: []const []const u8,
@@ -276,7 +284,7 @@ fn langFor(ext: []const u8) Lang {
         .{ .exts = &.{"rs"}, .lang = .{ .line_comments = &slash_comment, .keywords = &kw_rust } },
         .{ .exts = &.{ "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "java", "cs", "kt", "kts", "swift", "scala", "dart", "proto" }, .lang = .{ .line_comments = &slash_comment, .keywords = &kw_c } },
         .{ .exts = &.{ "py", "pyi", "rb", "toml", "yaml", "yml", "cfg", "conf", "properties", "gitignore", "gitattributes", "editorconfig", "dockerfile", "mk", "make", "cmake", "r", "jl", "nim", "ex", "exs" }, .lang = .{ .line_comments = &hash_comment, .keywords = &kw_py } },
-        .{ .exts = &.{ "js", "mjs", "cjs", "jsx", "ts", "tsx", "php", "go" }, .lang = .{ .line_comments = &slash_comment, .keywords = &kw_js } },
+        .{ .exts = &.{ "js", "mjs", "cjs", "jsx", "ts", "tsx", "php" }, .lang = .{ .line_comments = &slash_comment, .keywords = &kw_js } },
         .{ .exts = &.{"go"}, .lang = .{ .line_comments = &slash_comment, .keywords = &kw_go } },
         .{ .exts = &.{ "sh", "bash", "zsh", "fish", "ps1", "env" }, .lang = .{ .line_comments = &hash_comment, .keywords = &kw_sh } },
         .{ .exts = &.{ "lua", "sql", "hs" }, .lang = .{ .line_comments = &dash_comment, .keywords = &kw_lua } },
@@ -330,7 +338,10 @@ fn buildCodeDocument(gpa: std.mem.Allocator, text: []const u8, name: []const u8,
     while (n >= 10) : (n /= 10) digits += 1;
     if (digits < 3) digits = 3;
 
-    const code_cols = if (total_cols > digits + 3 + 16) total_cols - digits - 3 else 16;
+    // Gutter: numeri (digits) + 2 spazi, senza righello verticale (viewer non
+    // ne ha: numeri a destra, poi uno spazio prima del codice).
+    const gutter_cols = digits + 2;
+    const code_cols = if (total_cols > gutter_cols + 16) total_cols - gutter_cols else 16;
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -356,11 +367,11 @@ fn buildCodeDocument(gpa: std.mem.Allocator, text: []const u8, name: []const u8,
                 try w.print("<span foreground=\"{s}\">", .{col_line_no});
                 var d: usize = countDigits(line_no);
                 while (d < digits) : (d += 1) try w.writeByte(' ');
-                try w.print("{d}</span> <span foreground=\"{s}\">│</span> ", .{ line_no, col_rule });
+                try w.print("{d}</span>  ", .{line_no});
             } else {
+                // Riga di continuazione: gutter vuoto largo quanto numeri + 2 spazi
                 var d: usize = 0;
-                while (d < digits + 1) : (d += 1) try w.writeByte(' ');
-                try w.print("<span foreground=\"{s}\">│</span> ", .{col_rule});
+                while (d < gutter_cols) : (d += 1) try w.writeByte(' ');
             }
             try highlightChunk(w, chunk, lang);
             try w.writeByte('\n');
