@@ -40,3 +40,15 @@ export fn zuer_decode(
         };
     };
 }
+
+// Estensioni testuali note (parità con viewer); il plugin "text" resta comunque
+// il fallback dell'host per qualsiasi estensione non reclamata da altri plugin.
+const extensions = "txt,text,log,nfo,rst,adoc,asciidoc,org,tex,bib,srt,vtt,diff,patch," ++
+    "json,jsonl,ndjson,yaml,yml,toml,ini,cfg,conf,properties,env,plist,editorconfig,gitignore,gitattributes,lock," ++
+    "xml,html,htm,xhtml,css,scss,sass,less," ++
+    "sh,bash,zsh,fish,ps1,bat,cmd,mk,make,cmake,gradle,dockerfile," ++
+    "rs,py,pyi,js,mjs,cjs,jsx,ts,tsx,c,h,cc,cpp,cxx,hpp,hh,cs,java,kt,kts,go,rb,php,swift,scala,lua,pl,pm,r,sql,dart,ex,exs,erl,hrl,hs,clj,cljs,vim,asm,s,zig,jl,nim,proto,graphql,gql";
+
+export fn zuer_extensions() callconv(.c) decoder.SliceC {
+    return decoder.SliceC.fromSlice(extensions);
+}

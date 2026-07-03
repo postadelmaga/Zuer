@@ -19,10 +19,72 @@ const KEY_UP: u32 = 103;
 const KEY_DOWN: u32 = 108;
 const KEY_LEFT: u32 = 105;
 const KEY_RIGHT: u32 = 106;
+const KEY_PGUP: u32 = 104;
+const KEY_PGDOWN: u32 = 109;
+const KEY_MINUS: u32 = 12;
+const KEY_EQUAL: u32 = 13;
 const KEY_1: u32 = 2;
 const KEY_2: u32 = 3;
 const KEY_3: u32 = 4;
 const KEY_4: u32 = 5;
+const KEY_5: u32 = 6;
+
+// Il testo viene ri-rasterizzato al pointsize scalato: oltre questi limiti la
+// resa degrada (corpo minuscolo) o esplode in memoria (immagini enormi).
+const text_zoom_min: f32 = 0.4;
+const text_zoom_max: f32 = 6.0;
+const scroll_step: f32 = 60.0;
+
+/// Modalità documento per i contenuti testuali: l'immagine è già rasterizzata
+/// alla larghezza della finestra, quindi si blitta 1:1 (nessun ricampionamento
+/// che sfocherebbe il testo), ancorata in alto, con scorrimento verticale.
+fn composeTextFrame(
+    composited_rgba: []u8,
+    W: u32,
+    H: u32,
+    src_rgba: []const u8,
+    src_w: u32,
+    src_h: u32,
+    scroll_y: f32,
+) void {
+    const max_scroll: u32 = if (src_h > H) src_h - H else 0;
+    const off_y: u32 = @min(@as(u32, @intFromFloat(@max(scroll_y, 0))), max_scroll);
+    // Se una rasterizzazione è in ritardo su un resize l'immagine può essere
+    // più stretta o più larga della finestra: si centra senza scalare.
+    const x_dst: u32 = if (src_w < W) (W - src_w) / 2 else 0;
+    const x_src: u32 = if (src_w > W) (src_w - W) / 2 else 0;
+    const copy_w = @min(src_w, W);
+
+    var py: u32 = 0;
+    while (py < H) : (py += 1) {
+        const idx_row = py * W * 4;
+        const sy = py + off_y;
+        var px: u32 = 0;
+        while (px < W) : (px += 1) {
+            const idx = idx_row + px * 4;
+            if (sy < src_h and px >= x_dst and px < x_dst + copy_w) {
+                const sx = px - x_dst + x_src;
+                const s_idx = (sy * src_w + sx) * 4;
+                const sr = src_rgba[s_idx + 0];
+                const sg = src_rgba[s_idx + 1];
+                const sb = src_rgba[s_idx + 2];
+                var sa = src_rgba[s_idx + 3];
+                if (sr == 8 and sg == 8 and sb == 16) {
+                    sa = 0;
+                }
+                composited_rgba[idx + 0] = sr;
+                composited_rgba[idx + 1] = sg;
+                composited_rgba[idx + 2] = sb;
+                composited_rgba[idx + 3] = sa;
+            } else {
+                composited_rgba[idx + 0] = 0;
+                composited_rgba[idx + 1] = 0;
+                composited_rgba[idx + 2] = 0;
+                composited_rgba[idx + 3] = 0;
+            }
+        }
+    }
+}
 
 fn composeFrame(
     composited_rgba: []u8,
@@ -107,6 +169,10 @@ const GuiAppState = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
 
+    // Protegge lo stato condiviso tra thread finestra (callback input,
+    // loadFile) e thread di rendering (rasterizzazione testo, compose).
+    mutex: *std.Io.Mutex,
+
     // Stato file
     current_file_path: []const u8,
     file_list: std.ArrayList([]const u8),
@@ -116,11 +182,17 @@ const GuiAppState = struct {
     decoded: *decoder_mod.Decoded,
     stage_opt: *?loader_mod.GpuStage,
     renderer: *gpu.Renderer,
+    // Motore di resa testo: false = CPU (composizione diretta), true = atlante
+    // GPU (ZUER_TEXT_ENGINE=gpu). Stessa resa, percorso diverso.
+    text_gpu: bool,
 
     // Variabili di stato rendering
     is_mesh: *bool,
     is_text: *bool,
     file_changed: *bool,
+    // Incrementato a ogni load: il worker ri-rasterizza il testo solo quando
+    // cambiano file, larghezza o zoom — mai per un semplice scroll.
+    load_seq: *u32,
     zoom: *f32,
     static_rgba: *[]u8,
     static_w: *u32,
@@ -128,23 +200,27 @@ const GuiAppState = struct {
     mesh_center: *[3]f32,
     mesh_max_size: *f32,
 
-    // Stato di trascinamento e rotazione 3D
+    // Stato di trascinamento, scroll documento e rotazione 3D
     dragging: *bool,
     yaw: *f32,
     pitch: *f32,
     pan_x: *f32,
     pan_y: *f32,
+    scroll_y: *f32,
     last_x: *f32,
     last_y: *f32,
 
     fn loadFile(self: *GuiAppState, new_path: []const u8) !void {
-        // 1. Decodifica il nuovo file
+        // 1. Decodifica il nuovo file (fuori dal lock: non tocca stato condiviso)
         var new_decoded = decoder_mod.decode(new_path, self.io, self.gpa);
         if (new_decoded == .err) {
             std.debug.print("Errore nel caricamento del file {s}: {s}\n", .{ new_path, new_decoded.err });
             new_decoded.deinit(self.gpa);
             return;
         }
+
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         // 2. Libera le vecchie risorse decodificate
         self.decoded.deinit(self.gpa);
@@ -164,14 +240,9 @@ const GuiAppState = struct {
         self.is_mesh.* = self.decoded.* == .mesh;
         self.is_text.* = (self.decoded.* != .mesh and self.decoded.* != .image);
 
-        // 6. Gestione rasterizzazione per formati testuali
-        if (self.decoded.* != .mesh and self.decoded.* != .image) {
-            const img = try text_render.render(self.gpa, self.io, self.decoded, std.fs.path.basename(self.current_file_path));
-            self.decoded.deinit(self.gpa);
-            self.decoded.* = .{ .image = img };
-        }
-
-        // 7. Aggiorna i dati per GPU/CPU
+        // 6. Aggiorna i dati per GPU/CPU. I contenuti testuali non vengono
+        // rasterizzati qui: lo fa il thread di rendering alla larghezza
+        // corrente della finestra, per una resa 1:1 nitida.
         if (self.is_mesh.*) {
             const m = self.decoded.mesh;
             self.stage_opt.* = loader_mod.stageToGpu(self.gpa, self.decoded) orelse return error.StageFailed;
@@ -179,9 +250,10 @@ const GuiAppState = struct {
             try self.renderer.setMesh(stage.buffer.ptr, stage.vertex_bytes, @intCast(stage.index_bytes / @sizeOf(u32)));
             self.mesh_center.* = m.center;
             self.mesh_max_size.* = @max(m.bbox_max[0] - m.bbox_min[0], @max(m.bbox_max[1] - m.bbox_min[1], m.bbox_max[2] - m.bbox_min[2]));
-        } else {
+        } else if (self.decoded.* == .image) {
             const img = self.decoded.image;
             self.gpa.free(self.static_rgba.*);
+            self.static_rgba.* = &.{};
             self.static_w.* = @intCast(img.width);
             self.static_h.* = @intCast(img.height);
             self.static_rgba.* = try self.gpa.alloc(u8, self.static_w.* * self.static_h.* * 4);
@@ -191,6 +263,11 @@ const GuiAppState = struct {
                 self.static_rgba.*[i * 4 + 2] = img.pixels[i * 3 + 2];
                 self.static_rgba.*[i * 4 + 3] = 255;
             }
+        } else {
+            self.gpa.free(self.static_rgba.*);
+            self.static_rgba.* = &.{};
+            self.static_w.* = 0;
+            self.static_h.* = 0;
         }
 
         self.zoom.* = 1.0;
@@ -198,6 +275,8 @@ const GuiAppState = struct {
         self.pitch.* = 0.0;
         self.pan_x.* = 0.0;
         self.pan_y.* = 0.0;
+        self.scroll_y.* = 0.0;
+        self.load_seq.* +%= 1;
         self.file_changed.* = true;
     }
 
@@ -261,16 +340,43 @@ const GuiAppState = struct {
     }
 };
 
+fn applyZoom(app_state: *GuiAppState, factor: f32) void {
+    app_state.mutex.lockUncancelable(app_state.io);
+    defer app_state.mutex.unlock(app_state.io);
+    app_state.zoom.* = std.math.clamp(app_state.zoom.* * factor, 0.1, 20.0);
+    app_state.file_changed.* = true;
+}
+
+fn scrollText(app_state: *GuiAppState, delta: f32) void {
+    app_state.mutex.lockUncancelable(app_state.io);
+    defer app_state.mutex.unlock(app_state.io);
+    // Il limite superiore dipende dall'altezza rasterizzata, nota al worker:
+    // qui basta impedire i valori negativi, il clamp finale è nel compose.
+    app_state.scroll_y.* = @max(app_state.scroll_y.* + delta, 0);
+    app_state.file_changed.* = true;
+}
+
 fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) void {
     const app_state: *GuiAppState = @ptrCast(@alignCast(user orelse return));
     const pressed = (state == 1);
     if (pressed) {
+        const is_text = app_state.is_text.*;
         if (key == KEY_ESC) {
             win.close();
+        } else if (is_text and (key == KEY_UP or key == KEY_DOWN)) {
+            // Nei documenti le frecce verticali scorrono; ← → restano
+            // la navigazione tra i file della cartella (parità con viewer).
+            scrollText(app_state, if (key == KEY_DOWN) scroll_step else -scroll_step);
+        } else if (is_text and (key == KEY_PGUP or key == KEY_PGDOWN)) {
+            scrollText(app_state, if (key == KEY_PGDOWN) scroll_step * 10 else -scroll_step * 10);
         } else if (key == KEY_RIGHT or key == KEY_DOWN) {
             app_state.navigate(1);
         } else if (key == KEY_LEFT or key == KEY_UP) {
             app_state.navigate(-1);
+        } else if (key == KEY_EQUAL) {
+            applyZoom(app_state, 1.1);
+        } else if (key == KEY_MINUS) {
+            applyZoom(app_state, 1.0 / 1.1);
         } else if (key == KEY_1) {
             win.setStyle(zrame.Style.fluent()) catch {};
         } else if (key == KEY_2) {
@@ -279,6 +385,8 @@ fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) void
             win.setStyle(zrame.Style.aurora()) catch {};
         } else if (key == KEY_4) {
             win.setStyle(zrame.Style.material()) catch {};
+        } else if (key == KEY_5) {
+            win.setStyle(zrame.Style.psy()) catch {};
         }
     }
 }
@@ -288,16 +396,16 @@ fn scrollCallback(win: *zrame.Window, axis: u32, value: i32, user: ?*anyopaque) 
     const app_state: *GuiAppState = @ptrCast(@alignCast(user orelse return));
     if (axis == 0) {
         const val = @as(f32, @floatFromInt(value)) / 256.0;
-        if (val < 0) {
-            app_state.zoom.* *= 1.1;
-        } else if (val > 0) {
-            app_state.zoom.* /= 1.1;
+        if (app_state.is_text.*) {
+            // Documento: la rotella scorre (lo zoom testo resta su +/-)
+            scrollText(app_state, val * 5.0);
+            return;
         }
-
-        if (app_state.zoom.* < 0.1) app_state.zoom.* = 0.1;
-        if (app_state.zoom.* > 20.0) app_state.zoom.* = 20.0;
-
-        app_state.file_changed.* = true;
+        if (val < 0) {
+            applyZoom(app_state, 1.1);
+        } else if (val > 0) {
+            applyZoom(app_state, 1.0 / 1.1);
+        }
     }
 }
 
@@ -318,16 +426,87 @@ fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopaque)
                 if (app_state.is_mesh.*) {
                     app_state.yaw.* += dx * 0.01;
                     app_state.pitch.* += dy * 0.01;
+                } else if (app_state.is_text.*) {
+                    // Trascinare il documento verso il basso torna indietro
+                    scrollText(app_state, -dy);
                 } else {
+                    app_state.mutex.lockUncancelable(app_state.io);
                     app_state.pan_x.* += dx;
                     app_state.pan_y.* += dy;
                     app_state.file_changed.* = true;
+                    app_state.mutex.unlock(app_state.io);
                 }
             }
             app_state.last_x.* = mot.x;
             app_state.last_y.* = mot.y;
         },
     }
+}
+
+/// Rasterizza il contenuto testuale corrente alla larghezza richiesta e al
+/// corpo scalato dallo zoom, sostituendo il buffer statico RGBA.
+/// Da chiamare con `state.mutex` già acquisito.
+fn rasterizeText(state: *GuiAppState, width: u32, text_zoom: f32) void {
+    const pointsize: usize = @intFromFloat(@round(15.0 * text_zoom));
+    const opts = text_render.RenderOpts{ .width = @max(width, 64), .pointsize = @max(pointsize, 6) };
+    const name = std.fs.path.basename(state.current_file_path);
+
+    if (state.text_gpu) {
+        rasterizeTextGpu(state, name, opts);
+        return;
+    }
+
+    var img = text_render.render(state.gpa, state.io, state.decoded, name, opts) catch |err| {
+        std.debug.print("Impossibile rasterizzare il testo: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer img.deinit(state.gpa);
+
+    const w: u32 = @intCast(img.width);
+    const h: u32 = @intCast(img.height);
+    const rgba = state.gpa.alloc(u8, @as(usize, w) * h * 4) catch return;
+    for (0..@as(usize, w) * h) |i| {
+        rgba[i * 4 + 0] = img.pixels[i * 3 + 0];
+        rgba[i * 4 + 1] = img.pixels[i * 3 + 1];
+        rgba[i * 4 + 2] = img.pixels[i * 3 + 2];
+        rgba[i * 4 + 3] = 255;
+    }
+
+    state.gpa.free(state.static_rgba.*);
+    state.static_rgba.* = rgba;
+    state.static_w.* = w;
+    state.static_h.* = h;
+}
+
+/// Percorso GPU (Soluzione B): costruisce i quad glifo + atlante e li renderizza
+/// con la pipeline testo Vulkan, poi copia i pixel RGBA nel buffer statico.
+fn rasterizeTextGpu(state: *GuiAppState, name: []const u8, opts: text_render.RenderOpts) void {
+    var mesh = text_render.buildTextMesh(state.gpa, state.decoded, name, opts) catch |err| {
+        std.debug.print("Impossibile costruire i quad del testo: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer mesh.deinit(state.gpa);
+
+    const rgba_src = state.renderer.renderText(
+        std.mem.sliceAsBytes(mesh.vertices),
+        @intCast(mesh.vertices.len),
+        mesh.atlas.pixels,
+        @intCast(mesh.atlas.w),
+        @intCast(mesh.atlas.h),
+        @intCast(mesh.width),
+        @intCast(mesh.height),
+        text_render.clear_bg,
+    ) catch |err| {
+        std.debug.print("Render testo GPU fallito: {s}\n", .{@errorName(err)});
+        return;
+    };
+
+    // Il readback è riusato dalla chiamata successiva: copiane una proprietà.
+    const rgba = state.gpa.dupe(u8, rgba_src) catch return;
+    state.gpa.free(state.static_rgba.*);
+    state.static_rgba.* = rgba;
+    state.static_w.* = @intCast(mesh.width);
+    state.static_h.* = @intCast(mesh.height);
 }
 
 fn renderWorker(
@@ -340,6 +519,9 @@ fn renderWorker(
 ) void {
     var last_w: u32 = 0;
     var last_h: u32 = 0;
+    var last_text_w: u32 = 0;
+    var last_text_zoom: f32 = 0;
+    var last_seq: u32 = 0;
 
     var pacer_60 = zicro.time.Pacer.hz(state.io, 60.0);
     var pacer_20 = zicro.time.Pacer.hz(state.io, 20.0);
@@ -352,8 +534,30 @@ fn renderWorker(
             continue;
         }
 
+        state.mutex.lockUncancelable(state.io);
+
         const size_changed = (cur_w != last_w or cur_h != last_h);
-        const need_render = size_changed or state.file_changed.* or state.is_mesh.*;
+        var need_render = size_changed or state.file_changed.* or state.is_mesh.*;
+
+        if (state.is_text.*) {
+            // (Ri)compone il testo quando cambiano larghezza finestra, zoom o
+            // file: un solo tentativo per cambio di parametri (evita di ripetere
+            // il layout a 20 Hz se qualcosa fallisce in modo persistente).
+            const tz = std.math.clamp(zoom.*, text_zoom_min, text_zoom_max);
+            if (last_text_w != cur_w or last_text_zoom != tz or last_seq != state.load_seq.*) {
+                rasterizeText(state, cur_w, tz);
+                last_text_w = cur_w;
+                last_text_zoom = tz;
+                last_seq = state.load_seq.*;
+                need_render = true;
+            }
+            // Clamp dello scroll ora che l'altezza del documento è nota
+            const max_scroll: f32 = if (state.static_h.* > cur_h)
+                @floatFromInt(state.static_h.* - cur_h)
+            else
+                0;
+            if (state.scroll_y.* > max_scroll) state.scroll_y.* = max_scroll;
+        }
 
         if (need_render) {
             state.file_changed.* = false;
@@ -362,21 +566,32 @@ fn renderWorker(
 
             if (composited_rgba.len < cur_w * cur_h * 4) {
                 state.gpa.free(composited_rgba.*);
-                composited_rgba.* = state.gpa.alloc(u8, cur_w * cur_h * 4) catch break;
+                composited_rgba.* = state.gpa.alloc(u8, cur_w * cur_h * 4) catch {
+                    state.mutex.unlock(state.io);
+                    break;
+                };
             }
 
             if (state.is_mesh.*) {
                 const pc = gpu.buildPushConstants(state.mesh_center.*, state.mesh_max_size.* / zoom.*, yaw.*, pitch.*, cur_w, cur_h);
-                const mesh_rgba = state.renderer.render(cur_w, cur_h, &pc) catch break;
+                const mesh_rgba = state.renderer.render(cur_w, cur_h, &pc) catch {
+                    state.mutex.unlock(state.io);
+                    break;
+                };
                 composeFrame(composited_rgba.*, cur_w, cur_h, mesh_rgba, cur_w, cur_h, false, 1.0, 0.0, 0.0);
+            } else if (state.is_text.*) {
+                composeTextFrame(composited_rgba.*, cur_w, cur_h, state.static_rgba.*, state.static_w.*, state.static_h.*, state.scroll_y.*);
             } else {
-                composeFrame(composited_rgba.*, cur_w, cur_h, state.static_rgba.*, state.static_w.*, state.static_h.*, state.is_text.*, zoom.*, state.pan_x.*, state.pan_y.*);
+                composeFrame(composited_rgba.*, cur_w, cur_h, state.static_rgba.*, state.static_w.*, state.static_h.*, false, zoom.*, state.pan_x.*, state.pan_y.*);
             }
 
             win.presentRgba(cur_w, cur_h, composited_rgba.*);
         }
 
-        if (state.is_mesh.*) {
+        const is_mesh = state.is_mesh.*;
+        state.mutex.unlock(state.io);
+
+        if (is_mesh) {
             _ = pacer_60.tick();
         } else {
             _ = pacer_20.tick();
@@ -385,6 +600,32 @@ fn renderWorker(
 }
 
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+/// Dimensione iniziale della finestra. Per le immagini il frame si adatta al
+/// contenuto (l'immagine lo riempie per intero), con un tetto a ~metà schermo:
+/// zrame non espone la geometria dell'output, quindi il tetto è ZUER_MAX_WIN
+/// (formato "LxA") oppure 1600x900.
+fn initialWindowSize(is_image: bool, img_w: u32, img_h: u32) struct { w: u32, h: u32 } {
+    if (!is_image or img_w == 0 or img_h == 0) return .{ .w = 1280, .h = 720 };
+
+    var max_w: u32 = 1600;
+    var max_h: u32 = 900;
+    if (getenv("ZUER_MAX_WIN")) |val| {
+        const s = std.mem.span(val);
+        if (std.mem.indexOfScalar(u8, s, 'x')) |sep| {
+            max_w = std.fmt.parseInt(u32, s[0..sep], 10) catch max_w;
+            max_h = std.fmt.parseInt(u32, s[sep + 1 ..], 10) catch max_h;
+        }
+    }
+
+    const fw: f32 = @floatFromInt(img_w);
+    const fh: f32 = @floatFromInt(img_h);
+    const scale = @min(1.0, @min(@as(f32, @floatFromInt(max_w)) / fw, @as(f32, @floatFromInt(max_h)) / fh));
+    const w: u32 = @intFromFloat(@round(fw * scale));
+    const h: u32 = @intFromFloat(@round(fh * scale));
+    return .{ .w = @max(w, 320), .h = @max(h, 200) };
+}
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -412,15 +653,10 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("Errore: {s}\n", .{decoded.err});
         std.process.exit(1);
     }
+    // I contenuti testuali (testo, markdown, csv, schede info) non vengono
+    // rasterizzati qui: lo fa il thread di rendering alla larghezza reale
+    // della finestra, così il testo è nitido e scorre come un documento.
     var is_text = (decoded != .mesh and decoded != .image);
-    if (decoded != .mesh and decoded != .image) {
-        const img = text_render.render(gpa, io, &decoded, std.fs.path.basename(file_path)) catch |err| {
-            std.debug.print("Impossibile visualizzare il contenuto: {s}\n", .{@errorName(err)});
-            std.process.exit(1);
-        };
-        decoded.deinit(gpa);
-        decoded = .{ .image = img };
-    }
 
     var stage_opt: ?loader_mod.GpuStage = null;
     defer if (stage_opt) |*s| s.buffer.deinit(gpa);
@@ -445,7 +681,7 @@ pub fn main(init: std.process.Init) !void {
         try renderer.setMesh(stage.buffer.ptr, stage.vertex_bytes, @intCast(stage.index_bytes / @sizeOf(u32)));
         mesh_center = m.center;
         mesh_max_size = @max(m.bbox_max[0] - m.bbox_min[0], @max(m.bbox_max[1] - m.bbox_min[1], m.bbox_max[2] - m.bbox_min[2]));
-    } else {
+    } else if (decoded == .image) {
         const img = decoded.image;
         static_w = @intCast(img.width);
         static_h = @intCast(img.height);
@@ -458,12 +694,15 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    var state_mutex: std.Io.Mutex = .init;
+    var load_seq: u32 = 1;
     var file_changed = false;
     var zoom: f32 = 1.0;
     var yaw: f32 = 0;
     var pitch: f32 = 0;
     var pan_x: f32 = 0;
     var pan_y: f32 = 0;
+    var scroll_y: f32 = 0;
     var dragging = false;
     var last_x: f32 = 0;
     var last_y: f32 = 0;
@@ -471,15 +710,21 @@ pub fn main(init: std.process.Init) !void {
     var gui_state = GuiAppState{
         .gpa = gpa,
         .io = io,
+        .mutex = &state_mutex,
         .current_file_path = try gpa.dupe(u8, file_path),
         .file_list = .empty,
         .current_file_index = null,
         .decoded = &decoded,
         .stage_opt = &stage_opt,
         .renderer = &renderer,
+        .text_gpu = text_gpu: {
+            if (getenv("ZUER_TEXT_ENGINE")) |v| break :text_gpu std.mem.eql(u8, std.mem.span(v), "gpu");
+            break :text_gpu false;
+        },
         .is_mesh = &is_mesh,
         .is_text = &is_text,
         .file_changed = &file_changed,
+        .load_seq = &load_seq,
         .zoom = &zoom,
         .static_rgba = &static_rgba,
         .static_w = &static_w,
@@ -491,6 +736,7 @@ pub fn main(init: std.process.Init) !void {
         .pitch = &pitch,
         .pan_x = &pan_x,
         .pan_y = &pan_y,
+        .scroll_y = &scroll_y,
         .last_x = &last_x,
         .last_y = &last_y,
     };
@@ -504,11 +750,12 @@ pub fn main(init: std.process.Init) !void {
     var composited_rgba: []u8 = &.{};
     defer gpa.free(composited_rgba);
 
+    const win_size = initialWindowSize(decoded == .image, static_w, static_h);
     const win = try zrame.Window.init(gpa, .{
         .title = "zuer-gui",
         .app_id = "it.zuer.gui",
-        .width = 1280,
-        .height = 720,
+        .width = win_size.w,
+        .height = win_size.h,
         .on_key = keyCallback,
         .on_scroll = scrollCallback,
         .on_mouse = mouseCallback,

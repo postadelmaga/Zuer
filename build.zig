@@ -26,6 +26,17 @@ pub fn build(b: *std.Build) void {
     frag_cmd.addArg("-o");
     const frag_spv = frag_cmd.addOutputFileArg("mesh.frag.spv");
 
+    // Shader della pipeline testo (atlante glifi su GPU).
+    const tvert_cmd = b.addSystemCommand(&.{"glslc"});
+    tvert_cmd.addFileArg(b.path("src/shaders/text.vert"));
+    tvert_cmd.addArg("-o");
+    const text_vert_spv = tvert_cmd.addOutputFileArg("text.vert.spv");
+
+    const tfrag_cmd = b.addSystemCommand(&.{"glslc"});
+    tfrag_cmd.addFileArg(b.path("src/shaders/text.frag"));
+    tfrag_cmd.addArg("-o");
+    const text_frag_spv = tfrag_cmd.addOutputFileArg("text.frag.spv");
+
     const exe = b.addExecutable(.{
         .name = "zuer",
         .root_module = b.createModule(.{
@@ -42,6 +53,8 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("zicro", dep_zicro.module("zicro"));
     exe.root_module.addAnonymousImport("mesh_vert_spv", .{ .root_source_file = vert_spv });
     exe.root_module.addAnonymousImport("mesh_frag_spv", .{ .root_source_file = frag_spv });
+    exe.root_module.addAnonymousImport("text_vert_spv", .{ .root_source_file = text_vert_spv });
+    exe.root_module.addAnonymousImport("text_frag_spv", .{ .root_source_file = text_frag_spv });
     exe.root_module.linkSystemLibrary("vulkan", .{});
 
     b.installArtifact(exe);
@@ -60,10 +73,37 @@ pub fn build(b: *std.Build) void {
     gui_exe.root_module.addImport("zrame", dep_zrame.module("zrame"));
     gui_exe.root_module.addAnonymousImport("mesh_vert_spv", .{ .root_source_file = vert_spv });
     gui_exe.root_module.addAnonymousImport("mesh_frag_spv", .{ .root_source_file = frag_spv });
+    gui_exe.root_module.addAnonymousImport("text_vert_spv", .{ .root_source_file = text_vert_spv });
+    gui_exe.root_module.addAnonymousImport("text_frag_spv", .{ .root_source_file = text_frag_spv });
     gui_exe.root_module.linkSystemLibrary("vulkan", .{});
     gui_exe.root_module.linkSystemLibrary("wayland-client", .{});
+    // Motore di testo nativo: stb_truetype rasterizza i glifi Hack (embeddati),
+    // sostituendo ImageMagick/Pango. -fno-sanitize=undefined come per stb_image.
+    addStbTruetype(b, gui_exe.root_module);
 
     b.installArtifact(gui_exe);
+
+    // Tool di sviluppo: rasterizza un file col percorso reale di text_render e
+    // ne scrive il PPM, per verificare la resa headless (zig build raster-debug).
+    const raster_dbg = b.addExecutable(.{
+        .name = "raster-debug",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/raster_debug.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    addStbTruetype(b, raster_dbg.root_module);
+    // Anche il percorso GPU (gpu_renderer + shader) per confrontare CPU vs atlante.
+    raster_dbg.root_module.addAnonymousImport("mesh_vert_spv", .{ .root_source_file = vert_spv });
+    raster_dbg.root_module.addAnonymousImport("mesh_frag_spv", .{ .root_source_file = frag_spv });
+    raster_dbg.root_module.addAnonymousImport("text_vert_spv", .{ .root_source_file = text_vert_spv });
+    raster_dbg.root_module.addAnonymousImport("text_frag_spv", .{ .root_source_file = text_frag_spv });
+    raster_dbg.root_module.linkSystemLibrary("vulkan", .{});
+    const raster_dbg_run = b.addRunArtifact(raster_dbg);
+    if (b.args) |args| raster_dbg_run.addArgs(args);
+    b.step("raster-debug", "Rasterizza un file su PPM (stdout)").dependOn(&raster_dbg_run.step);
 
     const decoder_mod = b.createModule(.{
         .root_source_file = b.path("src/decoder.zig"),
@@ -72,7 +112,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // Compile decoders as shared library plugins
-    inline for (.{ "text", "csv", "markdown", "mesh", "image", "glb", "archive", "media" }) |name| {
+    inline for (.{ "text", "csv", "markdown", "mesh", "image", "glb", "archive", "media", "pdf", "office" }) |name| {
         const lib = b.addLibrary(.{
             .name = "decoder_" ++ name,
             .linkage = .dynamic,
@@ -107,4 +147,13 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run zuer");
     run_step.dependOn(&run_cmd.step);
+}
+
+/// Compila stb_truetype nel modulo e ne espone gli header a @cImport.
+fn addStbTruetype(b: *std.Build, mod: *std.Build.Module) void {
+    mod.addIncludePath(b.path("vendor/stb"));
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/stb/stb_truetype_impl.c"),
+        .flags = &.{ "-O2", "-fno-sanitize=undefined" },
+    });
 }

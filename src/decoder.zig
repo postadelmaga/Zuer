@@ -306,21 +306,31 @@ pub const DecodedC = extern struct {
     }
 };
 
+pub const DecodeFn = *const fn (
+    path: SliceC,
+    content: SliceC,
+    io_ptr: *const anyopaque,
+    allocator_ptr: *const anyopaque,
+) callconv(.c) DecodedC;
+
+/// Ogni plugin dichiara le estensioni che sa decodificare esportando
+/// `zuer_extensions`: una stringa statica di estensioni separate da virgola
+/// (es. "csv,tsv"). L'host la interroga una sola volta al caricamento, così
+/// aggiungere un formato significa solo installare un nuovo .so.
+pub const ExtensionsFn = *const fn () callconv(.c) SliceC;
+
 const LoadedPlugin = struct {
     type_name: []const u8,
+    extensions: []const []const u8,
     lib: std.DynLib,
-    decode_fn: *const fn (
-        path: SliceC,
-        content: SliceC,
-        io_ptr: *const anyopaque,
-        allocator_ptr: *const anyopaque,
-    ) callconv(.c) DecodedC,
+    decode_fn: DecodeFn,
 };
 
-var plugin_cache: std.ArrayList(LoadedPlugin) = .empty;
+var plugin_registry: std.ArrayList(LoadedPlugin) = .empty;
+var plugin_registry_scanned = false;
 var plugin_cache_mutex: std.atomic.Mutex = .unlocked;
 
-/// Chiude i plugin caricati e libera la cache. Da chiamare a fine processo,
+/// Chiude i plugin caricati e libera il registro. Da chiamare a fine processo,
 /// dopo il join di tutti i thread che possono decodificare.
 pub fn closePluginCache(allocator: std.mem.Allocator) void {
     while (!plugin_cache_mutex.tryLock()) {
@@ -328,12 +338,121 @@ pub fn closePluginCache(allocator: std.mem.Allocator) void {
     }
     defer plugin_cache_mutex.unlock();
 
-    for (plugin_cache.items) |*p| {
+    for (plugin_registry.items) |*p| {
         allocator.free(p.type_name);
+        for (p.extensions) |e| allocator.free(e);
+        allocator.free(p.extensions);
         p.lib.close();
     }
-    plugin_cache.deinit(allocator);
-    plugin_cache = .empty;
+    plugin_registry.deinit(allocator);
+    plugin_registry = .empty;
+    plugin_registry_scanned = false;
+}
+
+const plugin_prefix = "libdecoder_";
+const plugin_suffix = ".so";
+
+/// Scansiona una directory alla ricerca di plugin `libdecoder_*.so` e li
+/// registra interrogando `zuer_extensions`. Un plugin già registrato con lo
+/// stesso nome (da una directory precedente nell'ordine di ricerca) vince.
+fn scanPluginDir(dir_path: []const u8, io: std.Io, allocator: std.mem.Allocator) void {
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+
+    var iterator = dir.iterate();
+    while (iterator.next(io) catch null) |entry| {
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
+        if (!std.mem.startsWith(u8, entry.name, plugin_prefix)) continue;
+        if (!std.mem.endsWith(u8, entry.name, plugin_suffix)) continue;
+
+        const type_name = entry.name[plugin_prefix.len .. entry.name.len - plugin_suffix.len];
+        if (type_name.len == 0) continue;
+        if (findPluginByName(type_name) != null) continue;
+
+        const full_path = std.fs.path.join(allocator, &.{ dir_path, entry.name }) catch continue;
+        defer allocator.free(full_path);
+
+        var lib = std.DynLib.open(full_path) catch continue;
+        const decode_fn = lib.lookup(DecodeFn, "zuer_decode") orelse {
+            lib.close();
+            continue;
+        };
+
+        // `zuer_extensions` è opzionale: un plugin senza estensioni dichiarate
+        // resta raggiungibile solo come fallback per nome (es. "text").
+        var exts: std.ArrayList([]const u8) = .empty;
+        if (lib.lookup(ExtensionsFn, "zuer_extensions")) |ext_fn| {
+            var tokens = std.mem.tokenizeScalar(u8, ext_fn().toSlice(), ',');
+            while (tokens.next()) |tok| {
+                const trimmed = std.mem.trim(u8, tok, " \t\r\n");
+                if (trimmed.len == 0) continue;
+                const lower = allocator.dupe(u8, trimmed) catch continue;
+                for (lower) |*ch| ch.* = std.ascii.toLower(ch.*);
+                exts.append(allocator, lower) catch allocator.free(lower);
+            }
+        }
+
+        var registered = false;
+        defer if (!registered) {
+            for (exts.items) |e| allocator.free(e);
+            exts.deinit(allocator);
+            lib.close();
+        };
+
+        const type_name_dup = allocator.dupe(u8, type_name) catch continue;
+        const exts_owned = exts.toOwnedSlice(allocator) catch {
+            allocator.free(type_name_dup);
+            continue;
+        };
+        plugin_registry.append(allocator, .{
+            .type_name = type_name_dup,
+            .extensions = exts_owned,
+            .lib = lib,
+            .decode_fn = decode_fn,
+        }) catch {
+            allocator.free(type_name_dup);
+            for (exts_owned) |e| allocator.free(e);
+            allocator.free(exts_owned);
+            continue;
+        };
+        registered = true;
+    }
+}
+
+/// Costruisce il registro dei plugin (una sola volta) scandendo, nell'ordine,
+/// `<exe_dir>/decoders`, `<exe_dir>`, `zig-out/lib` e `decoders`.
+/// Deve essere chiamata con `plugin_cache_mutex` già acquisito.
+fn ensureRegistryLocked(io: std.Io, allocator: std.mem.Allocator) void {
+    if (plugin_registry_scanned) return;
+    plugin_registry_scanned = true;
+
+    if (std.process.executableDirPathAlloc(io, allocator)) |exe_dir| {
+        defer allocator.free(exe_dir);
+        if (std.fs.path.join(allocator, &.{ exe_dir, "decoders" })) |p| {
+            defer allocator.free(p);
+            scanPluginDir(p, io, allocator);
+        } else |_| {}
+        scanPluginDir(exe_dir, io, allocator);
+    } else |_| {}
+    scanPluginDir("zig-out/lib", io, allocator);
+    scanPluginDir("decoders", io, allocator);
+}
+
+fn findPluginByName(type_name: []const u8) ?*const LoadedPlugin {
+    for (plugin_registry.items) |*p| {
+        if (std.mem.eql(u8, p.type_name, type_name)) return p;
+    }
+    return null;
+}
+
+fn findPluginByExtension(ext: []const u8) ?*const LoadedPlugin {
+    if (ext.len == 0) return null;
+    for (plugin_registry.items) |*p| {
+        for (p.extensions) |e| {
+            if (asciiEqualIgnoreCase(ext, e)) return p;
+        }
+    }
+    return null;
 }
 
 pub fn decode(path: []const u8, io: std.Io, allocator: std.mem.Allocator) Decoded {
@@ -345,147 +464,32 @@ pub fn decode(path: []const u8, io: std.Io, allocator: std.mem.Allocator) Decode
     };
     errdefer allocator.free(content);
 
-    // Sniff format based on file extension
+    // Risolve il decoder dal registro: prima per estensione dichiarata dai
+    // plugin stessi, poi col plugin "text" come fallback universale.
     const ext = getExtension(path);
-    const plugin_type = if (extIn(ext, &.{ "csv", "tsv" }))
-        "csv"
-    else if (extIn(ext, &.{ "md", "markdown" }))
-        "markdown"
-    else if (extIn(ext, &.{"obj"}))
-        "mesh"
-    else if (extIn(ext, &.{"glb"}))
-        "glb"
-    else if (extIn(ext, &.{ "png", "jpg", "jpeg", "gif", "bmp", "svg" }))
-        "image"
-    else if (extIn(ext, &.{ "zip", "jar", "apk", "cbz", "epub", "xpi", "whl" }))
-        "archive"
-    else if (extIn(ext, &.{ "mp3", "wav", "flac", "ogg", "oga", "ogv", "opus", "m4a", "mp4", "m4v", "mov", "mkv", "webm", "avi" }))
-        "media"
-    else
-        "text";
-
-    const lib_name = std.fmt.allocPrint(allocator, "libdecoder_{s}.so", .{plugin_type}) catch return .{ .err = "" };
-    defer allocator.free(lib_name);
-
-    // 1. Locate the decoder plugin .so file
-    var plugin_path: ?[]const u8 = null;
-    if (std.process.executableDirPathAlloc(io, allocator)) |exe_dir| {
-        defer allocator.free(exe_dir);
-        // Try production path: <exe_dir>/decoders/libdecoder_<type>.so
-        const p1 = std.fs.path.join(allocator, &.{ exe_dir, "decoders", lib_name }) catch null;
-        if (p1) |p| {
-            if (std.Io.Dir.cwd().access(io, p, .{})) |_| {
-                plugin_path = p;
-            } else |_| {
-                allocator.free(p);
-            }
-        }
-        // Try adjacent path: <exe_dir>/libdecoder_<type>.so
-        if (plugin_path == null) {
-            const p2 = std.fs.path.join(allocator, &.{ exe_dir, lib_name }) catch null;
-            if (p2) |p| {
-                if (std.Io.Dir.cwd().access(io, p, .{})) |_| {
-                    plugin_path = p;
-                } else |_| {
-                    allocator.free(p);
-                }
-            }
-        }
-    } else |_| {}
-
-    // Try relative paths in CWD
-    if (plugin_path == null) {
-        const rp1 = std.fmt.allocPrint(allocator, "zig-out/lib/{s}", .{lib_name}) catch null;
-        const rp2 = std.fmt.allocPrint(allocator, "decoders/{s}", .{lib_name}) catch null;
-        defer {
-            if (rp1) |p| allocator.free(p);
-            if (rp2) |p| allocator.free(p);
-        }
-
-        if (rp1) |p| {
-            if (std.Io.Dir.cwd().access(io, p, .{})) |_| {
-                plugin_path = allocator.dupe(u8, p) catch null;
-            } else |_| {}
-        }
-        if (plugin_path == null and rp2 != null) {
-            const p = rp2.?;
-            if (std.Io.Dir.cwd().access(io, p, .{})) |_| {
-                plugin_path = allocator.dupe(u8, p) catch null;
-            } else |_| {}
-        }
-    }
-
-    const path_val = plugin_path orelse {
-        const msg = std.fmt.allocPrint(allocator, "Decoder plugin non trovato per il tipo: {s}", .{plugin_type}) catch "";
-        allocator.free(content);
-        return .{ .err = msg };
-    };
-    defer allocator.free(path_val);
-
-    // 2. Load the plugin and get decode function (utilizing thread-safe caching)
-    var cached_fn: ?*const fn (
-        path: SliceC,
-        content: SliceC,
-        io_ptr: *const anyopaque,
-        allocator_ptr: *const anyopaque,
-    ) callconv(.c) DecodedC = null;
 
     while (!plugin_cache_mutex.tryLock()) {
         std.Thread.yield() catch {};
     }
-    for (plugin_cache.items) |p| {
-        if (std.mem.eql(u8, p.type_name, plugin_type)) {
-            cached_fn = p.decode_fn;
-            break;
-        }
-    }
-
-    if (cached_fn == null) {
-        var lib = std.DynLib.open(path_val) catch |err| {
-            plugin_cache_mutex.unlock();
-            const msg = std.fmt.allocPrint(allocator, "Impossibile caricare il plugin {s}: {s}", .{ path_val, @errorName(err) }) catch "";
-            allocator.free(content);
-            return .{ .err = msg };
-        };
-
-        const DecodeFn = *const fn (
-            path: SliceC,
-            content: SliceC,
-            io_ptr: *const anyopaque,
-            allocator_ptr: *const anyopaque,
-        ) callconv(.c) DecodedC;
-
-        const decode_fn = lib.lookup(DecodeFn, "zuer_decode") orelse {
-            lib.close();
-            plugin_cache_mutex.unlock();
-            const msg = std.fmt.allocPrint(allocator, "Simbolo zuer_decode non trovato nel plugin: {s}", .{path_val}) catch "";
-            allocator.free(content);
-            return .{ .err = msg };
-        };
-
-        // Se la registrazione in cache fallisce si decodifica comunque:
-        // il plugin resta solo non riutilizzabile (verrà ricaricato).
-        if (allocator.dupe(u8, plugin_type)) |type_name_dup| {
-            plugin_cache.append(allocator, .{
-                .type_name = type_name_dup,
-                .lib = lib,
-                .decode_fn = decode_fn,
-            }) catch allocator.free(type_name_dup);
-        } else |_| {}
-
-        cached_fn = decode_fn;
-    }
+    ensureRegistryLocked(io, allocator);
+    const plugin = findPluginByExtension(ext) orelse findPluginByName("text");
+    const decode_fn: ?DecodeFn = if (plugin) |p| p.decode_fn else null;
     plugin_cache_mutex.unlock();
 
-    // 3. Perform decoding using the loaded dynamic function
-    const decoded_c = cached_fn.?(
+    const decode_fn_val = decode_fn orelse {
+        const msg = std.fmt.allocPrint(allocator, "Nessun plugin decoder disponibile per '.{s}' (cartella decoders/ vuota o mancante)", .{ext}) catch "";
+        allocator.free(content);
+        return .{ .err = msg };
+    };
+
+    const decoded_c = decode_fn_val(
         SliceC.fromSlice(path),
         SliceC.fromSlice(content),
         &io,
         &allocator,
     );
 
-    // 4. Convert the C-compatible decoded structure back to Zig union
+    // Convert the C-compatible decoded structure back to Zig union
     const decoded_data = decoded_c.toDecoded(allocator) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "Errore conversione struttura C in plugin: {s}", .{@errorName(err)}) catch "";
         return .{ .err = msg };
@@ -500,13 +504,6 @@ fn asciiEqualIgnoreCase(a: []const u8, b: []const u8) bool {
         if (std.ascii.toLower(ca) != std.ascii.toLower(cb)) return false;
     }
     return true;
-}
-
-fn extIn(ext: []const u8, comptime list: []const []const u8) bool {
-    inline for (list) |e| {
-        if (asciiEqualIgnoreCase(ext, e)) return true;
-    }
-    return false;
 }
 
 fn getExtension(path: []const u8) []const u8 {

@@ -25,10 +25,12 @@ const MediaInfo = struct {
     bitrate_kbps: ?u32 = null,
     width: ?u32 = null,
     height: ?u32 = null,
+    tracks: ?u16 = null,
 };
 
 fn sniff(b: []const u8) ?MediaInfo {
     if (b.len < 12) return null;
+    if (std.mem.eql(u8, b[0..4], "MThd")) return parseMidi(b);
     if (std.mem.eql(u8, b[0..4], "RIFF") and std.mem.eql(u8, b[8..12], "WAVE")) return parseWav(b);
     if (std.mem.eql(u8, b[0..4], "RIFF") and std.mem.eql(u8, b[8..12], "AVI ")) return parseAvi(b);
     if (std.mem.eql(u8, b[0..4], "fLaC")) return parseFlac(b);
@@ -268,6 +270,20 @@ fn parseMp3(b: []const u8) ?MediaInfo {
     return null;
 }
 
+fn parseMidi(b: []const u8) ?MediaInfo {
+    // Header MThd: length u32 (=6), format u16, ntrks u16, division u16 (big endian)
+    if (b.len < 14) return null;
+    const format = std.mem.readInt(u16, b[8..10], .big);
+    const ntrks = std.mem.readInt(u16, b[10..12], .big);
+    const fmt_name: []const u8 = switch (format) {
+        0 => "MIDI (formato 0, traccia singola)",
+        1 => "MIDI (formato 1, tracce simultanee)",
+        2 => "MIDI (formato 2, tracce indipendenti)",
+        else => "MIDI",
+    };
+    return .{ .format = fmt_name, .kind = .audio, .tracks = ntrks };
+}
+
 fn render(info: MediaInfo, filename: []const u8, file_size: usize, allocator: std.mem.Allocator) []const u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -290,6 +306,9 @@ fn render(info: MediaInfo, filename: []const u8, file_size: usize, allocator: st
     }
     if (info.width) |wd| {
         w.print("Risoluzione: {d}x{d}\n", .{ wd, info.height orelse 0 }) catch return fallback(allocator);
+    }
+    if (info.tracks) |t| {
+        w.print("Tracce:      {d}\n", .{t}) catch return fallback(allocator);
     }
     if (info.sample_rate) |sr| {
         w.print("Campioni:    {d} Hz", .{sr}) catch return fallback(allocator);
@@ -347,4 +366,10 @@ export fn zuer_decode(
             .payload = .{ .err = decoder.SliceC.fromSlice(msg) },
         };
     };
+}
+
+const extensions = "mp3,wav,flac,ogg,oga,ogv,opus,m4a,mp4,m4v,mov,mkv,webm,avi,mid,midi";
+
+export fn zuer_extensions() callconv(.c) decoder.SliceC {
+    return decoder.SliceC.fromSlice(extensions);
 }
