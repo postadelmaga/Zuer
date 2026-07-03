@@ -1,5 +1,5 @@
 const std = @import("std");
-const decoder = @import("../decoder.zig");
+const decoder = @import("decoder");
 const CsvData = decoder.CsvData;
 const Decoded = decoder.Decoded;
 
@@ -103,4 +103,35 @@ pub fn decode(bytes: []const u8, delimiter: u8, allocator: std.mem.Allocator) De
         .headers = headers,
         .rows = final_rows,
     } };
+}
+
+export fn zuer_decode(
+    path: decoder.SliceC,
+    content: decoder.SliceC,
+    io_ptr: *const anyopaque,
+    allocator_ptr: *const anyopaque,
+) callconv(.c) decoder.DecodedC {
+    _ = io_ptr;
+    const allocator = @as(*const std.mem.Allocator, @ptrCast(@alignCast(allocator_ptr))).*;
+
+    const path_slice = path.toSlice();
+    const content_slice = content.toSlice();
+
+    var delimiter: u8 = ',';
+    const filename = std.fs.path.basename(path_slice);
+    if (std.mem.lastIndexOfScalar(u8, filename, '.')) |dot_index| {
+        const ext = filename[dot_index + 1 ..];
+        if (std.mem.eql(u8, ext, "tsv")) {
+            delimiter = '\t';
+        }
+    }
+
+    const decoded = decode(content_slice, delimiter, allocator);
+    return decoded.toDecodedC(allocator) catch |err| {
+        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "error";
+        return .{
+            .tag = .err,
+            .payload = .{ .err = decoder.SliceC.fromSlice(msg) },
+        };
+    };
 }

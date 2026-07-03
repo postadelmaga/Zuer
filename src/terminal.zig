@@ -5,6 +5,12 @@ const InputEvent = zicro.input.InputEvent;
 
 pub const Terminal = struct {
     original_termios: std.posix.termios,
+    // I byte letti da stdin ma non ancora consumati: una read può consegnare
+    // più tasti in un colpo solo (paste, input veloce) e va drenata un evento
+    // alla volta, non un byte per read.
+    pending: [64]u8 = undefined,
+    pending_len: usize = 0,
+    pending_pos: usize = 0,
 
     pub fn init(io: std.Io) !Terminal {
         const original = try std.posix.tcgetattr(std.posix.STDIN_FILENO);
@@ -41,37 +47,41 @@ pub const Terminal = struct {
         stdout.writeStreamingAll(io, "\x1B[?25h\x1B[0m") catch {};
         std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original_termios) catch {};
     }
-
     pub fn readInputEvent(self: *Terminal, io: std.Io) !?InputEvent {
-        _ = self;
-        var buf: [8]u8 = undefined;
-        const stdin = std.Io.File.stdin();
-        
-        var slices = [_][]u8{&buf};
-        const n = stdin.readStreaming(io, &slices) catch |err| {
-            if (err == error.WouldBlock) return null;
-            return err;
-        };
-        if (n == 0) return null;
+        _ = io;
+        if (self.pending_pos >= self.pending_len) {
+            const n = std.posix.read(std.posix.STDIN_FILENO, &self.pending) catch |err| {
+                if (err == error.WouldBlock) return null;
+                return err;
+            };
+            if (n == 0) return null;
+            self.pending_pos = 0;
+            self.pending_len = n;
+        }
+
+        const buf = self.pending[self.pending_pos..self.pending_len];
 
         if (buf[0] == 27) { // Escape code
-            if (n == 1) {
-                return .{ .key_down = .escape };
-            }
-            if (buf[1] == '[') {
-                if (n >= 3) {
-                    switch (buf[2]) {
-                        'A' => return .{ .key_down = .up },
-                        'B' => return .{ .key_down = .down },
-                        'C' => return .{ .key_down = .right },
-                        'D' => return .{ .key_down = .left },
-                        else => {},
-                    }
+            if (buf.len >= 3 and buf[1] == '[') {
+                self.pending_pos += 3;
+                switch (buf[2]) {
+                    'A' => return .{ .key_down = .up },
+                    'B' => return .{ .key_down = .down },
+                    'C' => return .{ .key_down = .right },
+                    'D' => return .{ .key_down = .left },
+                    else => return .{ .key_down = .escape },
                 }
+            }
+            if (buf.len >= 2) {
+                // Alt+tasto o sequenza sconosciuta: scarta anche il byte seguente.
+                self.pending_pos += 2;
+            } else {
+                self.pending_pos += 1;
             }
             return .{ .key_down = .escape };
         }
 
+        self.pending_pos += 1;
         switch (buf[0]) {
             10, 13 => return .{ .key_down = .enter },
             127, 8 => return .{ .key_down = .backspace },
