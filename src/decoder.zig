@@ -494,9 +494,17 @@ pub fn decode(path: []const u8, io: std.Io, allocator: std.mem.Allocator) Decode
     return decoded_data;
 }
 
+fn asciiEqualIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |ca, cb| {
+        if (std.ascii.toLower(ca) != std.ascii.toLower(cb)) return false;
+    }
+    return true;
+}
+
 fn extIn(ext: []const u8, comptime list: []const []const u8) bool {
     inline for (list) |e| {
-        if (std.mem.eql(u8, ext, e)) return true;
+        if (asciiEqualIgnoreCase(ext, e)) return true;
     }
     return false;
 }

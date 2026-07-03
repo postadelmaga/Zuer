@@ -55,8 +55,8 @@ fn renderText(gpa: std.mem.Allocator, io: std.Io, content: []const u8, name: []c
     defer _ = unlink(path_c);
 
     const font_name = if (is_mono) "DejaVu-Sans-Mono" else "DejaVu-Sans";
-    const caption_path = try std.fmt.allocPrint(gpa, "caption:@{s}", .{tmp_path});
-    defer gpa.free(caption_path);
+    const pango_path = try std.fmt.allocPrint(gpa, "pango:@{s}", .{tmp_path});
+    defer gpa.free(pango_path);
 
     // 1. Rileva le dimensioni finali dell'immagine tipografica generata da ImageMagick
     const size_result = try std.process.run(gpa, io, .{
@@ -66,6 +66,8 @@ fn renderText(gpa: std.mem.Allocator, io: std.Io, content: []const u8, name: []c
             "#080810",
             "-fill",
             "#e6e6e6",
+            "-define",
+            "pango:markup=false",
             "-size",
             "1024x",
             "-font",
@@ -74,7 +76,7 @@ fn renderText(gpa: std.mem.Allocator, io: std.Io, content: []const u8, name: []c
             "15",
             "-gravity",
             "NorthWest",
-            caption_path,
+            pango_path,
             "-format",
             "%w %h",
             "info:",
@@ -107,6 +109,8 @@ fn renderText(gpa: std.mem.Allocator, io: std.Io, content: []const u8, name: []c
             "#080810",
             "-fill",
             "#e6e6e6",
+            "-define",
+            "pango:markup=false",
             "-size",
             "1024x",
             "-font",
@@ -115,7 +119,7 @@ fn renderText(gpa: std.mem.Allocator, io: std.Io, content: []const u8, name: []c
             "15",
             "-gravity",
             "NorthWest",
-            caption_path,
+            pango_path,
             "rgb:-",
         },
     });

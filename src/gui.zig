@@ -19,6 +19,10 @@ const KEY_UP: u32 = 103;
 const KEY_DOWN: u32 = 108;
 const KEY_LEFT: u32 = 105;
 const KEY_RIGHT: u32 = 106;
+const KEY_1: u32 = 2;
+const KEY_2: u32 = 3;
+const KEY_3: u32 = 4;
+const KEY_4: u32 = 5;
 
 fn composeFrame(
     composited_rgba: []u8,
@@ -267,6 +271,14 @@ fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) void
             app_state.navigate(1);
         } else if (key == KEY_LEFT or key == KEY_UP) {
             app_state.navigate(-1);
+        } else if (key == KEY_1) {
+            win.setStyle(zrame.Style.fluent()) catch {};
+        } else if (key == KEY_2) {
+            win.setStyle(zrame.Style.macos()) catch {};
+        } else if (key == KEY_3) {
+            win.setStyle(zrame.Style.aurora()) catch {};
+        } else if (key == KEY_4) {
+            win.setStyle(zrame.Style.material()) catch {};
         }
     }
 }
@@ -501,10 +513,7 @@ pub fn main(init: std.process.Init) !void {
         .on_scroll = scrollCallback,
         .on_mouse = mouseCallback,
         .user = &gui_state,
-        .style = .{
-            .glass = zrame.Color.rgba(15, 15, 20, 0.35),
-            .glass_fade_width = 30.0,
-        },
+        .style = zrame.Style.fluent(),
     });
     defer win.deinit();
 
