@@ -19,6 +19,7 @@ extern fn stbi_failure_reason() ?[*:0]const u8;
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
 pub fn decode(path: []const u8, io: std.Io, file_bytes: []const u8, filename: []const u8, allocator: std.mem.Allocator) Decoded {
+    _ = io; // i subprocess ora usano decoder.runCapture (fork/exec diretti)
     var max_dim: usize = 160;
     if (getenv("ZUER_GUI")) |val| {
         if (std.mem.eql(u8, std.mem.span(val), "1")) {
@@ -29,7 +30,7 @@ pub fn decode(path: []const u8, io: std.Io, file_bytes: []const u8, filename: []
     // SVG: prima librsvg (rendering di qualità, gestisce anche .svgz),
     // poi il fallback ImageMagick come per gli altri formati non-stb.
     if (hasSvgExtension(filename)) {
-        if (decodeWithRsvg(path, io, filename, max_dim, allocator)) |img| {
+        if (decodeWithRsvg(path, filename, max_dim, allocator)) |img| {
             return .{ .image = img };
         } else |_| {}
     }
@@ -43,7 +44,7 @@ pub fn decode(path: []const u8, io: std.Io, file_bytes: []const u8, filename: []
         };
 
         // Formati vettoriali non coperti da stb_image (es. SVG): fallback a ImageMagick.
-        if (decodeWithImageMagick(path, io, filename, max_dim, allocator)) |img| {
+        if (decodeWithImageMagick(path, filename, max_dim, allocator)) |img| {
             return .{ .image = img };
         } else |im_err| {
             const msg = std.fmt.allocPrint(
@@ -72,22 +73,15 @@ fn hasSvgExtension(filename: []const u8) bool {
 
 /// Rasterizza l'SVG con librsvg in un PNG in memoria (adattato al box
 /// max_dim×max_dim), poi lo decodifica con stb come qualsiasi altro PNG.
-fn decodeWithRsvg(path: []const u8, io: std.Io, filename: []const u8, max_dim: usize, allocator: std.mem.Allocator) !ImageData {
+fn decodeWithRsvg(path: []const u8, filename: []const u8, max_dim: usize, allocator: std.mem.Allocator) !ImageData {
     var dim_buf: [16]u8 = undefined;
     const dim_str = try std.fmt.bufPrint(&dim_buf, "{d}", .{max_dim});
 
-    const result = try std.process.run(allocator, io, .{
-        // Sfondo esplicito: stb scarta l'alpha e il trasparente diverrebbe nero
-        .argv = &.{ "rsvg-convert", "--width", dim_str, "--height", dim_str, "--keep-aspect-ratio", "--format", "png", "--background-color", "#101018", path },
-    });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
+    // Sfondo esplicito: stb scarta l'alpha e il trasparente diverrebbe nero.
+    var result = try decoder.runCapture(allocator, &.{ "rsvg-convert", "--width", dim_str, "--height", dim_str, "--keep-aspect-ratio", "--format", "png", "--background-color", "#101018", path });
+    defer result.deinit(allocator);
 
-    switch (result.term) {
-        .exited => |code| if (code != 0) return error.RsvgFailed,
-        else => return error.RsvgFailed,
-    }
-    if (result.stdout.len == 0) return error.RsvgFailed;
+    if (result.exit_code != 0 or result.stdout.len == 0) return error.RsvgFailed;
 
     return decodeNative(result.stdout, filename, max_dim, allocator);
 }
@@ -158,20 +152,11 @@ fn resizeToFit(src: [*]const u8, src_w: usize, src_h: usize, filename: []const u
     };
 }
 
-fn decodeWithImageMagick(path: []const u8, io: std.Io, filename: []const u8, max_dim: usize, allocator: std.mem.Allocator) !ImageData {
+fn decodeWithImageMagick(path: []const u8, filename: []const u8, max_dim: usize, allocator: std.mem.Allocator) !ImageData {
     // 1. identify to get original size
-    const size_result = try std.process.run(allocator, io, .{
-        .argv = &.{ "identify", "-format", "%w %h", path },
-    });
-    defer allocator.free(size_result.stdout);
-    defer allocator.free(size_result.stderr);
-
-    switch (size_result.term) {
-        .exited => |code| {
-            if (code != 0) return error.IdentifyProcessFailed;
-        },
-        else => return error.IdentifyProcessFailed,
-    }
+    var size_result = try decoder.runCapture(allocator, &.{ "identify", "-format", "%w %h", path });
+    defer size_result.deinit(allocator);
+    if (size_result.exit_code != 0) return error.IdentifyProcessFailed;
 
     var size_tokens = std.mem.tokenizeAny(u8, size_result.stdout, " \n\r\t");
     const w_str = size_tokens.next() orelse return error.InvalidImageMetadata;
@@ -195,43 +180,19 @@ fn decodeWithImageMagick(path: []const u8, io: std.Io, filename: []const u8, max
     var resize_buf: [32]u8 = undefined;
     const resize_str = try std.fmt.bufPrint(&resize_buf, "{d}x{d}", .{ width, height });
 
-    const convert_result = try std.process.run(allocator, io, .{
-        .argv = &.{ "convert", path, "-depth", "8", "-resize", resize_str, "rgb:-" },
-    });
-    errdefer allocator.free(convert_result.stdout);
-    defer allocator.free(convert_result.stderr);
-
-    switch (convert_result.term) {
-        .exited => |code| {
-            if (code != 0) {
-                allocator.free(convert_result.stdout);
-                return error.ConvertProcessFailed;
-            }
-        },
-        else => {
-            allocator.free(convert_result.stdout);
-            return error.ConvertProcessFailed;
-        },
-    }
+    var convert_result = try decoder.runCapture(allocator, &.{ "convert", path, "-depth", "8", "-resize", resize_str, "rgb:-" });
+    defer convert_result.deinit(allocator);
+    if (convert_result.exit_code != 0) return error.ConvertProcessFailed;
 
     const expected_bytes = width * height * 3;
-    if (convert_result.stdout.len < expected_bytes) {
-        allocator.free(convert_result.stdout);
-        return error.IncompleteImagePixels;
-    }
+    if (convert_result.stdout.len < expected_bytes) return error.IncompleteImagePixels;
 
     const name = try allocator.dupe(u8, filename);
     errdefer allocator.free(name);
 
-    // Vale quanto in text_render: mai liberare una slice diversa
-    // dall'allocazione originale.
-    const pixels = if (convert_result.stdout.len == expected_bytes)
-        convert_result.stdout
-    else blk: {
-        const exact = try allocator.dupe(u8, convert_result.stdout[0..expected_bytes]);
-        allocator.free(convert_result.stdout);
-        break :blk exact;
-    };
+    // Copia esatta dei pixel utili: liberare una slice diversa dall'allocazione
+    // originale corromperebbe l'allocator.
+    const pixels = try allocator.dupe(u8, convert_result.stdout[0..expected_bytes]);
 
     return .{
         .width = width,

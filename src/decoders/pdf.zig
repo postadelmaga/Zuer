@@ -28,7 +28,7 @@ pub fn decode(path: []const u8, io: std.Io, filename: []const u8, allocator: std
 
     return decodeInner(path, io, filename, dpi, max_pages, allocator) catch |err| {
         const hint = switch (err) {
-            error.FileNotFound => "pdftoppm/pdfinfo non trovati: installa poppler-utils",
+            error.CommandNotFound => "pdftoppm/pdfinfo non trovati: installa poppler-utils",
             else => @errorName(err),
         };
         const msg = std.fmt.allocPrint(allocator, "Errore rendering PDF: {s}", .{hint}) catch "Errore PDF";
@@ -38,15 +38,9 @@ pub fn decode(path: []const u8, io: std.Io, filename: []const u8, allocator: std
 
 fn decodeInner(path: []const u8, io: std.Io, filename: []const u8, dpi: []const u8, max_pages: usize, allocator: std.mem.Allocator) !Decoded {
     // 1. Numero di pagine dal sommario di pdfinfo
-    const info = try std.process.run(allocator, io, .{
-        .argv = &.{ "pdfinfo", path },
-    });
-    defer allocator.free(info.stdout);
-    defer allocator.free(info.stderr);
-    switch (info.term) {
-        .exited => |code| if (code != 0) return error.PdfInfoFailed,
-        else => return error.PdfInfoFailed,
-    }
+    var info = try decoder.runCapture(allocator, &.{ "pdfinfo", path });
+    defer info.deinit(allocator);
+    if (info.exit_code != 0) return error.PdfInfoFailed;
 
     var total_pages: usize = 1;
     var lines = std.mem.splitScalar(u8, info.stdout, '\n');
@@ -73,15 +67,9 @@ fn decodeInner(path: []const u8, io: std.Io, filename: []const u8, dpi: []const 
     var last_buf: [16]u8 = undefined;
     const last_str = try std.fmt.bufPrint(&last_buf, "{d}", .{pages});
 
-    const run_result = try std.process.run(allocator, io, .{
-        .argv = &.{ "pdftoppm", "-f", "1", "-l", last_str, "-r", dpi, path, prefix },
-    });
-    defer allocator.free(run_result.stdout);
-    defer allocator.free(run_result.stderr);
-    switch (run_result.term) {
-        .exited => |code| if (code != 0) return error.PdfToPpmFailed,
-        else => return error.PdfToPpmFailed,
-    }
+    var run_result = try decoder.runCapture(allocator, &.{ "pdftoppm", "-f", "1", "-l", last_str, "-r", dpi, path, prefix });
+    defer run_result.deinit(allocator);
+    if (run_result.exit_code != 0) return error.PdfToPpmFailed;
 
     // 3. Lettura delle pagine generate. pdftoppm azzeropadda il numero di
     // pagina in modo dipendente dalla versione/documento: si provano le

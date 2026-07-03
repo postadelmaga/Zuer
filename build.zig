@@ -147,6 +147,20 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run zuer");
     run_step.dependOn(&run_cmd.step);
+
+    // Tool di sviluppo: chiama decoder.decode() su un file e stampa il risultato.
+    const decode_dbg = b.addExecutable(.{
+        .name = "decode-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/decode_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const decode_run = b.addRunArtifact(decode_dbg);
+    if (b.args) |args| decode_run.addArgs(args);
+    b.step("decode-test", "Decodifica un file e stampa il risultato").dependOn(&decode_run.step);
 }
 
 /// Compila stb_truetype nel modulo e ne espone gli header a @cImport.

@@ -456,6 +456,82 @@ fn findPluginByExtension(ext: []const u8) ?*const LoadedPlugin {
 }
 
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+extern "c" fn pipe(fds: *[2]c_int) c_int;
+extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
+extern "c" fn close(fd: c_int) c_int;
+extern "c" fn waitpid(pid: c_int, status: ?*c_int, options: c_int) c_int;
+// posix_spawn: fork+exec+ricerca PATH in modo sicuro anche in processi
+// multi-thread (niente malloc nel figlio forkato → niente deadlock, a
+// differenza di fork()+execvp manuale).
+extern "c" fn posix_spawnp(pid: *c_int, file: [*:0]const u8, file_actions: ?*const anyopaque, attrp: ?*const anyopaque, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) c_int;
+extern "c" fn posix_spawn_file_actions_init(fa: *anyopaque) c_int;
+extern "c" fn posix_spawn_file_actions_destroy(fa: *anyopaque) c_int;
+extern "c" fn posix_spawn_file_actions_adddup2(fa: *anyopaque, fd: c_int, newfd: c_int) c_int;
+extern "c" fn posix_spawn_file_actions_addclose(fa: *anyopaque, fd: c_int) c_int;
+extern "c" var environ: [*:null]const ?[*:0]const u8;
+
+pub const RunResult = struct {
+    stdout: []u8,
+    exit_code: u8,
+
+    pub fn deinit(self: *RunResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.stdout);
+    }
+};
+
+/// Esegue un comando catturandone lo stdout, con fork/exec/pipe diretti — senza
+/// dipendere da `std.Io`. `std.process.run` NON funziona dentro i plugin `.so`:
+/// l'`io` dell'host non attraversa il confine DynLib e la run si blocca. Questo
+/// helper libc-based è invece indipendente dal contesto e va bene nei plugin.
+pub fn runCapture(allocator: std.mem.Allocator, argv: []const []const u8) !RunResult {
+    if (argv.len == 0) return error.EmptyArgv;
+
+    // argv null-terminato costruito PRIMA della fork: nel figlio non si può
+    // allocare in sicurezza (processo multi-thread → solo funzioni async-signal-safe).
+    const argvZ = try allocator.allocSentinel(?[*:0]const u8, argv.len, null);
+    defer {
+        for (argvZ[0..argv.len]) |a| if (a) |p| allocator.free(std.mem.span(p));
+        allocator.free(argvZ);
+    }
+    for (argv, 0..) |a, i| argvZ[i] = (try allocator.dupeZ(u8, a)).ptr;
+
+    var fds: [2]c_int = undefined;
+    if (pipe(&fds) != 0) return error.PipeFailed;
+    const read_fd = fds[0];
+    const write_fd = fds[1];
+    defer _ = close(read_fd);
+
+    // file_actions: stdout del figlio → estremo di scrittura della pipe, e
+    // chiusura dell'estremo di lettura. Buffer sovradimensionato per l'opaco
+    // posix_spawn_file_actions_t (glibc ~80 byte).
+    var fa: [256]u8 align(16) = undefined;
+    if (posix_spawn_file_actions_init(&fa) != 0) {
+        _ = close(write_fd);
+        return error.SpawnInit;
+    }
+    defer _ = posix_spawn_file_actions_destroy(&fa);
+    _ = posix_spawn_file_actions_adddup2(&fa, write_fd, 1);
+    _ = posix_spawn_file_actions_addclose(&fa, read_fd);
+
+    var pid: c_int = 0;
+    const rc = posix_spawnp(&pid, argvZ[0].?, &fa, null, argvZ.ptr, environ);
+    _ = close(write_fd);
+    if (rc != 0) return if (rc == 2) error.CommandNotFound else error.SpawnFailed; // 2 = ENOENT
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var buf: [65536]u8 = undefined;
+    while (true) {
+        const n = read(read_fd, &buf, buf.len);
+        if (n <= 0) break;
+        try out.appendSlice(allocator, buf[0..@intCast(n)]);
+    }
+
+    var status: c_int = 0;
+    _ = waitpid(pid, &status, 0);
+    // WIFEXITED / WEXITSTATUS espansi a mano (glibc): byte basso = segnale.
+    const code: u8 = if ((status & 0x7f) == 0) @intCast((status >> 8) & 0xff) else 1;
+    return .{ .stdout = try out.toOwnedSlice(allocator), .exit_code = code };
+}
 
 /// Budget di dimensione file di default, proporzionale alla memoria disponibile:
 /// metà di MemAvailable (il file viene letto in RAM e il decoder vi alloca sopra).
