@@ -12,656 +12,7 @@
 const std = @import("std");
 const decoder = @import("decoder.zig");
 
-// ---------------------------------------------------------------------------
-// Binding Vulkan minimali
-// ---------------------------------------------------------------------------
-
-pub const VkResult = i32;
-pub const VK_SUCCESS: VkResult = 0;
-
-pub const VkInstance = ?*opaque {};
-pub const VkPhysicalDevice = ?*opaque {};
-pub const VkDevice = ?*opaque {};
-pub const VkQueue = ?*opaque {};
-pub const VkCommandBuffer = ?*opaque {};
-
-// Handle non-dispatchable: u64 su tutte le piattaforme.
-pub const VkBuffer = u64;
-pub const VkImage = u64;
-pub const VkImageView = u64;
-pub const VkDeviceMemory = u64;
-pub const VkShaderModule = u64;
-pub const VkPipelineLayout = u64;
-pub const VkRenderPass = u64;
-pub const VkFramebuffer = u64;
-pub const VkPipeline = u64;
-pub const VkCommandPool = u64;
-pub const VkFence = u64;
-pub const VK_NULL: u64 = 0;
-
-pub const VkStructureType = u32;
-const ST_APPLICATION_INFO: VkStructureType = 0;
-const ST_INSTANCE_CREATE_INFO: VkStructureType = 1;
-const ST_DEVICE_QUEUE_CREATE_INFO: VkStructureType = 2;
-const ST_DEVICE_CREATE_INFO: VkStructureType = 3;
-const ST_SUBMIT_INFO: VkStructureType = 4;
-const ST_MEMORY_ALLOCATE_INFO: VkStructureType = 5;
-const ST_FENCE_CREATE_INFO: VkStructureType = 8;
-const ST_BUFFER_CREATE_INFO: VkStructureType = 12;
-const ST_IMAGE_CREATE_INFO: VkStructureType = 14;
-const ST_IMAGE_VIEW_CREATE_INFO: VkStructureType = 15;
-const ST_SHADER_MODULE_CREATE_INFO: VkStructureType = 16;
-const ST_PIPELINE_SHADER_STAGE_CREATE_INFO: VkStructureType = 18;
-const ST_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO: VkStructureType = 19;
-const ST_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO: VkStructureType = 20;
-const ST_PIPELINE_VIEWPORT_STATE_CREATE_INFO: VkStructureType = 22;
-const ST_PIPELINE_RASTERIZATION_STATE_CREATE_INFO: VkStructureType = 23;
-const ST_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO: VkStructureType = 24;
-const ST_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO: VkStructureType = 25;
-const ST_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO: VkStructureType = 26;
-const ST_PIPELINE_DYNAMIC_STATE_CREATE_INFO: VkStructureType = 27;
-const ST_GRAPHICS_PIPELINE_CREATE_INFO: VkStructureType = 28;
-const ST_PIPELINE_LAYOUT_CREATE_INFO: VkStructureType = 30;
-const ST_FRAMEBUFFER_CREATE_INFO: VkStructureType = 37;
-const ST_RENDER_PASS_CREATE_INFO: VkStructureType = 38;
-const ST_COMMAND_POOL_CREATE_INFO: VkStructureType = 39;
-const ST_COMMAND_BUFFER_ALLOCATE_INFO: VkStructureType = 40;
-const ST_COMMAND_BUFFER_BEGIN_INFO: VkStructureType = 42;
-const ST_RENDER_PASS_BEGIN_INFO: VkStructureType = 43;
-const ST_BUFFER_MEMORY_BARRIER: VkStructureType = 44;
-const ST_IMAGE_MEMORY_BARRIER: VkStructureType = 45;
-// VK_EXT_external_memory_host (extension #179)
-const ST_IMPORT_MEMORY_HOST_POINTER_INFO_EXT: VkStructureType = 1000178000;
-const ST_MEMORY_HOST_POINTER_PROPERTIES_EXT: VkStructureType = 1000178001;
-
-pub const FORMAT_R8G8B8A8_UNORM: u32 = 37;
-pub const FORMAT_R8G8B8A8_SRGB: u32 = 43;
-pub const FORMAT_R32G32B32_SFLOAT: u32 = 106;
-pub const FORMAT_R32G32B32A32_SFLOAT: u32 = 109;
-pub const FORMAT_D32_SFLOAT: u32 = 126;
-
-const IMAGE_LAYOUT_UNDEFINED: u32 = 0;
-const IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL: u32 = 2;
-const IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL: u32 = 3;
-const IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL: u32 = 4;
-pub const IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL: u32 = 6;
-pub const IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL: u32 = 7;
-
-const EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT: u32 = 0x80;
-
-pub const VkExtent2D = extern struct { width: u32, height: u32 };
-pub const VkExtent3D = extern struct { width: u32, height: u32, depth: u32 };
-pub const VkOffset2D = extern struct { x: i32, y: i32 };
-pub const VkOffset3D = extern struct { x: i32, y: i32, z: i32 };
-pub const VkRect2D = extern struct { offset: VkOffset2D, extent: VkExtent2D };
-
-const VkApplicationInfo = extern struct {
-    sType: VkStructureType = ST_APPLICATION_INFO,
-    pNext: ?*const anyopaque = null,
-    pApplicationName: ?[*:0]const u8 = null,
-    applicationVersion: u32 = 0,
-    pEngineName: ?[*:0]const u8 = null,
-    engineVersion: u32 = 0,
-    apiVersion: u32 = 0,
-};
-
-const VkInstanceCreateInfo = extern struct {
-    sType: VkStructureType = ST_INSTANCE_CREATE_INFO,
-    pNext: ?*const anyopaque = null,
-    flags: u32 = 0,
-    pApplicationInfo: ?*const VkApplicationInfo = null,
-    enabledLayerCount: u32 = 0,
-    ppEnabledLayerNames: ?[*]const [*:0]const u8 = null,
-    enabledExtensionCount: u32 = 0,
-    ppEnabledExtensionNames: ?[*]const [*:0]const u8 = null,
-};
-
-const VkQueueFamilyProperties = extern struct {
-    queueFlags: u32,
-    queueCount: u32,
-    timestampValidBits: u32,
-    minImageTransferGranularity: VkExtent3D,
-};
-
-const VkExtensionProperties = extern struct {
-    extensionName: [256]u8,
-    specVersion: u32,
-};
-
-const VkDeviceQueueCreateInfo = extern struct {
-    sType: VkStructureType = ST_DEVICE_QUEUE_CREATE_INFO,
-    pNext: ?*const anyopaque = null,
-    flags: u32 = 0,
-    queueFamilyIndex: u32,
-    queueCount: u32 = 1,
-    pQueuePriorities: [*]const f32,
-};
-
-const VkDeviceCreateInfo = extern struct {
-    sType: VkStructureType = ST_DEVICE_CREATE_INFO,
-    pNext: ?*const anyopaque = null,
-    flags: u32 = 0,
-    queueCreateInfoCount: u32 = 1,
-    pQueueCreateInfos: *const VkDeviceQueueCreateInfo,
-    enabledLayerCount: u32 = 0,
-    ppEnabledLayerNames: ?[*]const [*:0]const u8 = null,
-    enabledExtensionCount: u32 = 0,
-    ppEnabledExtensionNames: ?[*]const [*:0]const u8 = null,
-    pEnabledFeatures: ?*const anyopaque = null,
-};
-
-const VkMemoryType = extern struct { propertyFlags: u32, heapIndex: u32 };
-const VkMemoryHeap = extern struct { size: u64, flags: u32 };
-const VkPhysicalDeviceMemoryProperties = extern struct {
-    memoryTypeCount: u32,
-    memoryTypes: [32]VkMemoryType,
-    memoryHeapCount: u32,
-    memoryHeaps: [16]VkMemoryHeap,
-};
-
-const VkMemoryRequirements = extern struct {
-    size: u64,
-    alignment: u64,
-    memoryTypeBits: u32,
-};
-
-const VkBufferCreateInfo = extern struct {
-    sType: VkStructureType = ST_BUFFER_CREATE_INFO,
-    pNext: ?*const anyopaque = null,
-    flags: u32 = 0,
-    size: u64,
-    usage: u32,
-    sharingMode: u32 = 0,
-    queueFamilyIndexCount: u32 = 0,
-    pQueueFamilyIndices: ?[*]const u32 = null,
-};
-
-const VkMemoryAllocateInfo = extern struct {
-    sType: VkStructureType = ST_MEMORY_ALLOCATE_INFO,
-    pNext: ?*const anyopaque = null,
-    allocationSize: u64,
-    memoryTypeIndex: u32,
-};
-
-const VkImportMemoryHostPointerInfoEXT = extern struct {
-    sType: VkStructureType = ST_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
-    pNext: ?*const anyopaque = null,
-    handleType: u32 = EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
-    pHostPointer: *anyopaque,
-};
-
-const VkMemoryHostPointerPropertiesEXT = extern struct {
-    sType: VkStructureType = ST_MEMORY_HOST_POINTER_PROPERTIES_EXT,
-    pNext: ?*anyopaque = null,
-    memoryTypeBits: u32 = 0,
-};
-
-// VK_KHR_external_memory (promossa in core 1.1, extension #73 → base 1000072000)
-const VkExternalMemoryBufferCreateInfo = extern struct {
-    sType: VkStructureType = 1000072000,
-    pNext: ?*const anyopaque = null,
-    handleTypes: u32 = EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
-};
-
-const VkImageCreateInfo = extern struct {
-    sType: VkStructureType = ST_IMAGE_CREATE_INFO,
-    pNext: ?*const anyopaque = null,
-    flags: u32 = 0,
-    imageType: u32 = 1, // 2D
-    format: u32,
-    extent: VkExtent3D,
-    mipLevels: u32 = 1,
-    arrayLayers: u32 = 1,
-    samples: u32 = 1,
-    tiling: u32 = 0, // OPTIMAL
-    usage: u32,
-    sharingMode: u32 = 0,
-    queueFamilyIndexCount: u32 = 0,
-    pQueueFamilyIndices: ?[*]const u32 = null,
-    initialLayout: u32 = IMAGE_LAYOUT_UNDEFINED,
-};
-
-const VkComponentMapping = extern struct { r: u32 = 0, g: u32 = 0, b: u32 = 0, a: u32 = 0 };
-pub const VkImageSubresourceRange = extern struct {
-    aspectMask: u32,
-    baseMipLevel: u32 = 0,
-    levelCount: u32 = 1,
-    baseArrayLayer: u32 = 0,
-    layerCount: u32 = 1,
-};
-
-const VkImageViewCreateInfo = extern struct {
-    sType: VkStructureType = ST_IMAGE_VIEW_CREATE_INFO,
-    pNext: ?*const anyopaque = null,
-    flags: u32 = 0,
-    image: VkImage,
-    viewType: u32 = 1, // 2D
-    format: u32,
-    components: VkComponentMapping = .{},
-    subresourceRange: VkImageSubresourceRange,
-};
-
-const VkShaderModuleCreateInfo = extern struct {
-    sType: VkStructureType = ST_SHADER_MODULE_CREATE_INFO,
-    pNext: ?*const anyopaque = null,
-    flags: u32 = 0,
-    codeSize: usize,
-    pCode: [*]const u32,
-};
-
-const VkPushConstantRange = extern struct { stageFlags: u32, offset: u32, size: u32 };
-
-const VkPipelineLayoutCreateInfo = extern struct {
-    sType: VkStructureType = ST_PIPELINE_LAYOUT_CREATE_INFO,
-    pNext: ?*const anyopaque = null,
-    flags: u32 = 0,
-    setLayoutCount: u32 = 0,
-    pSetLayouts: ?*const anyopaque = null,
-    pushConstantRangeCount: u32 = 0,
-    pPushConstantRanges: ?[*]const VkPushConstantRange = null,
-};
-
-const VkAttachmentDescription = extern struct {
-    flags: u32 = 0,
-    format: u32,
-    samples: u32 = 1,
-    loadOp: u32, // 0 load, 1 clear, 2 dont care
-    storeOp: u32, // 0 store, 1 dont care
-    stencilLoadOp: u32 = 2,
-    stencilStoreOp: u32 = 1,
-    initialLayout: u32,
-    finalLayout: u32,
-};
-
-const VkAttachmentReference = extern struct { attachment: u32, layout: u32 };
-
-const VkSubpassDescription = extern struct {
-    flags: u32 = 0,
-    pipelineBindPoint: u32 = 0, // GRAPHICS
-    inputAttachmentCount: u32 = 0,
-    pInputAttachments: ?*const anyopaque = null,
-    colorAttachmentCount: u32 = 1,
-    pColorAttachments: *const VkAttachmentReference,
-    pResolveAttachments: ?*const anyopaque = null,
-    pDepthStencilAttachment: ?*const VkAttachmentReference = null,
-    preserveAttachmentCount: u32 = 0,
-    pPreserveAttachments: ?*const anyopaque = null,
-};
-
-const VkSubpassDependency = extern struct {
-    srcSubpass: u32,
-    dstSubpass: u32,
-    srcStageMask: u32,
-    dstStageMask: u32,
-    srcAccessMask: u32,
-    dstAccessMask: u32,
-    dependencyFlags: u32 = 0,
-};
-
-const VkRenderPassCreateInfo = extern struct {
-    sType: VkStructureType = ST_RENDER_PASS_CREATE_INFO,
-    pNext: ?*const anyopaque = null,
-    flags: u32 = 0,
-    attachmentCount: u32,
-    pAttachments: [*]const VkAttachmentDescription,
-    subpassCount: u32 = 1,
-    pSubpasses: *const VkSubpassDescription,
-    dependencyCount: u32,
-    pDependencies: [*]const VkSubpassDependency,
-};
-
-const VkFramebufferCreateInfo = extern struct {
-    sType: VkStructureType = ST_FRAMEBUFFER_CREATE_INFO,
-    pNext: ?*const anyopaque = null,
-    flags: u32 = 0,
-    renderPass: VkRenderPass,
-    attachmentCount: u32,
-    pAttachments: [*]const VkImageView,
-    width: u32,
-    height: u32,
-    layers: u32 = 1,
-};
-
-const VkPipelineShaderStageCreateInfo = extern struct {
-    sType: VkStructureType = ST_PIPELINE_SHADER_STAGE_CREATE_INFO,
-    pNext: ?*const anyopaque = null,
-    flags: u32 = 0,
-    stage: u32,
-    module: VkShaderModule,
-    pName: [*:0]const u8 = "main",
-    pSpecializationInfo: ?*const anyopaque = null,
-};
-
-const VkVertexInputBindingDescription = extern struct { binding: u32, stride: u32, inputRate: u32 = 0 };
-const VkVertexInputAttributeDescription = extern struct { location: u32, binding: u32, format: u32, offset: u32 };
-
-const VkPipelineVertexInputStateCreateInfo = extern struct {
-    sType: VkStructureType = ST_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-    pNext: ?*const anyopaque = null,
-    flags: u32 = 0,
-    vertexBindingDescriptionCount: u32,
-    pVertexBindingDescriptions: [*]const VkVertexInputBindingDescription,
-    vertexAttributeDescriptionCount: u32,
-    pVertexAttributeDescriptions: [*]const VkVertexInputAttributeDescription,
-};
-
-const VkPipelineInputAssemblyStateCreateInfo = extern struct {
-    sType: VkStructureType = ST_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-    pNext: ?*const anyopaque = null,
-    flags: u32 = 0,
-    topology: u32 = 3, // TRIANGLE_LIST
-    primitiveRestartEnable: u32 = 0,
-};
-
-const VkPipelineViewportStateCreateInfo = extern struct {
-    sType: VkStructureType = ST_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-    pNext: ?*const anyopaque = null,
-    flags: u32 = 0,
-    viewportCount: u32 = 1,
-    pViewports: ?*const anyopaque = null, // dinamico
-    scissorCount: u32 = 1,
-    pScissors: ?*const anyopaque = null, // dinamico
-};
-
-const VkPipelineRasterizationStateCreateInfo = extern struct {
-    sType: VkStructureType = ST_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-    pNext: ?*const anyopaque = null,
-    flags: u32 = 0,
-    depthClampEnable: u32 = 0,
-    rasterizerDiscardEnable: u32 = 0,
-    polygonMode: u32 = 0, // FILL
-    cullMode: u32 = 0, // NONE: winding OBJ non affidabile
-    frontFace: u32 = 0,
-    depthBiasEnable: u32 = 0,
-    depthBiasConstantFactor: f32 = 0,
-    depthBiasClamp: f32 = 0,
-    depthBiasSlopeFactor: f32 = 0,
-    lineWidth: f32 = 1.0,
-};
-
-const VkPipelineMultisampleStateCreateInfo = extern struct {
-    sType: VkStructureType = ST_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-    pNext: ?*const anyopaque = null,
-    flags: u32 = 0,
-    rasterizationSamples: u32 = 1,
-    sampleShadingEnable: u32 = 0,
-    minSampleShading: f32 = 0,
-    pSampleMask: ?*const anyopaque = null,
-    alphaToCoverageEnable: u32 = 0,
-    alphaToOneEnable: u32 = 0,
-};
-
-const VkStencilOpState = extern struct {
-    failOp: u32 = 0,
-    passOp: u32 = 0,
-    depthFailOp: u32 = 0,
-    compareOp: u32 = 0,
-    compareMask: u32 = 0,
-    writeMask: u32 = 0,
-    reference: u32 = 0,
-};
-
-const VkPipelineDepthStencilStateCreateInfo = extern struct {
-    sType: VkStructureType = ST_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
-    pNext: ?*const anyopaque = null,
-    flags: u32 = 0,
-    depthTestEnable: u32 = 1,
-    depthWriteEnable: u32 = 1,
-    depthCompareOp: u32 = 1, // LESS
-    depthBoundsTestEnable: u32 = 0,
-    stencilTestEnable: u32 = 0,
-    front: VkStencilOpState = .{},
-    back: VkStencilOpState = .{},
-    minDepthBounds: f32 = 0,
-    maxDepthBounds: f32 = 1,
-};
-
-const VkPipelineColorBlendAttachmentState = extern struct {
-    blendEnable: u32 = 0,
-    srcColorBlendFactor: u32 = 0,
-    dstColorBlendFactor: u32 = 0,
-    colorBlendOp: u32 = 0,
-    srcAlphaBlendFactor: u32 = 0,
-    dstAlphaBlendFactor: u32 = 0,
-    alphaBlendOp: u32 = 0,
-    colorWriteMask: u32 = 0xF,
-};
-
-const VkPipelineColorBlendStateCreateInfo = extern struct {
-    sType: VkStructureType = ST_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-    pNext: ?*const anyopaque = null,
-    flags: u32 = 0,
-    logicOpEnable: u32 = 0,
-    logicOp: u32 = 0,
-    attachmentCount: u32 = 1,
-    pAttachments: *const VkPipelineColorBlendAttachmentState,
-    blendConstants: [4]f32 = .{ 0, 0, 0, 0 },
-};
-
-const VkPipelineDynamicStateCreateInfo = extern struct {
-    sType: VkStructureType = ST_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-    pNext: ?*const anyopaque = null,
-    flags: u32 = 0,
-    dynamicStateCount: u32,
-    pDynamicStates: [*]const u32,
-};
-
-const VkGraphicsPipelineCreateInfo = extern struct {
-    sType: VkStructureType = ST_GRAPHICS_PIPELINE_CREATE_INFO,
-    pNext: ?*const anyopaque = null,
-    flags: u32 = 0,
-    stageCount: u32 = 2,
-    pStages: [*]const VkPipelineShaderStageCreateInfo,
-    pVertexInputState: *const VkPipelineVertexInputStateCreateInfo,
-    pInputAssemblyState: *const VkPipelineInputAssemblyStateCreateInfo,
-    pTessellationState: ?*const anyopaque = null,
-    pViewportState: *const VkPipelineViewportStateCreateInfo,
-    pRasterizationState: *const VkPipelineRasterizationStateCreateInfo,
-    pMultisampleState: *const VkPipelineMultisampleStateCreateInfo,
-    pDepthStencilState: *const VkPipelineDepthStencilStateCreateInfo,
-    pColorBlendState: *const VkPipelineColorBlendStateCreateInfo,
-    pDynamicState: *const VkPipelineDynamicStateCreateInfo,
-    layout: VkPipelineLayout,
-    renderPass: VkRenderPass,
-    subpass: u32 = 0,
-    basePipelineHandle: VkPipeline = VK_NULL,
-    basePipelineIndex: i32 = -1,
-};
-
-const VkCommandPoolCreateInfo = extern struct {
-    sType: VkStructureType = ST_COMMAND_POOL_CREATE_INFO,
-    pNext: ?*const anyopaque = null,
-    flags: u32 = 2, // RESET_COMMAND_BUFFER
-    queueFamilyIndex: u32,
-};
-
-const VkCommandBufferAllocateInfo = extern struct {
-    sType: VkStructureType = ST_COMMAND_BUFFER_ALLOCATE_INFO,
-    pNext: ?*const anyopaque = null,
-    commandPool: VkCommandPool,
-    level: u32 = 0, // PRIMARY
-    commandBufferCount: u32 = 1,
-};
-
-const VkCommandBufferBeginInfo = extern struct {
-    sType: VkStructureType = ST_COMMAND_BUFFER_BEGIN_INFO,
-    pNext: ?*const anyopaque = null,
-    flags: u32 = 1, // ONE_TIME_SUBMIT
-    pInheritanceInfo: ?*const anyopaque = null,
-};
-
-pub const VkClearValue = extern union {
-    color: [4]f32,
-    depth_stencil: extern struct { depth: f32, stencil: u32 },
-};
-
-const VkRenderPassBeginInfo = extern struct {
-    sType: VkStructureType = ST_RENDER_PASS_BEGIN_INFO,
-    pNext: ?*const anyopaque = null,
-    renderPass: VkRenderPass,
-    framebuffer: VkFramebuffer,
-    renderArea: VkRect2D,
-    clearValueCount: u32,
-    pClearValues: [*]const VkClearValue,
-};
-
-pub const VkViewport = extern struct { x: f32, y: f32, width: f32, height: f32, minDepth: f32 = 0, maxDepth: f32 = 1 };
-
-pub const VkImageSubresourceLayers = extern struct {
-    aspectMask: u32,
-    mipLevel: u32 = 0,
-    baseArrayLayer: u32 = 0,
-    layerCount: u32 = 1,
-};
-
-const VkBufferImageCopy = extern struct {
-    bufferOffset: u64 = 0,
-    bufferRowLength: u32 = 0,
-    bufferImageHeight: u32 = 0,
-    imageSubresource: VkImageSubresourceLayers,
-    imageOffset: VkOffset3D = .{ .x = 0, .y = 0, .z = 0 },
-    imageExtent: VkExtent3D,
-};
-
-const VkBufferMemoryBarrier = extern struct {
-    sType: VkStructureType = ST_BUFFER_MEMORY_BARRIER,
-    pNext: ?*const anyopaque = null,
-    srcAccessMask: u32,
-    dstAccessMask: u32,
-    srcQueueFamilyIndex: u32 = 0xFFFFFFFF, // IGNORED
-    dstQueueFamilyIndex: u32 = 0xFFFFFFFF,
-    buffer: VkBuffer,
-    offset: u64 = 0,
-    size: u64,
-};
-
-pub const VkImageMemoryBarrier = extern struct {
-    sType: VkStructureType = ST_IMAGE_MEMORY_BARRIER,
-    pNext: ?*const anyopaque = null,
-    srcAccessMask: u32,
-    dstAccessMask: u32,
-    oldLayout: u32,
-    newLayout: u32,
-    srcQueueFamilyIndex: u32 = 0xFFFFFFFF,
-    dstQueueFamilyIndex: u32 = 0xFFFFFFFF,
-    image: VkImage,
-    subresourceRange: VkImageSubresourceRange,
-};
-
-const VkFenceCreateInfo = extern struct {
-    sType: VkStructureType = ST_FENCE_CREATE_INFO,
-    pNext: ?*const anyopaque = null,
-    flags: u32 = 0,
-};
-
-pub const VkSubmitInfo = extern struct {
-    sType: VkStructureType = ST_SUBMIT_INFO,
-    pNext: ?*const anyopaque = null,
-    waitSemaphoreCount: u32 = 0,
-    pWaitSemaphores: ?[*]const u64 = null,
-    pWaitDstStageMask: ?[*]const u32 = null,
-    commandBufferCount: u32 = 1,
-    pCommandBuffers: [*]const VkCommandBuffer,
-    signalSemaphoreCount: u32 = 0,
-    pSignalSemaphores: ?[*]const u64 = null,
-};
-
-// Flag usati
-const BUFFER_USAGE_TRANSFER_SRC: u32 = 0x1;
-const BUFFER_USAGE_TRANSFER_DST: u32 = 0x2;
-const BUFFER_USAGE_INDEX: u32 = 0x40;
-const BUFFER_USAGE_VERTEX: u32 = 0x80;
-const MEM_DEVICE_LOCAL: u32 = 1;
-const MEM_HOST_VISIBLE: u32 = 2;
-const MEM_HOST_COHERENT: u32 = 4;
-const IMAGE_USAGE_TRANSFER_SRC: u32 = 0x1;
-const IMAGE_USAGE_TRANSFER_DST: u32 = 0x2;
-const IMAGE_USAGE_COLOR_ATTACHMENT: u32 = 0x10;
-const IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT: u32 = 0x20;
-pub const ASPECT_COLOR: u32 = 1;
-const ASPECT_DEPTH: u32 = 2;
-const QUEUE_GRAPHICS: u32 = 1;
-const SHADER_STAGE_VERTEX: u32 = 1;
-const SHADER_STAGE_FRAGMENT: u32 = 0x10;
-pub const STAGE_TOP: u32 = 0x1;
-const STAGE_COLOR_ATTACHMENT_OUTPUT: u32 = 0x400;
-const STAGE_EARLY_FRAGMENT_TESTS: u32 = 0x100;
-const STAGE_LATE_FRAGMENT_TESTS: u32 = 0x200;
-pub const STAGE_TRANSFER: u32 = 0x1000;
-const STAGE_HOST: u32 = 0x4000;
-const ACCESS_COLOR_WRITE: u32 = 0x100;
-const ACCESS_DEPTH_WRITE: u32 = 0x400;
-pub const ACCESS_TRANSFER_READ: u32 = 0x800;
-pub const ACCESS_TRANSFER_WRITE: u32 = 0x1000;
-const ACCESS_HOST_READ: u32 = 0x2000;
-const SUBPASS_EXTERNAL: u32 = 0xFFFFFFFF;
-
-pub extern "vulkan" fn vkCreateInstance(*const VkInstanceCreateInfo, ?*const anyopaque, *VkInstance) VkResult;
-pub extern "vulkan" fn vkDestroyInstance(VkInstance, ?*const anyopaque) void;
-pub extern "vulkan" fn vkEnumeratePhysicalDevices(VkInstance, *u32, ?[*]VkPhysicalDevice) VkResult;
-extern "vulkan" fn vkGetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice, *u32, ?[*]VkQueueFamilyProperties) void;
-extern "vulkan" fn vkGetPhysicalDeviceMemoryProperties(VkPhysicalDevice, *VkPhysicalDeviceMemoryProperties) void;
-extern "vulkan" fn vkEnumerateDeviceExtensionProperties(VkPhysicalDevice, ?[*:0]const u8, *u32, ?[*]VkExtensionProperties) VkResult;
-extern "vulkan" fn vkCreateDevice(VkPhysicalDevice, *const VkDeviceCreateInfo, ?*const anyopaque, *VkDevice) VkResult;
-pub extern "vulkan" fn vkDestroyDevice(VkDevice, ?*const anyopaque) void;
-extern "vulkan" fn vkGetDeviceQueue(VkDevice, u32, u32, *VkQueue) void;
-extern "vulkan" fn vkGetDeviceProcAddr(VkDevice, [*:0]const u8) ?*const fn () callconv(.c) void;
-extern "vulkan" fn vkCreateBuffer(VkDevice, *const VkBufferCreateInfo, ?*const anyopaque, *VkBuffer) VkResult;
-extern "vulkan" fn vkDestroyBuffer(VkDevice, VkBuffer, ?*const anyopaque) void;
-extern "vulkan" fn vkGetBufferMemoryRequirements(VkDevice, VkBuffer, *VkMemoryRequirements) void;
-extern "vulkan" fn vkAllocateMemory(VkDevice, *const VkMemoryAllocateInfo, ?*const anyopaque, *VkDeviceMemory) VkResult;
-extern "vulkan" fn vkFreeMemory(VkDevice, VkDeviceMemory, ?*const anyopaque) void;
-extern "vulkan" fn vkBindBufferMemory(VkDevice, VkBuffer, VkDeviceMemory, u64) VkResult;
-extern "vulkan" fn vkMapMemory(VkDevice, VkDeviceMemory, u64, u64, u32, **anyopaque) VkResult;
-extern "vulkan" fn vkCreateImage(VkDevice, *const VkImageCreateInfo, ?*const anyopaque, *VkImage) VkResult;
-extern "vulkan" fn vkDestroyImage(VkDevice, VkImage, ?*const anyopaque) void;
-extern "vulkan" fn vkGetImageMemoryRequirements(VkDevice, VkImage, *VkMemoryRequirements) void;
-extern "vulkan" fn vkBindImageMemory(VkDevice, VkImage, VkDeviceMemory, u64) VkResult;
-extern "vulkan" fn vkCreateImageView(VkDevice, *const VkImageViewCreateInfo, ?*const anyopaque, *VkImageView) VkResult;
-extern "vulkan" fn vkDestroyImageView(VkDevice, VkImageView, ?*const anyopaque) void;
-extern "vulkan" fn vkCreateShaderModule(VkDevice, *const VkShaderModuleCreateInfo, ?*const anyopaque, *VkShaderModule) VkResult;
-extern "vulkan" fn vkDestroyShaderModule(VkDevice, VkShaderModule, ?*const anyopaque) void;
-extern "vulkan" fn vkCreatePipelineLayout(VkDevice, *const VkPipelineLayoutCreateInfo, ?*const anyopaque, *VkPipelineLayout) VkResult;
-extern "vulkan" fn vkDestroyPipelineLayout(VkDevice, VkPipelineLayout, ?*const anyopaque) void;
-extern "vulkan" fn vkCreateRenderPass(VkDevice, *const VkRenderPassCreateInfo, ?*const anyopaque, *VkRenderPass) VkResult;
-extern "vulkan" fn vkDestroyRenderPass(VkDevice, VkRenderPass, ?*const anyopaque) void;
-extern "vulkan" fn vkCreateFramebuffer(VkDevice, *const VkFramebufferCreateInfo, ?*const anyopaque, *VkFramebuffer) VkResult;
-extern "vulkan" fn vkDestroyFramebuffer(VkDevice, VkFramebuffer, ?*const anyopaque) void;
-extern "vulkan" fn vkCreateGraphicsPipelines(VkDevice, u64, u32, [*]const VkGraphicsPipelineCreateInfo, ?*const anyopaque, [*]VkPipeline) VkResult;
-extern "vulkan" fn vkDestroyPipeline(VkDevice, VkPipeline, ?*const anyopaque) void;
-extern "vulkan" fn vkCreateCommandPool(VkDevice, *const VkCommandPoolCreateInfo, ?*const anyopaque, *VkCommandPool) VkResult;
-extern "vulkan" fn vkDestroyCommandPool(VkDevice, VkCommandPool, ?*const anyopaque) void;
-extern "vulkan" fn vkAllocateCommandBuffers(VkDevice, *const VkCommandBufferAllocateInfo, [*]VkCommandBuffer) VkResult;
-extern "vulkan" fn vkBeginCommandBuffer(VkCommandBuffer, *const VkCommandBufferBeginInfo) VkResult;
-extern "vulkan" fn vkEndCommandBuffer(VkCommandBuffer) VkResult;
-extern "vulkan" fn vkCmdBeginRenderPass(VkCommandBuffer, *const VkRenderPassBeginInfo, u32) void;
-extern "vulkan" fn vkCmdEndRenderPass(VkCommandBuffer) void;
-extern "vulkan" fn vkCmdBindPipeline(VkCommandBuffer, u32, VkPipeline) void;
-extern "vulkan" fn vkCmdSetViewport(VkCommandBuffer, u32, u32, [*]const VkViewport) void;
-extern "vulkan" fn vkCmdSetScissor(VkCommandBuffer, u32, u32, [*]const VkRect2D) void;
-extern "vulkan" fn vkCmdBindVertexBuffers(VkCommandBuffer, u32, u32, [*]const VkBuffer, [*]const u64) void;
-extern "vulkan" fn vkCmdBindIndexBuffer(VkCommandBuffer, VkBuffer, u64, u32) void;
-extern "vulkan" fn vkCmdPushConstants(VkCommandBuffer, VkPipelineLayout, u32, u32, u32, *const anyopaque) void;
-extern "vulkan" fn vkCmdDrawIndexed(VkCommandBuffer, u32, u32, u32, i32, u32) void;
-extern "vulkan" fn vkCmdCopyImageToBuffer(VkCommandBuffer, VkImage, u32, VkBuffer, u32, [*]const VkBufferImageCopy) void;
-extern "vulkan" fn vkCmdCopyBufferToImage(VkCommandBuffer, VkBuffer, VkImage, u32, u32, [*]const VkBufferImageCopy) void;
-pub extern "vulkan" fn vkCmdPipelineBarrier(VkCommandBuffer, u32, u32, u32, u32, ?*const anyopaque, u32, ?[*]const VkBufferMemoryBarrier, u32, ?[*]const VkImageMemoryBarrier) void;
-extern "vulkan" fn vkCreateFence(VkDevice, *const VkFenceCreateInfo, ?*const anyopaque, *VkFence) VkResult;
-extern "vulkan" fn vkDestroyFence(VkDevice, VkFence, ?*const anyopaque) void;
-extern "vulkan" fn vkResetFences(VkDevice, u32, [*]const VkFence) VkResult;
-extern "vulkan" fn vkWaitForFences(VkDevice, u32, [*]const VkFence, u32, u64) VkResult;
-pub extern "vulkan" fn vkQueueSubmit(VkQueue, u32, [*]const VkSubmitInfo, VkFence) VkResult;
-pub extern "vulkan" fn vkDeviceWaitIdle(VkDevice) VkResult;
-
-const PfnGetMemoryHostPointerProperties = *const fn (VkDevice, u32, *const anyopaque, *VkMemoryHostPointerPropertiesEXT) callconv(.c) VkResult;
-
-fn check(r: VkResult) !void {
-    if (r != VK_SUCCESS) return error.VulkanError;
-}
-
-// ---------------------------------------------------------------------------
-// Renderer
-// ---------------------------------------------------------------------------
+const vk = @import("renderer/vk.zig");
 
 const vert_spv = @embedFile("mesh_vert_spv");
 const frag_spv = @embedFile("mesh_frag_spv");
@@ -670,158 +21,282 @@ const shadow_frag_spv = @embedFile("shadow_frag_spv");
 const voxel_vert_spv = @embedFile("voxel_vert_spv");
 const voxel_frag_spv = @embedFile("voxel_frag_spv");
 
-/// Risoluzione della shadow map (depth della key light).
-const SHADOW_SIZE: u32 = 1024;
+pub const SHADOW_SIZE: u32 = 1024;
 
 pub const PushConstants = extern struct {
     mvp: [16]f32,
-    // Righe della sola rotazione oggetto→camera: trasformano le normali senza
-    // la scala non-uniforme della MVP. I `w` trasportano i fattori materiale.
-    nrm0: [4]f32, // xyz = riga 0; w = roughness
-    nrm1: [4]f32, // xyz = riga 1; w = metallic
-    nrm2: [4]f32, // xyz = riga 2; w inutilizzato
-    material: [4]f32, // rgb = baseColor factor; a = alpha
-    // Ombre: proiezione oggetto→clip della luce (per il lookup nella shadow map)
-    // e direzione della key light in spazio camera (illuminazione coerente con
-    // le ombre). 208 byte totali (device qui: maxPushConstantsSize = 256).
+    nrm0: [4]f32,
+    nrm1: [4]f32,
+    nrm2: [4]f32,
+    material: [4]f32,
     light_vp: [16]f32,
     light_dir_cam: [4]f32,
 };
 
-/// Push constant della shadow pass: solo la proiezione oggetto→clip della luce.
 pub const ShadowPush = extern struct {
     light_vp: [16]f32,
 };
 
-/// Push constant del ray-march voxel (96 byte). Raggio ortografico ricostruito
-/// da origine + right·ndc.x + up·ndc.y, marciato lungo `dir` in spazio griglia.
 pub const VoxelPush = extern struct {
-    origin: [4]f32, // origine raggio (spazio griglia [0,1])
-    right: [4]f32, // × ndc.x
-    up: [4]f32, // × ndc.y
-    dir: [4]f32, // direzione di marcia (spazio griglia)
-    light_g: [4]f32, // dir verso la luce (spazio griglia, raggio d'ombra)
-    light_obj: [4]f32, // xyz = dir luce oggetto (N·L); w = dim
+    origin: [4]f32,
+    right: [4]f32,
+    up: [4]f32,
+    dir: [4]f32,
+    light_g: [4]f32,
+    light_obj: [4]f32,
 };
 
 pub const InitOptions = struct {
-    /// Extension di instance aggiuntive (es. surface per zuer-gui).
     instance_extensions: []const [*:0]const u8 = &.{},
-    /// Extension di device aggiuntive (es. VK_KHR_swapchain).
     device_extensions: []const [*:0]const u8 = &.{},
 };
 
-// ---------------------------------------------------------------------------
-// Binding aggiuntivi per la pipeline testo (atlante glifi campionabile).
-// ---------------------------------------------------------------------------
-
-const ST_SAMPLER_CREATE_INFO: VkStructureType = 31;
-const ST_DESCRIPTOR_SET_LAYOUT_CREATE_INFO: VkStructureType = 32;
-const ST_DESCRIPTOR_POOL_CREATE_INFO: VkStructureType = 33;
-const ST_DESCRIPTOR_SET_ALLOCATE_INFO: VkStructureType = 34;
-const ST_WRITE_DESCRIPTOR_SET: VkStructureType = 35;
-
-const FORMAT_R8_UNORM: u32 = 9;
-const FORMAT_R32G32_SFLOAT: u32 = 103;
-const IMAGE_USAGE_SAMPLED: u32 = 0x4;
-const IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL: u32 = 5;
-const DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: u32 = 1;
-const BLEND_FACTOR_SRC_ALPHA: u32 = 6;
-const BLEND_FACTOR_ONE_MINUS_SRC_ALPHA: u32 = 7;
-const ACCESS_SHADER_READ: u32 = 0x20;
-const STAGE_FRAGMENT_SHADER: u32 = 0x80;
-const COLOR_WRITE_RGB: u32 = 0x7;
-
-const VkSampler = u64;
-const VkDescriptorSetLayout = u64;
-const VkDescriptorPool = u64;
-const VkDescriptorSet = u64;
-
-const VkSamplerCreateInfo = extern struct {
-    sType: VkStructureType = ST_SAMPLER_CREATE_INFO,
-    pNext: ?*const anyopaque = null,
-    flags: u32 = 0,
-    magFilter: u32 = 1, // LINEAR
-    minFilter: u32 = 1,
-    mipmapMode: u32 = 0, // NEAREST
-    addressModeU: u32 = 2, // CLAMP_TO_EDGE
-    addressModeV: u32 = 2,
-    addressModeW: u32 = 2,
-    mipLodBias: f32 = 0,
-    anisotropyEnable: u32 = 0,
-    maxAnisotropy: f32 = 1,
-    compareEnable: u32 = 0,
-    compareOp: u32 = 0,
-    minLod: f32 = 0,
-    maxLod: f32 = 0,
-    borderColor: u32 = 0,
-    unnormalizedCoordinates: u32 = 0,
-};
-
-const VkDescriptorSetLayoutBinding = extern struct {
-    binding: u32,
-    descriptorType: u32,
-    descriptorCount: u32,
-    stageFlags: u32,
-    pImmutableSamplers: ?*const anyopaque = null,
-};
-
-const VkDescriptorSetLayoutCreateInfo = extern struct {
-    sType: VkStructureType = ST_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-    pNext: ?*const anyopaque = null,
-    flags: u32 = 0,
-    bindingCount: u32,
-    pBindings: [*]const VkDescriptorSetLayoutBinding,
-};
-
-const VkDescriptorPoolSize = extern struct { type: u32, descriptorCount: u32 };
-
-const VkDescriptorPoolCreateInfo = extern struct {
-    sType: VkStructureType = ST_DESCRIPTOR_POOL_CREATE_INFO,
-    pNext: ?*const anyopaque = null,
-    flags: u32 = 0,
-    maxSets: u32,
-    poolSizeCount: u32,
-    pPoolSizes: [*]const VkDescriptorPoolSize,
-};
-
-const VkDescriptorSetAllocateInfo = extern struct {
-    sType: VkStructureType = ST_DESCRIPTOR_SET_ALLOCATE_INFO,
-    pNext: ?*const anyopaque = null,
-    descriptorPool: VkDescriptorPool,
-    descriptorSetCount: u32 = 1,
-    pSetLayouts: [*]const VkDescriptorSetLayout,
-};
-
-const VkDescriptorImageInfo = extern struct {
-    sampler: VkSampler,
-    imageView: VkImageView,
-    imageLayout: u32,
-};
-
-const VkWriteDescriptorSet = extern struct {
-    sType: VkStructureType = ST_WRITE_DESCRIPTOR_SET,
-    pNext: ?*const anyopaque = null,
-    dstSet: VkDescriptorSet,
-    dstBinding: u32,
-    dstArrayElement: u32 = 0,
-    descriptorCount: u32 = 1,
-    descriptorType: u32,
-    pImageInfo: ?*const VkDescriptorImageInfo = null,
-    pBufferInfo: ?*const anyopaque = null,
-    pTexelBufferView: ?*const anyopaque = null,
-};
-
-extern "vulkan" fn vkCreateSampler(VkDevice, *const VkSamplerCreateInfo, ?*const anyopaque, *VkSampler) VkResult;
-extern "vulkan" fn vkDestroySampler(VkDevice, VkSampler, ?*const anyopaque) void;
-extern "vulkan" fn vkCreateDescriptorSetLayout(VkDevice, *const VkDescriptorSetLayoutCreateInfo, ?*const anyopaque, *VkDescriptorSetLayout) VkResult;
-extern "vulkan" fn vkDestroyDescriptorSetLayout(VkDevice, VkDescriptorSetLayout, ?*const anyopaque) void;
-extern "vulkan" fn vkCreateDescriptorPool(VkDevice, *const VkDescriptorPoolCreateInfo, ?*const anyopaque, *VkDescriptorPool) VkResult;
-extern "vulkan" fn vkDestroyDescriptorPool(VkDevice, VkDescriptorPool, ?*const anyopaque) void;
-extern "vulkan" fn vkAllocateDescriptorSets(VkDevice, *const VkDescriptorSetAllocateInfo, *VkDescriptorSet) VkResult;
-extern "vulkan" fn vkUpdateDescriptorSets(VkDevice, u32, [*]const VkWriteDescriptorSet, u32, ?*const anyopaque) void;
-extern "vulkan" fn vkCmdBindDescriptorSets(VkCommandBuffer, u32, VkPipelineLayout, u32, u32, [*]const VkDescriptorSet, u32, ?*const u32) void;
-extern "vulkan" fn vkCmdDraw(VkCommandBuffer, u32, u32, u32, u32) void;
+const ACCESS_COLOR_WRITE = vk.ACCESS_COLOR_WRITE;
+const ACCESS_DEPTH_WRITE = vk.ACCESS_DEPTH_WRITE;
+const ACCESS_HOST_READ = vk.ACCESS_HOST_READ;
+const ACCESS_SHADER_READ = vk.ACCESS_SHADER_READ;
+const ACCESS_TRANSFER_READ = vk.ACCESS_TRANSFER_READ;
+const ACCESS_TRANSFER_WRITE = vk.ACCESS_TRANSFER_WRITE;
+const ASPECT_COLOR = vk.ASPECT_COLOR;
+const ASPECT_DEPTH = vk.ASPECT_DEPTH;
+const BLEND_FACTOR_ONE_MINUS_SRC_ALPHA = vk.BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+const BLEND_FACTOR_SRC_ALPHA = vk.BLEND_FACTOR_SRC_ALPHA;
+const BUFFER_USAGE_INDEX = vk.BUFFER_USAGE_INDEX;
+const BUFFER_USAGE_TRANSFER_DST = vk.BUFFER_USAGE_TRANSFER_DST;
+const BUFFER_USAGE_TRANSFER_SRC = vk.BUFFER_USAGE_TRANSFER_SRC;
+const BUFFER_USAGE_VERTEX = vk.BUFFER_USAGE_VERTEX;
+const COLOR_WRITE_RGB = vk.COLOR_WRITE_RGB;
+const DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER = vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+const EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT = vk.EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+const FORMAT_D32_SFLOAT = vk.FORMAT_D32_SFLOAT;
+const FORMAT_R32G32B32A32_SFLOAT = vk.FORMAT_R32G32B32A32_SFLOAT;
+const FORMAT_R32G32B32_SFLOAT = vk.FORMAT_R32G32B32_SFLOAT;
+const FORMAT_R32G32_SFLOAT = vk.FORMAT_R32G32_SFLOAT;
+const FORMAT_R8G8B8A8_SRGB = vk.FORMAT_R8G8B8A8_SRGB;
+const FORMAT_R8G8B8A8_UNORM = vk.FORMAT_R8G8B8A8_UNORM;
+const FORMAT_R8_UNORM = vk.FORMAT_R8_UNORM;
+const IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL = vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+const IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL = vk.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+const IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL = vk.IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+const IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL = vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+const IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL = vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+const IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL = vk.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+const IMAGE_LAYOUT_UNDEFINED = vk.IMAGE_LAYOUT_UNDEFINED;
+const IMAGE_USAGE_COLOR_ATTACHMENT = vk.IMAGE_USAGE_COLOR_ATTACHMENT;
+const IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT = vk.IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT;
+const IMAGE_USAGE_SAMPLED = vk.IMAGE_USAGE_SAMPLED;
+const IMAGE_USAGE_TRANSFER_DST = vk.IMAGE_USAGE_TRANSFER_DST;
+const IMAGE_USAGE_TRANSFER_SRC = vk.IMAGE_USAGE_TRANSFER_SRC;
+const MEM_DEVICE_LOCAL = vk.MEM_DEVICE_LOCAL;
+const MEM_HOST_COHERENT = vk.MEM_HOST_COHERENT;
+const MEM_HOST_VISIBLE = vk.MEM_HOST_VISIBLE;
+const PfnGetMemoryHostPointerProperties = vk.PfnGetMemoryHostPointerProperties;
+const QUEUE_GRAPHICS = vk.QUEUE_GRAPHICS;
+const SHADER_STAGE_FRAGMENT = vk.SHADER_STAGE_FRAGMENT;
+const SHADER_STAGE_VERTEX = vk.SHADER_STAGE_VERTEX;
+const STAGE_COLOR_ATTACHMENT_OUTPUT = vk.STAGE_COLOR_ATTACHMENT_OUTPUT;
+const STAGE_EARLY_FRAGMENT_TESTS = vk.STAGE_EARLY_FRAGMENT_TESTS;
+const STAGE_FRAGMENT_SHADER = vk.STAGE_FRAGMENT_SHADER;
+const STAGE_HOST = vk.STAGE_HOST;
+const STAGE_LATE_FRAGMENT_TESTS = vk.STAGE_LATE_FRAGMENT_TESTS;
+const STAGE_TOP = vk.STAGE_TOP;
+const STAGE_TRANSFER = vk.STAGE_TRANSFER;
+const ST_APPLICATION_INFO = vk.ST_APPLICATION_INFO;
+const ST_BUFFER_CREATE_INFO = vk.ST_BUFFER_CREATE_INFO;
+const ST_BUFFER_MEMORY_BARRIER = vk.ST_BUFFER_MEMORY_BARRIER;
+const ST_COMMAND_BUFFER_ALLOCATE_INFO = vk.ST_COMMAND_BUFFER_ALLOCATE_INFO;
+const ST_COMMAND_BUFFER_BEGIN_INFO = vk.ST_COMMAND_BUFFER_BEGIN_INFO;
+const ST_COMMAND_POOL_CREATE_INFO = vk.ST_COMMAND_POOL_CREATE_INFO;
+const ST_DESCRIPTOR_POOL_CREATE_INFO = vk.ST_DESCRIPTOR_POOL_CREATE_INFO;
+const ST_DESCRIPTOR_SET_ALLOCATE_INFO = vk.ST_DESCRIPTOR_SET_ALLOCATE_INFO;
+const ST_DESCRIPTOR_SET_LAYOUT_CREATE_INFO = vk.ST_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+const ST_DEVICE_CREATE_INFO = vk.ST_DEVICE_CREATE_INFO;
+const ST_DEVICE_QUEUE_CREATE_INFO = vk.ST_DEVICE_QUEUE_CREATE_INFO;
+const ST_FENCE_CREATE_INFO = vk.ST_FENCE_CREATE_INFO;
+const ST_FRAMEBUFFER_CREATE_INFO = vk.ST_FRAMEBUFFER_CREATE_INFO;
+const ST_GRAPHICS_PIPELINE_CREATE_INFO = vk.ST_GRAPHICS_PIPELINE_CREATE_INFO;
+const ST_IMAGE_CREATE_INFO = vk.ST_IMAGE_CREATE_INFO;
+const ST_IMAGE_MEMORY_BARRIER = vk.ST_IMAGE_MEMORY_BARRIER;
+const ST_IMAGE_VIEW_CREATE_INFO = vk.ST_IMAGE_VIEW_CREATE_INFO;
+const ST_IMPORT_MEMORY_HOST_POINTER_INFO_EXT = vk.ST_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;
+const ST_INSTANCE_CREATE_INFO = vk.ST_INSTANCE_CREATE_INFO;
+const ST_MEMORY_ALLOCATE_INFO = vk.ST_MEMORY_ALLOCATE_INFO;
+const ST_MEMORY_HOST_POINTER_PROPERTIES_EXT = vk.ST_MEMORY_HOST_POINTER_PROPERTIES_EXT;
+const ST_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO = vk.ST_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+const ST_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO = vk.ST_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+const ST_PIPELINE_DYNAMIC_STATE_CREATE_INFO = vk.ST_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+const ST_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO = vk.ST_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+const ST_PIPELINE_LAYOUT_CREATE_INFO = vk.ST_PIPELINE_LAYOUT_CREATE_INFO;
+const ST_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO = vk.ST_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+const ST_PIPELINE_RASTERIZATION_STATE_CREATE_INFO = vk.ST_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+const ST_PIPELINE_SHADER_STAGE_CREATE_INFO = vk.ST_PIPELINE_SHADER_STAGE_CREATE_INFO;
+const ST_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO = vk.ST_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+const ST_PIPELINE_VIEWPORT_STATE_CREATE_INFO = vk.ST_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+const ST_RENDER_PASS_BEGIN_INFO = vk.ST_RENDER_PASS_BEGIN_INFO;
+const ST_RENDER_PASS_CREATE_INFO = vk.ST_RENDER_PASS_CREATE_INFO;
+const ST_SAMPLER_CREATE_INFO = vk.ST_SAMPLER_CREATE_INFO;
+const ST_SHADER_MODULE_CREATE_INFO = vk.ST_SHADER_MODULE_CREATE_INFO;
+const ST_SUBMIT_INFO = vk.ST_SUBMIT_INFO;
+const ST_WRITE_DESCRIPTOR_SET = vk.ST_WRITE_DESCRIPTOR_SET;
+const SUBPASS_EXTERNAL = vk.SUBPASS_EXTERNAL;
+const VK_NULL = vk.VK_NULL;
+const VK_SUCCESS = vk.VK_SUCCESS;
+const VkApplicationInfo = vk.VkApplicationInfo;
+const VkAttachmentDescription = vk.VkAttachmentDescription;
+const VkAttachmentReference = vk.VkAttachmentReference;
+const VkBuffer = vk.VkBuffer;
+const VkBufferCreateInfo = vk.VkBufferCreateInfo;
+const VkBufferImageCopy = vk.VkBufferImageCopy;
+const VkBufferMemoryBarrier = vk.VkBufferMemoryBarrier;
+const VkClearValue = vk.VkClearValue;
+const VkCommandBuffer = vk.VkCommandBuffer;
+const VkCommandBufferAllocateInfo = vk.VkCommandBufferAllocateInfo;
+const VkCommandBufferBeginInfo = vk.VkCommandBufferBeginInfo;
+const VkCommandPool = vk.VkCommandPool;
+const VkCommandPoolCreateInfo = vk.VkCommandPoolCreateInfo;
+const VkComponentMapping = vk.VkComponentMapping;
+const VkDescriptorImageInfo = vk.VkDescriptorImageInfo;
+const VkDescriptorPool = vk.VkDescriptorPool;
+const VkDescriptorPoolCreateInfo = vk.VkDescriptorPoolCreateInfo;
+const VkDescriptorPoolSize = vk.VkDescriptorPoolSize;
+const VkDescriptorSet = vk.VkDescriptorSet;
+const VkDescriptorSetAllocateInfo = vk.VkDescriptorSetAllocateInfo;
+const VkDescriptorSetLayout = vk.VkDescriptorSetLayout;
+const VkDescriptorSetLayoutBinding = vk.VkDescriptorSetLayoutBinding;
+const VkDescriptorSetLayoutCreateInfo = vk.VkDescriptorSetLayoutCreateInfo;
+const VkDevice = vk.VkDevice;
+const VkDeviceCreateInfo = vk.VkDeviceCreateInfo;
+const VkDeviceMemory = vk.VkDeviceMemory;
+const VkDeviceQueueCreateInfo = vk.VkDeviceQueueCreateInfo;
+const VkExtensionProperties = vk.VkExtensionProperties;
+const VkExtent2D = vk.VkExtent2D;
+const VkExtent3D = vk.VkExtent3D;
+const VkExternalMemoryBufferCreateInfo = vk.VkExternalMemoryBufferCreateInfo;
+const VkFence = vk.VkFence;
+const VkFenceCreateInfo = vk.VkFenceCreateInfo;
+const VkFramebuffer = vk.VkFramebuffer;
+const VkFramebufferCreateInfo = vk.VkFramebufferCreateInfo;
+const VkGraphicsPipelineCreateInfo = vk.VkGraphicsPipelineCreateInfo;
+const VkImage = vk.VkImage;
+const VkImageCreateInfo = vk.VkImageCreateInfo;
+const VkImageMemoryBarrier = vk.VkImageMemoryBarrier;
+const VkImageSubresourceLayers = vk.VkImageSubresourceLayers;
+const VkImageSubresourceRange = vk.VkImageSubresourceRange;
+const VkImageView = vk.VkImageView;
+const VkImageViewCreateInfo = vk.VkImageViewCreateInfo;
+const VkImportMemoryHostPointerInfoEXT = vk.VkImportMemoryHostPointerInfoEXT;
+const VkInstance = vk.VkInstance;
+const VkInstanceCreateInfo = vk.VkInstanceCreateInfo;
+const VkMemoryAllocateInfo = vk.VkMemoryAllocateInfo;
+const VkMemoryHeap = vk.VkMemoryHeap;
+const VkMemoryHostPointerPropertiesEXT = vk.VkMemoryHostPointerPropertiesEXT;
+const VkMemoryRequirements = vk.VkMemoryRequirements;
+const VkMemoryType = vk.VkMemoryType;
+const VkOffset2D = vk.VkOffset2D;
+const VkOffset3D = vk.VkOffset3D;
+const VkPhysicalDevice = vk.VkPhysicalDevice;
+const VkPhysicalDeviceMemoryProperties = vk.VkPhysicalDeviceMemoryProperties;
+const VkPipeline = vk.VkPipeline;
+const VkPipelineColorBlendAttachmentState = vk.VkPipelineColorBlendAttachmentState;
+const VkPipelineColorBlendStateCreateInfo = vk.VkPipelineColorBlendStateCreateInfo;
+const VkPipelineDepthStencilStateCreateInfo = vk.VkPipelineDepthStencilStateCreateInfo;
+const VkPipelineDynamicStateCreateInfo = vk.VkPipelineDynamicStateCreateInfo;
+const VkPipelineInputAssemblyStateCreateInfo = vk.VkPipelineInputAssemblyStateCreateInfo;
+const VkPipelineLayout = vk.VkPipelineLayout;
+const VkPipelineLayoutCreateInfo = vk.VkPipelineLayoutCreateInfo;
+const VkPipelineMultisampleStateCreateInfo = vk.VkPipelineMultisampleStateCreateInfo;
+const VkPipelineRasterizationStateCreateInfo = vk.VkPipelineRasterizationStateCreateInfo;
+const VkPipelineShaderStageCreateInfo = vk.VkPipelineShaderStageCreateInfo;
+const VkPipelineVertexInputStateCreateInfo = vk.VkPipelineVertexInputStateCreateInfo;
+const VkPipelineViewportStateCreateInfo = vk.VkPipelineViewportStateCreateInfo;
+const VkPushConstantRange = vk.VkPushConstantRange;
+const VkQueue = vk.VkQueue;
+const VkQueueFamilyProperties = vk.VkQueueFamilyProperties;
+const VkRect2D = vk.VkRect2D;
+const VkRenderPass = vk.VkRenderPass;
+const VkRenderPassBeginInfo = vk.VkRenderPassBeginInfo;
+const VkRenderPassCreateInfo = vk.VkRenderPassCreateInfo;
+const VkResult = vk.VkResult;
+const VkSampler = vk.VkSampler;
+const VkSamplerCreateInfo = vk.VkSamplerCreateInfo;
+const VkShaderModule = vk.VkShaderModule;
+const VkShaderModuleCreateInfo = vk.VkShaderModuleCreateInfo;
+const VkStencilOpState = vk.VkStencilOpState;
+const VkStructureType = vk.VkStructureType;
+const VkSubmitInfo = vk.VkSubmitInfo;
+const VkSubpassDependency = vk.VkSubpassDependency;
+const VkSubpassDescription = vk.VkSubpassDescription;
+const VkVertexInputAttributeDescription = vk.VkVertexInputAttributeDescription;
+const VkVertexInputBindingDescription = vk.VkVertexInputBindingDescription;
+const VkViewport = vk.VkViewport;
+const VkWriteDescriptorSet = vk.VkWriteDescriptorSet;
+const check = vk.check;
+const vkAllocateCommandBuffers = vk.vkAllocateCommandBuffers;
+const vkAllocateDescriptorSets = vk.vkAllocateDescriptorSets;
+const vkAllocateMemory = vk.vkAllocateMemory;
+const vkBeginCommandBuffer = vk.vkBeginCommandBuffer;
+const vkBindBufferMemory = vk.vkBindBufferMemory;
+const vkBindImageMemory = vk.vkBindImageMemory;
+const vkCmdBeginRenderPass = vk.vkCmdBeginRenderPass;
+const vkCmdBindDescriptorSets = vk.vkCmdBindDescriptorSets;
+const vkCmdBindIndexBuffer = vk.vkCmdBindIndexBuffer;
+const vkCmdBindPipeline = vk.vkCmdBindPipeline;
+const vkCmdBindVertexBuffers = vk.vkCmdBindVertexBuffers;
+const vkCmdCopyBufferToImage = vk.vkCmdCopyBufferToImage;
+const vkCmdCopyImageToBuffer = vk.vkCmdCopyImageToBuffer;
+const vkCmdDraw = vk.vkCmdDraw;
+const vkCmdDrawIndexed = vk.vkCmdDrawIndexed;
+const vkCmdEndRenderPass = vk.vkCmdEndRenderPass;
+const vkCmdPipelineBarrier = vk.vkCmdPipelineBarrier;
+const vkCmdPushConstants = vk.vkCmdPushConstants;
+const vkCmdSetScissor = vk.vkCmdSetScissor;
+const vkCmdSetViewport = vk.vkCmdSetViewport;
+const vkCreateBuffer = vk.vkCreateBuffer;
+const vkCreateCommandPool = vk.vkCreateCommandPool;
+const vkCreateDescriptorPool = vk.vkCreateDescriptorPool;
+const vkCreateDescriptorSetLayout = vk.vkCreateDescriptorSetLayout;
+const vkCreateDevice = vk.vkCreateDevice;
+const vkCreateFence = vk.vkCreateFence;
+const vkCreateFramebuffer = vk.vkCreateFramebuffer;
+const vkCreateGraphicsPipelines = vk.vkCreateGraphicsPipelines;
+const vkCreateImage = vk.vkCreateImage;
+const vkCreateImageView = vk.vkCreateImageView;
+const vkCreateInstance = vk.vkCreateInstance;
+const vkCreatePipelineLayout = vk.vkCreatePipelineLayout;
+const vkCreateRenderPass = vk.vkCreateRenderPass;
+const vkCreateSampler = vk.vkCreateSampler;
+const vkCreateShaderModule = vk.vkCreateShaderModule;
+const vkDestroyBuffer = vk.vkDestroyBuffer;
+const vkDestroyCommandPool = vk.vkDestroyCommandPool;
+const vkDestroyDescriptorPool = vk.vkDestroyDescriptorPool;
+const vkDestroyDescriptorSetLayout = vk.vkDestroyDescriptorSetLayout;
+const vkDestroyDevice = vk.vkDestroyDevice;
+const vkDestroyFence = vk.vkDestroyFence;
+const vkDestroyFramebuffer = vk.vkDestroyFramebuffer;
+const vkDestroyImage = vk.vkDestroyImage;
+const vkDestroyImageView = vk.vkDestroyImageView;
+const vkDestroyInstance = vk.vkDestroyInstance;
+const vkDestroyPipeline = vk.vkDestroyPipeline;
+const vkDestroyPipelineLayout = vk.vkDestroyPipelineLayout;
+const vkDestroyRenderPass = vk.vkDestroyRenderPass;
+const vkDestroySampler = vk.vkDestroySampler;
+const vkDestroyShaderModule = vk.vkDestroyShaderModule;
+const vkDeviceWaitIdle = vk.vkDeviceWaitIdle;
+const vkEndCommandBuffer = vk.vkEndCommandBuffer;
+const vkEnumerateDeviceExtensionProperties = vk.vkEnumerateDeviceExtensionProperties;
+const vkEnumeratePhysicalDevices = vk.vkEnumeratePhysicalDevices;
+const vkFreeMemory = vk.vkFreeMemory;
+const vkGetBufferMemoryRequirements = vk.vkGetBufferMemoryRequirements;
+const vkGetDeviceProcAddr = vk.vkGetDeviceProcAddr;
+const vkGetDeviceQueue = vk.vkGetDeviceQueue;
+const vkGetImageMemoryRequirements = vk.vkGetImageMemoryRequirements;
+const vkGetPhysicalDeviceMemoryProperties = vk.vkGetPhysicalDeviceMemoryProperties;
+const vkGetPhysicalDeviceQueueFamilyProperties = vk.vkGetPhysicalDeviceQueueFamilyProperties;
+const vkMapMemory = vk.vkMapMemory;
+const vkQueueSubmit = vk.vkQueueSubmit;
+const vkResetFences = vk.vkResetFences;
+const vkUpdateDescriptorSets = vk.vkUpdateDescriptorSets;
+const vkWaitForFences = vk.vkWaitForFences;
 
 const text_vert_spv = @embedFile("text_vert_spv");
 const text_frag_spv = @embedFile("text_frag_spv");
