@@ -555,6 +555,7 @@ pub const VkSubmitInfo = extern struct {
 // Flag usati
 pub const BUFFER_USAGE_TRANSFER_SRC: u32 = 0x1;
 pub const BUFFER_USAGE_TRANSFER_DST: u32 = 0x2;
+pub const BUFFER_USAGE_STORAGE: u32 = 0x20;
 pub const BUFFER_USAGE_INDEX: u32 = 0x40;
 pub const BUFFER_USAGE_VERTEX: u32 = 0x80;
 pub const MEM_DEVICE_LOCAL: u32 = 1;
@@ -656,6 +657,7 @@ pub const FORMAT_R32G32_SFLOAT: u32 = 103;
 pub const IMAGE_USAGE_SAMPLED: u32 = 0x4;
 pub const IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL: u32 = 5;
 pub const DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: u32 = 1;
+pub const DESCRIPTOR_TYPE_STORAGE_BUFFER: u32 = 7;
 pub const BLEND_FACTOR_SRC_ALPHA: u32 = 6;
 pub const BLEND_FACTOR_ONE_MINUS_SRC_ALPHA: u32 = 7;
 pub const ACCESS_SHADER_READ: u32 = 0x20;
@@ -727,6 +729,12 @@ pub const VkDescriptorImageInfo = extern struct {
     sampler: VkSampler,
     imageView: VkImageView,
     imageLayout: u32,
+};
+
+pub const VkDescriptorBufferInfo = extern struct {
+    buffer: VkBuffer,
+    offset: u64 = 0,
+    range: u64,
 };
 
 pub const VkWriteDescriptorSet = extern struct {

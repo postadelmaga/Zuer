@@ -325,13 +325,12 @@ fn colFromRef(ref: []const u8) ?usize {
     return col - 1;
 }
 
-/// xlsx/xlsm: primo foglio (xl/worksheets/sheet1.xml) + sharedStrings.
-fn decodeXlsx(bytes: []const u8, allocator: std.mem.Allocator) Decoded {
-    const sheet_xml = readZipEntry(bytes, "xl/worksheets/sheet1.xml", allocator) catch |err| {
-        return errMsg(allocator, "Impossibile leggere il foglio xlsx: {s}", .{@errorName(err)});
-    };
-    defer allocator.free(sheet_xml);
+const max_sheets = 256;
 
+/// xlsx/xlsm: tutti i fogli. Uno solo → tabella semplice (`.csv`); più fogli →
+/// `.workbook` con le linguette. Nomi da `xl/workbook.xml`, dati da
+/// `xl/worksheets/sheetN.xml`, testo condiviso da `xl/sharedStrings.xml`.
+fn decodeXlsx(bytes: []const u8, allocator: std.mem.Allocator) Decoded {
     const shared_xml: ?[]u8 = readZipEntry(bytes, "xl/sharedStrings.xml", allocator) catch null;
     defer if (shared_xml) |sx| allocator.free(sx);
 
@@ -346,6 +345,96 @@ fn decodeXlsx(bytes: []const u8, allocator: std.mem.Allocator) Decoded {
         };
     }
 
+    // Nomi dei fogli (in ordine di workbook.xml); assenti → "Foglio N".
+    var names = std.ArrayList([]const u8).empty;
+    defer {
+        for (names.items) |n| allocator.free(n);
+        names.deinit(allocator);
+    }
+    readSheetNames(bytes, allocator, &names);
+
+    var sheets = std.ArrayList(decoder.Sheet).empty;
+    errdefer {
+        for (sheets.items) |*s| s.deinit(allocator);
+        sheets.deinit(allocator);
+    }
+
+    var idx: usize = 1;
+    while (idx <= max_sheets) : (idx += 1) {
+        var name_buf: [64]u8 = undefined;
+        const entry = std.fmt.bufPrint(&name_buf, "xl/worksheets/sheet{d}.xml", .{idx}) catch break;
+        const sheet_xml = readZipEntry(bytes, entry, allocator) catch break; // foglio mancante → fine
+        defer allocator.free(sheet_xml);
+
+        var d = parseSheetRows(sheet_xml, shared.items, allocator);
+        switch (d) {
+            .csv => |csvd| {
+                const nm = if (idx - 1 < names.items.len)
+                    (allocator.dupe(u8, names.items[idx - 1]) catch {
+                        var cc = csvd;
+                        cc.deinit(allocator);
+                        break;
+                    })
+                else
+                    (std.fmt.allocPrint(allocator, "Foglio {d}", .{idx}) catch {
+                        var cc = csvd;
+                        cc.deinit(allocator);
+                        break;
+                    });
+                sheets.append(allocator, .{ .name = nm, .data = csvd }) catch {
+                    allocator.free(nm);
+                    var cc = csvd;
+                    cc.deinit(allocator);
+                    break;
+                };
+            },
+            // Foglio vuoto o illeggibile: lo si salta senza abortire il workbook.
+            else => d.deinit(allocator),
+        }
+    }
+
+    if (sheets.items.len == 0) {
+        sheets.deinit(allocator);
+        return .{ .err = allocator.dupe(u8, "Nessun foglio leggibile nel file xlsx.") catch "" };
+    }
+    if (sheets.items.len == 1) {
+        // Un foglio solo: tabella semplice, niente barra delle linguette.
+        const only = sheets.orderedRemove(0);
+        sheets.deinit(allocator);
+        allocator.free(only.name);
+        return .{ .csv = only.data };
+    }
+    const owned = sheets.toOwnedSlice(allocator) catch {
+        return .{ .err = allocator.dupe(u8, "Memoria esaurita.") catch "" };
+    };
+    return .{ .workbook = .{ .sheets = owned, .active = 0 } };
+}
+
+/// Legge i nomi dei fogli da `xl/workbook.xml` (elemento `<sheet name="…"/>`).
+/// Fallimento non fatale: i fogli senza nome ricadono su "Foglio N".
+fn readSheetNames(bytes: []const u8, allocator: std.mem.Allocator, out: *std.ArrayList([]const u8)) void {
+    const wb = readZipEntry(bytes, "xl/workbook.xml", allocator) catch return;
+    defer allocator.free(wb);
+
+    var pos: usize = 0;
+    // findTag("sheet") non matcha `<sheets>` (il carattere dopo "sheet" è 's').
+    while (findTag(wb, pos, "sheet")) |at| {
+        const open_end = std.mem.indexOfScalarPos(u8, wb, at, '>') orelse break;
+        const tag = wb[at..open_end];
+        if (attrValue(tag, "name")) |raw| {
+            const nm = xmlTextDupe(allocator, raw) catch break;
+            out.append(allocator, nm) catch {
+                allocator.free(nm);
+                break;
+            };
+        }
+        pos = open_end + 1;
+    }
+}
+
+/// Analizza un singolo foglio (`xl/worksheets/sheetN.xml`) in `.csv` (prima riga
+/// = intestazioni) usando le stringhe condivise `shared`. `.err` se vuoto.
+fn parseSheetRows(sheet_xml: []const u8, shared: []const []const u8, allocator: std.mem.Allocator) Decoded {
     var builder = RowsBuilder{};
     errdefer builder.deinitAll(allocator);
 
@@ -398,9 +487,9 @@ fn decodeXlsx(bytes: []const u8, allocator: std.mem.Allocator) Decoded {
                     if (std.mem.eql(u8, cell_type, "s")) {
                         // indice nelle shared strings
                         if (std.fmt.parseInt(usize, raw, 10) catch null) |idx| {
-                            if (idx < shared.items.len) {
+                            if (idx < shared.len) {
                                 allocator.free(value);
-                                value = allocator.dupe(u8, shared.items[idx]) catch break;
+                                value = allocator.dupe(u8, shared[idx]) catch break;
                             }
                         }
                     } else {

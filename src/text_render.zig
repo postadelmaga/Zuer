@@ -28,6 +28,29 @@ const c_comment = Rgb.fromHex("#707070"); // commenti (viewer: gray 112)
 const c_md_code = Rgb.fromHex("#9ece6a"); // codice inline/blocchi markdown
 const c_md_link = Rgb.fromHex("#7aa2f7"); // link markdown
 
+// Griglia tabellare (parità viewer). Lo sfondo è OPACO e diverso dalla key di
+// trasparenza (#080810), così il compositore della GUI NON lo rende trasparente
+// → tabella leggibile su vetro scuro invece che sul wallpaper.
+// Palette grigio-neutra allineata al viewer di riferimento (egui): sfondo
+// extreme #101115, accent blu #6286F8. Rimosso il tinto viola precedente.
+const table_bg = Rgb.fromHex("#101116"); // sfondo opaco scuro (righe pari)
+const table_zebra = Rgb.fromHex("#16171d"); // righe dispari (striping a zebra)
+const table_header_bg = Rgb.fromHex("#21232f"); // barra d'intestazione (neutra, hint blu)
+const c_th = Rgb.fromHex("#e6e9f2"); // intestazioni colonna (bold)
+const c_gutter = Rgb.fromHex("#676873"); // numeri di riga nel gutter
+const c_grid = Rgb.fromHex("#2b2c34"); // linee della griglia (│ ─ ┼)
+
+// Barra delle linguette (workbook multi-foglio). La tab attiva "aggancia" lo
+// sfondo del foglio (table_bg) con una barretta accent in cima; le inattive
+// restano sul fondo scuro della barra.
+const tab_bar_h: i32 = 30; // altezza barra linguette (px)
+const tab_pad_x: i32 = 16; // padding orizzontale dentro la linguetta
+const c_tab_bar_bg = Rgb.fromHex("#191b24"); // fondo barra / linguette inattive
+const c_tab_active_bg = table_bg; // linguetta attiva = sfondo del foglio
+const c_tab_accent = Rgb.fromHex("#6286f8"); // barretta accent della tab attiva
+const c_tab_text = Rgb.fromHex("#8a8c99"); // testo linguette inattive
+const c_tab_text_active = Rgb.fromHex("#e6e9f2"); // testo linguetta attiva
+
 /// Parametri di resa: larghezza in pixel dell'immagine prodotta (idealmente la
 /// larghezza della finestra) e corpo del carattere (scalato dallo zoom del
 /// chiamante). L'altezza è determinata dal contenuto.
@@ -60,6 +83,9 @@ const Row = []const Run;
 pub fn render(gpa: std.mem.Allocator, io: std.Io, decoded: *const decoder_mod.Decoded, name: []const u8, opts: RenderOpts) !decoder_mod.ImageData {
     _ = io;
 
+    // Le tabelle usano il rendering proporzionale dedicato (look foglio di calcolo).
+    if (decoded.* == .csv) return paintTable(gpa, decoded.csv, opts);
+
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -70,7 +96,7 @@ pub fn render(gpa: std.mem.Allocator, io: std.Io, decoded: *const decoder_mod.De
     var rows: std.ArrayList(Row) = .empty;
     try buildRows(arena, &rows, &raster, decoded, name, opts);
 
-    return paint(gpa, &raster, rows.items, name, opts);
+    return paint(gpa, &raster, rows.items, name, opts, bg);
 }
 
 /// Metriche della griglia monospazio dell'ultima rasterizzazione, per mappare
@@ -86,6 +112,37 @@ pub const Metrics = struct {
 /// (per selezione/copia, allocato con `gpa` in `out_lines`) e le metriche della
 /// griglia. Il chiamante possiede e libera le stringhe in `out_lines`.
 pub fn renderDoc(gpa: std.mem.Allocator, decoded: *const decoder_mod.Decoded, name: []const u8, opts: RenderOpts, out_lines: *std.ArrayList([]const u8), out_metrics: *Metrics) !decoder_mod.ImageData {
+    // Tabella: rendering proporzionale. Righe visive = header + righe dati (senza
+    // gutter), separate da TAB per la copia. La selezione mappa la riga (line_h =
+    // altezza riga) ma non il carattere esatto (font proporzionale).
+    const table_csv: ?decoder_mod.CsvData = switch (decoded.*) {
+        .csv => |c| c,
+        .workbook => |w| w.activeCsv(),
+        else => null,
+    };
+    if (table_csv) |c| {
+        var hdr: std.ArrayList(u8) = .empty;
+        for (c.headers, 0..) |h, i| {
+            if (i > 0) try hdr.append(gpa, '\t');
+            try hdr.appendSlice(gpa, h);
+        }
+        try out_lines.append(gpa, try hdr.toOwnedSlice(gpa));
+        for (c.rows) |row| {
+            var line: std.ArrayList(u8) = .empty;
+            errdefer line.deinit(gpa);
+            for (row, 0..) |cell, i| {
+                if (i > 0) try line.append(gpa, '\t');
+                try line.appendSlice(gpa, cell);
+            }
+            try out_lines.append(gpa, try line.toOwnedSlice(gpa));
+        }
+        var sans = try glyph.Raster.initFamily(gpa, pxHeight(opts.pointsize), .sans);
+        const row_h = sans.lineHeight() + row_extra;
+        sans.deinit();
+        out_metrics.* = .{ .advance = 8, .line_h = row_h, .pad_x = pad_x, .pad_y = pad_y };
+        return paintTable(gpa, c, opts);
+    }
+
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -104,7 +161,7 @@ pub fn renderDoc(gpa: std.mem.Allocator, decoded: *const decoder_mod.Decoded, na
     }
     out_metrics.* = .{ .advance = raster.advance, .line_h = raster.lineHeight(), .pad_x = pad_x, .pad_y = pad_y };
 
-    return paint(gpa, &raster, rows.items, name, opts);
+    return paint(gpa, &raster, rows.items, name, opts, bg);
 }
 
 /// Costruisce le righe visive (run posizionati) del contenuto decodificato.
@@ -117,8 +174,10 @@ fn buildRows(arena: std.mem.Allocator, rows: *std.ArrayList(Row), raster: *glyph
             try layoutCode(arena, rows, raster, t, opts, rich, lang);
         },
         .csv => |c| {
-            const table = try formatTable(arena, c);
-            try layoutCode(arena, rows, raster, table, opts, false, null);
+            try layoutTable(arena, rows, c);
+        },
+        .workbook => |w| {
+            try layoutTable(arena, rows, w.activeCsv());
         },
         .markdown => |m| {
             try layoutMarkdown(arena, rows, raster, m.content, opts);
@@ -254,7 +313,7 @@ pub fn buildTextMesh(gpa: std.mem.Allocator, decoded: *const decoder_mod.Decoded
 /// Dipinge le righe visive in un buffer RGB: sfondo pieno, poi i glifi di ogni
 /// run fusi sopra secondo la loro copertura. Griglia monospazio (una colonna per
 /// codepoint), altezza determinata dal numero di righe.
-fn paint(gpa: std.mem.Allocator, raster: *glyph.Raster, rows: []const Row, name: []const u8, opts: RenderOpts) !decoder_mod.ImageData {
+fn paint(gpa: std.mem.Allocator, raster: *glyph.Raster, rows: []const Row, name: []const u8, opts: RenderOpts, bg_color: Rgb) !decoder_mod.ImageData {
     const line_h = raster.lineHeight();
     const advance = raster.advance;
     const width: usize = @max(opts.width, 2 * @as(usize, @intCast(pad_x)) + 1);
@@ -263,7 +322,7 @@ fn paint(gpa: std.mem.Allocator, raster: *glyph.Raster, rows: []const Row, name:
 
     const pixels = try gpa.alloc(u8, width * height * 3);
     errdefer gpa.free(pixels);
-    fillBackground(pixels, bg);
+    fillBackground(pixels, bg_color);
 
     const w_i: i32 = @intCast(width);
     const h_i: i32 = @intCast(height);
@@ -300,6 +359,272 @@ fn fillBackground(pixels: []u8, color: Rgb) void {
         pixels[i + 1] = color.g;
         pixels[i + 2] = color.b;
     }
+}
+
+// --- Rendering tabellare proporzionale (look "foglio di calcolo") -----------
+// A differenza di `paint` (griglia monospazio), qui il testo è proporzionale
+// (Liberation Sans via `glyph.Family.sans`): colonne misurate in PIXEL, gridline
+// disegnate a 1px, celle con padding e allineamento numerico a destra. È il path
+// CPU di default per le tabelle; il path GPU resta la griglia monospazio.
+
+const cell_pad_x: i32 = 12; // padding orizzontale dentro le celle
+const row_extra: i32 = 8; // altezza extra per riga (respiro verticale)
+const max_col_px: i32 = 380; // larghezza massima di una colonna
+
+/// Riempie il rettangolo [x0,x1)×[y0,y1) con `color` (clampato al buffer).
+fn fillRect(pixels: []u8, w: usize, h: usize, x0: i32, y0: i32, x1: i32, y1: i32, color: Rgb) void {
+    var y: i32 = @max(y0, 0);
+    const ymax: i32 = @min(y1, @as(i32, @intCast(h)));
+    const xa: i32 = @max(x0, 0);
+    const xb: i32 = @min(x1, @as(i32, @intCast(w)));
+    while (y < ymax) : (y += 1) {
+        var x: i32 = xa;
+        const base = @as(usize, @intCast(y)) * w * 3;
+        while (x < xb) : (x += 1) {
+            const idx = base + @as(usize, @intCast(x)) * 3;
+            pixels[idx + 0] = color.r;
+            pixels[idx + 1] = color.g;
+            pixels[idx + 2] = color.b;
+        }
+    }
+}
+
+/// Larghezza in pixel di `s` nella faccia `style` (somma degli avanzamenti).
+fn measureText(raster: *glyph.Raster, style: glyph.Style, s: []const u8) !i32 {
+    var wsum: i32 = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        const seq = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        const end = @min(i + seq, s.len);
+        const cp: u32 = std.unicode.utf8Decode(s[i..end]) catch s[i];
+        const g = try raster.getGlyph(style, cp);
+        wsum += g.advance;
+        i = end;
+    }
+    return wsum;
+}
+
+/// Disegna `s` a partire da `x` (baseline `baseline`), avanzando la penna per
+/// glifo; si ferma prima di superare `max_x` (troncamento a destra della cella).
+fn drawText(raster: *glyph.Raster, pixels: []u8, w: i32, h: i32, x: i32, baseline: i32, style: glyph.Style, s: []const u8, color: Rgb, max_x: i32) !void {
+    var pen: i32 = x;
+    var i: usize = 0;
+    while (i < s.len) {
+        const seq = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        const end = @min(i + seq, s.len);
+        const cp: u32 = std.unicode.utf8Decode(s[i..end]) catch s[i];
+        const g = try raster.getGlyph(style, cp);
+        if (pen + g.advance > max_x) break;
+        try raster.drawCodepoint(pixels, w, h, pen, baseline, style, cp, color);
+        pen += g.advance;
+        i = end;
+    }
+}
+
+/// Una cella è numerica se `s` (trimmato) è un numero (per allineamento a destra).
+fn cellIsNumeric(s: []const u8) bool {
+    const t = std.mem.trim(u8, s, " \t");
+    if (t.len == 0) return false;
+    _ = std.fmt.parseFloat(f64, t) catch return false;
+    return true;
+}
+
+/// Dimensione NATURALE della tabella in pixel (larghezza = gutter + tutte le
+/// colonne ai loro ampiezza reale + margini; altezza = header + righe). Usata per
+/// dimensionare la finestra sulle colonne. Mantiene la stessa logica di `paintTable`.
+pub fn tableNaturalSize(gpa: std.mem.Allocator, c: decoder_mod.CsvData, opts: RenderOpts) !struct { w: usize, h: usize } {
+    var raster = try glyph.Raster.initFamily(gpa, pxHeight(opts.pointsize), .sans);
+    defer raster.deinit();
+    const row_h: i32 = raster.lineHeight() + row_extra;
+    const ncols = c.headers.len;
+    const height: i32 = 2 * pad_y + (1 + @as(i32, @intCast(c.rows.len))) * row_h;
+    if (ncols == 0) return .{ .w = 480, .h = @intCast(@max(height, 2 * pad_y + row_h)) };
+
+    var total: i32 = pad_x;
+    var num_buf: [24]u8 = undefined;
+    const last_num = std.fmt.bufPrint(&num_buf, "{d}", .{c.rows.len}) catch "0";
+    total += @max(try measureText(&raster, .bold, "#"), try measureText(&raster, .regular, last_num)) + 2 * cell_pad_x;
+    for (c.headers, 0..) |h, i| {
+        var wd = try measureText(&raster, .bold, h);
+        for (c.rows) |row| {
+            if (i < row.len) wd = @max(wd, try measureText(&raster, .regular, row[i]));
+        }
+        total += @min(wd, max_col_px) + 2 * cell_pad_x;
+    }
+    total += pad_x;
+    return .{ .w = @intCast(total), .h = @intCast(height) };
+}
+
+/// Rende una tabella CSV con font proporzionale e chrome da foglio di calcolo.
+fn paintTable(gpa: std.mem.Allocator, c: decoder_mod.CsvData, opts: RenderOpts) !decoder_mod.ImageData {
+    var raster = try glyph.Raster.initFamily(gpa, pxHeight(opts.pointsize), .sans);
+    defer raster.deinit();
+
+    const ascent = raster.ascent;
+    const row_h: i32 = raster.lineHeight() + row_extra;
+    const ncols = c.headers.len;
+
+    if (ncols == 0) {
+        const width: usize = @max(opts.width, 2 * @as(usize, @intCast(pad_x)) + 1);
+        const height: usize = @intCast(2 * pad_y + row_h);
+        const pixels = try gpa.alloc(u8, width * height * 3);
+        errdefer gpa.free(pixels);
+        fillBackground(pixels, table_bg);
+        try drawText(&raster, pixels, @intCast(width), @intCast(height), pad_x, pad_y + ascent, .regular, "(tabella vuota)", fg, @intCast(width));
+        return .{ .width = width, .height = height, .pixels = pixels, .name = try gpa.dupe(u8, "table") };
+    }
+
+    // Larghezze colonna (pixel) e rilevamento colonne numeriche.
+    const col_w = try gpa.alloc(i32, ncols);
+    defer gpa.free(col_w);
+    const numeric = try gpa.alloc(bool, ncols);
+    defer gpa.free(numeric);
+    const has_data = try gpa.alloc(bool, ncols);
+    defer gpa.free(has_data);
+    for (c.headers, 0..) |hh, i| {
+        col_w[i] = try measureText(&raster, .bold, hh);
+        numeric[i] = true;
+        has_data[i] = false;
+    }
+    for (c.rows) |row| {
+        for (row, 0..) |cell, i| {
+            if (i >= ncols) break;
+            col_w[i] = @max(col_w[i], try measureText(&raster, .regular, cell));
+            if (std.mem.trim(u8, cell, " \t").len > 0) {
+                has_data[i] = true;
+                if (!cellIsNumeric(cell)) numeric[i] = false;
+            }
+        }
+    }
+    for (col_w, 0..) |*wd, i| {
+        wd.* = @min(wd.*, max_col_px) + 2 * cell_pad_x;
+        if (!has_data[i]) numeric[i] = false;
+    }
+
+    // Gutter: largo abbastanza per "#" e il numero di riga più alto.
+    var num_buf: [24]u8 = undefined;
+    const last_num = std.fmt.bufPrint(&num_buf, "{d}", .{c.rows.len}) catch "0";
+    const gutter_w: i32 = @max(try measureText(&raster, .bold, "#"), try measureText(&raster, .regular, last_num)) + 2 * cell_pad_x;
+
+    // Dimensioni immagine: larghezza almeno quella della finestra.
+    var content_w: i32 = pad_x + gutter_w;
+    for (col_w) |wd| content_w += wd;
+    content_w += pad_x;
+    const width: usize = @max(opts.width, @as(usize, @intCast(content_w)));
+    const n_visual: i32 = 1 + @as(i32, @intCast(c.rows.len));
+    const height: usize = @intCast(2 * pad_y + n_visual * row_h);
+    const w_i: i32 = @intCast(width);
+    const h_i: i32 = @intCast(height);
+
+    const pixels = try gpa.alloc(u8, width * height * 3);
+    errdefer gpa.free(pixels);
+    fillBackground(pixels, table_bg);
+
+    // Barra d'intestazione (piena, tutta larghezza) e righe a zebra.
+    fillRect(pixels, width, height, 0, pad_y, w_i, pad_y + row_h, table_header_bg);
+    for (c.rows, 0..) |_, ri| {
+        if (ri % 2 == 1) {
+            const yt = pad_y + (1 + @as(i32, @intCast(ri))) * row_h;
+            fillRect(pixels, width, height, 0, yt, w_i, yt + row_h, table_zebra);
+        }
+    }
+
+    // Gridline verticali ai confini di colonna + sottolineatura header.
+    var gx: i32 = pad_x + gutter_w;
+    fillRect(pixels, width, height, gx - 1, pad_y, gx, pad_y + n_visual * row_h, c_grid);
+    for (col_w) |wd| {
+        gx += wd;
+        fillRect(pixels, width, height, gx - 1, pad_y, gx, pad_y + n_visual * row_h, c_grid);
+    }
+    fillRect(pixels, width, height, 0, pad_y + row_h - 1, w_i, pad_y + row_h, c_grid);
+
+    // Testo: intestazione (grassetto) + righe dati (numeri di riga nel gutter).
+    const text_dy = @divTrunc(row_extra, 2) + ascent;
+    // Header.
+    {
+        const base = pad_y + text_dy;
+        try drawCellText(&raster, pixels, w_i, h_i, pad_x, gutter_w, base, .bold, "#", c_gutter, true);
+        var x = pad_x + gutter_w;
+        for (c.headers, 0..) |hh, i| {
+            try drawCellText(&raster, pixels, w_i, h_i, x, col_w[i], base, .bold, hh, c_th, false);
+            x += col_w[i];
+        }
+    }
+    // Righe dati.
+    for (c.rows, 0..) |row, ri| {
+        const base = pad_y + (1 + @as(i32, @intCast(ri))) * row_h + text_dy;
+        var nb: [24]u8 = undefined;
+        const num = std.fmt.bufPrint(&nb, "{d}", .{ri + 1}) catch "";
+        try drawCellText(&raster, pixels, w_i, h_i, pad_x, gutter_w, base, .regular, num, c_gutter, true);
+        var x = pad_x + gutter_w;
+        for (col_w, 0..) |wd, i| {
+            const cell = if (i < row.len) row[i] else "";
+            try drawCellText(&raster, pixels, w_i, h_i, x, wd, base, .regular, cell, fg, numeric[i]);
+            x += wd;
+        }
+    }
+
+    return .{ .width = width, .height = height, .pixels = pixels, .name = try gpa.dupe(u8, "table") };
+}
+
+/// Altezza (px) della barra delle linguette dei fogli. Costante: la GUI la usa
+/// per posizionare la barra e per l'hit-test dei click.
+pub fn tabBarHeight() u32 {
+    return @intCast(tab_bar_h);
+}
+
+/// Rende la barra delle linguette di un workbook: una linguetta per foglio, con
+/// il nome; quella `active` è evidenziata (sfondo del foglio + accent + testo in
+/// grassetto). Riempie `bounds_out[i]` col bordo destro X della linguetta i (per
+/// l'hit-test dei click), fino a `bounds_out.len` linguette. Immagine RGB alta
+/// `tabBarHeight()` × `width`.
+pub fn renderTabBar(gpa: std.mem.Allocator, sheets: []const decoder_mod.Sheet, active: usize, width: u32, bounds_out: []u32) !decoder_mod.ImageData {
+    var raster = try glyph.Raster.initFamily(gpa, pxHeight(14), .sans);
+    defer raster.deinit();
+
+    const h_i: i32 = tab_bar_h;
+    const w: usize = @max(width, 1);
+    const h: usize = @intCast(tab_bar_h);
+    const w_i: i32 = @intCast(w);
+
+    const pixels = try gpa.alloc(u8, w * h * 3);
+    errdefer gpa.free(pixels);
+    fillBackground(pixels, c_tab_bar_bg);
+
+    const base = @divTrunc(tab_bar_h - raster.lineHeight(), 2) + raster.ascent;
+    var x: i32 = 0;
+    for (sheets, 0..) |s, i| {
+        if (x >= w_i) break;
+        const tw = try measureText(&raster, if (i == active) .bold else .regular, s.name);
+        const x_end = @min(x + tw + 2 * tab_pad_x, w_i);
+        if (i == active) {
+            fillRect(pixels, w, h, x, 0, x_end, h_i, c_tab_active_bg);
+            // Barretta accent in cima alla linguetta attiva.
+            fillRect(pixels, w, h, x, 0, x_end, 2, c_tab_accent);
+        }
+        // Separatore verticale a destra della linguetta.
+        fillRect(pixels, w, h, x_end - 1, 0, x_end, h_i, c_grid);
+        const col = if (i == active) c_tab_text_active else c_tab_text;
+        try drawText(&raster, pixels, w_i, h_i, x + tab_pad_x, base, if (i == active) .bold else .regular, s.name, col, x_end - tab_pad_x / 2);
+        if (i < bounds_out.len) bounds_out[i] = @intCast(@max(x_end, 0));
+        x = x_end;
+    }
+
+    return .{ .width = w, .height = h, .pixels = pixels, .name = try gpa.dupe(u8, "tabbar") };
+}
+
+/// Disegna il testo di una cella [cell_x, cell_x+cell_w) alla baseline `base`,
+/// con padding orizzontale; allineato a destra se `right`, altrimenti a sinistra.
+fn drawCellText(raster: *glyph.Raster, pixels: []u8, w: i32, h: i32, cell_x: i32, cell_w: i32, base: i32, style: glyph.Style, s: []const u8, color: Rgb, right: bool) !void {
+    if (s.len == 0) return;
+    const avail = cell_w - 2 * cell_pad_x;
+    const tw = try measureText(raster, style, s);
+    const max_x = cell_x + cell_w - cell_pad_x;
+    const start_x = if (right and tw <= avail)
+        cell_x + cell_w - cell_pad_x - tw
+    else
+        cell_x + cell_pad_x;
+    try drawText(raster, pixels, w, h, start_x, base, style, s, color, max_x);
 }
 
 /// Colonne di testo disponibili alla larghezza richiesta (al netto dei margini).
@@ -687,41 +1012,116 @@ fn isCodeLike(name: []const u8) bool {
     return false;
 }
 
-/// Formatta una tabella CSV come testo monospazio con colonne allineate.
-fn formatTable(arena: std.mem.Allocator, c: decoder_mod.CsvData) ![]u8 {
-    const ncols = c.headers.len;
-    if (ncols == 0) return arena.dupe(u8, "(tabella vuota)");
+// --- Griglia tabellare (parità viewer) --------------------------------------
+// Ogni codepoint occupa una cella monospazio in `paint`, quindi i box-drawing
+// Unicode (│ ─ ┼, presenti nel font Hack) si allineano perfettamente alla
+// griglia. Costruiamo direttamente le `Row` (run colorati/stilizzati) invece di
+// passare per testo monospazio: header in grassetto, gutter col numero di riga,
+// separatori di colonna e una riga-regola sotto l'intestazione.
 
-    const widths = try arena.alloc(usize, ncols);
-    for (c.headers, 0..) |h, i| widths[i] = @min(h.len, max_table_col);
-    for (c.rows) |row| {
-        for (row, 0..) |cell_text, i| {
-            if (i >= ncols) break;
-            widths[i] = @max(widths[i], @min(cell_text.len, max_table_col));
-        }
+const sep_mid = " │ "; // separatore tra celle (3 celle: spazio, │, spazio)
+
+/// Numero di codepoint in `s` (larghezza monospazio, non byte).
+fn cpCount(s: []const u8) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) : (n += 1) {
+        i += std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
     }
+    return n;
+}
 
+/// Prefisso di `s` con al più `max_cp` codepoint (taglio su confine UTF-8).
+fn truncCp(s: []const u8, max_cp: usize) []const u8 {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < s.len and n < max_cp) : (n += 1) {
+        i += std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+    }
+    return s[0..@min(i, s.len)];
+}
+
+/// `s` allineato in un campo largo `w` celle (a sinistra se `right`=false, a
+/// destra altrimenti), troncato se necessario. Restituisce una stringa d'arena.
+fn padCell(arena: std.mem.Allocator, s: []const u8, w: usize, right: bool) ![]const u8 {
+    const shown = truncCp(s, w);
+    const pad = w - cpCount(shown);
     var out: std.ArrayList(u8) = .empty;
-    try writeTableRow(arena, &out, c.headers, widths);
-    for (widths, 0..) |wd, i| {
-        try out.appendNTimes(arena, '-', wd);
-        if (i + 1 < ncols) try out.appendSlice(arena, "  ");
-    }
-    try out.append(arena, '\n');
-    for (c.rows) |row| {
-        try writeTableRow(arena, &out, row, widths);
-    }
+    if (right) try out.appendNTimes(arena, ' ', pad);
+    try out.appendSlice(arena, shown);
+    if (!right) try out.appendNTimes(arena, ' ', pad);
     return out.toOwnedSlice(arena);
 }
 
-fn writeTableRow(arena: std.mem.Allocator, out: *std.ArrayList(u8), cells: []const []const u8, widths: []const usize) !void {
-    for (widths, 0..) |wd, i| {
-        const cell = if (i < cells.len) cells[i] else "";
-        const shown = cell[0..@min(cell.len, wd)];
-        try out.appendSlice(arena, shown);
-        if (i + 1 < widths.len) {
-            try out.appendNTimes(arena, ' ', wd - shown.len + 2);
+/// `cp` (un box-drawing) ripetuto `n` volte, come stringa d'arena.
+fn repeatCp(arena: std.mem.Allocator, cp: []const u8, n: usize) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (0..n) |_| try out.appendSlice(arena, cp);
+    return out.toOwnedSlice(arena);
+}
+
+/// Costruisce le righe visive di una tabella CSV come vera griglia.
+fn layoutTable(arena: std.mem.Allocator, rows: *std.ArrayList(Row), c: decoder_mod.CsvData) !void {
+    const ncols = c.headers.len;
+    if (ncols == 0) {
+        const run = try arena.alloc(Run, 1);
+        run[0] = .{ .text = "(tabella vuota)", .color = fg };
+        try rows.append(arena, run);
+        return;
+    }
+
+    // Larghezze colonna (in celle), limitate a max_table_col.
+    const widths = try arena.alloc(usize, ncols);
+    for (c.headers, 0..) |h, i| widths[i] = @min(cpCount(h), max_table_col);
+    for (c.rows) |row| {
+        for (row, 0..) |cell_text, i| {
+            if (i >= ncols) break;
+            widths[i] = @max(widths[i], @min(cpCount(cell_text), max_table_col));
         }
     }
-    try out.append(arena, '\n');
+
+    // Larghezza del gutter: cifre del numero di riga più alto (min 1).
+    var gutter_w: usize = 1;
+    {
+        var n = c.rows.len;
+        var digits: usize = 1;
+        while (n >= 10) : (n = n / 10) digits += 1;
+        gutter_w = digits;
+    }
+
+    // Riga di intestazione: "#" nel gutter + celle header in grassetto.
+    {
+        var hdr: std.ArrayList(Run) = .empty;
+        try hdr.append(arena, .{ .text = try padCell(arena, "#", gutter_w, true), .color = c_gutter, .style = .bold });
+        for (c.headers, 0..) |h, i| {
+            try hdr.append(arena, .{ .text = sep_mid, .color = c_grid });
+            try hdr.append(arena, .{ .text = try padCell(arena, h, widths[i], false), .color = c_th, .style = .bold });
+        }
+        try rows.append(arena, try hdr.toOwnedSlice(arena));
+    }
+
+    // Riga-regola sotto l'intestazione: ─ nel gutter, ┼ agli incroci di colonna.
+    {
+        var rule: std.ArrayList(Run) = .empty;
+        try rule.append(arena, .{ .text = try repeatCp(arena, "─", gutter_w), .color = c_grid });
+        for (widths) |wd| {
+            // "─┼─" allinea il ┼ sotto il │ di sep_mid; poi ─ per la cella.
+            try rule.append(arena, .{ .text = "─┼─", .color = c_grid });
+            try rule.append(arena, .{ .text = try repeatCp(arena, "─", wd), .color = c_grid });
+        }
+        try rows.append(arena, try rule.toOwnedSlice(arena));
+    }
+
+    // Righe dati: numero di riga (1-based) nel gutter + celle allineate.
+    for (c.rows, 0..) |row, ri| {
+        var line: std.ArrayList(Run) = .empty;
+        const num = try std.fmt.allocPrint(arena, "{d}", .{ri + 1});
+        try line.append(arena, .{ .text = try padCell(arena, num, gutter_w, true), .color = c_gutter });
+        for (widths, 0..) |wd, i| {
+            const cell = if (i < row.len) row[i] else "";
+            try line.append(arena, .{ .text = sep_mid, .color = c_grid });
+            try line.append(arena, .{ .text = try padCell(arena, cell, wd, false), .color = fg });
+        }
+        try rows.append(arena, try line.toOwnedSlice(arena));
+    }
 }

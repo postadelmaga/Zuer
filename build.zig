@@ -94,7 +94,18 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    gui_exe.root_module.addImport("zicro", dep_zicro.module("zicro"));
+    // IMPORTANTE: `zuer-gui` importa zicro sia direttamente sia (transitivamente)
+    // via zrame. Se prendessimo l'istanza da `dep_zicro` (builder di zuer) sarebbe
+    // un modulo DISTINTO da quello che linka zrame (builder di zrame): il
+    // `protocol.c` xdg-shell generato da zicro verrebbe compilato DUE volte →
+    // `duplicate symbol xdg_wm_base_interface`. Prendiamo perciò l'unica istanza
+    // di zicro dal builder di zrame, così protocol.c si compila una volta sola
+    // (e i tipi zicro sono identici tra zuer e zrame).
+    const gui_zicro = dep_zrame.builder.dependency("zicro", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("zicro");
+    gui_exe.root_module.addImport("zicro", gui_zicro);
     gui_exe.root_module.addImport("zrame", dep_zrame.module("zrame"));
     gui_exe.root_module.addAnonymousImport("mesh_vert_spv", .{ .root_source_file = vert_spv });
     gui_exe.root_module.addAnonymousImport("mesh_frag_spv", .{ .root_source_file = frag_spv });
@@ -107,8 +118,11 @@ pub fn build(b: *std.Build) void {
     gui_exe.root_module.linkSystemLibrary("vulkan", .{});
     gui_exe.root_module.linkSystemLibrary("wayland-client", .{});
     // Motore di testo nativo: stb_truetype rasterizza i glifi Hack (embeddati),
-    // sostituendo ImageMagick/Pango. -fno-sanitize=undefined come per stb_image.
-    addStbTruetype(b, gui_exe.root_module);
+    // sostituendo ImageMagick/Pango. NB: `zuer-gui` linka zrame, che ora compila
+    // la propria copia di stb_truetype_impl.c per il suo motore di testo. Per
+    // evitare simboli duplicati nel binario, qui aggiungiamo SOLO l'include path
+    // (serve al @cImport di glyph.zig): l'implementazione la fornisce zrame.
+    gui_exe.root_module.addIncludePath(b.path("vendor/stb"));
 
     b.installArtifact(gui_exe);
 

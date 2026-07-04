@@ -24,11 +24,15 @@ pub fn main(init: std.process.Init) !void {
     const name = std.fs.path.basename(in_path);
     const opts = text_render.RenderOpts{ .width = 1100, .pointsize = 15 };
 
-    const content = try std.Io.Dir.cwd().readFileAlloc(io, in_path, gpa, std.Io.Limit.limited(10 * 1024 * 1024));
-    var decoded: decoder_mod.Decoded = if (std.mem.eql(u8, kind, "md"))
-        .{ .markdown = .{ .content = content } }
-    else
-        .{ .text = content };
+    var decoded: decoder_mod.Decoded = if (std.mem.eql(u8, kind, "auto"))
+        decoder_mod.decode(in_path, io, gpa)
+    else blk: {
+        const content = try std.Io.Dir.cwd().readFileAlloc(io, in_path, gpa, std.Io.Limit.limited(10 * 1024 * 1024));
+        break :blk if (std.mem.eql(u8, kind, "md"))
+            .{ .markdown = .{ .content = content } }
+        else
+            .{ .text = content };
+    };
     defer decoded.deinit(gpa);
 
     var stdout_buf: [65536]u8 = undefined;

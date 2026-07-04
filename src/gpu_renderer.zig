@@ -62,11 +62,14 @@ const ASPECT_DEPTH = vk.ASPECT_DEPTH;
 const BLEND_FACTOR_ONE_MINUS_SRC_ALPHA = vk.BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
 const BLEND_FACTOR_SRC_ALPHA = vk.BLEND_FACTOR_SRC_ALPHA;
 const BUFFER_USAGE_INDEX = vk.BUFFER_USAGE_INDEX;
+const BUFFER_USAGE_STORAGE = vk.BUFFER_USAGE_STORAGE;
 const BUFFER_USAGE_TRANSFER_DST = vk.BUFFER_USAGE_TRANSFER_DST;
 const BUFFER_USAGE_TRANSFER_SRC = vk.BUFFER_USAGE_TRANSFER_SRC;
 const BUFFER_USAGE_VERTEX = vk.BUFFER_USAGE_VERTEX;
 const COLOR_WRITE_RGB = vk.COLOR_WRITE_RGB;
 const DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER = vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+const DESCRIPTOR_TYPE_STORAGE_BUFFER = vk.DESCRIPTOR_TYPE_STORAGE_BUFFER;
+const VkDescriptorBufferInfo = vk.VkDescriptorBufferInfo;
 const EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT = vk.EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
 const FORMAT_D32_SFLOAT = vk.FORMAT_D32_SFLOAT;
 const FORMAT_R32G32B32A32_SFLOAT = vk.FORMAT_R32G32B32A32_SFLOAT;
@@ -375,9 +378,12 @@ pub const Renderer = struct {
     shadow_vert_module: VkShaderModule = VK_NULL,
     shadow_frag_module: VkShaderModule = VK_NULL,
 
-    // Rendering voxel (ray-march di una texture 3D), inizializzato pigramente.
+    // Rendering voxel (ray-march), inizializzato pigramente. La griglia vive in
+    // uno storage buffer host-visible (un uint RGBA8-packed per voxel), non in
+    // una texture 3D: alcuni driver (Intel/NVIDIA su questo laptop) vanno in
+    // device-lost sull'upload di immagini 3D. Lo SSBO è memoria lineare che lo
+    // shader indicizza a mano, aggirando del tutto formati/tiling/layout 3D.
     voxel_ready: bool = false, // pipeline/risorse statiche create
-    voxel_sampler: VkSampler = VK_NULL,
     voxel_dsl: VkDescriptorSetLayout = VK_NULL,
     voxel_dpool: VkDescriptorPool = VK_NULL,
     voxel_dset: VkDescriptorSet = VK_NULL,
@@ -385,7 +391,8 @@ pub const Renderer = struct {
     voxel_pipeline: VkPipeline = VK_NULL,
     voxel_vert_module: VkShaderModule = VK_NULL,
     voxel_frag_module: VkShaderModule = VK_NULL,
-    voxel_tex: ImageBundle = .{ .image = VK_NULL, .mem = VK_NULL, .view = VK_NULL },
+    voxel_buf: VkBuffer = VK_NULL,
+    voxel_mem: VkDeviceMemory = VK_NULL,
     voxel_dim: u32 = 0, // >0 se una griglia è caricata
 
     // Texture immagine (per zuer-gui: blit diretto sulla swapchain)
@@ -596,9 +603,11 @@ pub const Renderer = struct {
             vkDestroyShaderModule(self.device, self.voxel_frag_module, null);
             vkDestroyDescriptorPool(self.device, self.voxel_dpool, null);
             vkDestroyDescriptorSetLayout(self.device, self.voxel_dsl, null);
-            vkDestroySampler(self.device, self.voxel_sampler, null);
         }
-        if (self.voxel_tex.image != VK_NULL) self.destroyImage(self.voxel_tex);
+        if (self.voxel_buf != VK_NULL) {
+            vkDestroyBuffer(self.device, self.voxel_buf, null);
+            vkFreeMemory(self.device, self.voxel_mem, null);
+        }
         self.releaseSubmeshes();
         if (self.white_tex.image != VK_NULL) self.destroyImage(self.white_tex);
         if (self.flat_normal_tex.image != VK_NULL) self.destroyImage(self.flat_normal_tex);
@@ -1002,6 +1011,18 @@ pub const Renderer = struct {
         return self.readback_ptrs[prev_slot].?[0 .. @as(usize, width) * height * 4];
     }
 
+    /// Render sincrono a singolo frame: invia e attende, restituendo i pixel del
+    /// frame *corrente* (a differenza di `render()`, che è pipelined e ritorna il
+    /// frame precedente). Per selftest/screenshot headless dove serve leggere
+    /// subito lo stato appena impostato. Usa lo slot 0: non mescolare con
+    /// `render()` nella stessa sessione senza un `vkDeviceWaitIdle` in mezzo.
+    pub fn renderSync(self: *Renderer, width: u32, height: u32, pc: *const PushConstants) ![]const u8 {
+        try self.recordAndSubmitFrame(0, width, height, pc);
+        try check(vkWaitForFences(self.device, 1, @ptrCast(&self.frame_fences[0]), 1, 2 * std.time.ns_per_s));
+        try check(vkResetFences(self.device, 1, @ptrCast(&self.frame_fences[0])));
+        return self.readback_ptrs[0].?[0 .. @as(usize, width) * height * 4];
+    }
+
     fn recordAndSubmitFrame(self: *Renderer, slot: usize, width: u32, height: u32, pc: *const PushConstants) !void {
         if (self.mesh_buf == VK_NULL) return error.NoMesh;
         if (width == 0 or height == 0) return error.EmptyTarget;
@@ -1190,8 +1211,10 @@ pub const Renderer = struct {
         return self.voxel_dim > 0;
     }
 
-    /// Carica la griglia voxel `dim`³ (RGBA8, `data` = dim³×4) come texture 3D
-    /// sRGB campionabile e la aggancia al descriptor set voxel.
+    /// Carica la griglia voxel `dim`³ (RGBA8, `data` = dim³×4) in uno storage
+    /// buffer host-visible (un uint RGBA8-packed little-endian per voxel) e lo
+    /// aggancia al descriptor set voxel. Nessun command buffer: solo memcpy,
+    /// quindi non può andare in device-lost come l'upload di una texture 3D.
     pub fn setVoxels(self: *Renderer, dim: u32, data: []const u8) !void {
         if (dim == 0) return error.BadVoxelGrid;
         const cells: u64 = @as(u64, dim) * dim * dim;
@@ -1201,75 +1224,54 @@ pub const Renderer = struct {
         try self.ensureVoxelPipeline();
 
         _ = vkDeviceWaitIdle(self.device);
-        if (self.voxel_tex.image != VK_NULL) {
-            self.destroyImage(self.voxel_tex);
-            self.voxel_tex = .{ .image = VK_NULL, .mem = VK_NULL, .view = VK_NULL };
+        if (self.voxel_buf != VK_NULL) {
+            vkDestroyBuffer(self.device, self.voxel_buf, null);
+            vkFreeMemory(self.device, self.voxel_mem, null);
+            self.voxel_buf = VK_NULL;
+            self.voxel_mem = VK_NULL;
             self.voxel_dim = 0;
         }
 
-        // UNORM (non SRGB): le texture 3D sRGB non sono garantite dall'hardware;
-        // lo shader linearizza l'albedo campionato (pow 2.2).
-        const tex = try self.createImage3D(dim, FORMAT_R8G8B8A8_UNORM, IMAGE_USAGE_SAMPLED | IMAGE_USAGE_TRANSFER_DST);
-        errdefer self.destroyImage(tex);
-
-        var staging: VkBuffer = VK_NULL;
-        try check(vkCreateBuffer(self.device, &.{ .size = size, .usage = BUFFER_USAGE_TRANSFER_SRC }, null, &staging));
-        defer vkDestroyBuffer(self.device, staging, null);
+        var buf: VkBuffer = VK_NULL;
+        try check(vkCreateBuffer(self.device, &.{ .size = size, .usage = BUFFER_USAGE_STORAGE }, null, &buf));
+        errdefer vkDestroyBuffer(self.device, buf, null);
         var req: VkMemoryRequirements = undefined;
-        vkGetBufferMemoryRequirements(self.device, staging, &req);
+        vkGetBufferMemoryRequirements(self.device, buf, &req);
         const mt = self.findMemoryType(req.memoryTypeBits, MEM_HOST_VISIBLE | MEM_HOST_COHERENT) orelse return error.NoMemoryType;
-        var smem: VkDeviceMemory = VK_NULL;
-        try check(vkAllocateMemory(self.device, &.{ .allocationSize = req.size, .memoryTypeIndex = mt }, null, &smem));
-        defer vkFreeMemory(self.device, smem, null);
-        try check(vkBindBufferMemory(self.device, staging, smem, 0));
+        var mem: VkDeviceMemory = VK_NULL;
+        try check(vkAllocateMemory(self.device, &.{ .allocationSize = req.size, .memoryTypeIndex = mt }, null, &mem));
+        errdefer vkFreeMemory(self.device, mem, null);
+        try check(vkBindBufferMemory(self.device, buf, mem, 0));
         var mapped: *anyopaque = undefined;
-        try check(vkMapMemory(self.device, smem, 0, size, 0, &mapped));
+        try check(vkMapMemory(self.device, mem, 0, size, 0, &mapped));
         const dst: [*]u8 = @ptrCast(mapped);
         @memcpy(dst[0..@intCast(size)], data[0..@intCast(size)]);
 
-        try check(vkBeginCommandBuffer(self.cmd, &.{}));
-        const to_dst = [_]VkImageMemoryBarrier{.{
-            .srcAccessMask = 0,
-            .dstAccessMask = ACCESS_TRANSFER_WRITE,
-            .oldLayout = IMAGE_LAYOUT_UNDEFINED,
-            .newLayout = IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            .image = tex.image,
-            .subresourceRange = .{ .aspectMask = ASPECT_COLOR },
-        }};
-        vkCmdPipelineBarrier(self.cmd, STAGE_TOP, STAGE_TRANSFER, 0, 0, null, 0, null, 1, &to_dst);
-        vkCmdCopyBufferToImage(self.cmd, staging, tex.image, IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &[_]VkBufferImageCopy{.{
-            .imageSubresource = .{ .aspectMask = ASPECT_COLOR },
-            .imageExtent = .{ .width = dim, .height = dim, .depth = dim },
-        }});
-        const to_read = [_]VkImageMemoryBarrier{.{
-            .srcAccessMask = ACCESS_TRANSFER_WRITE,
-            .dstAccessMask = ACCESS_SHADER_READ,
-            .oldLayout = IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            .newLayout = IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            .image = tex.image,
-            .subresourceRange = .{ .aspectMask = ASPECT_COLOR },
-        }};
-        vkCmdPipelineBarrier(self.cmd, STAGE_TRANSFER, STAGE_FRAGMENT_SHADER, 0, 0, null, 0, null, 1, &to_read);
-        try check(vkEndCommandBuffer(self.cmd));
-        try check(vkQueueSubmit(self.queue, 1, &[_]VkSubmitInfo{.{ .pCommandBuffers = @ptrCast(&self.cmd) }}, self.fence));
-        try check(vkWaitForFences(self.device, 1, @ptrCast(&self.fence), 1, 2 * std.time.ns_per_s));
-        try check(vkResetFences(self.device, 1, @ptrCast(&self.fence)));
-
-        const img_info = VkDescriptorImageInfo{
-            .sampler = self.voxel_sampler,
-            .imageView = tex.view,
-            .imageLayout = IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        };
+        const buf_info = VkDescriptorBufferInfo{ .buffer = buf, .offset = 0, .range = size };
         const write = [_]VkWriteDescriptorSet{.{
             .dstSet = self.voxel_dset,
             .dstBinding = 0,
-            .descriptorType = DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            .pImageInfo = &img_info,
+            .descriptorType = DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &buf_info,
         }};
         vkUpdateDescriptorSets(self.device, 1, &write, 0, null);
 
-        self.voxel_tex = tex;
+        self.voxel_buf = buf;
+        self.voxel_mem = mem;
         self.voxel_dim = dim;
+    }
+
+    /// Riporta il double-buffer di `render()` a uno stato pulito e sincrono.
+    /// Necessario quando si alterna `render()` (pipelined, slot ping-pong) e
+    /// `renderVoxel()`/`renderSync()` (slot 0 sincrono): senza questo, una fence
+    /// signaled in volo dal path pipelined verrebbe ri-submittata (invalido) o
+    /// una attesa su slot 0 già resettato andrebbe in timeout.
+    pub fn resetFrameSync(self: *Renderer) void {
+        _ = vkDeviceWaitIdle(self.device);
+        // Dopo il wait idle nessun submit è pendente: si possono resettare
+        // entrambe le fence (reset di una fence già unsignaled è valido).
+        _ = vkResetFences(self.device, 2, @ptrCast(&self.frame_fences));
+        self.frame_index = 0;
     }
 
     /// Renderizza la griglia voxel e ne fa il readback (RGBA, valido fino alla
@@ -1289,57 +1291,62 @@ pub const Renderer = struct {
         if (width == 0 or height == 0) return error.EmptyTarget;
         try self.ensureTarget(width, height);
 
-        try check(vkBeginCommandBuffer(self.cmd, &.{}));
+        // Usa lo slot 0 del path frame (come `renderSync`): `renderVoxel` è
+        // sincrono e non si interlaccia con `render()` durante il selftest/GUI.
+        const cmd = self.frame_cmds[0];
+        const fence = self.frame_fences[0];
+        const readback_buf = self.readback_bufs[0];
+
+        try check(vkBeginCommandBuffer(cmd, &.{}));
         const clears = [_]VkClearValue{
             .{ .color = .{ 0, 0, 0, 0 } },
             .{ .depth_stencil = .{ .depth = 1.0, .stencil = 0 } },
         };
-        vkCmdBeginRenderPass(self.cmd, &.{
+        vkCmdBeginRenderPass(cmd, &.{
             .renderPass = self.render_pass,
             .framebuffer = self.framebuffer,
             .renderArea = .{ .offset = .{ .x = 0, .y = 0 }, .extent = .{ .width = width, .height = height } },
             .clearValueCount = clears.len,
             .pClearValues = &clears,
         }, 0);
-        vkCmdBindPipeline(self.cmd, 0, self.voxel_pipeline);
-        vkCmdSetViewport(self.cmd, 0, 1, &[_]VkViewport{.{ .x = 0, .y = 0, .width = @floatFromInt(width), .height = @floatFromInt(height) }});
-        vkCmdSetScissor(self.cmd, 0, 1, &[_]VkRect2D{.{ .offset = .{ .x = 0, .y = 0 }, .extent = .{ .width = width, .height = height } }});
-        vkCmdPushConstants(self.cmd, self.voxel_pipeline_layout, SHADER_STAGE_FRAGMENT, 0, @sizeOf(VoxelPush), pc);
-        vkCmdBindDescriptorSets(self.cmd, 0, self.voxel_pipeline_layout, 0, 1, &[_]VkDescriptorSet{self.voxel_dset}, 0, null);
-        vkCmdDraw(self.cmd, 3, 1, 0, 0);
-        vkCmdEndRenderPass(self.cmd);
+        vkCmdBindPipeline(cmd, 0, self.voxel_pipeline);
+        vkCmdSetViewport(cmd, 0, 1, &[_]VkViewport{.{ .x = 0, .y = 0, .width = @floatFromInt(width), .height = @floatFromInt(height) }});
+        vkCmdSetScissor(cmd, 0, 1, &[_]VkRect2D{.{ .offset = .{ .x = 0, .y = 0 }, .extent = .{ .width = width, .height = height } }});
+        vkCmdPushConstants(cmd, self.voxel_pipeline_layout, SHADER_STAGE_FRAGMENT, 0, @sizeOf(VoxelPush), pc);
+        vkCmdBindDescriptorSets(cmd, 0, self.voxel_pipeline_layout, 0, 1, &[_]VkDescriptorSet{self.voxel_dset}, 0, null);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+        vkCmdEndRenderPass(cmd);
 
         if (do_readback) {
-            vkCmdCopyImageToBuffer(self.cmd, self.color_image, IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, self.readback_buf, 1, &[_]VkBufferImageCopy{.{
+            vkCmdCopyImageToBuffer(cmd, self.color_image, IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback_buf, 1, &[_]VkBufferImageCopy{.{
                 .imageSubresource = .{ .aspectMask = ASPECT_COLOR },
                 .imageExtent = .{ .width = width, .height = height, .depth = 1 },
             }});
             const host_barrier = [_]VkBufferMemoryBarrier{.{
                 .srcAccessMask = ACCESS_TRANSFER_WRITE,
                 .dstAccessMask = ACCESS_HOST_READ,
-                .buffer = self.readback_buf,
+                .buffer = readback_buf,
                 .size = @as(u64, width) * height * 4,
             }};
-            vkCmdPipelineBarrier(self.cmd, STAGE_TRANSFER, STAGE_HOST, 0, 0, null, 1, &host_barrier, 0, null);
+            vkCmdPipelineBarrier(cmd, STAGE_TRANSFER, STAGE_HOST, 0, 0, null, 1, &host_barrier, 0, null);
         }
 
-        try check(vkEndCommandBuffer(self.cmd));
-        try check(vkQueueSubmit(self.queue, 1, &[_]VkSubmitInfo{.{ .pCommandBuffers = @ptrCast(&self.cmd) }}, self.fence));
-        try check(vkWaitForFences(self.device, 1, @ptrCast(&self.fence), 1, 2 * std.time.ns_per_s));
-        try check(vkResetFences(self.device, 1, @ptrCast(&self.fence)));
+        try check(vkEndCommandBuffer(cmd));
+        try check(vkQueueSubmit(self.queue, 1, &[_]VkSubmitInfo{.{ .pCommandBuffers = @ptrCast(&cmd) }}, fence));
+        try check(vkWaitForFences(self.device, 1, @ptrCast(&fence), 1, 2 * std.time.ns_per_s));
+        try check(vkResetFences(self.device, 1, @ptrCast(&fence)));
     }
 
-    /// Crea (una sola volta) sampler 3D, descriptor set, layout e pipeline del
-    /// ray-march voxel. Riusa il render pass principale (fullscreen, no depth).
+    /// Crea (una sola volta) descriptor set, layout e pipeline del ray-march
+    /// voxel. La griglia è uno storage buffer (binding 0). Riusa il render pass
+    /// principale (fullscreen, no depth).
     fn ensureVoxelPipeline(self: *Renderer) !void {
         if (self.voxel_ready) return;
 
-        try check(vkCreateSampler(self.device, &.{}, null, &self.voxel_sampler)); // NEAREST → voxel netti
-
-        const binding = VkDescriptorSetLayoutBinding{ .binding = 0, .descriptorType = DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = SHADER_STAGE_FRAGMENT };
+        const binding = VkDescriptorSetLayoutBinding{ .binding = 0, .descriptorType = DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = SHADER_STAGE_FRAGMENT };
         try check(vkCreateDescriptorSetLayout(self.device, &.{ .bindingCount = 1, .pBindings = @ptrCast(&binding) }, null, &self.voxel_dsl));
 
-        const pool_size = VkDescriptorPoolSize{ .type = DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1 };
+        const pool_size = VkDescriptorPoolSize{ .type = DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1 };
         try check(vkCreateDescriptorPool(self.device, &.{ .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = @ptrCast(&pool_size) }, null, &self.voxel_dpool));
         try check(vkAllocateDescriptorSets(self.device, &.{ .descriptorPool = self.voxel_dpool, .pSetLayouts = @ptrCast(&self.voxel_dsl) }, &self.voxel_dset));
 
@@ -1356,36 +1363,6 @@ pub const Renderer = struct {
         self.voxel_pipeline = try createVoxelPipeline(self.device, self.render_pass, self.voxel_pipeline_layout, self.voxel_vert_module, self.voxel_frag_module);
 
         self.voxel_ready = true;
-    }
-
-    fn createImage3D(self: *Renderer, dim: u32, format: u32, usage: u32) !ImageBundle {
-        var image: VkImage = VK_NULL;
-        try check(vkCreateImage(self.device, &.{
-            .imageType = 2, // 3D
-            .format = format,
-            .extent = .{ .width = dim, .height = dim, .depth = dim },
-            .usage = usage,
-        }, null, &image));
-        errdefer vkDestroyImage(self.device, image, null);
-
-        var req: VkMemoryRequirements = undefined;
-        vkGetImageMemoryRequirements(self.device, image, &req);
-        const mem_type = self.findMemoryType(req.memoryTypeBits, MEM_DEVICE_LOCAL) orelse
-            self.findMemoryType(req.memoryTypeBits, 0) orelse return error.NoMemoryType;
-        var mem: VkDeviceMemory = VK_NULL;
-        try check(vkAllocateMemory(self.device, &.{ .allocationSize = req.size, .memoryTypeIndex = mem_type }, null, &mem));
-        errdefer vkFreeMemory(self.device, mem, null);
-        try check(vkBindImageMemory(self.device, image, mem, 0));
-
-        var view: VkImageView = VK_NULL;
-        try check(vkCreateImageView(self.device, &.{
-            .image = image,
-            .viewType = 2, // 3D
-            .format = format,
-            .subresourceRange = .{ .aspectMask = ASPECT_COLOR },
-        }, null, &view));
-
-        return .{ .image = image, .mem = mem, .view = view };
     }
 
     fn ensureTarget(self: *Renderer, width: u32, height: u32) !void {

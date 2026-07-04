@@ -56,6 +56,7 @@ pub fn main(init: std.process.Init) !void {
         .image => |img| try w.print("OK IMAGE {d}x{d}\n", .{ img.width, img.height }),
         .text => |txt| try w.print("OK TEXT ({d} byte)\n", .{txt.len}),
         .csv => try w.print("OK CSV\n", .{}),
+        .workbook => |wb| try w.print("OK WORKBOOK ({d} fogli)\n", .{wb.sheets.len}),
         .markdown => try w.print("OK MARKDOWN\n", .{}),
         .mesh => try w.print("OK MESH\n", .{}),
         .err => |e| try w.print("ERR: {s}\n", .{e}),

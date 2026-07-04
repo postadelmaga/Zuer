@@ -1,9 +1,25 @@
 #!/usr/bin/env bash
 set -e
 
-# Compile zuer and zuer-gui in ReleaseSafe mode (highly optimized, safe, and smaller binary size)
-echo "Building zuer and zuer-gui in ReleaseSafe mode..."
-zig build -Doptimize=ReleaseSafe
+# Modalità di build. Default: ReleaseSafe (ottimizzato, sicuro, binario piccolo).
+#   --fast | -f : build Debug col backend self-hosted di Zig (niente LLVM) →
+#                 compila in pochi secondi invece di ~50s, ma i binari sono NON
+#                 ottimizzati (più lenti a runtime). Utile per iterare in fretta.
+# NB: mold/altri linker esterni NON aiutano — Zig 0.16 linka in-process (LLD o
+# self-hosted), non invoca mai un linker di sistema, quindi non c'è nulla da
+# accelerare sul link: il tempo è tutto in LLVM (codegen ReleaseSafe).
+OPTIMIZE="ReleaseSafe"
+for arg in "$@"; do
+  case "$arg" in
+    --fast|-f) OPTIMIZE="Debug" ;;
+  esac
+done
+
+echo "Building zuer and zuer-gui in ${OPTIMIZE} mode..."
+if [ "$OPTIMIZE" = "Debug" ]; then
+  echo "  (build veloce senza LLVM: binari non ottimizzati, per sviluppo)"
+fi
+zig build -Doptimize="$OPTIMIZE"
 
 # Set target directory
 # ~/.local/bin is the standard user-level binary directory.

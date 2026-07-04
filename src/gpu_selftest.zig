@@ -68,7 +68,7 @@ pub fn main() !void {
         .metallic = 0.0,
         .roughness = 0.5,
     });
-    const rgba = try renderer.render(w, h, &pc);
+    const rgba = try renderer.renderSync(w, h, &pc);
 
     var covered: usize = 0;
     var lum_min: f32 = 1e9;
@@ -122,7 +122,7 @@ pub fn main() !void {
     // assoluto; però la texture rossa deve rendere il render *relativamente*
     // molto più rosso di quello bianco (prova di upload+descriptor+sampling).
     try renderer.setBaseColor(&red_tex, 2, 2);
-    const rgba_red = try renderer.render(w, h, &pc_white);
+    const rgba_red = try renderer.renderSync(w, h, &pc_white);
     var rr: u64 = 0;
     var rb: u64 = 0;
     var k: usize = 0;
@@ -133,7 +133,7 @@ pub fn main() !void {
     }
     const white_tex = [_]u8{ 220, 220, 220, 255 };
     try renderer.setBaseColor(&white_tex, 1, 1);
-    const rgba_white = try renderer.render(w, h, &pc_white);
+    const rgba_white = try renderer.renderSync(w, h, &pc_white);
     var wr: u64 = 0;
     var wb: u64 = 0;
     k = 0;
@@ -231,6 +231,11 @@ fn renderCountDark(renderer: *gpu.Renderer, gpa: std.mem.Allocator, with_caster:
 
     var stage = loader.stageToGpu(gpa, &decoded) orelse return error.StageFailed;
     defer stage.buffer.deinit(gpa);
+    // Rilascia l'import mesh PRIMA di liberare la memoria host di `stage`
+    // (LIFO: questo defer gira prima di stage.buffer.deinit): setMesh importa
+    // il puntatore host zero-copy, e liberarlo mentre il VkBuffer lo mappa
+    // ancora lascerebbe un riferimento pendente nelle page table GPU.
+    defer renderer.releaseMesh();
     try renderer.setMesh(stage.buffer.ptr, stage.vertex_bytes, @intCast(stage.index_bytes / @sizeOf(u32)));
     try renderer.setBaseColor(&.{}, 0, 0); // baseColor bianco
 
@@ -240,7 +245,7 @@ fn renderCountDark(renderer: *gpu.Renderer, gpa: std.mem.Allocator, with_caster:
         .metallic = 0.0,
         .roughness = 0.9,
     });
-    const rgba = try renderer.render(w, h, &pc);
+    const rgba = try renderer.renderSync(w, h, &pc);
 
     // Massimo di luminanza fra i pixel coperti = base pienamente illuminata.
     var maxlum: f32 = 0;

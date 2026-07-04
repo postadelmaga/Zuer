@@ -17,6 +17,16 @@ const font_bold = @embedFile("assets/Hack-Bold.ttf");
 const font_italic = @embedFile("assets/Hack-Italic.ttf");
 const font_bold_italic = @embedFile("assets/Hack-BoldItalic.ttf");
 
+// Famiglia proporzionale (Liberation Sans, metrica-compatibile con Arial) per il
+// rendering "foglio di calcolo" delle tabelle. Corsivi non necessari: ripiegano
+// su regular/bold.
+const font_sans_regular = @embedFile("assets/LiberationSans-Regular.ttf");
+const font_sans_bold = @embedFile("assets/LiberationSans-Bold.ttf");
+
+/// Famiglia tipografica: `mono` (Hack, per codice/testo, resa a griglia) oppure
+/// `sans` (Liberation Sans, proporzionale, per le tabelle).
+pub const Family = enum { mono, sans };
+
 pub const Rgb = struct {
     r: u8,
     g: u8,
@@ -42,6 +52,9 @@ const Glyph = struct {
     h: i32,
     xoff: i32,
     yoff: i32,
+    /// Avanzamento orizzontale in pixel del glifo (per il layout proporzionale;
+    /// con Hack coincide con `Raster.advance`).
+    advance: i32,
     bitmap: []const u8,
 };
 
@@ -62,7 +75,15 @@ pub const Raster = struct {
     cache: std.AutoHashMapUnmanaged(CacheKey, Glyph),
 
     pub fn init(gpa: std.mem.Allocator, px_height: f32) !Raster {
-        const bytes = [4][]const u8{ font_regular, font_bold, font_italic, font_bold_italic };
+        return initFamily(gpa, px_height, .mono);
+    }
+
+    pub fn initFamily(gpa: std.mem.Allocator, px_height: f32, family: Family) !Raster {
+        const bytes: [4][]const u8 = switch (family) {
+            .mono => .{ font_regular, font_bold, font_italic, font_bold_italic },
+            // Sans: corsivi ripiegano su regular/bold (le tabelle non li usano).
+            .sans => .{ font_sans_regular, font_sans_bold, font_sans_regular, font_sans_bold },
+        };
         var infos: [4]c.stbtt_fontinfo = undefined;
         var scale: [4]f32 = undefined;
         for (bytes, 0..) |data, i| {
@@ -123,7 +144,13 @@ pub const Raster = struct {
         } else &[_]u8{};
         if (bmp != null) c.stbtt_FreeBitmap(bmp, null);
 
-        const g = Glyph{ .w = w, .h = h, .xoff = xoff, .yoff = yoff, .bitmap = owned };
+        // Avanzamento orizzontale del glifo (per il layout proporzionale).
+        var adv: c_int = 0;
+        var lsb: c_int = 0;
+        c.stbtt_GetCodepointHMetrics(&self.infos[si], @intCast(cp), &adv, &lsb);
+        const advance: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(adv)) * self.scale[si]));
+
+        const g = Glyph{ .w = w, .h = h, .xoff = xoff, .yoff = yoff, .advance = advance, .bitmap = owned };
         try self.cache.put(self.gpa, key, g);
         return self.cache.getPtr(key).?;
     }
@@ -258,11 +285,42 @@ pub fn buildAtlas(raster: *Raster) !Atlas {
     return .{ .gpa = gpa, .pixels = pixels, .w = atlas_w, .h = atlas_h, .map = map };
 }
 
-/// out = out*(1-a) + color*a, con a = cov/255, per canale RGB.
+// Blending gamma-corretto (in luce lineare) per una resa tipografica. Fondere la
+// copertura del glifo direttamente in sRGB (come faceva la vecchia `blend`) rende
+// i bordi troppo scuri/frastagliati su fondo scuro; convertendo in lineare, fondendo
+// e riconvertendo in sRGB le sfumature dell'antialiasing hanno il peso corretto.
+
+/// LUT sRGB(0..255) → lineare(0..1), calcolata a compile-time (formula sRGB standard).
+const srgb_to_linear: [256]f32 = blk: {
+    @setEvalBranchQuota(20000);
+    var t: [256]f32 = undefined;
+    for (&t, 0..) |*v, i| {
+        const u = @as(f64, @floatFromInt(i)) / 255.0;
+        v.* = @floatCast(if (u <= 0.04045) u / 12.92 else std.math.pow(f64, (u + 0.055) / 1.055, 2.4));
+    }
+    break :blk t;
+};
+
+/// lineare(0..1) → sRGB(0..255).
+fn linearToSrgb(x: f32) u8 {
+    const u: f64 = std.math.clamp(@as(f64, x), 0.0, 1.0);
+    const s = if (u <= 0.0031308) u * 12.92 else 1.055 * std.math.pow(f64, u, 1.0 / 2.4) - 0.055;
+    return @intFromFloat(@round(std.math.clamp(s, 0.0, 1.0) * 255.0));
+}
+
+/// "Font smoothing" in stile macOS: solleva la copertura media per ingrassare i
+/// tratti (macOS rende il testo più pieno del grayscale grezzo). Esponente < 1.
+fn smoothCoverage(a: f32) f32 {
+    return std.math.pow(f32, a, 0.72);
+}
+
+/// out = srgb(lin(out)*(1-a) + lin(color)*a), con a = smoothing(cov/255), per canale.
 fn blend(dst: []u8, color: Rgb, cov: u8) void {
-    const a: u32 = cov;
-    const ia: u32 = 255 - a;
-    dst[0] = @intCast((@as(u32, dst[0]) * ia + @as(u32, color.r) * a + 127) / 255);
-    dst[1] = @intCast((@as(u32, dst[1]) * ia + @as(u32, color.g) * a + 127) / 255);
-    dst[2] = @intCast((@as(u32, dst[2]) * ia + @as(u32, color.b) * a + 127) / 255);
+    const a: f32 = smoothCoverage(@as(f32, @floatFromInt(cov)) / 255.0);
+    const ia: f32 = 1.0 - a;
+    const cr = [3]u8{ color.r, color.g, color.b };
+    inline for (0..3) |ch| {
+        const out = srgb_to_linear[dst[ch]] * ia + srgb_to_linear[cr[ch]] * a;
+        dst[ch] = linearToSrgb(out);
+    }
 }

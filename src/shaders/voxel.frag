@@ -8,7 +8,14 @@
 layout(location = 0) in vec2 v_ndc;
 layout(location = 0) out vec4 out_color;
 
-layout(set = 0, binding = 0) uniform sampler3D voxTex; // RGBA sRGB, a = occupazione
+// Griglia voxel come storage buffer: un uint RGBA8-packed per cella
+// (little-endian: byte0=R, byte1=G, byte2=B, byte3=A/occupazione). Evita le
+// texture 3D (device-lost su alcuni driver).
+layout(std430, set = 0, binding = 0) readonly buffer Voxels { uint data[]; };
+
+uint voxelAt(ivec3 c, int dim) {
+    return data[(c.z * dim + c.y) * dim + c.x];
+}
 
 layout(push_constant) uniform PC {
     vec4 origin;    // origine raggio, spazio griglia [0,1]
@@ -25,7 +32,7 @@ vec3 aces(vec3 x) {
 
 bool occupied(ivec3 c, int dim) {
     if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, ivec3(dim)))) return false;
-    return texelFetch(voxTex, c, 0).a > 0.5;
+    return (voxelAt(c, dim) >> 24) > 127u; // byte alfa = occupazione
 }
 
 // DDA primario: ritorna hit + cella + normale della faccia d'ingresso.
@@ -100,7 +107,9 @@ void main() {
         return;
     }
 
-    vec3 albedo = pow(texelFetch(voxTex, cell, 0).rgb, vec3(2.2)); // sRGB→lineare
+    uint packed = voxelAt(cell, dim);
+    vec3 srgb = vec3(float(packed & 0xffu), float((packed >> 8) & 0xffu), float((packed >> 16) & 0xffu)) / 255.0;
+    vec3 albedo = pow(srgb, vec3(2.2)); // sRGB→lineare
     vec3 N = nrm; // asse griglia = asse oggetto
     vec3 L = normalize(pc.light_obj.xyz);
     float ndl = max(dot(N, L), 0.0);

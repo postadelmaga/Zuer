@@ -15,6 +15,35 @@ pub const CsvData = struct {
     }
 };
 
+/// Un singolo foglio di un workbook: nome (per la linguetta) + dati tabellari.
+pub const Sheet = struct {
+    name: []const u8,
+    data: CsvData,
+
+    pub fn deinit(self: *Sheet, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        self.data.deinit(allocator);
+    }
+};
+
+/// Foglio di calcolo multi-foglio (xlsx con più sheet). Il foglio mostrato è
+/// `active`, un indice di RUNTIME della GUI (non attraversa il confine C-ABI:
+/// il plugin restituisce sempre tutti i fogli, la selezione è lato host).
+pub const WorkbookData = struct {
+    sheets: []Sheet,
+    active: usize = 0,
+
+    pub fn deinit(self: *WorkbookData, allocator: std.mem.Allocator) void {
+        for (self.sheets) |*s| s.deinit(allocator);
+        allocator.free(self.sheets);
+    }
+
+    /// Dati del foglio attivo (clampato: `active` è convalidato dalla GUI).
+    pub fn activeCsv(self: *const WorkbookData) CsvData {
+        return self.sheets[self.active].data;
+    }
+};
+
 pub const MarkdownData = struct {
     content: []const u8,
 
@@ -106,6 +135,7 @@ pub const ImageData = struct {
 pub const Decoded = union(enum) {
     text: []const u8,
     csv: CsvData,
+    workbook: WorkbookData,
     markdown: MarkdownData,
     mesh: MeshData,
     image: ImageData,
@@ -115,6 +145,7 @@ pub const Decoded = union(enum) {
         switch (self.*) {
             .text => |t| allocator.free(t),
             .csv => |*c| c.deinit(allocator),
+            .workbook => |*w| w.deinit(allocator),
             .markdown => |*m| m.deinit(allocator),
             .mesh => |*m| m.deinit(allocator),
             .image => |*i| i.deinit(allocator),
@@ -131,32 +162,26 @@ pub const Decoded = union(enum) {
                 };
             },
             .csv => |c| {
-                const headers_c = try allocator.alloc(SliceC, c.headers.len);
-                for (c.headers, 0..) |h, i| {
-                    headers_c[i] = SliceC.fromSlice(h);
-                }
-                const rows_c = try allocator.alloc(RowC, c.rows.len);
-                for (c.rows, 0..) |row, r_idx| {
-                    const row_cells_c = try allocator.alloc(SliceC, row.len);
-                    for (row, 0..) |cell, c_idx| {
-                        row_cells_c[c_idx] = SliceC.fromSlice(cell);
-                    }
-                    rows_c[r_idx] = .{ .ptr = row_cells_c.ptr, .len = row_cells_c.len };
-                }
-                // Free container arrays of the original (the leaves are kept, now owned by DecodedC)
-                allocator.free(c.headers);
-                for (c.rows) |row| {
-                    allocator.free(row);
-                }
-                allocator.free(c.rows);
-
                 return .{
                     .tag = .csv,
+                    .payload = .{ .csv = try csvToC(allocator, c) },
+                };
+            },
+            .workbook => |w| {
+                const sheets_c = try allocator.alloc(SheetC, w.sheets.len);
+                for (w.sheets, 0..) |s, i| {
+                    sheets_c[i] = .{
+                        .name = SliceC.fromSlice(s.name),
+                        .data = try csvToC(allocator, s.data),
+                    };
+                }
+                // Il container []Sheet si libera (le leaf name/celle restano vive,
+                // ora possedute da DecodedC via i SliceC).
+                allocator.free(w.sheets);
+                return .{
+                    .tag = .workbook,
                     .payload = .{
-                        .csv = .{
-                            .headers = .{ .ptr = headers_c.ptr, .len = headers_c.len },
-                            .rows = .{ .ptr = rows_c.ptr, .len = rows_c.len },
-                        },
+                        .workbook = .{ .sheets = .{ .ptr = sheets_c.ptr, .len = sheets_c.len } },
                     },
                 };
             },
@@ -237,6 +262,53 @@ pub const Decoded = union(enum) {
     }
 };
 
+/// Converte una CsvData Zig nel layout C: alloca i container SliceC/RowC e
+/// libera i container Zig originali (le leaf — header/celle — restano vive,
+/// ora possedute dal chiamante via i SliceC).
+fn csvToC(allocator: std.mem.Allocator, c: CsvData) !CsvDataC {
+    const headers_c = try allocator.alloc(SliceC, c.headers.len);
+    for (c.headers, 0..) |h, i| {
+        headers_c[i] = SliceC.fromSlice(h);
+    }
+    const rows_c = try allocator.alloc(RowC, c.rows.len);
+    for (c.rows, 0..) |row, r_idx| {
+        const row_cells_c = try allocator.alloc(SliceC, row.len);
+        for (row, 0..) |cell, c_idx| {
+            row_cells_c[c_idx] = SliceC.fromSlice(cell);
+        }
+        rows_c[r_idx] = .{ .ptr = row_cells_c.ptr, .len = row_cells_c.len };
+    }
+    allocator.free(c.headers);
+    for (c.rows) |row| allocator.free(row);
+    allocator.free(c.rows);
+    return .{
+        .headers = .{ .ptr = headers_c.ptr, .len = headers_c.len },
+        .rows = .{ .ptr = rows_c.ptr, .len = rows_c.len },
+    };
+}
+
+/// Converte un CsvDataC nel layout Zig: ricostruisce i container slice e libera
+/// i container C (le leaf restano possedute dal CsvData risultante).
+fn csvFromC(allocator: std.mem.Allocator, c: CsvDataC) !CsvData {
+    const headers = try allocator.alloc([]const u8, c.headers.len);
+    for (c.headers.ptr[0..c.headers.len], 0..) |h, i| {
+        headers[i] = h.toSlice();
+    }
+    allocator.free(c.headers.ptr[0..c.headers.len]);
+
+    const rows = try allocator.alloc([][]const u8, c.rows.len);
+    for (c.rows.ptr[0..c.rows.len], 0..) |row_c, r_idx| {
+        const row = try allocator.alloc([]const u8, row_c.len);
+        for (row_c.ptr[0..row_c.len], 0..) |cell, c_idx| {
+            row[c_idx] = cell.toSlice();
+        }
+        rows[r_idx] = row;
+        allocator.free(row_c.ptr[0..row_c.len]);
+    }
+    allocator.free(c.rows.ptr[0..c.rows.len]);
+    return .{ .headers = headers, .rows = rows };
+}
+
 // C-compatible Layouts for Plugins
 pub const SliceC = extern struct {
     ptr: [*]const u8,
@@ -258,6 +330,15 @@ pub const RowC = extern struct {
 pub const CsvDataC = extern struct {
     headers: extern struct { ptr: [*]const SliceC, len: usize },
     rows: extern struct { ptr: [*]const RowC, len: usize },
+};
+
+pub const SheetC = extern struct {
+    name: SliceC,
+    data: CsvDataC,
+};
+
+pub const WorkbookDataC = extern struct {
+    sheets: extern struct { ptr: [*]const SheetC, len: usize },
 };
 
 pub const MarkdownDataC = extern struct {
@@ -314,6 +395,7 @@ pub const DecodedTag = enum(u32) {
     mesh = 3,
     image = 4,
     err = 5,
+    workbook = 6,
 };
 
 pub const DecodedC = extern struct {
@@ -321,6 +403,7 @@ pub const DecodedC = extern struct {
     payload: extern union {
         text: SliceC,
         csv: CsvDataC,
+        workbook: WorkbookDataC,
         markdown: MarkdownDataC,
         mesh: MeshDataC,
         image: ImageDataC,
@@ -334,30 +417,19 @@ pub const DecodedC = extern struct {
                 return .{ .text = t.toSlice() };
             },
             .csv => {
-                const c = self.payload.csv;
-                const headers = try allocator.alloc([]const u8, c.headers.len);
-                for (c.headers.ptr[0..c.headers.len], 0..) |h, i| {
-                    headers[i] = h.toSlice();
+                return .{ .csv = try csvFromC(allocator, self.payload.csv) };
+            },
+            .workbook => {
+                const w = self.payload.workbook;
+                const sheets = try allocator.alloc(Sheet, w.sheets.len);
+                for (w.sheets.ptr[0..w.sheets.len], 0..) |s_c, i| {
+                    sheets[i] = .{
+                        .name = s_c.name.toSlice(),
+                        .data = try csvFromC(allocator, s_c.data),
+                    };
                 }
-                allocator.free(c.headers.ptr[0..c.headers.len]);
-
-                const rows = try allocator.alloc([][]const u8, c.rows.len);
-                for (c.rows.ptr[0..c.rows.len], 0..) |row_c, r_idx| {
-                    const row = try allocator.alloc([]const u8, row_c.len);
-                    for (row_c.ptr[0..row_c.len], 0..) |cell, c_idx| {
-                        row[c_idx] = cell.toSlice();
-                    }
-                    rows[r_idx] = row;
-                    allocator.free(row_c.ptr[0..row_c.len]);
-                }
-                allocator.free(c.rows.ptr[0..c.rows.len]);
-
-                return .{
-                    .csv = .{
-                        .headers = headers,
-                        .rows = rows,
-                    },
-                };
+                allocator.free(w.sheets.ptr[0..w.sheets.len]);
+                return .{ .workbook = .{ .sheets = sheets, .active = 0 } };
             },
             .markdown => {
                 const m = self.payload.markdown;
@@ -691,7 +763,14 @@ pub fn readFileLibc(allocator: std.mem.Allocator, path: []const u8, max_bytes: u
 /// Fallback a 128 MB se /proc/meminfo non è leggibile.
 fn defaultMaxSize(io: std.Io, allocator: std.mem.Allocator) usize {
     const fallback: usize = 128 * 1024 * 1024;
-    const data = std.Io.Dir.cwd().readFileAlloc(io, "/proc/meminfo", allocator, std.Io.Limit.limited(64 * 1024)) catch return fallback;
+    // /proc/meminfo riporta dimensione 0 in stat, quindi un reader posizionale
+    // (readFileAlloc) legge zero byte e si finisce sempre nel fallback: serve un
+    // reader in streaming che legga fino all'EOF reale.
+    var file = std.Io.Dir.cwd().openFile(io, "/proc/meminfo", .{}) catch return fallback;
+    defer file.close(io);
+    var buf: [8 * 1024]u8 = undefined;
+    var reader = file.readerStreaming(io, &buf);
+    const data = reader.interface.allocRemaining(allocator, std.Io.Limit.limited(64 * 1024)) catch return fallback;
     defer allocator.free(data);
     const key = "MemAvailable:";
     const start = std.mem.indexOf(u8, data, key) orelse return fallback;

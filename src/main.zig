@@ -136,6 +136,20 @@ fn dumpJson(decoded: Decoded, writer: *std.Io.Writer) !void {
             try std.json.fmt(c.rows, .{}).format(writer);
             try writer.writeAll("}");
         },
+        .workbook => |wb| {
+            try writer.writeAll("{\"type\":\"workbook\",\"sheets\":[");
+            for (wb.sheets, 0..) |s, i| {
+                if (i > 0) try writer.writeAll(",");
+                try writer.writeAll("{\"name\":");
+                try std.json.fmt(s.name, .{}).format(writer);
+                try writer.writeAll(",\"headers\":");
+                try std.json.fmt(s.data.headers, .{}).format(writer);
+                try writer.writeAll(",\"rows\":");
+                try std.json.fmt(s.data.rows, .{}).format(writer);
+                try writer.writeAll("}");
+            }
+            try writer.writeAll("]}");
+        },
         .mesh => |m| {
             try writer.writeAll("{\"type\":\"mesh\",\"name\":");
             try std.json.fmt(m.name, .{}).format(writer);
@@ -153,11 +167,11 @@ fn dumpJson(decoded: Decoded, writer: *std.Io.Writer) !void {
             try writer.print("],\"center\":[{d},{d},{d}],\"size\":{d}", .{ m.center[0], m.center[1], m.center[2], size });
             // Attributi PBR estratti (diagnostica): normali/UV autorali e texture baseColor.
             try writer.print(",\"normals\":{d},\"uvs\":{d},\"baseColor\":[{d},{d},{d},{d}],\"metallic\":{d},\"roughness\":{d},\"texture\":[{d},{d}]", .{
-                m.normals.len,       m.uvs.len,
-                m.base_color[0],     m.base_color[1],
-                m.base_color[2],     m.base_color[3],
-                m.metallic,          m.roughness,
-                m.tex_width,         m.tex_height,
+                m.normals.len,   m.uvs.len,
+                m.base_color[0], m.base_color[1],
+                m.base_color[2], m.base_color[3],
+                m.metallic,      m.roughness,
+                m.tex_width,     m.tex_height,
             });
             // Sotto-mesh per-materiale (multi-mesh/multi-primitiva glTF).
             try writer.writeAll(",\"submeshes\":[");

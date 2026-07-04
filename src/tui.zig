@@ -303,6 +303,10 @@ pub const TuiSink = struct {
                 .csv => |csv| {
                     try self.renderCsv(writer, csv, state.scroll_offset, state.filter_text, content_height, size.cols);
                 },
+                .workbook => |w| {
+                    // TUI: mostra il foglio attivo (default il primo) come tabella.
+                    try self.renderCsv(writer, w.activeCsv(), state.scroll_offset, state.filter_text, content_height, size.cols);
+                },
                 .markdown => |md| {
                     try self.renderMarkdown(writer, md.content, state.scroll_offset, content_height);
                 },

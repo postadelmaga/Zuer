@@ -3,3 +3,6 @@ zig-out/
 zig-pkg/
 __pycache__/
 *.pyc
+
+# Claude Code local config/worktrees
+.claude/
