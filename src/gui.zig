@@ -13,6 +13,8 @@ const loader_mod = @import("loader.zig");
 const text_render = @import("text_render.zig");
 const zrame = @import("zrame");
 const zicro = @import("zicro");
+const paint = zicro.paint;
+const zscroll = zicro.scroll;
 
 // evdev key codes standard per Linux
 const KEY_ESC: u32 = 1;
@@ -42,8 +44,6 @@ const KEY_RIGHTSHIFT: u32 = 54;
 const text_zoom_min: f32 = 0.4;
 const text_zoom_max: f32 = 6.0;
 const scroll_step: f32 = 60.0;
-const scrollbar_w: u32 = 14; // larghezza della scrollbar del testo (px)
-const scroll_ease: f32 = 0.35; // frazione di avvicinamento a scroll_target per frame
 
 /// Numero massimo di linguette di cui teniamo i confini per l'hit-test. Fogli
 /// oltre questo limite si disegnano ma non sono cliccabili (workbook enormi).
@@ -60,19 +60,6 @@ const TabBarState = struct {
     count: usize = 0,
 };
 
-/// Geometria del cursore (thumb) della scrollbar verticale: altezza ∝ frazione
-/// visibile, posizione ∝ scorrimento. `off_y` è l'offset di scroll già clampato.
-fn scrollbarThumb(H: u32, src_h: u32, off_y: u32) struct { y: u32, h: u32 } {
-    if (src_h <= H) return .{ .y = 0, .h = H };
-    const max_scroll = src_h - H;
-    const min_h: u32 = 32;
-    const prop: u64 = @as(u64, H) * H / src_h;
-    const th: u32 = @min(H, @as(u32, @intCast(@max(@as(u64, min_h), prop))));
-    const travel = H - th;
-    const y: u32 = if (max_scroll > 0) @intCast(@as(u64, off_y) * travel / max_scroll) else 0;
-    return .{ .y = y, .h = th };
-}
-
 /// Alpha-blend src-over di un colore sul pixel RGBA in `buf[idx..]`.
 fn blendPixel(buf: []u8, idx: usize, r: u8, g: u8, b: u8, a: u8) void {
     const af: u32 = a;
@@ -81,64 +68,6 @@ fn blendPixel(buf: []u8, idx: usize, r: u8, g: u8, b: u8, a: u8) void {
     buf[idx + 1] = @intCast((@as(u32, g) * af + @as(u32, buf[idx + 1]) * inv) / 255);
     buf[idx + 2] = @intCast((@as(u32, b) * af + @as(u32, buf[idx + 2]) * inv) / 255);
     buf[idx + 3] = @max(buf[idx + 3], a);
-}
-
-/// Disegna la scrollbar verticale (traccia + cursore) sul bordo destro. Appare
-/// solo quando il contenuto è più alto della viewport.
-fn drawScrollbar(buf: []u8, W: u32, H: u32, src_h: u32, off_y: u32) void {
-    if (src_h <= H or W < scrollbar_w) return;
-    const x0 = W - scrollbar_w;
-    const t = scrollbarThumb(H, src_h, off_y);
-    var py: u32 = 0;
-    while (py < H) : (py += 1) {
-        const on_thumb = py >= t.y and py < t.y + t.h;
-        var px: u32 = x0;
-        while (px < W) : (px += 1) {
-            const idx = (py * W + px) * 4;
-            if (px == x0) {
-                blendPixel(buf, idx, 90, 96, 112, 60); // sottile bordo interno
-            } else if (on_thumb) {
-                blendPixel(buf, idx, 150, 158, 178, 240);
-            } else {
-                blendPixel(buf, idx, 32, 34, 44, 90);
-            }
-        }
-    }
-}
-
-/// Geometria del cursore orizzontale (specchio di scrollbarThumb sull'asse X).
-fn hscrollThumb(W: u32, src_w: u32, off_x: u32) struct { x: u32, w: u32 } {
-    if (src_w <= W) return .{ .x = 0, .w = W };
-    const max_scroll = src_w - W;
-    const min_w: u32 = 32;
-    const prop: u64 = @as(u64, W) * W / src_w;
-    const tw: u32 = @min(W, @as(u32, @intCast(@max(@as(u64, min_w), prop))));
-    const travel = W - tw;
-    const x: u32 = if (max_scroll > 0) @intCast(@as(u64, off_x) * travel / max_scroll) else 0;
-    return .{ .x = x, .w = tw };
-}
-
-/// Scrollbar orizzontale sul bordo inferiore: appare solo quando il contenuto è
-/// più largo della viewport (es. tabella con molte colonne).
-fn drawHScrollbar(buf: []u8, W: u32, H: u32, src_w: u32, off_x: u32) void {
-    if (src_w <= W or H < scrollbar_w) return;
-    const y0 = H - scrollbar_w;
-    const t = hscrollThumb(W, src_w, off_x);
-    var py: u32 = y0;
-    while (py < H) : (py += 1) {
-        var px: u32 = 0;
-        while (px < W) : (px += 1) {
-            const on_thumb = px >= t.x and px < t.x + t.w;
-            const idx = (py * W + px) * 4;
-            if (py == y0) {
-                blendPixel(buf, idx, 90, 96, 112, 60);
-            } else if (on_thumb) {
-                blendPixel(buf, idx, 150, 158, 178, 240);
-            } else {
-                blendPixel(buf, idx, 32, 34, 44, 90);
-            }
-        }
-    }
 }
 
 /// Blitta la barra delle linguette (RGBA opaca) in fondo alla finestra, sopra il
@@ -501,16 +430,15 @@ const GuiAppState = struct {
     pitch: *f32,
     pan_x: *f32,
     pan_y: *f32,
+    // Offset di scroll corrente (asse Y e X), rispecchiato dalla primitiva `sc` a
+    // ogni frame del worker; i consumatori (compose/selezione/header) leggono questi.
     scroll_y: *f32,
-    // Posizione di scroll desiderata: la rotella/i tasti la muovono, il worker
-    // fa scorrere scroll_y verso di essa con easing (scroll fluido).
-    scroll_target: *f32,
-    // Scroll orizzontale (tabelle più larghe della finestra): posizione corrente
-    // + meta, con lo stesso easing dell'asse Y.
     scroll_x: *f32,
-    scroll_target_x: *f32,
-    // Trascinamento del cursore della scrollbar (mappa mouse.y → posizione).
-    scrollbar_drag: *bool,
+    // Scrollbar flottanti egui (zicro.scroll): proprietarie dell'offset, della
+    // kinetica e del drag del thumb. Condivise tra thread finestra (callback input:
+    // onWheel/onButton*/onMotion) e worker (setViewport/setContent/tick/draw), quindi
+    // ogni accesso è sotto `mutex`.
+    sc: *zscroll.Scroll,
     last_x: *f32,
     last_y: *f32,
 
@@ -683,9 +611,8 @@ const GuiAppState = struct {
         self.pan_x.* = 0.0;
         self.pan_y.* = 0.0;
         self.scroll_y.* = 0.0;
-        self.scroll_target.* = 0.0;
         self.scroll_x.* = 0.0;
-        self.scroll_target_x.* = 0.0;
+        resetScroll(self.sc);
         freeTextLines(self);
         self.sel_active.* = false;
         self.sel_selecting.* = false;
@@ -817,25 +744,42 @@ fn applyZoom(app_state: *GuiAppState, factor: f32) void {
     app_state.file_changed.* = true;
 }
 
+/// Scroll verticale fluido (rotella/tasti): accumula `delta` px nel buffer di
+/// smoothing low-pass della primitiva, che il worker applica in `tick` (stesso feel
+/// egui della rotella). Il clamp ai limiti del contenuto avviene nel `tick`.
 fn scrollText(app_state: *GuiAppState, delta: f32) void {
     app_state.mutex.lockUncancelable(app_state.io);
     defer app_state.mutex.unlock(app_state.io);
-    // Muove la meta di scroll: il worker vi fa scorrere scroll_y con easing
-    // (scroll fluido). Il limite superiore dipende dall'altezza rasterizzata,
-    // nota al worker; qui basta impedire i valori negativi.
-    app_state.scroll_target.* = @max(app_state.scroll_target.* + delta, 0);
+    app_state.sc.unprocessed[1] += delta;
     app_state.file_changed.* = true;
 }
 
-/// Scroll immediato (senza easing) a una posizione assoluta: per il
-/// trascinamento del documento e della scrollbar, dove serve reattività 1:1.
+/// Come `scrollText` ma sull'asse orizzontale (tabelle più larghe della finestra).
+fn scrollTextX(app_state: *GuiAppState, delta: f32) void {
+    app_state.mutex.lockUncancelable(app_state.io);
+    defer app_state.mutex.unlock(app_state.io);
+    app_state.sc.unprocessed[0] += delta;
+    app_state.file_changed.* = true;
+}
+
+/// Scroll immediato (senza smoothing) a una posizione verticale assoluta: per il
+/// trascinamento del documento (fallback), dove serve reattività 1:1. Il clamp
+/// definitivo ai limiti avviene nel `tick` del worker.
 fn scrollTo(app_state: *GuiAppState, y: f32) void {
     app_state.mutex.lockUncancelable(app_state.io);
     defer app_state.mutex.unlock(app_state.io);
-    const yy = @max(y, 0);
-    app_state.scroll_y.* = yy;
-    app_state.scroll_target.* = yy;
+    app_state.sc.offset[1] = @max(y, 0);
+    app_state.sc.vel[1] = 0;
+    app_state.sc.unprocessed[1] = 0;
     app_state.file_changed.* = true;
+}
+
+/// Riporta la scrollbar all'origine azzerando offset, kinetica e coda di smoothing.
+/// Il chiamante deve già detenere il `mutex`. Usato ai cambi di foglio/file.
+fn resetScroll(sc: *zscroll.Scroll) void {
+    sc.offset = .{ 0, 0 };
+    sc.vel = .{ 0, 0 };
+    sc.unprocessed = .{ 0, 0 };
 }
 
 fn isPdfPath(path: []const u8) bool {
@@ -1000,8 +944,7 @@ fn scrollCallback(win: *zrame.Window, axis: u32, value: i32, user: ?*anyopaque) 
         // Asse orizzontale (trackpad/tilt-wheel): scorre le tabelle larghe.
         if (app_state.is_text.*) {
             const val = @as(f32, @floatFromInt(value)) / 256.0;
-            app_state.scroll_target_x.* = @max(app_state.scroll_target_x.* + val * 5.0, 0);
-            app_state.file_changed.* = true;
+            scrollTextX(app_state, val * 5.0);
         }
         return;
     }
@@ -1010,8 +953,7 @@ fn scrollCallback(win: *zrame.Window, axis: u32, value: i32, user: ?*anyopaque) 
         if (app_state.is_text.*) {
             // Shift+rotella = scroll orizzontale (per chi non ha rotella orizzontale).
             if (app_state.shift_down.*) {
-                app_state.scroll_target_x.* = @max(app_state.scroll_target_x.* + val * 5.0, 0);
-                app_state.file_changed.* = true;
+                scrollTextX(app_state, val * 5.0);
                 return;
             }
             // Documento: la rotella scorre (lo zoom testo resta su +/-)
@@ -1026,18 +968,6 @@ fn scrollCallback(win: *zrame.Window, axis: u32, value: i32, user: ?*anyopaque) 
     }
 }
 
-/// Mappa la coordinata verticale del mouse sulla scrollbar in una posizione di
-/// scroll assoluta (cursore centrato sotto il puntatore) e vi salta immediato.
-fn scrollFromBar(app_state: *GuiAppState, H: u32, src_h: u32, mouse_y: f32) void {
-    if (src_h <= H) return;
-    const t = scrollbarThumb(H, src_h, 0);
-    const travel: f32 = if (H > t.h) @floatFromInt(H - t.h) else 1;
-    const max_scroll: f32 = @floatFromInt(src_h - H);
-    var ty = mouse_y - @as(f32, @floatFromInt(t.h)) / 2.0;
-    ty = std.math.clamp(ty, 0, travel);
-    scrollTo(app_state, ty / travel * max_scroll);
-}
-
 fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopaque) void {
     const app_state: *GuiAppState = @ptrCast(@alignCast(user orelse return));
     switch (event) {
@@ -1047,7 +977,7 @@ fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopaque)
             const down = (btn.state == 1);
             if (!down) {
                 app_state.mutex.lockUncancelable(app_state.io);
-                app_state.scrollbar_drag.* = false;
+                _ = app_state.sc.onButtonUp();
                 app_state.sel_selecting.* = false;
                 // Click senza trascinamento (ancora == estremo) → deseleziona.
                 if (app_state.sel_a.*[0] == app_state.sel_b.*[0] and app_state.sel_a.*[1] == app_state.sel_b.*[1]) {
@@ -1072,9 +1002,8 @@ fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopaque)
                             app_state.decoded.workbook.active = idx;
                             // Nuovo foglio: riparti dall'alto/sinistra e ri-rasterizza.
                             app_state.scroll_y.* = 0;
-                            app_state.scroll_target.* = 0;
                             app_state.scroll_x.* = 0;
-                            app_state.scroll_target_x.* = 0;
+                            resetScroll(app_state.sc);
                             app_state.load_seq.* +%= 1;
                             app_state.file_changed.* = true;
                         }
@@ -1083,18 +1012,19 @@ fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopaque)
                     return; // click sulla barra consumato (niente selezione)
                 }
             }
-            // Pressione sinistra sul testo: scrollbar oppure avvio selezione.
+            // Click sinistro: prima offri la pressione alla scrollbar (afferra il
+            // thumb o salta sotto il cursore); se la consuma, niente selezione/drag.
+            if (btn.button == 0x110) {
+                app_state.mutex.lockUncancelable(app_state.io);
+                const grabbed = app_state.sc.onButtonDown(app_state.last_x.*, app_state.last_y.*);
+                if (grabbed) app_state.file_changed.* = true;
+                app_state.mutex.unlock(app_state.io);
+                if (grabbed) return;
+            }
+            // Pressione sinistra sul testo: avvia la selezione.
             if (btn.button == 0x110 and app_state.is_text.*) {
                 const W = win.panel_w;
                 const H = win.panel_h;
-                const src_h = app_state.static_h.*;
-                if (W >= scrollbar_w and src_h > H and
-                    app_state.last_x.* >= @as(f32, @floatFromInt(W - scrollbar_w)))
-                {
-                    app_state.scrollbar_drag.* = true;
-                    scrollFromBar(app_state, H, src_h, app_state.last_y.*);
-                    return;
-                }
                 app_state.mutex.lockUncancelable(app_state.io);
                 if (app_state.text_lines.items.len > 0) {
                     const hit = textHit(app_state, W, H, app_state.last_x.*, app_state.last_y.*);
@@ -1111,9 +1041,19 @@ fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopaque)
             app_state.dragging.* = down;
         },
         .motion => |mot| {
-            if (app_state.scrollbar_drag.*) {
-                scrollFromBar(app_state, win.panel_h, app_state.static_h.*, mot.y);
-            } else if (app_state.sel_selecting.*) {
+            // La scrollbar vede sempre il movimento: aggiorna hover/thumb e, se sta
+            // trascinando il cursore, muove l'offset. Se lo consuma (sopra la barra o
+            // in drag), non facciamo selezione/pan.
+            app_state.mutex.lockUncancelable(app_state.io);
+            const sc_consumed = app_state.sc.onMotion(mot.x, mot.y);
+            if (sc_consumed) app_state.file_changed.* = true;
+            app_state.mutex.unlock(app_state.io);
+            if (sc_consumed) {
+                app_state.last_x.* = mot.x;
+                app_state.last_y.* = mot.y;
+                return;
+            }
+            if (app_state.sel_selecting.*) {
                 app_state.mutex.lockUncancelable(app_state.io);
                 app_state.sel_b.* = textHit(app_state, win.panel_w, win.panel_h, mot.x, mot.y);
                 app_state.file_changed.* = true;
@@ -1138,6 +1078,17 @@ fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopaque)
             }
             app_state.last_x.* = mot.x;
             app_state.last_y.* = mot.y;
+        },
+        .leave => {
+            // Puntatore fuori dalla finestra: spegni l'hover della scrollbar (fade)
+            // e dimentica l'ultima posizione così un click successivo non parte da
+            // coordinate stantie.
+            app_state.mutex.lockUncancelable(app_state.io);
+            app_state.sc.onLeave();
+            app_state.file_changed.* = true;
+            app_state.mutex.unlock(app_state.io);
+            app_state.last_x.* = -1;
+            app_state.last_y.* = -1;
         },
     }
 }
@@ -1336,11 +1287,19 @@ fn renderWorker(
     // Fotogramma dello spinner di caricamento (animazione a 60 Hz).
     var spin_frame: u32 = 0;
 
+    // La primitiva scrollbar `state.sc` è condivisa coi callback input: qui la si usa
+    // solo entro il lock del mutex (già preso attorno alla sezione compose).
+    // Secondi trascorsi dall'ultimo frame presentato (dal Pacer a fine loop); guida
+    // fade/hover/kinetica delle scrollbar. Primo giro: stima a 1/60.
+    var frame_dt: f32 = 1.0 / 60.0;
+
     while (!win.closed) {
         const cur_w = win.panel_w;
         const cur_h = win.panel_h;
         if (cur_w == 0 or cur_h == 0) {
-            _ = pacer_20.tick();
+            // Clamp: alternando pacer_60/pacer_20 quello inattivo ha `last` vecchio e
+            // restituisce un dt enorme al primo tick → il fade delle barre scatterebbe.
+            frame_dt = @min(0.1, @as(f32, @floatCast(pacer_20.tick())));
             continue;
         }
 
@@ -1351,7 +1310,9 @@ fn renderWorker(
         if (state.loading.*) {
             if (composited_rgba.len < cur_w * cur_h * 4) {
                 state.gpa.free(composited_rgba.*);
-                composited_rgba.* = state.gpa.alloc(u8, cur_w * cur_h * 4) catch {
+                // 4-byte aligned: la fase di compose lo rilegge come []u32 per il
+                // Canvas straight di zicro (scrollbar).
+                composited_rgba.* = state.gpa.alignedAlloc(u8, .@"4", cur_w * cur_h * 4) catch {
                     state.mutex.unlock(state.io);
                     break;
                 };
@@ -1383,38 +1344,19 @@ fn renderWorker(
                 last_seq = state.load_seq.*;
                 need_render = true;
             }
-            // Clamp della meta di scroll ora che l'altezza del documento è nota,
-            // poi easing di scroll_y verso di essa (scroll fluido).
-            const max_scroll: f32 = if (state.static_h.* > cur_h)
-                @floatFromInt(state.static_h.* - cur_h)
-            else
-                0;
-            state.scroll_target.* = std.math.clamp(state.scroll_target.*, 0, max_scroll);
-            const diff = state.scroll_target.* - state.scroll_y.*;
-            if (@abs(diff) > 0.5) {
-                state.scroll_y.* += diff * scroll_ease;
+            // La scrollbar flottante egui possiede l'offset di scroll: la geometria
+            // viene da viewport (finestra) e contenuto (testo rasterizzato); `tick`
+            // applica rotella/tasti smussati + fade + kinetica di `dt` e clampa. Poi
+            // rispecchiamo l'offset in scroll_y/scroll_x per compose/selezione/header.
+            // Wheel/click/motion sono instradati alla primitiva dai callback (sotto lock).
+            state.sc.setViewport(.{ .x = 0, .y = 0, .w = @floatFromInt(cur_w), .h = @floatFromInt(cur_h) });
+            state.sc.setContent(@floatFromInt(state.static_w.*), @floatFromInt(state.static_h.*));
+            if (state.sc.tick(frame_dt)) {
                 need_render = true;
                 text_animating = true;
-            } else {
-                state.scroll_y.* = state.scroll_target.*;
             }
-            state.scroll_y.* = std.math.clamp(state.scroll_y.*, 0, max_scroll);
-
-            // Stesso easing sull'asse orizzontale (tabelle più larghe della finestra).
-            const max_scroll_x: f32 = if (state.static_w.* > cur_w)
-                @floatFromInt(state.static_w.* - cur_w)
-            else
-                0;
-            state.scroll_target_x.* = std.math.clamp(state.scroll_target_x.*, 0, max_scroll_x);
-            const diff_x = state.scroll_target_x.* - state.scroll_x.*;
-            if (@abs(diff_x) > 0.5) {
-                state.scroll_x.* += diff_x * scroll_ease;
-                need_render = true;
-                text_animating = true;
-            } else {
-                state.scroll_x.* = state.scroll_target_x.*;
-            }
-            state.scroll_x.* = std.math.clamp(state.scroll_x.*, 0, max_scroll_x);
+            state.scroll_y.* = state.sc.scrollY();
+            state.scroll_x.* = state.sc.scrollX();
         }
 
         if (need_render) {
@@ -1424,7 +1366,8 @@ fn renderWorker(
 
             if (composited_rgba.len < cur_w * cur_h * 4) {
                 state.gpa.free(composited_rgba.*);
-                composited_rgba.* = state.gpa.alloc(u8, cur_w * cur_h * 4) catch {
+                // 4-byte aligned: rilettura come []u32 per il Canvas straight (scrollbar).
+                composited_rgba.* = state.gpa.alignedAlloc(u8, .@"4", cur_w * cur_h * 4) catch {
                     state.mutex.unlock(state.io);
                     break;
                 };
@@ -1462,9 +1405,12 @@ fn renderWorker(
                 if (state.sel_active.*) {
                     drawTextSelection(composited_rgba.*, cur_w, cur_h, state.static_w.*, state.static_h.*, state.scroll_y.*, state.scroll_x.*, state.text_metrics.*, state.text_lines.items, state.sel_a.*, state.sel_b.*);
                 }
-                const tgeom = textBlitGeom(cur_w, cur_h, state.static_w.*, state.static_h.*, state.scroll_y.*, state.scroll_x.*);
-                drawScrollbar(composited_rgba.*, cur_w, cur_h, state.static_h.*, tgeom.off_y);
-                drawHScrollbar(composited_rgba.*, cur_w, cur_h, state.static_w.*, tgeom.x_src);
+                // Scrollbar flottanti egui, disegnate dal Canvas straight di zicro
+                // direttamente sul frame RGBA8 (rilettura []u8 → []u32 aliasata).
+                const buf = composited_rgba.*;
+                const u32px: [*]u32 = @ptrCast(@alignCast(buf.ptr));
+                var sc_canvas = paint.Canvas.initRgba8(u32px[0 .. @as(usize, cur_w) * cur_h], cur_w, cur_h);
+                state.sc.draw(&sc_canvas);
                 // Barra delle linguette in fondo (workbook multi-foglio), sopra tutto.
                 blitTabBar(composited_rgba.*, cur_w, cur_h, state.tab_bar);
             } else {
@@ -1477,12 +1423,14 @@ fn renderWorker(
         state.mutex.unlock(state.io);
 
         // 60 Hz mentre la mesh si muove (drag/zoom) o durante l'animazione dello
-        // scroll testo; 20 Hz a riposo (così il dispatch input resta reattivo).
-        if (mesh_moved or text_animating) {
-            _ = pacer_60.tick();
-        } else {
-            _ = pacer_20.tick();
-        }
+        // scroll testo; 20 Hz a riposo (così il dispatch input resta reattivo). Il
+        // dt restituito alimenta l'animazione delle scrollbar al giro successivo.
+        // Clamp: il pacer inattivo (l'altro ramo) porta un `last` vecchio → dt enorme
+        // al primo tick dopo un cambio di ritmo; limitalo così i fade non scattano.
+        frame_dt = @min(0.1, @as(f32, @floatCast(if (mesh_moved or text_animating)
+            pacer_60.tick()
+        else
+            pacer_20.tick())));
     }
 }
 
@@ -1794,13 +1742,14 @@ pub fn main(init: std.process.Init) !void {
     var pan_x: f32 = 0;
     var pan_y: f32 = 0;
     var scroll_y: f32 = 0;
-    var scroll_target: f32 = 0;
     var scroll_x: f32 = 0;
-    var scroll_target_x: f32 = 0;
-    var scrollbar_drag = false;
+    // Scrollbar flottanti egui: proprietarie di offset/kinetica/drag (vedi GuiAppState.sc).
+    var sc_scroll: zscroll.Scroll = .{};
     var dragging = false;
-    var last_x: f32 = 0;
-    var last_y: f32 = 0;
+    // -1 = puntatore ancora fuori: tiene nascoste le scrollbar flottanti finché il
+    // puntatore non entra davvero (0,0 sarebbe già "dentro" e le mostrerebbe subito).
+    var last_x: f32 = -1;
+    var last_y: f32 = -1;
     var text_lines: std.ArrayList([]const u8) = .empty;
     var text_metrics: text_render.Metrics = .{ .advance = 1, .line_h = 1, .pad_x = 20, .pad_y = 14 };
     var sel_active = false;
@@ -1855,10 +1804,8 @@ pub fn main(init: std.process.Init) !void {
         .pan_x = &pan_x,
         .pan_y = &pan_y,
         .scroll_y = &scroll_y,
-        .scroll_target = &scroll_target,
         .scroll_x = &scroll_x,
-        .scroll_target_x = &scroll_target_x,
-        .scrollbar_drag = &scrollbar_drag,
+        .sc = &sc_scroll,
         .last_x = &last_x,
         .last_y = &last_y,
         .text_lines = &text_lines,
