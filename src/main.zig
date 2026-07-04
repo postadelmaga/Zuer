@@ -151,7 +151,28 @@ fn dumpJson(decoded: Decoded, writer: *std.Io.Writer) !void {
             }
             const size = @max(m.bbox_max[0] - m.bbox_min[0], @max(m.bbox_max[1] - m.bbox_min[1], m.bbox_max[2] - m.bbox_min[2]));
             try writer.print("],\"center\":[{d},{d},{d}],\"size\":{d}", .{ m.center[0], m.center[1], m.center[2], size });
-            try writer.writeAll("}");
+            // Attributi PBR estratti (diagnostica): normali/UV autorali e texture baseColor.
+            try writer.print(",\"normals\":{d},\"uvs\":{d},\"baseColor\":[{d},{d},{d},{d}],\"metallic\":{d},\"roughness\":{d},\"texture\":[{d},{d}]", .{
+                m.normals.len,       m.uvs.len,
+                m.base_color[0],     m.base_color[1],
+                m.base_color[2],     m.base_color[3],
+                m.metallic,          m.roughness,
+                m.tex_width,         m.tex_height,
+            });
+            // Sotto-mesh per-materiale (multi-mesh/multi-primitiva glTF).
+            try writer.writeAll(",\"submeshes\":[");
+            for (m.submeshes, 0..) |s, i| {
+                if (i > 0) try writer.writeAll(",");
+                try writer.print("{{\"first_index\":{d},\"index_count\":{d},\"baseColor\":[{d},{d},{d},{d}],\"metallic\":{d},\"roughness\":{d},\"texture\":[{d},{d}],\"normalMap\":[{d},{d}]}}", .{
+                    s.first_index,   s.index_count,
+                    s.base_color[0], s.base_color[1],
+                    s.base_color[2], s.base_color[3],
+                    s.metallic,      s.roughness,
+                    s.tex_width,     s.tex_height,
+                    s.nrm_tex_width, s.nrm_tex_height,
+                });
+            }
+            try writer.writeAll("]}");
         },
         .image => |img| {
             try writer.writeAll("{\"type\":\"image\",\"name\":");

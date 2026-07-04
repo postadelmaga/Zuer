@@ -29,6 +29,25 @@ pub const Face = struct {
     v3: usize,
 };
 
+/// Un sotto-mesh = un intervallo contiguo dell'index buffer con il proprio
+/// materiale e la propria texture. I modelli glTF con più mesh/primitive/
+/// materiali producono più submesh sulla stessa geometria fusa; il renderer
+/// disegna ogni intervallo con la sua texture.
+pub const SubMesh = struct {
+    first_index: usize, // offset (in indici) nel buffer indici fuso
+    index_count: usize, // numero di indici del submesh (3 × facce)
+    base_color: [4]f32 = .{ 1, 1, 1, 1 },
+    metallic: f32 = 1.0,
+    roughness: f32 = 1.0,
+    tex_width: usize = 0,
+    tex_height: usize = 0,
+    tex_pixels: []const u8 = &.{},
+    // Normal map tangent-space RGBA8 (dati lineari); vuota se assente.
+    nrm_tex_width: usize = 0,
+    nrm_tex_height: usize = 0,
+    nrm_tex_pixels: []const u8 = &.{},
+};
+
 pub const MeshData = struct {
     num_vertices: usize,
     num_faces: usize,
@@ -39,11 +58,36 @@ pub const MeshData = struct {
     name: []const u8,
     vertices: [][3]f32,
     faces: []Face,
+    // Attributi opzionali (len 0 se assenti): normali autorali, UV e tangenti
+    // autorali (vec4: xyz + handedness, per il normal mapping).
+    normals: [][3]f32 = &.{},
+    uvs: [][2]f32 = &.{},
+    tangents: [][4]f32 = &.{},
+    // Materiale PBR di fallback (glTF metallic-roughness), usato quando non ci
+    // sono submesh (es. OBJ/STL). Default: bianco opaco, plastica.
+    base_color: [4]f32 = .{ 1, 1, 1, 1 },
+    metallic: f32 = 1.0,
+    roughness: f32 = 1.0,
+    // Texture baseColor di fallback RGBA8 (tex_width*tex_height*4); vuota se assente.
+    tex_width: usize = 0,
+    tex_height: usize = 0,
+    tex_pixels: []const u8 = &.{},
+    // Sotto-mesh per-materiale (vuoto = si usa il materiale/texture di fallback).
+    submeshes: []SubMesh = &.{},
 
     pub fn deinit(self: *MeshData, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         allocator.free(self.vertices);
         allocator.free(self.faces);
+        if (self.normals.len > 0) allocator.free(self.normals);
+        if (self.uvs.len > 0) allocator.free(self.uvs);
+        if (self.tangents.len > 0) allocator.free(self.tangents);
+        if (self.tex_pixels.len > 0) allocator.free(self.tex_pixels);
+        for (self.submeshes) |s| {
+            if (s.tex_pixels.len > 0) allocator.free(s.tex_pixels);
+            if (s.nrm_tex_pixels.len > 0) allocator.free(s.nrm_tex_pixels);
+        }
+        if (self.submeshes.len > 0) allocator.free(self.submeshes);
     }
 };
 
@@ -123,6 +167,26 @@ pub const Decoded = union(enum) {
                 };
             },
             .mesh => |m| {
+                // Converte i submesh in layout C (le texture-leaf restano vive,
+                // ora possedute da DecodedC; il container []SubMesh si libera).
+                const subs_c = try allocator.alloc(SubMeshC, m.submeshes.len);
+                for (m.submeshes, 0..) |s, i| {
+                    subs_c[i] = .{
+                        .first_index = s.first_index,
+                        .index_count = s.index_count,
+                        .base_color = s.base_color,
+                        .metallic = s.metallic,
+                        .roughness = s.roughness,
+                        .tex_width = s.tex_width,
+                        .tex_height = s.tex_height,
+                        .tex_pixels = SliceC.fromSlice(s.tex_pixels),
+                        .nrm_tex_width = s.nrm_tex_width,
+                        .nrm_tex_height = s.nrm_tex_height,
+                        .nrm_tex_pixels = SliceC.fromSlice(s.nrm_tex_pixels),
+                    };
+                }
+                if (m.submeshes.len > 0) allocator.free(m.submeshes);
+
                 return .{
                     .tag = .mesh,
                     .payload = .{
@@ -136,6 +200,16 @@ pub const Decoded = union(enum) {
                             .name = SliceC.fromSlice(m.name),
                             .vertices = .{ .ptr = m.vertices.ptr, .len = m.vertices.len },
                             .faces = .{ .ptr = m.faces.ptr, .len = m.faces.len },
+                            .normals = .{ .ptr = m.normals.ptr, .len = m.normals.len },
+                            .uvs = .{ .ptr = m.uvs.ptr, .len = m.uvs.len },
+                            .tangents = .{ .ptr = m.tangents.ptr, .len = m.tangents.len },
+                            .base_color = m.base_color,
+                            .metallic = m.metallic,
+                            .roughness = m.roughness,
+                            .tex_width = m.tex_width,
+                            .tex_height = m.tex_height,
+                            .tex_pixels = SliceC.fromSlice(m.tex_pixels),
+                            .submeshes = .{ .ptr = subs_c.ptr, .len = subs_c.len },
                         },
                     },
                 };
@@ -190,6 +264,20 @@ pub const MarkdownDataC = extern struct {
     content: SliceC,
 };
 
+pub const SubMeshC = extern struct {
+    first_index: usize,
+    index_count: usize,
+    base_color: [4]f32,
+    metallic: f32,
+    roughness: f32,
+    tex_width: usize,
+    tex_height: usize,
+    tex_pixels: SliceC,
+    nrm_tex_width: usize,
+    nrm_tex_height: usize,
+    nrm_tex_pixels: SliceC,
+};
+
 pub const MeshDataC = extern struct {
     num_vertices: usize,
     num_faces: usize,
@@ -200,6 +288,16 @@ pub const MeshDataC = extern struct {
     name: SliceC,
     vertices: extern struct { ptr: [*]const [3]f32, len: usize },
     faces: extern struct { ptr: [*]const Face, len: usize },
+    normals: extern struct { ptr: [*]const [3]f32, len: usize },
+    uvs: extern struct { ptr: [*]const [2]f32, len: usize },
+    tangents: extern struct { ptr: [*]const [4]f32, len: usize },
+    base_color: [4]f32,
+    metallic: f32,
+    roughness: f32,
+    tex_width: usize,
+    tex_height: usize,
+    tex_pixels: SliceC,
+    submeshes: extern struct { ptr: [*]const SubMeshC, len: usize },
 };
 
 pub const ImageDataC = extern struct {
@@ -269,6 +367,27 @@ pub const DecodedC = extern struct {
             },
             .mesh => {
                 const m = self.payload.mesh;
+                // Ricostruisce i submesh in slice Zig (copia il container C, che
+                // poi si libera; le texture-leaf restano possedute dal MeshData).
+                const subs = try allocator.alloc(SubMesh, m.submeshes.len);
+                for (0..m.submeshes.len) |i| {
+                    const s = m.submeshes.ptr[i];
+                    subs[i] = .{
+                        .first_index = s.first_index,
+                        .index_count = s.index_count,
+                        .base_color = s.base_color,
+                        .metallic = s.metallic,
+                        .roughness = s.roughness,
+                        .tex_width = s.tex_width,
+                        .tex_height = s.tex_height,
+                        .tex_pixels = s.tex_pixels.toSlice(),
+                        .nrm_tex_width = s.nrm_tex_width,
+                        .nrm_tex_height = s.nrm_tex_height,
+                        .nrm_tex_pixels = s.nrm_tex_pixels.toSlice(),
+                    };
+                }
+                if (m.submeshes.len > 0) allocator.free(@constCast(m.submeshes.ptr[0..m.submeshes.len]));
+
                 return .{
                     .mesh = .{
                         .num_vertices = m.num_vertices,
@@ -280,6 +399,16 @@ pub const DecodedC = extern struct {
                         .name = m.name.toSlice(),
                         .vertices = @constCast(m.vertices.ptr[0..m.vertices.len]),
                         .faces = @constCast(m.faces.ptr[0..m.faces.len]),
+                        .normals = @constCast(m.normals.ptr[0..m.normals.len]),
+                        .uvs = @constCast(m.uvs.ptr[0..m.uvs.len]),
+                        .tangents = @constCast(m.tangents.ptr[0..m.tangents.len]),
+                        .base_color = m.base_color,
+                        .metallic = m.metallic,
+                        .roughness = m.roughness,
+                        .tex_width = m.tex_width,
+                        .tex_height = m.tex_height,
+                        .tex_pixels = m.tex_pixels.toSlice(),
+                        .submeshes = subs,
                     },
                 };
             },
@@ -591,6 +720,11 @@ fn guessImageFormat(bytes: []const u8) bool {
 }
 
 pub fn decode(path: []const u8, io: std.Io, allocator: std.mem.Allocator) Decoded {
+    var clean_path = path;
+    if (std.mem.indexOfScalar(u8, path, '#')) |hash_idx| {
+        clean_path = path[0..hash_idx];
+    }
+
     // Limite di dimensione proporzionale alla memoria disponibile; ZUER_MAX_MB lo
     // forza a un valore assoluto. Pre-check via stat per rifiutare i file troppo
     // grandi prima di allocarli.
@@ -601,8 +735,8 @@ pub fn decode(path: []const u8, io: std.Io, allocator: std.mem.Allocator) Decode
         } else |_| {}
     }
 
-    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "Impossibile ottenere informazioni sul file: {s} ({s})", .{ path, @errorName(err) }) catch "";
+    const stat = std.Io.Dir.cwd().statFile(io, clean_path, .{}) catch |err| {
+        const msg = std.fmt.allocPrint(allocator, "Impossibile ottenere informazioni sul file: {s} ({s})", .{ clean_path, @errorName(err) }) catch "";
         return .{ .err = msg };
     };
     if (stat.size > max_size) {
@@ -611,15 +745,15 @@ pub fn decode(path: []const u8, io: std.Io, allocator: std.mem.Allocator) Decode
     }
 
     const limit = std.Io.Limit.limited(max_size);
-    const content = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, limit) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "Impossibile aprire o leggere il file: {s} ({s})", .{ path, @errorName(err) }) catch "";
+    const content = std.Io.Dir.cwd().readFileAlloc(io, clean_path, allocator, limit) catch |err| {
+        const msg = std.fmt.allocPrint(allocator, "Impossibile aprire o leggere il file: {s} ({s})", .{ clean_path, @errorName(err) }) catch "";
         return .{ .err = msg };
     };
     errdefer allocator.free(content);
 
     // Risolve il decoder dal registro: prima per estensione dichiarata dai
     // plugin stessi, poi immagine per byte magici, infine "text" come fallback.
-    const ext = getExtension(path);
+    const ext = getExtension(clean_path);
 
     while (!plugin_cache_mutex.tryLock()) {
         std.Thread.yield() catch {};

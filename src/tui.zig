@@ -692,6 +692,7 @@ pub const TuiSink = struct {
 
         if (!self.gpu_mesh_loaded) {
             try g.setMesh(stage.buffer.ptr, stage.vertex_bytes, @intCast(stage.index_bytes / @sizeOf(u32)));
+            try g.setMeshMaterials(&mesh);
             self.gpu_mesh_loaded = true;
         }
 
@@ -713,7 +714,11 @@ pub const TuiSink = struct {
         const size_z = mesh.bbox_max[2] - mesh.bbox_min[2];
         const max_size = @max(size_x, @max(size_y, size_z));
 
-        const pc = gpu_mod.buildPushConstants(mesh.center, max_size, state.yaw, state.pitch, pw, ph);
+        const pc = gpu_mod.buildPushConstants(mesh.center, max_size, state.yaw, state.pitch, pw, ph, .{
+            .base_color = mesh.base_color,
+            .metallic = mesh.metallic,
+            .roughness = mesh.roughness,
+        });
         const rgba = try g.render(pw, ph, &pc);
 
         if (use_kitty) {

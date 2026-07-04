@@ -124,29 +124,42 @@ fn composeTextFrame(
     while (py < H) : (py += 1) {
         const idx_row = py * W * 4;
         const sy = py + off_y;
+
+        if (sy >= src_h or copy_w == 0) {
+            @memset(composited_rgba[idx_row .. idx_row + W * 4], 0);
+            continue;
+        }
+
+        // Clear left margin
+        if (x_dst > 0) {
+            @memset(composited_rgba[idx_row .. idx_row + x_dst * 4], 0);
+        }
+
+        // Copy and process middle part
         var px: u32 = 0;
-        while (px < W) : (px += 1) {
-            const idx = idx_row + px * 4;
-            if (sy < src_h and px >= x_dst and px < x_dst + copy_w) {
-                const sx = px - x_dst + x_src;
-                const s_idx = (sy * src_w + sx) * 4;
-                const sr = src_rgba[s_idx + 0];
-                const sg = src_rgba[s_idx + 1];
-                const sb = src_rgba[s_idx + 2];
-                var sa = src_rgba[s_idx + 3];
-                if (sr == 8 and sg == 8 and sb == 16) {
-                    sa = 0;
-                }
-                composited_rgba[idx + 0] = sr;
-                composited_rgba[idx + 1] = sg;
-                composited_rgba[idx + 2] = sb;
-                composited_rgba[idx + 3] = sa;
-            } else {
-                composited_rgba[idx + 0] = 0;
-                composited_rgba[idx + 1] = 0;
-                composited_rgba[idx + 2] = 0;
-                composited_rgba[idx + 3] = 0;
+        const s_row_offset = sy * src_w;
+        while (px < copy_w) : (px += 1) {
+            const dest_idx = idx_row + (x_dst + px) * 4;
+            const src_idx = (s_row_offset + x_src + px) * 4;
+
+            const sr = src_rgba[src_idx + 0];
+            const sg = src_rgba[src_idx + 1];
+            const sb = src_rgba[src_idx + 2];
+            var sa = src_rgba[src_idx + 3];
+
+            if (sr == 8 and sg == 8 and sb == 16) {
+                sa = 0;
             }
+
+            composited_rgba[dest_idx + 0] = sr;
+            composited_rgba[dest_idx + 1] = sg;
+            composited_rgba[dest_idx + 2] = sb;
+            composited_rgba[dest_idx + 3] = sa;
+        }
+
+        // Clear right margin
+        if (x_dst + copy_w < W) {
+            @memset(composited_rgba[idx_row + (x_dst + copy_w) * 4 .. idx_row + W * 4], 0);
         }
     }
 }
@@ -261,44 +274,74 @@ fn composeFrame(
     const fit_x = @divFloor(@as(i32, @intCast(W)) - @as(i32, @intCast(fit_w_zoomed)), 2) + @as(i32, @intFromFloat(pan_x));
     const fit_y = @divFloor(@as(i32, @intCast(H)) - @as(i32, @intCast(fit_h_zoomed)), 2) + @as(i32, @intFromFloat(pan_y));
 
-    var py: u32 = 0;
-    while (py < H) : (py += 1) {
+    const start_x: u32 = @intCast(@max(@as(i32, 0), fit_x));
+    const end_x: u32 = @intCast(@max(@as(i32, 0), @min(@as(i32, @intCast(W)), fit_x + @as(i32, @intCast(fit_w_zoomed)))));
+    const start_y: u32 = @intCast(@max(@as(i32, 0), fit_y));
+    const end_y: u32 = @intCast(@max(@as(i32, 0), @min(@as(i32, @intCast(H)), fit_y + @as(i32, @intCast(fit_h_zoomed)))));
+
+    // Clear top rows
+    if (start_y > 0) {
+        @memset(composited_rgba[0 .. start_y * W * 4], 0);
+    }
+
+    // Clear bottom rows
+    if (end_y < H) {
+        @memset(composited_rgba[end_y * W * 4 .. H * W * 4], 0);
+    }
+
+    if (start_x >= end_x or start_y >= end_y) {
+        var py = start_y;
+        while (py < end_y) : (py += 1) {
+            @memset(composited_rgba[py * W * 4 .. (py + 1) * W * 4], 0);
+        }
+        return;
+    }
+
+    const inv_w = (@as(u64, src_w) << 32) / fit_w_zoomed;
+    const inv_h = (@as(u64, src_h) << 32) / fit_h_zoomed;
+
+    var py = start_y;
+    while (py < end_y) : (py += 1) {
         const idx_row = py * W * 4;
-        const iy = @as(i32, @intCast(py));
-        var px: u32 = 0;
-        while (px < W) : (px += 1) {
+        
+        // Clear left margin of the row
+        if (start_x > 0) {
+            @memset(composited_rgba[idx_row .. idx_row + start_x * 4], 0);
+        }
+
+        // Clear right margin of the row
+        if (end_x < W) {
+            @memset(composited_rgba[idx_row + end_x * 4 .. idx_row + W * 4], 0);
+        }
+
+        const ry = @as(u64, @intCast(@as(i32, @intCast(py)) - fit_y));
+        const sy = @min(@as(u32, @intCast((ry * inv_h) >> 32)), src_h - 1);
+        const s_row_offset = sy * src_w;
+
+        const start_rx = @as(u64, @intCast(@as(i32, @intCast(start_x)) - fit_x));
+        var rx_fp = start_rx * inv_w;
+
+        var px = start_x;
+        while (px < end_x) : (px += 1) {
             const idx = idx_row + px * 4;
-            const ix = @as(i32, @intCast(px));
+            const sx = @min(@as(u32, @intCast(rx_fp >> 32)), src_w - 1);
+            rx_fp += inv_w;
 
-            if (iy >= fit_y and iy < fit_y + @as(i32, @intCast(fit_h_zoomed)) and
-                ix >= fit_x and ix < fit_x + @as(i32, @intCast(fit_w_zoomed)))
-            {
-                const sx = @as(u32, @intCast(@divFloor((ix - fit_x) * @as(i32, @intCast(src_w)), @as(i32, @intCast(fit_w_zoomed)))));
-                const sy = @as(u32, @intCast(@divFloor((iy - fit_y) * @as(i32, @intCast(src_h)), @as(i32, @intCast(fit_h_zoomed)))));
+            const s_idx = (s_row_offset + sx) * 4;
 
-                const bounded_sx = @min(sx, src_w - 1);
-                const bounded_sy = @min(sy, src_h - 1);
-                const s_idx = (bounded_sy * src_w + bounded_sx) * 4;
+            const sr = src_rgba[s_idx + 0];
+            const sg = src_rgba[s_idx + 1];
+            const sb = src_rgba[s_idx + 2];
+            var sa = src_rgba[s_idx + 3];
 
-                const sr = src_rgba[s_idx + 0];
-                const sg = src_rgba[s_idx + 1];
-                const sb = src_rgba[s_idx + 2];
-                var sa = src_rgba[s_idx + 3];
-
-                if (is_text and sr == 8 and sg == 8 and sb == 16) {
-                    sa = 0;
-                }
-
-                composited_rgba[idx + 0] = sr;
-                composited_rgba[idx + 1] = sg;
-                composited_rgba[idx + 2] = sb;
-                composited_rgba[idx + 3] = sa;
-            } else {
-                composited_rgba[idx + 0] = 0;
-                composited_rgba[idx + 1] = 0;
-                composited_rgba[idx + 2] = 0;
-                composited_rgba[idx + 3] = 0;
+            if (is_text and sr == 8 and sg == 8 and sb == 16) {
+                sa = 0;
             }
+
+            composited_rgba[idx + 0] = sr;
+            composited_rgba[idx + 1] = sg;
+            composited_rgba[idx + 2] = sb;
+            composited_rgba[idx + 3] = sa;
         }
     }
 }
@@ -337,6 +380,7 @@ const GuiAppState = struct {
     static_h: *u32,
     mesh_center: *[3]f32,
     mesh_max_size: *f32,
+    mesh_material: *gpu.Material,
 
     // Stato di trascinamento, scroll documento e rotazione 3D
     dragging: *bool,
@@ -403,8 +447,10 @@ const GuiAppState = struct {
             self.stage_opt.* = loader_mod.stageToGpu(self.gpa, self.decoded) orelse return error.StageFailed;
             const stage = &self.stage_opt.*.?;
             try self.renderer.setMesh(stage.buffer.ptr, stage.vertex_bytes, @intCast(stage.index_bytes / @sizeOf(u32)));
+            try self.renderer.setMeshMaterials(&m);
             self.mesh_center.* = m.center;
             self.mesh_max_size.* = @max(m.bbox_max[0] - m.bbox_min[0], @max(m.bbox_max[1] - m.bbox_min[1], m.bbox_max[2] - m.bbox_min[2]));
+            self.mesh_material.* = .{ .base_color = m.base_color, .metallic = m.metallic, .roughness = m.roughness };
         } else if (self.decoded.* == .image) {
             const img = self.decoded.image;
             self.gpa.free(self.static_rgba.*);
@@ -527,6 +573,73 @@ fn scrollTo(app_state: *GuiAppState, y: f32) void {
     app_state.file_changed.* = true;
 }
 
+fn isPdfPath(path: []const u8) bool {
+    var clean_path = path;
+    if (std.mem.indexOfScalar(u8, path, '#')) |hash_idx| {
+        clean_path = path[0..hash_idx];
+    }
+    return std.mem.endsWith(u8, clean_path, ".pdf") or std.mem.endsWith(u8, clean_path, ".PDF");
+}
+
+fn changePdfPage(app_state: *GuiAppState, direction: i32) void {
+    app_state.mutex.lockUncancelable(app_state.io);
+    const path = app_state.gpa.dupe(u8, app_state.current_file_path) catch {
+        app_state.mutex.unlock(app_state.io);
+        return;
+    };
+    const is_image = (app_state.decoded.* == .image);
+    var name_dup: ?[]const u8 = null;
+    if (is_image) {
+        name_dup = app_state.gpa.dupe(u8, app_state.decoded.image.name) catch null;
+    }
+    app_state.mutex.unlock(app_state.io);
+    defer app_state.gpa.free(path);
+    defer if (name_dup) |n| app_state.gpa.free(n);
+
+    var clean_path = path;
+    var current_page: usize = 1;
+    if (std.mem.indexOfScalar(u8, path, '#')) |hash_idx| {
+        clean_path = path[0..hash_idx];
+        const suffix = path[hash_idx + 1 ..];
+        var page_str = suffix;
+        if (std.mem.startsWith(u8, suffix, "page=")) {
+            page_str = suffix["page=".len..];
+        }
+        current_page = std.fmt.parseInt(usize, page_str, 10) catch 1;
+    }
+
+    var total_pages: usize = 99999;
+    if (name_dup) |name| {
+        if (std.mem.lastIndexOf(u8, name, " di ")) |di_idx| {
+            const after_di = name[di_idx + " di ".len ..];
+            if (std.mem.indexOfScalar(u8, after_di, ')')) |paren_idx| {
+                const total_str = after_di[0..paren_idx];
+                total_pages = std.fmt.parseInt(usize, total_str, 10) catch 99999;
+            }
+        }
+    }
+
+    var new_page = current_page;
+    if (direction > 0) {
+        if (current_page < total_pages) {
+            new_page += 1;
+        }
+    } else {
+        if (current_page > 1) {
+            new_page -= 1;
+        }
+    }
+
+    if (new_page == current_page) return;
+
+    const new_path = std.fmt.allocPrint(app_state.gpa, "{s}#{d}", .{ clean_path, new_page }) catch return;
+    defer app_state.gpa.free(new_path);
+
+    app_state.loadFile(new_path) catch |err| {
+        std.debug.print("Impossibile caricare pagina PDF: {s}\n", .{@errorName(err)});
+    };
+}
+
 fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) void {
     const app_state: *GuiAppState = @ptrCast(@alignCast(user orelse return));
     const pressed = (state == 1);
@@ -555,6 +668,9 @@ fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) void
             scrollText(app_state, if (key == KEY_DOWN) scroll_step else -scroll_step);
         } else if (is_text and (key == KEY_PGUP or key == KEY_PGDOWN)) {
             scrollText(app_state, if (key == KEY_PGDOWN) scroll_step * 10 else -scroll_step * 10);
+        } else if (isPdfPath(app_state.current_file_path) and (key == KEY_UP or key == KEY_DOWN or key == KEY_PGUP or key == KEY_PGDOWN)) {
+            const dir: i32 = if (key == KEY_DOWN or key == KEY_PGDOWN) 1 else -1;
+            changePdfPage(app_state, dir);
         } else if (key == KEY_RIGHT or key == KEY_DOWN) {
             app_state.navigate(1);
         } else if (key == KEY_LEFT or key == KEY_UP) {
@@ -777,6 +893,13 @@ fn renderWorker(
     var last_text_w: u32 = 0;
     var last_text_zoom: f32 = 0;
     var last_seq: u32 = 0;
+    // Ultima camera renderizzata: le mesh si ri-renderizzano SOLO quando cambia
+    // (NaN iniziale ⇒ primo frame sempre reso). Senza questo il worker presenta
+    // a 60 Hz all'infinito anche a mesh ferma, contendendo il socket Wayland col
+    // thread di dispatch input → tasti (ESC) poco reattivi.
+    var last_yaw: f32 = std.math.nan(f32);
+    var last_pitch: f32 = std.math.nan(f32);
+    var last_zoom: f32 = std.math.nan(f32);
 
     var pacer_60 = zicro.time.Pacer.hz(state.io, 60.0);
     var pacer_20 = zicro.time.Pacer.hz(state.io, 20.0);
@@ -792,7 +915,10 @@ fn renderWorker(
         state.mutex.lockUncancelable(state.io);
 
         const size_changed = (cur_w != last_w or cur_h != last_h);
-        var need_render = size_changed or state.file_changed.* or state.is_mesh.*;
+        // La mesh va ridisegnata solo se la camera è cambiata (drag/zoom).
+        const mesh_moved = state.is_mesh.* and
+            (yaw.* != last_yaw or pitch.* != last_pitch or zoom.* != last_zoom);
+        var need_render = size_changed or state.file_changed.* or mesh_moved;
         var text_animating = false;
 
         if (state.is_text.*) {
@@ -839,12 +965,15 @@ fn renderWorker(
             }
 
             if (state.is_mesh.*) {
-                const pc = gpu.buildPushConstants(state.mesh_center.*, state.mesh_max_size.* / zoom.*, yaw.*, pitch.*, cur_w, cur_h);
+                const pc = gpu.buildPushConstants(state.mesh_center.*, state.mesh_max_size.* / zoom.*, yaw.*, pitch.*, cur_w, cur_h, state.mesh_material.*);
                 const mesh_rgba = state.renderer.render(cur_w, cur_h, &pc) catch {
                     state.mutex.unlock(state.io);
                     break;
                 };
                 composeFrame(composited_rgba.*, cur_w, cur_h, mesh_rgba, cur_w, cur_h, false, 1.0, 0.0, 0.0);
+                last_yaw = yaw.*;
+                last_pitch = pitch.*;
+                last_zoom = zoom.*;
             } else if (state.is_text.*) {
                 composeTextFrame(composited_rgba.*, cur_w, cur_h, state.static_rgba.*, state.static_w.*, state.static_h.*, state.scroll_y.*);
                 if (state.sel_active.*) {
@@ -858,12 +987,11 @@ fn renderWorker(
             win.presentRgba(cur_w, cur_h, composited_rgba.*);
         }
 
-        const is_mesh = state.is_mesh.*;
         state.mutex.unlock(state.io);
 
-        // 60 Hz per mesh (rotazione continua) e durante l'animazione dello
-        // scroll testo; 20 Hz a riposo.
-        if (is_mesh or text_animating) {
+        // 60 Hz mentre la mesh si muove (drag/zoom) o durante l'animazione dello
+        // scroll testo; 20 Hz a riposo (così il dispatch input resta reattivo).
+        if (mesh_moved or text_animating) {
             _ = pacer_60.tick();
         } else {
             _ = pacer_20.tick();
@@ -1035,6 +1163,7 @@ pub fn main(init: std.process.Init) !void {
 
     var mesh_center: [3]f32 = .{ 0, 0, 0 };
     var mesh_max_size: f32 = 1;
+    var mesh_material: gpu.Material = .{};
     var is_mesh = decoded == .mesh;
 
     var static_rgba: []u8 = &.{};
@@ -1047,8 +1176,10 @@ pub fn main(init: std.process.Init) !void {
         stage_opt = loader_mod.stageToGpu(gpa, &decoded) orelse return error.StageFailed;
         const stage = &stage_opt.?;
         try renderer.setMesh(stage.buffer.ptr, stage.vertex_bytes, @intCast(stage.index_bytes / @sizeOf(u32)));
+        try renderer.setMeshMaterials(&m);
         mesh_center = m.center;
         mesh_max_size = @max(m.bbox_max[0] - m.bbox_min[0], @max(m.bbox_max[1] - m.bbox_min[1], m.bbox_max[2] - m.bbox_min[2]));
+        mesh_material = .{ .base_color = m.base_color, .metallic = m.metallic, .roughness = m.roughness };
     } else if (decoded == .image) {
         const img = decoded.image;
         static_w = @intCast(img.width);
@@ -1108,6 +1239,7 @@ pub fn main(init: std.process.Init) !void {
         .static_h = &static_h,
         .mesh_center = &mesh_center,
         .mesh_max_size = &mesh_max_size,
+        .mesh_material = &mesh_material,
         .dragging = &dragging,
         .yaw = &yaw,
         .pitch = &pitch,

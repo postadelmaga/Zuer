@@ -21,11 +21,9 @@ pub fn decode(path: []const u8, io: std.Io, filename: []const u8, allocator: std
     // (a 70 DPI risultava sfocato su schermi grandi). La GUI, che consente lo
     // zoom, va ancora più su. Sovrascrivibile con ZUER_PDF_DPI.
     var dpi: []const u8 = "150";
-    var max_pages: usize = 4;
     if (getenv("ZUER_GUI")) |val| {
         if (std.mem.eql(u8, std.mem.span(val), "1")) {
             dpi = "200";
-            max_pages = 12;
         }
     }
     if (getenv("ZUER_PDF_DPI")) |val| {
@@ -36,7 +34,24 @@ pub fn decode(path: []const u8, io: std.Io, filename: []const u8, allocator: std
         }
     }
 
-    return decodeInner(path, filename, dpi, max_pages, allocator) catch |err| {
+    var clean_path = path;
+    var page_num: usize = 1;
+    if (std.mem.indexOfScalar(u8, path, '#')) |hash_idx| {
+        clean_path = path[0..hash_idx];
+        const suffix = path[hash_idx + 1 ..];
+        var page_str = suffix;
+        if (std.mem.startsWith(u8, suffix, "page=")) {
+            page_str = suffix["page=".len..];
+        }
+        page_num = std.fmt.parseInt(usize, page_str, 10) catch 1;
+    }
+
+    var clean_filename = filename;
+    if (std.mem.indexOfScalar(u8, filename, '#')) |hash_idx| {
+        clean_filename = filename[0..hash_idx];
+    }
+
+    return decodeInner(clean_path, clean_filename, dpi, page_num, allocator) catch |err| {
         const hint = switch (err) {
             error.CommandNotFound => "pdftoppm/pdfinfo non trovati: installa poppler-utils",
             else => @errorName(err),
@@ -46,9 +61,9 @@ pub fn decode(path: []const u8, io: std.Io, filename: []const u8, allocator: std
     };
 }
 
-fn decodeInner(path: []const u8, filename: []const u8, dpi: []const u8, max_pages: usize, allocator: std.mem.Allocator) !Decoded {
+fn decodeInner(clean_path: []const u8, filename: []const u8, dpi: []const u8, page_num: usize, allocator: std.mem.Allocator) !Decoded {
     // 1. Numero di pagine dal sommario di pdfinfo
-    var info = try decoder.runCapture(allocator, &.{ "pdfinfo", path });
+    var info = try decoder.runCapture(allocator, &.{ "pdfinfo", clean_path });
     defer info.deinit(allocator);
     if (info.exit_code != 0) return error.PdfInfoFailed;
 
@@ -61,10 +76,12 @@ fn decodeInner(path: []const u8, filename: []const u8, dpi: []const u8, max_page
             break;
         }
     }
-    const pages = @min(total_pages, max_pages);
-    if (pages == 0) return error.EmptyPdf;
 
-    // 2. Rasterizzazione in PPM temporanei, dentro una directory privata
+    var page = page_num;
+    if (page < 1) page = 1;
+    if (page > total_pages) page = total_pages;
+
+    // 2. Rasterizzazione della singola pagina in PPM temporaneo, dentro una directory privata
     // creata con mkdtemp: nome imprevedibile, niente symlink pre-creabili.
     var dir_template: [32]u8 = undefined;
     const tmpl = try std.fmt.bufPrintZ(&dir_template, "/tmp/zuer_pdf_XXXXXX", .{});
@@ -74,72 +91,27 @@ fn decodeInner(path: []const u8, filename: []const u8, dpi: []const u8, max_page
     var prefix_buf: [48]u8 = undefined;
     const prefix = try std.fmt.bufPrint(&prefix_buf, "{s}/page", .{tmpl});
 
-    var last_buf: [16]u8 = undefined;
-    const last_str = try std.fmt.bufPrint(&last_buf, "{d}", .{pages});
+    var page_buf: [16]u8 = undefined;
+    const page_str = try std.fmt.bufPrint(&page_buf, "{d}", .{page});
 
-    var run_result = try decoder.runCapture(allocator, &.{ "pdftoppm", "-f", "1", "-l", last_str, "-r", dpi, path, prefix });
+    var run_result = try decoder.runCapture(allocator, &.{ "pdftoppm", "-f", page_str, "-l", page_str, "-r", dpi, clean_path, prefix });
     defer run_result.deinit(allocator);
     if (run_result.exit_code != 0) return error.PdfToPpmFailed;
 
-    // 3. Lettura delle pagine generate. pdftoppm azzeropadda il numero di
-    // pagina in modo dipendente dalla versione/documento: si provano le
-    // larghezze di padding da 1 a 6 cifre.
-    var ppm_pages = std.ArrayList(Ppm).empty;
-    defer {
-        for (ppm_pages.items) |p| allocator.free(p.pixels);
-        ppm_pages.deinit(allocator);
-    }
+    // 3. Lettura della pagina generata.
+    const bytes = readPageFile(prefix, page, allocator) orelse return error.NoPagesRendered;
+    defer allocator.free(bytes);
+    const ppm = try parsePpm(bytes, allocator);
+    errdefer allocator.free(ppm.pixels);
 
-    var page: usize = 1;
-    while (page <= pages) : (page += 1) {
-        const bytes = readPageFile(prefix, page, allocator) orelse continue;
-        defer allocator.free(bytes);
-        const ppm = parsePpm(bytes, allocator) catch continue;
-        ppm_pages.append(allocator, ppm) catch {
-            allocator.free(ppm.pixels);
-            break;
-        };
-    }
-    if (ppm_pages.items.len == 0) return error.NoPagesRendered;
+    // Passiamo al chiamante l'ownership diretta dei pixel parsati, evitando duplicazioni.
+    const pixels = ppm.pixels;
 
-    // 4. Impila le pagine in un'unica immagine
-    var width: usize = 0;
-    var height: usize = 0;
-    for (ppm_pages.items) |p| {
-        width = @max(width, p.width);
-        height += p.height;
-    }
-    height += page_gap * (ppm_pages.items.len - 1);
-
-    const pixels = try allocator.alloc(u8, width * height * 3);
-    errdefer allocator.free(pixels);
-    // Sfondo = colore separatore, così i bordi di pagine più strette non restano neri
-    var i: usize = 0;
-    while (i < width * height) : (i += 1) {
-        pixels[i * 3 ..][0..3].* = gap_color;
-    }
-
-    var y: usize = 0;
-    for (ppm_pages.items) |p| {
-        const x_off = (width - p.width) / 2;
-        for (0..p.height) |row| {
-            const dst = ((y + row) * width + x_off) * 3;
-            const src = row * p.width * 3;
-            @memcpy(pixels[dst .. dst + p.width * 3], p.pixels[src .. src + p.width * 3]);
-        }
-        y += p.height + page_gap;
-    }
-
-    var name: []const u8 = undefined;
-    if (total_pages > pages) {
-        name = try std.fmt.allocPrint(allocator, "{s} (prime {d} di {d} pagine)", .{ filename, pages, total_pages });
-    } else {
-        name = try allocator.dupe(u8, filename);
-    }
+    const name = try std.fmt.allocPrint(allocator, "{s} (pagina {d} di {d})", .{ filename, page, total_pages });
 
     return .{ .image = .{
-        .width = width,
-        .height = height,
+        .width = ppm.width,
+        .height = ppm.height,
         .pixels = pixels,
         .name = name,
     } };

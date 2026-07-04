@@ -10,6 +10,7 @@
 //!  - zuer-gui: `renderToImage()` lascia il frame pronto, presentato da zrame.
 
 const std = @import("std");
+const decoder = @import("decoder.zig");
 
 // ---------------------------------------------------------------------------
 // Binding Vulkan minimali
@@ -74,12 +75,15 @@ const ST_IMPORT_MEMORY_HOST_POINTER_INFO_EXT: VkStructureType = 1000178000;
 const ST_MEMORY_HOST_POINTER_PROPERTIES_EXT: VkStructureType = 1000178001;
 
 pub const FORMAT_R8G8B8A8_UNORM: u32 = 37;
+pub const FORMAT_R8G8B8A8_SRGB: u32 = 43;
 pub const FORMAT_R32G32B32_SFLOAT: u32 = 106;
+pub const FORMAT_R32G32B32A32_SFLOAT: u32 = 109;
 pub const FORMAT_D32_SFLOAT: u32 = 126;
 
 const IMAGE_LAYOUT_UNDEFINED: u32 = 0;
 const IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL: u32 = 2;
 const IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL: u32 = 3;
+const IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL: u32 = 4;
 pub const IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL: u32 = 6;
 pub const IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL: u32 = 7;
 
@@ -582,6 +586,7 @@ const SHADER_STAGE_FRAGMENT: u32 = 0x10;
 pub const STAGE_TOP: u32 = 0x1;
 const STAGE_COLOR_ATTACHMENT_OUTPUT: u32 = 0x400;
 const STAGE_EARLY_FRAGMENT_TESTS: u32 = 0x100;
+const STAGE_LATE_FRAGMENT_TESTS: u32 = 0x200;
 pub const STAGE_TRANSFER: u32 = 0x1000;
 const STAGE_HOST: u32 = 0x4000;
 const ACCESS_COLOR_WRITE: u32 = 0x100;
@@ -660,10 +665,43 @@ fn check(r: VkResult) !void {
 
 const vert_spv = @embedFile("mesh_vert_spv");
 const frag_spv = @embedFile("mesh_frag_spv");
+const shadow_vert_spv = @embedFile("shadow_vert_spv");
+const shadow_frag_spv = @embedFile("shadow_frag_spv");
+const voxel_vert_spv = @embedFile("voxel_vert_spv");
+const voxel_frag_spv = @embedFile("voxel_frag_spv");
+
+/// Risoluzione della shadow map (depth della key light).
+const SHADOW_SIZE: u32 = 1024;
 
 pub const PushConstants = extern struct {
     mvp: [16]f32,
-    light: [4]f32,
+    // Righe della sola rotazione oggetto→camera: trasformano le normali senza
+    // la scala non-uniforme della MVP. I `w` trasportano i fattori materiale.
+    nrm0: [4]f32, // xyz = riga 0; w = roughness
+    nrm1: [4]f32, // xyz = riga 1; w = metallic
+    nrm2: [4]f32, // xyz = riga 2; w inutilizzato
+    material: [4]f32, // rgb = baseColor factor; a = alpha
+    // Ombre: proiezione oggetto→clip della luce (per il lookup nella shadow map)
+    // e direzione della key light in spazio camera (illuminazione coerente con
+    // le ombre). 208 byte totali (device qui: maxPushConstantsSize = 256).
+    light_vp: [16]f32,
+    light_dir_cam: [4]f32,
+};
+
+/// Push constant della shadow pass: solo la proiezione oggetto→clip della luce.
+pub const ShadowPush = extern struct {
+    light_vp: [16]f32,
+};
+
+/// Push constant del ray-march voxel (96 byte). Raggio ortografico ricostruito
+/// da origine + right·ndc.x + up·ndc.y, marciato lungo `dir` in spazio griglia.
+pub const VoxelPush = extern struct {
+    origin: [4]f32, // origine raggio (spazio griglia [0,1])
+    right: [4]f32, // × ndc.x
+    up: [4]f32, // × ndc.y
+    dir: [4]f32, // direzione di marcia (spazio griglia)
+    light_g: [4]f32, // dir verso la luce (spazio griglia, raggio d'ombra)
+    light_obj: [4]f32, // xyz = dir luce oggetto (N·L); w = dim
 };
 
 pub const InitOptions = struct {
@@ -825,12 +863,55 @@ pub const Renderer = struct {
     readback_mem: VkDeviceMemory = VK_NULL,
     readback_ptr: ?[*]u8 = null,
 
+    // Supporto per double-buffering dell'asynchronous readback
+    frame_cmds: [2]VkCommandBuffer = .{ null, null },
+    frame_fences: [2]VkFence = .{ VK_NULL, VK_NULL },
+    frame_index: u64 = 0,
+    readback_bufs: [2]VkBuffer = .{ VK_NULL, VK_NULL },
+    readback_mems: [2]VkDeviceMemory = .{ VK_NULL, VK_NULL },
+    readback_ptrs: [2]?[*]u8 = .{ null, null },
+
     // Geometria corrente (import zero-copy del memfd o copia una tantum)
     mesh_buf: VkBuffer = VK_NULL,
     mesh_mem: VkDeviceMemory = VK_NULL,
     mesh_vertex_bytes: u64 = 0,
     mesh_index_count: u32 = 0,
     mesh_imported: bool = false,
+
+    // Materiali/texture per sotto-mesh (combined image sampler, set 0). Ogni
+    // submesh ha il proprio descriptor set (bind 0 = baseColor, bind 1 = shadow
+    // map). Modelli multi-materiale → più submesh sulla stessa geometria fusa.
+    // La texture 1×1 bianca è condivisa per i submesh senza texture propria.
+    mesh_sampler: VkSampler = VK_NULL,
+    mesh_dsl: VkDescriptorSetLayout = VK_NULL,
+    mesh_dpool: VkDescriptorPool = VK_NULL,
+    white_tex: ImageBundle = .{ .image = VK_NULL, .mem = VK_NULL, .view = VK_NULL },
+    flat_normal_tex: ImageBundle = .{ .image = VK_NULL, .mem = VK_NULL, .view = VK_NULL },
+    submeshes: []SubMeshGpu = &.{},
+
+    // Ombre (shadow map depth della key light), inizializzate pigramente.
+    shadow_ready: bool = false,
+    shadow_pass: VkRenderPass = VK_NULL,
+    shadow_depth: ImageBundle = .{ .image = VK_NULL, .mem = VK_NULL, .view = VK_NULL },
+    shadow_fb: VkFramebuffer = VK_NULL,
+    shadow_sampler: VkSampler = VK_NULL,
+    shadow_pipeline_layout: VkPipelineLayout = VK_NULL,
+    shadow_pipeline: VkPipeline = VK_NULL,
+    shadow_vert_module: VkShaderModule = VK_NULL,
+    shadow_frag_module: VkShaderModule = VK_NULL,
+
+    // Rendering voxel (ray-march di una texture 3D), inizializzato pigramente.
+    voxel_ready: bool = false, // pipeline/risorse statiche create
+    voxel_sampler: VkSampler = VK_NULL,
+    voxel_dsl: VkDescriptorSetLayout = VK_NULL,
+    voxel_dpool: VkDescriptorPool = VK_NULL,
+    voxel_dset: VkDescriptorSet = VK_NULL,
+    voxel_pipeline_layout: VkPipelineLayout = VK_NULL,
+    voxel_pipeline: VkPipeline = VK_NULL,
+    voxel_vert_module: VkShaderModule = VK_NULL,
+    voxel_frag_module: VkShaderModule = VK_NULL,
+    voxel_tex: ImageBundle = .{ .image = VK_NULL, .mem = VK_NULL, .view = VK_NULL },
+    voxel_dim: u32 = 0, // >0 se una griglia è caricata
 
     // Texture immagine (per zuer-gui: blit diretto sulla swapchain)
 
@@ -930,6 +1011,15 @@ pub const Renderer = struct {
         try check(vkCreateFence(device, &.{}, null, &fence));
         errdefer vkDestroyFence(device, fence, null);
 
+        var frame_cmds: [2]VkCommandBuffer = .{ null, null };
+        try check(vkAllocateCommandBuffers(device, &.{ .commandPool = cmd_pool, .commandBufferCount = 2 }, @ptrCast(&frame_cmds)));
+
+        var frame_fences: [2]VkFence = .{ VK_NULL, VK_NULL };
+        try check(vkCreateFence(device, &.{}, null, &frame_fences[0]));
+        errdefer vkDestroyFence(device, frame_fences[0], null);
+        try check(vkCreateFence(device, &.{}, null, &frame_fences[1]));
+        errdefer vkDestroyFence(device, frame_fences[1], null);
+
         const render_pass = try createRenderPass(device);
         errdefer vkDestroyRenderPass(device, render_pass, null);
 
@@ -938,6 +1028,37 @@ pub const Renderer = struct {
         const frag_module = try createShaderModule(gpa, device, frag_spv);
         errdefer vkDestroyShaderModule(device, frag_module, null);
 
+        // Descriptor set 0: texture baseColor (combined image sampler) per la
+        // mesh. Creato qui perché il pipeline layout lo referenzia.
+        var mesh_sampler: VkSampler = VK_NULL;
+        try check(vkCreateSampler(device, &.{}, null, &mesh_sampler));
+        errdefer vkDestroySampler(device, mesh_sampler, null);
+
+        // Binding 0 = texture baseColor, binding 1 = shadow map depth. Le risorse
+        // effettive sono create pigramente; il DSL però è definitivo qui perché
+        // il pipeline layout (e quindi la pipeline) lo referenzia.
+        // binding 0 = baseColor, 1 = shadow map, 2 = normal map.
+        const tex_bindings = [_]VkDescriptorSetLayoutBinding{
+            .{ .binding = 0, .descriptorType = DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = SHADER_STAGE_FRAGMENT },
+            .{ .binding = 1, .descriptorType = DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = SHADER_STAGE_FRAGMENT },
+            .{ .binding = 2, .descriptorType = DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = SHADER_STAGE_FRAGMENT },
+        };
+        var mesh_dsl: VkDescriptorSetLayout = VK_NULL;
+        try check(vkCreateDescriptorSetLayout(device, &.{
+            .bindingCount = tex_bindings.len,
+            .pBindings = &tex_bindings,
+        }, null, &mesh_dsl));
+        errdefer vkDestroyDescriptorSetLayout(device, mesh_dsl, null);
+
+        const tex_pool_size = VkDescriptorPoolSize{ .type = DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 2 };
+        var mesh_dpool: VkDescriptorPool = VK_NULL;
+        try check(vkCreateDescriptorPool(device, &.{
+            .maxSets = 1,
+            .poolSizeCount = 1,
+            .pPoolSizes = @ptrCast(&tex_pool_size),
+        }, null, &mesh_dpool));
+        errdefer vkDestroyDescriptorPool(device, mesh_dpool, null);
+
         const push_range = VkPushConstantRange{
             .stageFlags = SHADER_STAGE_VERTEX | SHADER_STAGE_FRAGMENT,
             .offset = 0,
@@ -945,6 +1066,8 @@ pub const Renderer = struct {
         };
         var pipeline_layout: VkPipelineLayout = VK_NULL;
         try check(vkCreatePipelineLayout(device, &.{
+            .setLayoutCount = 1,
+            .pSetLayouts = @ptrCast(&mesh_dsl),
             .pushConstantRangeCount = 1,
             .pPushConstantRanges = @ptrCast(&push_range),
         }, null, &pipeline_layout));
@@ -965,17 +1088,48 @@ pub const Renderer = struct {
             .cmd_pool = cmd_pool,
             .cmd = cmd,
             .fence = fence,
+            .frame_cmds = frame_cmds,
+            .frame_fences = frame_fences,
             .render_pass = render_pass,
             .pipeline_layout = pipeline_layout,
             .pipeline = pipeline,
             .vert_module = vert_module,
             .frag_module = frag_module,
+            .mesh_sampler = mesh_sampler,
+            .mesh_dsl = mesh_dsl,
+            .mesh_dpool = mesh_dpool,
         };
     }
 
     pub fn deinit(self: *Renderer) void {
         _ = vkDeviceWaitIdle(self.device);
         self.releaseMesh();
+        if (self.shadow_ready) {
+            vkDestroyPipeline(self.device, self.shadow_pipeline, null);
+            vkDestroyPipelineLayout(self.device, self.shadow_pipeline_layout, null);
+            vkDestroyShaderModule(self.device, self.shadow_vert_module, null);
+            vkDestroyShaderModule(self.device, self.shadow_frag_module, null);
+            vkDestroyFramebuffer(self.device, self.shadow_fb, null);
+            self.destroyImage(self.shadow_depth);
+            vkDestroyRenderPass(self.device, self.shadow_pass, null);
+            vkDestroySampler(self.device, self.shadow_sampler, null);
+        }
+        if (self.voxel_ready) {
+            vkDestroyPipeline(self.device, self.voxel_pipeline, null);
+            vkDestroyPipelineLayout(self.device, self.voxel_pipeline_layout, null);
+            vkDestroyShaderModule(self.device, self.voxel_vert_module, null);
+            vkDestroyShaderModule(self.device, self.voxel_frag_module, null);
+            vkDestroyDescriptorPool(self.device, self.voxel_dpool, null);
+            vkDestroyDescriptorSetLayout(self.device, self.voxel_dsl, null);
+            vkDestroySampler(self.device, self.voxel_sampler, null);
+        }
+        if (self.voxel_tex.image != VK_NULL) self.destroyImage(self.voxel_tex);
+        self.releaseSubmeshes();
+        if (self.white_tex.image != VK_NULL) self.destroyImage(self.white_tex);
+        if (self.flat_normal_tex.image != VK_NULL) self.destroyImage(self.flat_normal_tex);
+        vkDestroyDescriptorPool(self.device, self.mesh_dpool, null);
+        vkDestroyDescriptorSetLayout(self.device, self.mesh_dsl, null);
+        vkDestroySampler(self.device, self.mesh_sampler, null);
         self.destroyTextPipe();
         self.destroyTarget();
         vkDestroyPipeline(self.device, self.pipeline, null);
@@ -983,6 +1137,8 @@ pub const Renderer = struct {
         vkDestroyShaderModule(self.device, self.vert_module, null);
         vkDestroyShaderModule(self.device, self.frag_module, null);
         vkDestroyRenderPass(self.device, self.render_pass, null);
+        vkDestroyFence(self.device, self.frame_fences[0], null);
+        vkDestroyFence(self.device, self.frame_fences[1], null);
         vkDestroyFence(self.device, self.fence, null);
         vkDestroyCommandPool(self.device, self.cmd_pool, null);
         vkDestroyDevice(self.device, null);
@@ -1107,11 +1263,353 @@ pub const Renderer = struct {
         self.mesh_imported = false;
     }
 
+    /// Imposta la texture baseColor del modello corrente. Pixel RGBA8 in spazio
+    /// sRGB, `w`×`h`. Con pixel vuoti/incoerenti associa una 1×1 bianca (così il
+    /// materiale resta il solo colore-fattore). Da chiamare al cambio di mesh.
+    pub fn setBaseColor(self: *Renderer, pixels: []const u8, w: u32, h: u32) !void {
+        var sub = decoder.SubMesh{ .first_index = 0, .index_count = self.mesh_index_count };
+        if (w > 0 and h > 0 and pixels.len >= @as(usize, w) * h * 4) {
+            sub.tex_width = w;
+            sub.tex_height = h;
+            sub.tex_pixels = pixels;
+        }
+        try self.setSubmeshes(&[_]decoder.SubMesh{sub});
+    }
+
+    /// Configura i materiali/texture del modello a partire dai suoi submesh
+    /// (glTF multi-materiale). Se il decoder non ne ha prodotti (es. OBJ/STL),
+    /// sintetizza un submesh unico sui campi materiale di fallback della mesh.
+    pub fn setMeshMaterials(self: *Renderer, mesh: *const decoder.MeshData) !void {
+        if (mesh.submeshes.len > 0) {
+            try self.setSubmeshes(mesh.submeshes);
+        } else {
+            const one = decoder.SubMesh{
+                .first_index = 0,
+                .index_count = mesh.faces.len * 3,
+                .base_color = mesh.base_color,
+                .metallic = mesh.metallic,
+                .roughness = mesh.roughness,
+                .tex_width = mesh.tex_width,
+                .tex_height = mesh.tex_height,
+                .tex_pixels = mesh.tex_pixels,
+            };
+            try self.setSubmeshes(&[_]decoder.SubMesh{one});
+        }
+    }
+
+    /// Carica su GPU i submesh del modello corrente: per ciascuno un descriptor
+    /// set con la propria texture baseColor (bind 0) e la shadow map (bind 1).
+    /// Il pool descriptor viene ricreato dimensionato al numero di submesh.
+    /// `subs` vuoto ⇒ un submesh unico bianco sull'intera geometria.
+    pub fn setSubmeshes(self: *Renderer, subs: []const decoder.SubMesh) !void {
+        _ = vkDeviceWaitIdle(self.device);
+        self.releaseSubmeshes();
+        try self.ensureWhiteTexture();
+        try self.ensureFlatNormal();
+        try self.ensureShadow(); // la shadow map serve al binding 1 di ogni set
+
+        const count: u32 = if (subs.len == 0) 1 else @intCast(subs.len);
+
+        // Ricrea il pool dimensionato per `count` set (3 sampler ciascuno:
+        // baseColor + shadow map + normal map).
+        vkDestroyDescriptorPool(self.device, self.mesh_dpool, null);
+        self.mesh_dpool = VK_NULL;
+        const pool_size = VkDescriptorPoolSize{ .type = DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 3 * count };
+        try check(vkCreateDescriptorPool(self.device, &.{
+            .maxSets = count,
+            .poolSizeCount = 1,
+            .pPoolSizes = @ptrCast(&pool_size),
+        }, null, &self.mesh_dpool));
+
+        const out = try self.gpa.alloc(SubMeshGpu, count);
+        errdefer self.gpa.free(out);
+
+        for (0..count) |i| {
+            var g = SubMeshGpu{
+                .first_index = 0,
+                .index_count = self.mesh_index_count,
+                .base_color = .{ 1, 1, 1, 1 },
+                .metallic = 1,
+                .roughness = 1,
+                .tex = self.white_tex,
+                .owns_tex = false,
+                .nrm_tex = self.flat_normal_tex,
+                .owns_nrm_tex = false,
+                .dset = VK_NULL,
+            };
+            if (subs.len > 0) {
+                const s = subs[i];
+                g.first_index = @intCast(s.first_index);
+                g.index_count = @intCast(s.index_count);
+                g.base_color = s.base_color;
+                g.metallic = s.metallic;
+                g.roughness = s.roughness;
+                if (s.tex_width > 0 and s.tex_height > 0 and s.tex_pixels.len >= s.tex_width * s.tex_height * 4) {
+                    g.tex = try self.createSampledTexture(s.tex_pixels, @intCast(s.tex_width), @intCast(s.tex_height), true);
+                    g.owns_tex = true;
+                }
+                if (s.nrm_tex_width > 0 and s.nrm_tex_height > 0 and s.nrm_tex_pixels.len >= s.nrm_tex_width * s.nrm_tex_height * 4) {
+                    // Normal map = dati lineari (non sRGB).
+                    g.nrm_tex = try self.createSampledTexture(s.nrm_tex_pixels, @intCast(s.nrm_tex_width), @intCast(s.nrm_tex_height), false);
+                    g.owns_nrm_tex = true;
+                }
+            }
+            errdefer {
+                if (g.owns_tex) self.destroyImage(g.tex);
+                if (g.owns_nrm_tex) self.destroyImage(g.nrm_tex);
+            }
+
+            try check(vkAllocateDescriptorSets(self.device, &.{
+                .descriptorPool = self.mesh_dpool,
+                .pSetLayouts = @ptrCast(&self.mesh_dsl),
+            }, &g.dset));
+            self.writeSubmeshDescriptors(g.dset, g.tex.view, g.nrm_tex.view);
+
+            out[i] = g;
+        }
+
+        self.submeshes = out;
+    }
+
+    /// Distrugge le texture possedute dai submesh e libera l'array. I descriptor
+    /// set si liberano con la ricreazione del pool (fatta dal chiamante).
+    fn releaseSubmeshes(self: *Renderer) void {
+        for (self.submeshes) |sm| {
+            if (sm.owns_tex and sm.tex.image != VK_NULL) self.destroyImage(sm.tex);
+            if (sm.owns_nrm_tex and sm.nrm_tex.image != VK_NULL) self.destroyImage(sm.nrm_tex);
+        }
+        if (self.submeshes.len > 0) self.gpa.free(self.submeshes);
+        self.submeshes = &.{};
+    }
+
+    /// Texture 1×1 bianca condivisa (per i submesh senza baseColor propria).
+    fn ensureWhiteTexture(self: *Renderer) !void {
+        if (self.white_tex.image != VK_NULL) return;
+        const white = [_]u8{ 255, 255, 255, 255 };
+        self.white_tex = try self.createSampledTexture(&white, 1, 1, true);
+    }
+
+    /// Normal map 1×1 "piatta" (+Z = (0.5,0.5,1.0)) condivisa: per i submesh senza
+    /// normal map propria, il campionamento restituisce la normale geometrica.
+    fn ensureFlatNormal(self: *Renderer) !void {
+        if (self.flat_normal_tex.image != VK_NULL) return;
+        const flat = [_]u8{ 128, 128, 255, 255 };
+        self.flat_normal_tex = try self.createSampledTexture(&flat, 1, 1, false);
+    }
+
+    /// Collega al descriptor set baseColor (bind 0), shadow map (bind 1) e
+    /// normal map (bind 2), in una sola update.
+    fn writeSubmeshDescriptors(self: *Renderer, dset: VkDescriptorSet, tex_view: VkImageView, nrm_view: VkImageView) void {
+        const infos = [_]VkDescriptorImageInfo{
+            .{ .sampler = self.mesh_sampler, .imageView = tex_view, .imageLayout = IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+            .{ .sampler = self.shadow_sampler, .imageView = self.shadow_depth.view, .imageLayout = IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL },
+            .{ .sampler = self.mesh_sampler, .imageView = nrm_view, .imageLayout = IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+        };
+        const writes = [_]VkWriteDescriptorSet{
+            .{ .dstSet = dset, .dstBinding = 0, .descriptorType = DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &infos[0] },
+            .{ .dstSet = dset, .dstBinding = 1, .descriptorType = DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &infos[1] },
+            .{ .dstSet = dset, .dstBinding = 2, .descriptorType = DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &infos[2] },
+        };
+        vkUpdateDescriptorSets(self.device, writes.len, &writes, 0, null);
+    }
+
+    /// Carica pixel RGBA come texture campionabile (sRGB se `srgb`, altrimenti
+    /// lineare per le normal map) e ritorna l'ImageBundle in layout
+    /// SHADER_READ_ONLY. Il chiamante ne assume la proprietà.
+    fn createSampledTexture(self: *Renderer, pixels: []const u8, w: u32, h: u32, srgb: bool) !ImageBundle {
+        const size: u64 = @as(u64, w) * h * 4;
+        if (size == 0 or pixels.len < size) return error.BadTexture;
+
+        const fmt: u32 = if (srgb) FORMAT_R8G8B8A8_SRGB else FORMAT_R8G8B8A8_UNORM;
+        const tex = try self.createImage(w, h, fmt, IMAGE_USAGE_SAMPLED | IMAGE_USAGE_TRANSFER_DST, ASPECT_COLOR, true);
+        errdefer self.destroyImage(tex);
+
+        var staging: VkBuffer = VK_NULL;
+        try check(vkCreateBuffer(self.device, &.{ .size = size, .usage = BUFFER_USAGE_TRANSFER_SRC }, null, &staging));
+        defer vkDestroyBuffer(self.device, staging, null);
+        var req: VkMemoryRequirements = undefined;
+        vkGetBufferMemoryRequirements(self.device, staging, &req);
+        const mt = self.findMemoryType(req.memoryTypeBits, MEM_HOST_VISIBLE | MEM_HOST_COHERENT) orelse return error.NoMemoryType;
+        var smem: VkDeviceMemory = VK_NULL;
+        try check(vkAllocateMemory(self.device, &.{ .allocationSize = req.size, .memoryTypeIndex = mt }, null, &smem));
+        defer vkFreeMemory(self.device, smem, null);
+        try check(vkBindBufferMemory(self.device, staging, smem, 0));
+        var mapped: *anyopaque = undefined;
+        try check(vkMapMemory(self.device, smem, 0, size, 0, &mapped));
+        const dst: [*]u8 = @ptrCast(mapped);
+        @memcpy(dst[0..@intCast(size)], pixels[0..@intCast(size)]);
+
+        try check(vkBeginCommandBuffer(self.cmd, &.{}));
+        const to_dst = [_]VkImageMemoryBarrier{.{
+            .srcAccessMask = 0,
+            .dstAccessMask = ACCESS_TRANSFER_WRITE,
+            .oldLayout = IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .image = tex.image,
+            .subresourceRange = .{ .aspectMask = ASPECT_COLOR },
+        }};
+        vkCmdPipelineBarrier(self.cmd, STAGE_TOP, STAGE_TRANSFER, 0, 0, null, 0, null, 1, &to_dst);
+        vkCmdCopyBufferToImage(self.cmd, staging, tex.image, IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &[_]VkBufferImageCopy{.{
+            .imageSubresource = .{ .aspectMask = ASPECT_COLOR },
+            .imageExtent = .{ .width = w, .height = h, .depth = 1 },
+        }});
+        const to_read = [_]VkImageMemoryBarrier{.{
+            .srcAccessMask = ACCESS_TRANSFER_WRITE,
+            .dstAccessMask = ACCESS_SHADER_READ,
+            .oldLayout = IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .newLayout = IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .image = tex.image,
+            .subresourceRange = .{ .aspectMask = ASPECT_COLOR },
+        }};
+        vkCmdPipelineBarrier(self.cmd, STAGE_TRANSFER, STAGE_FRAGMENT_SHADER, 0, 0, null, 0, null, 1, &to_read);
+        try check(vkEndCommandBuffer(self.cmd));
+        try check(vkQueueSubmit(self.queue, 1, &[_]VkSubmitInfo{.{ .pCommandBuffers = @ptrCast(&self.cmd) }}, self.fence));
+        try check(vkWaitForFences(self.device, 1, @ptrCast(&self.fence), 1, 2 * std.time.ns_per_s));
+        try check(vkResetFences(self.device, 1, @ptrCast(&self.fence)));
+
+        return tex;
+    }
+
+    /// Crea (una sola volta) le risorse per le ombre: render pass depth-only,
+    /// shadow map campionabile, framebuffer, pipeline della shadow pass, e
+    /// aggancia la shadow map al binding 1 del descriptor set mesh.
+    fn ensureShadow(self: *Renderer) !void {
+        if (self.shadow_ready) return;
+
+        try check(vkCreateSampler(self.device, &.{}, null, &self.shadow_sampler));
+        self.shadow_pass = try createShadowRenderPass(self.device);
+        self.shadow_depth = try self.createImage(SHADOW_SIZE, SHADOW_SIZE, FORMAT_D32_SFLOAT, IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT | IMAGE_USAGE_SAMPLED, ASPECT_DEPTH, true);
+        try check(vkCreateFramebuffer(self.device, &.{
+            .renderPass = self.shadow_pass,
+            .attachmentCount = 1,
+            .pAttachments = &[_]VkImageView{self.shadow_depth.view},
+            .width = SHADOW_SIZE,
+            .height = SHADOW_SIZE,
+        }, null, &self.shadow_fb));
+
+        const push = VkPushConstantRange{ .stageFlags = SHADER_STAGE_VERTEX, .offset = 0, .size = @sizeOf(ShadowPush) };
+        try check(vkCreatePipelineLayout(self.device, &.{
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = @ptrCast(&push),
+        }, null, &self.shadow_pipeline_layout));
+
+        self.shadow_vert_module = try createShaderModule(self.gpa, self.device, shadow_vert_spv);
+        self.shadow_frag_module = try createShaderModule(self.gpa, self.device, shadow_frag_spv);
+        self.shadow_pipeline = try createShadowPipeline(self.device, self.shadow_pass, self.shadow_pipeline_layout, self.shadow_vert_module, self.shadow_frag_module);
+
+        // La shadow map viene collegata al binding 1 di ogni descriptor set dei
+        // submesh in setSubmeshes (writeSubmeshDescriptors).
+        self.shadow_ready = true;
+    }
+
     /// Renderizza la mesh corrente su un target `width`×`height` e ne fa il
     /// readback: ritorna i pixel RGBA (validi fino alla prossima chiamata).
+    /// Ottimizzato con double buffering per non bloccare la CPU (asynchronous readback).
     pub fn render(self: *Renderer, width: u32, height: u32, pc: *const PushConstants) ![]const u8 {
-        try self.recordAndSubmit(width, height, pc, true);
-        return self.readback_ptr.?[0 .. @as(usize, width) * height * 4];
+        const slot = self.frame_index % 2;
+        const prev_slot = (self.frame_index + 1) % 2;
+
+        if (self.frame_index >= 2) {
+            try check(vkWaitForFences(self.device, 1, @ptrCast(&self.frame_fences[slot]), 1, 2 * std.time.ns_per_s));
+            try check(vkResetFences(self.device, 1, @ptrCast(&self.frame_fences[slot])));
+        }
+
+        try self.recordAndSubmitFrame(slot, width, height, pc);
+
+        if (self.frame_index == 0) {
+            try check(vkWaitForFences(self.device, 1, @ptrCast(&self.frame_fences[0]), 1, 2 * std.time.ns_per_s));
+            self.frame_index += 1;
+            return self.readback_ptrs[0].?[0 .. @as(usize, width) * height * 4];
+        }
+
+        try check(vkWaitForFences(self.device, 1, @ptrCast(&self.frame_fences[prev_slot]), 1, 2 * std.time.ns_per_s));
+        self.frame_index += 1;
+        return self.readback_ptrs[prev_slot].?[0 .. @as(usize, width) * height * 4];
+    }
+
+    fn recordAndSubmitFrame(self: *Renderer, slot: usize, width: u32, height: u32, pc: *const PushConstants) !void {
+        if (self.mesh_buf == VK_NULL) return error.NoMesh;
+        if (width == 0 or height == 0) return error.EmptyTarget;
+        try self.ensureTarget(width, height);
+        try self.ensureShadow();
+        if (self.submeshes.len == 0) try self.setSubmeshes(&[_]decoder.SubMesh{});
+
+        const cmd = self.frame_cmds[slot];
+        const fence = self.frame_fences[slot];
+        const readback_buf = self.readback_bufs[slot];
+
+        try check(vkBeginCommandBuffer(cmd, &.{}));
+
+        // --- Shadow pass: depth della scena dal punto di vista della key light.
+        const shadow_clear = [_]VkClearValue{.{ .depth_stencil = .{ .depth = 1.0, .stencil = 0 } }};
+        vkCmdBeginRenderPass(cmd, &.{
+            .renderPass = self.shadow_pass,
+            .framebuffer = self.shadow_fb,
+            .renderArea = .{ .offset = .{ .x = 0, .y = 0 }, .extent = .{ .width = SHADOW_SIZE, .height = SHADOW_SIZE } },
+            .clearValueCount = 1,
+            .pClearValues = &shadow_clear,
+        }, 0);
+        vkCmdBindPipeline(cmd, 0, self.shadow_pipeline);
+        vkCmdSetViewport(cmd, 0, 1, &[_]VkViewport{.{ .x = 0, .y = 0, .width = @floatFromInt(SHADOW_SIZE), .height = @floatFromInt(SHADOW_SIZE) }});
+        vkCmdSetScissor(cmd, 0, 1, &[_]VkRect2D{.{ .offset = .{ .x = 0, .y = 0 }, .extent = .{ .width = SHADOW_SIZE, .height = SHADOW_SIZE } }});
+        const shadow_push = ShadowPush{ .light_vp = pc.light_vp };
+        vkCmdPushConstants(cmd, self.shadow_pipeline_layout, SHADER_STAGE_VERTEX, 0, @sizeOf(ShadowPush), &shadow_push);
+        vkCmdBindVertexBuffers(cmd, 0, 1, &[_]VkBuffer{self.mesh_buf}, &[_]u64{0});
+        vkCmdBindIndexBuffer(cmd, self.mesh_buf, self.mesh_vertex_bytes, 1);
+        vkCmdDrawIndexed(cmd, self.mesh_index_count, 1, 0, 0, 0);
+        vkCmdEndRenderPass(cmd);
+
+        const clears = [_]VkClearValue{
+            .{ .color = .{ 0, 0, 0, 0 } },
+            .{ .depth_stencil = .{ .depth = 1.0, .stencil = 0 } },
+        };
+        vkCmdBeginRenderPass(cmd, &.{
+            .renderPass = self.render_pass,
+            .framebuffer = self.framebuffer,
+            .renderArea = .{ .offset = .{ .x = 0, .y = 0 }, .extent = .{ .width = width, .height = height } },
+            .clearValueCount = clears.len,
+            .pClearValues = &clears,
+        }, 0);
+
+        vkCmdBindPipeline(cmd, 0, self.pipeline);
+        vkCmdSetViewport(cmd, 0, 1, &[_]VkViewport{.{
+            .x = 0,
+            .y = 0,
+            .width = @floatFromInt(width),
+            .height = @floatFromInt(height),
+        }});
+        vkCmdSetScissor(cmd, 0, 1, &[_]VkRect2D{.{
+            .offset = .{ .x = 0, .y = 0 },
+            .extent = .{ .width = width, .height = height },
+        }});
+        vkCmdBindVertexBuffers(cmd, 0, 1, &[_]VkBuffer{self.mesh_buf}, &[_]u64{0});
+        vkCmdBindIndexBuffer(cmd, self.mesh_buf, self.mesh_vertex_bytes, 1); // UINT32
+
+        for (self.submeshes) |sm| {
+            var lpc = pc.*;
+            lpc.material = sm.base_color;
+            lpc.nrm0[3] = sm.roughness;
+            lpc.nrm1[3] = sm.metallic;
+            vkCmdPushConstants(cmd, self.pipeline_layout, SHADER_STAGE_VERTEX | SHADER_STAGE_FRAGMENT, 0, @sizeOf(PushConstants), &lpc);
+            vkCmdBindDescriptorSets(cmd, 0, self.pipeline_layout, 0, 1, &[_]VkDescriptorSet{sm.dset}, 0, null);
+            vkCmdDrawIndexed(cmd, sm.index_count, 1, sm.first_index, 0, 0);
+        }
+        vkCmdEndRenderPass(cmd);
+
+        vkCmdCopyImageToBuffer(cmd, self.color_image, IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback_buf, 1, &[_]VkBufferImageCopy{.{
+            .imageSubresource = .{ .aspectMask = ASPECT_COLOR },
+            .imageExtent = .{ .width = width, .height = height, .depth = 1 },
+        }});
+        const host_barrier = [_]VkBufferMemoryBarrier{.{
+            .srcAccessMask = ACCESS_TRANSFER_WRITE,
+            .dstAccessMask = ACCESS_HOST_READ,
+            .buffer = readback_buf,
+            .size = @as(u64, width) * height * 4,
+        }};
+        vkCmdPipelineBarrier(cmd, STAGE_TRANSFER, STAGE_HOST, 0, 0, null, 1, &host_barrier, 0, null);
+
+        try check(vkEndCommandBuffer(cmd));
+        try check(vkQueueSubmit(self.queue, 1, &[_]VkSubmitInfo{.{ .pCommandBuffers = @ptrCast(&cmd) }}, fence));
     }
 
     /// Come `render()` ma senza readback: lascia l'immagine color in layout
@@ -1124,8 +1622,31 @@ pub const Renderer = struct {
         if (self.mesh_buf == VK_NULL) return error.NoMesh;
         if (width == 0 or height == 0) return error.EmptyTarget;
         try self.ensureTarget(width, height);
+        try self.ensureShadow();
+        // Rete di sicurezza: senza submesh non verrebbe disegnato nulla. Ne
+        // sintetizza uno bianco sull'intera geometria (materiale di default).
+        if (self.submeshes.len == 0) try self.setSubmeshes(&[_]decoder.SubMesh{});
 
         try check(vkBeginCommandBuffer(self.cmd, &.{}));
+
+        // --- Shadow pass: depth della scena dal punto di vista della key light.
+        const shadow_clear = [_]VkClearValue{.{ .depth_stencil = .{ .depth = 1.0, .stencil = 0 } }};
+        vkCmdBeginRenderPass(self.cmd, &.{
+            .renderPass = self.shadow_pass,
+            .framebuffer = self.shadow_fb,
+            .renderArea = .{ .offset = .{ .x = 0, .y = 0 }, .extent = .{ .width = SHADOW_SIZE, .height = SHADOW_SIZE } },
+            .clearValueCount = 1,
+            .pClearValues = &shadow_clear,
+        }, 0);
+        vkCmdBindPipeline(self.cmd, 0, self.shadow_pipeline);
+        vkCmdSetViewport(self.cmd, 0, 1, &[_]VkViewport{.{ .x = 0, .y = 0, .width = @floatFromInt(SHADOW_SIZE), .height = @floatFromInt(SHADOW_SIZE) }});
+        vkCmdSetScissor(self.cmd, 0, 1, &[_]VkRect2D{.{ .offset = .{ .x = 0, .y = 0 }, .extent = .{ .width = SHADOW_SIZE, .height = SHADOW_SIZE } }});
+        const shadow_push = ShadowPush{ .light_vp = pc.light_vp };
+        vkCmdPushConstants(self.cmd, self.shadow_pipeline_layout, SHADER_STAGE_VERTEX, 0, @sizeOf(ShadowPush), &shadow_push);
+        vkCmdBindVertexBuffers(self.cmd, 0, 1, &[_]VkBuffer{self.mesh_buf}, &[_]u64{0});
+        vkCmdBindIndexBuffer(self.cmd, self.mesh_buf, self.mesh_vertex_bytes, 1);
+        vkCmdDrawIndexed(self.cmd, self.mesh_index_count, 1, 0, 0, 0);
+        vkCmdEndRenderPass(self.cmd);
 
         const clears = [_]VkClearValue{
             .{ .color = .{ 0, 0, 0, 0 } },
@@ -1150,10 +1671,20 @@ pub const Renderer = struct {
             .offset = .{ .x = 0, .y = 0 },
             .extent = .{ .width = width, .height = height },
         }});
-        vkCmdPushConstants(self.cmd, self.pipeline_layout, SHADER_STAGE_VERTEX | SHADER_STAGE_FRAGMENT, 0, @sizeOf(PushConstants), pc);
         vkCmdBindVertexBuffers(self.cmd, 0, 1, &[_]VkBuffer{self.mesh_buf}, &[_]u64{0});
         vkCmdBindIndexBuffer(self.cmd, self.mesh_buf, self.mesh_vertex_bytes, 1); // UINT32
-        vkCmdDrawIndexed(self.cmd, self.mesh_index_count, 1, 0, 0, 0);
+
+        // Un draw per submesh: stessa geometria, ma materiale (baseColor factor,
+        // roughness, metallic nei .w) e texture propri, iniettati per intervallo.
+        for (self.submeshes) |sm| {
+            var lpc = pc.*;
+            lpc.material = sm.base_color;
+            lpc.nrm0[3] = sm.roughness;
+            lpc.nrm1[3] = sm.metallic;
+            vkCmdPushConstants(self.cmd, self.pipeline_layout, SHADER_STAGE_VERTEX | SHADER_STAGE_FRAGMENT, 0, @sizeOf(PushConstants), &lpc);
+            vkCmdBindDescriptorSets(self.cmd, 0, self.pipeline_layout, 0, 1, &[_]VkDescriptorSet{sm.dset}, 0, null);
+            vkCmdDrawIndexed(self.cmd, sm.index_count, 1, sm.first_index, 0, 0);
+        }
         vkCmdEndRenderPass(self.cmd);
 
         if (do_readback) {
@@ -1177,6 +1708,211 @@ pub const Renderer = struct {
         try check(vkResetFences(self.device, 1, @ptrCast(&self.fence)));
     }
 
+    // --- Rendering voxel (ray-march di una texture 3D) --------------------
+
+    /// True se una griglia voxel è stata caricata (`setVoxels`).
+    pub fn hasVoxels(self: *const Renderer) bool {
+        return self.voxel_dim > 0;
+    }
+
+    /// Carica la griglia voxel `dim`³ (RGBA8, `data` = dim³×4) come texture 3D
+    /// sRGB campionabile e la aggancia al descriptor set voxel.
+    pub fn setVoxels(self: *Renderer, dim: u32, data: []const u8) !void {
+        if (dim == 0) return error.BadVoxelGrid;
+        const cells: u64 = @as(u64, dim) * dim * dim;
+        const size: u64 = cells * 4;
+        if (data.len < size) return error.BadVoxelGrid;
+
+        try self.ensureVoxelPipeline();
+
+        _ = vkDeviceWaitIdle(self.device);
+        if (self.voxel_tex.image != VK_NULL) {
+            self.destroyImage(self.voxel_tex);
+            self.voxel_tex = .{ .image = VK_NULL, .mem = VK_NULL, .view = VK_NULL };
+            self.voxel_dim = 0;
+        }
+
+        // UNORM (non SRGB): le texture 3D sRGB non sono garantite dall'hardware;
+        // lo shader linearizza l'albedo campionato (pow 2.2).
+        const tex = try self.createImage3D(dim, FORMAT_R8G8B8A8_UNORM, IMAGE_USAGE_SAMPLED | IMAGE_USAGE_TRANSFER_DST);
+        errdefer self.destroyImage(tex);
+
+        var staging: VkBuffer = VK_NULL;
+        try check(vkCreateBuffer(self.device, &.{ .size = size, .usage = BUFFER_USAGE_TRANSFER_SRC }, null, &staging));
+        defer vkDestroyBuffer(self.device, staging, null);
+        var req: VkMemoryRequirements = undefined;
+        vkGetBufferMemoryRequirements(self.device, staging, &req);
+        const mt = self.findMemoryType(req.memoryTypeBits, MEM_HOST_VISIBLE | MEM_HOST_COHERENT) orelse return error.NoMemoryType;
+        var smem: VkDeviceMemory = VK_NULL;
+        try check(vkAllocateMemory(self.device, &.{ .allocationSize = req.size, .memoryTypeIndex = mt }, null, &smem));
+        defer vkFreeMemory(self.device, smem, null);
+        try check(vkBindBufferMemory(self.device, staging, smem, 0));
+        var mapped: *anyopaque = undefined;
+        try check(vkMapMemory(self.device, smem, 0, size, 0, &mapped));
+        const dst: [*]u8 = @ptrCast(mapped);
+        @memcpy(dst[0..@intCast(size)], data[0..@intCast(size)]);
+
+        try check(vkBeginCommandBuffer(self.cmd, &.{}));
+        const to_dst = [_]VkImageMemoryBarrier{.{
+            .srcAccessMask = 0,
+            .dstAccessMask = ACCESS_TRANSFER_WRITE,
+            .oldLayout = IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .image = tex.image,
+            .subresourceRange = .{ .aspectMask = ASPECT_COLOR },
+        }};
+        vkCmdPipelineBarrier(self.cmd, STAGE_TOP, STAGE_TRANSFER, 0, 0, null, 0, null, 1, &to_dst);
+        vkCmdCopyBufferToImage(self.cmd, staging, tex.image, IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &[_]VkBufferImageCopy{.{
+            .imageSubresource = .{ .aspectMask = ASPECT_COLOR },
+            .imageExtent = .{ .width = dim, .height = dim, .depth = dim },
+        }});
+        const to_read = [_]VkImageMemoryBarrier{.{
+            .srcAccessMask = ACCESS_TRANSFER_WRITE,
+            .dstAccessMask = ACCESS_SHADER_READ,
+            .oldLayout = IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .newLayout = IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .image = tex.image,
+            .subresourceRange = .{ .aspectMask = ASPECT_COLOR },
+        }};
+        vkCmdPipelineBarrier(self.cmd, STAGE_TRANSFER, STAGE_FRAGMENT_SHADER, 0, 0, null, 0, null, 1, &to_read);
+        try check(vkEndCommandBuffer(self.cmd));
+        try check(vkQueueSubmit(self.queue, 1, &[_]VkSubmitInfo{.{ .pCommandBuffers = @ptrCast(&self.cmd) }}, self.fence));
+        try check(vkWaitForFences(self.device, 1, @ptrCast(&self.fence), 1, 2 * std.time.ns_per_s));
+        try check(vkResetFences(self.device, 1, @ptrCast(&self.fence)));
+
+        const img_info = VkDescriptorImageInfo{
+            .sampler = self.voxel_sampler,
+            .imageView = tex.view,
+            .imageLayout = IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        const write = [_]VkWriteDescriptorSet{.{
+            .dstSet = self.voxel_dset,
+            .dstBinding = 0,
+            .descriptorType = DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &img_info,
+        }};
+        vkUpdateDescriptorSets(self.device, 1, &write, 0, null);
+
+        self.voxel_tex = tex;
+        self.voxel_dim = dim;
+    }
+
+    /// Renderizza la griglia voxel e ne fa il readback (RGBA, valido fino alla
+    /// prossima chiamata).
+    pub fn renderVoxel(self: *Renderer, width: u32, height: u32, pc: *const VoxelPush) ![]const u8 {
+        try self.recordVoxel(width, height, pc, true);
+        return self.readback_ptr.?[0 .. @as(usize, width) * height * 4];
+    }
+
+    /// Come `renderVoxel` ma senza readback (per il blit su swapchain).
+    pub fn renderVoxelToImage(self: *Renderer, width: u32, height: u32, pc: *const VoxelPush) !void {
+        try self.recordVoxel(width, height, pc, false);
+    }
+
+    fn recordVoxel(self: *Renderer, width: u32, height: u32, pc: *const VoxelPush, do_readback: bool) !void {
+        if (self.voxel_dim == 0) return error.NoVoxels;
+        if (width == 0 or height == 0) return error.EmptyTarget;
+        try self.ensureTarget(width, height);
+
+        try check(vkBeginCommandBuffer(self.cmd, &.{}));
+        const clears = [_]VkClearValue{
+            .{ .color = .{ 0, 0, 0, 0 } },
+            .{ .depth_stencil = .{ .depth = 1.0, .stencil = 0 } },
+        };
+        vkCmdBeginRenderPass(self.cmd, &.{
+            .renderPass = self.render_pass,
+            .framebuffer = self.framebuffer,
+            .renderArea = .{ .offset = .{ .x = 0, .y = 0 }, .extent = .{ .width = width, .height = height } },
+            .clearValueCount = clears.len,
+            .pClearValues = &clears,
+        }, 0);
+        vkCmdBindPipeline(self.cmd, 0, self.voxel_pipeline);
+        vkCmdSetViewport(self.cmd, 0, 1, &[_]VkViewport{.{ .x = 0, .y = 0, .width = @floatFromInt(width), .height = @floatFromInt(height) }});
+        vkCmdSetScissor(self.cmd, 0, 1, &[_]VkRect2D{.{ .offset = .{ .x = 0, .y = 0 }, .extent = .{ .width = width, .height = height } }});
+        vkCmdPushConstants(self.cmd, self.voxel_pipeline_layout, SHADER_STAGE_FRAGMENT, 0, @sizeOf(VoxelPush), pc);
+        vkCmdBindDescriptorSets(self.cmd, 0, self.voxel_pipeline_layout, 0, 1, &[_]VkDescriptorSet{self.voxel_dset}, 0, null);
+        vkCmdDraw(self.cmd, 3, 1, 0, 0);
+        vkCmdEndRenderPass(self.cmd);
+
+        if (do_readback) {
+            vkCmdCopyImageToBuffer(self.cmd, self.color_image, IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, self.readback_buf, 1, &[_]VkBufferImageCopy{.{
+                .imageSubresource = .{ .aspectMask = ASPECT_COLOR },
+                .imageExtent = .{ .width = width, .height = height, .depth = 1 },
+            }});
+            const host_barrier = [_]VkBufferMemoryBarrier{.{
+                .srcAccessMask = ACCESS_TRANSFER_WRITE,
+                .dstAccessMask = ACCESS_HOST_READ,
+                .buffer = self.readback_buf,
+                .size = @as(u64, width) * height * 4,
+            }};
+            vkCmdPipelineBarrier(self.cmd, STAGE_TRANSFER, STAGE_HOST, 0, 0, null, 1, &host_barrier, 0, null);
+        }
+
+        try check(vkEndCommandBuffer(self.cmd));
+        try check(vkQueueSubmit(self.queue, 1, &[_]VkSubmitInfo{.{ .pCommandBuffers = @ptrCast(&self.cmd) }}, self.fence));
+        try check(vkWaitForFences(self.device, 1, @ptrCast(&self.fence), 1, 2 * std.time.ns_per_s));
+        try check(vkResetFences(self.device, 1, @ptrCast(&self.fence)));
+    }
+
+    /// Crea (una sola volta) sampler 3D, descriptor set, layout e pipeline del
+    /// ray-march voxel. Riusa il render pass principale (fullscreen, no depth).
+    fn ensureVoxelPipeline(self: *Renderer) !void {
+        if (self.voxel_ready) return;
+
+        try check(vkCreateSampler(self.device, &.{}, null, &self.voxel_sampler)); // NEAREST → voxel netti
+
+        const binding = VkDescriptorSetLayoutBinding{ .binding = 0, .descriptorType = DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = SHADER_STAGE_FRAGMENT };
+        try check(vkCreateDescriptorSetLayout(self.device, &.{ .bindingCount = 1, .pBindings = @ptrCast(&binding) }, null, &self.voxel_dsl));
+
+        const pool_size = VkDescriptorPoolSize{ .type = DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1 };
+        try check(vkCreateDescriptorPool(self.device, &.{ .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = @ptrCast(&pool_size) }, null, &self.voxel_dpool));
+        try check(vkAllocateDescriptorSets(self.device, &.{ .descriptorPool = self.voxel_dpool, .pSetLayouts = @ptrCast(&self.voxel_dsl) }, &self.voxel_dset));
+
+        const push = VkPushConstantRange{ .stageFlags = SHADER_STAGE_FRAGMENT, .offset = 0, .size = @sizeOf(VoxelPush) };
+        try check(vkCreatePipelineLayout(self.device, &.{
+            .setLayoutCount = 1,
+            .pSetLayouts = @ptrCast(&self.voxel_dsl),
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = @ptrCast(&push),
+        }, null, &self.voxel_pipeline_layout));
+
+        self.voxel_vert_module = try createShaderModule(self.gpa, self.device, voxel_vert_spv);
+        self.voxel_frag_module = try createShaderModule(self.gpa, self.device, voxel_frag_spv);
+        self.voxel_pipeline = try createVoxelPipeline(self.device, self.render_pass, self.voxel_pipeline_layout, self.voxel_vert_module, self.voxel_frag_module);
+
+        self.voxel_ready = true;
+    }
+
+    fn createImage3D(self: *Renderer, dim: u32, format: u32, usage: u32) !ImageBundle {
+        var image: VkImage = VK_NULL;
+        try check(vkCreateImage(self.device, &.{
+            .imageType = 2, // 3D
+            .format = format,
+            .extent = .{ .width = dim, .height = dim, .depth = dim },
+            .usage = usage,
+        }, null, &image));
+        errdefer vkDestroyImage(self.device, image, null);
+
+        var req: VkMemoryRequirements = undefined;
+        vkGetImageMemoryRequirements(self.device, image, &req);
+        const mem_type = self.findMemoryType(req.memoryTypeBits, MEM_DEVICE_LOCAL) orelse
+            self.findMemoryType(req.memoryTypeBits, 0) orelse return error.NoMemoryType;
+        var mem: VkDeviceMemory = VK_NULL;
+        try check(vkAllocateMemory(self.device, &.{ .allocationSize = req.size, .memoryTypeIndex = mem_type }, null, &mem));
+        errdefer vkFreeMemory(self.device, mem, null);
+        try check(vkBindImageMemory(self.device, image, mem, 0));
+
+        var view: VkImageView = VK_NULL;
+        try check(vkCreateImageView(self.device, &.{
+            .image = image,
+            .viewType = 2, // 3D
+            .format = format,
+            .subresourceRange = .{ .aspectMask = ASPECT_COLOR },
+        }, null, &view));
+
+        return .{ .image = image, .mem = mem, .view = view };
+    }
+
     fn ensureTarget(self: *Renderer, width: u32, height: u32) !void {
         if (self.width == width and self.height == height) return;
         _ = vkDeviceWaitIdle(self.device);
@@ -1198,20 +1934,28 @@ pub const Renderer = struct {
         }, null, &framebuffer));
         errdefer vkDestroyFramebuffer(self.device, framebuffer, null);
 
-        // Buffer di readback host-visible, mappato in modo persistente.
+        // Buffer di readback host-visible, mappato in modo persistente (due slot per pipelining).
         const rb_size = @as(u64, width) * height * 4;
-        var rb_buf: VkBuffer = VK_NULL;
-        try check(vkCreateBuffer(self.device, &.{ .size = rb_size, .usage = BUFFER_USAGE_TRANSFER_DST }, null, &rb_buf));
-        errdefer vkDestroyBuffer(self.device, rb_buf, null);
-        var req: VkMemoryRequirements = undefined;
-        vkGetBufferMemoryRequirements(self.device, rb_buf, &req);
-        const mem_type = self.findMemoryType(req.memoryTypeBits, MEM_HOST_VISIBLE | MEM_HOST_COHERENT) orelse return error.NoMemoryType;
-        var rb_mem: VkDeviceMemory = VK_NULL;
-        try check(vkAllocateMemory(self.device, &.{ .allocationSize = req.size, .memoryTypeIndex = mem_type }, null, &rb_mem));
-        errdefer vkFreeMemory(self.device, rb_mem, null);
-        try check(vkBindBufferMemory(self.device, rb_buf, rb_mem, 0));
-        var mapped: *anyopaque = undefined;
-        try check(vkMapMemory(self.device, rb_mem, 0, rb_size, 0, &mapped));
+        
+        var i: usize = 0;
+        while (i < 2) : (i += 1) {
+            var rb_buf: VkBuffer = VK_NULL;
+            try check(vkCreateBuffer(self.device, &.{ .size = rb_size, .usage = BUFFER_USAGE_TRANSFER_DST }, null, &rb_buf));
+            errdefer vkDestroyBuffer(self.device, rb_buf, null);
+            var req: VkMemoryRequirements = undefined;
+            vkGetBufferMemoryRequirements(self.device, rb_buf, &req);
+            const mem_type = self.findMemoryType(req.memoryTypeBits, MEM_HOST_VISIBLE | MEM_HOST_COHERENT) orelse return error.NoMemoryType;
+            var rb_mem: VkDeviceMemory = VK_NULL;
+            try check(vkAllocateMemory(self.device, &.{ .allocationSize = req.size, .memoryTypeIndex = mem_type }, null, &rb_mem));
+            errdefer vkFreeMemory(self.device, rb_mem, null);
+            try check(vkBindBufferMemory(self.device, rb_buf, rb_mem, 0));
+            var mapped: *anyopaque = undefined;
+            try check(vkMapMemory(self.device, rb_mem, 0, rb_size, 0, &mapped));
+
+            self.readback_bufs[i] = rb_buf;
+            self.readback_mems[i] = rb_mem;
+            self.readback_ptrs[i] = @ptrCast(mapped);
+        }
 
         self.width = width;
         self.height = height;
@@ -1222,12 +1966,29 @@ pub const Renderer = struct {
         self.depth_mem = depth.mem;
         self.depth_view = depth.view;
         self.framebuffer = framebuffer;
-        self.readback_buf = rb_buf;
-        self.readback_mem = rb_mem;
-        self.readback_ptr = @ptrCast(mapped);
+        
+        // Mappatura compatibile a singolo buffer su slot 0
+        self.readback_buf = self.readback_bufs[0];
+        self.readback_mem = self.readback_mems[0];
+        self.readback_ptr = self.readback_ptrs[0];
     }
 
     const ImageBundle = struct { image: VkImage, mem: VkDeviceMemory, view: VkImageView };
+
+    /// Sotto-mesh sul lato GPU: intervallo dell'index buffer + materiale +
+    /// descriptor set con la propria texture baseColor.
+    const SubMeshGpu = struct {
+        first_index: u32,
+        index_count: u32,
+        base_color: [4]f32,
+        metallic: f32,
+        roughness: f32,
+        tex: ImageBundle,
+        owns_tex: bool, // false se `tex` è la bianca condivisa
+        nrm_tex: ImageBundle,
+        owns_nrm_tex: bool, // false se `nrm_tex` è la flat condivisa
+        dset: VkDescriptorSet,
+    };
 
     fn createImage(self: *Renderer, width: u32, height: u32, format: u32, usage: u32, aspect: u32, with_view: bool) !ImageBundle {
         var image: VkImage = VK_NULL;
@@ -1271,11 +2032,27 @@ pub const Renderer = struct {
         vkDestroyFramebuffer(self.device, self.framebuffer, null);
         self.destroyImage(.{ .image = self.color_image, .mem = self.color_mem, .view = self.color_view });
         self.destroyImage(.{ .image = self.depth_image, .mem = self.depth_mem, .view = self.depth_view });
-        vkDestroyBuffer(self.device, self.readback_buf, null);
-        vkFreeMemory(self.device, self.readback_mem, null);
+        
+        var i: usize = 0;
+        while (i < 2) : (i += 1) {
+            if (self.readback_bufs[i] != VK_NULL) {
+                vkDestroyBuffer(self.device, self.readback_bufs[i], null);
+                self.readback_bufs[i] = VK_NULL;
+            }
+            if (self.readback_mems[i] != VK_NULL) {
+                vkFreeMemory(self.device, self.readback_mems[i], null);
+                self.readback_mems[i] = VK_NULL;
+            }
+            self.readback_ptrs[i] = null;
+        }
+
+        self.readback_buf = VK_NULL;
+        self.readback_mem = VK_NULL;
+        self.readback_ptr = null;
+
         self.width = 0;
         self.height = 0;
-        self.readback_ptr = null;
+        self.frame_index = 0;
     }
 
     fn findMemoryType(self: *const Renderer, type_bits: u32, required: u32) ?u32 {
@@ -1594,13 +2371,19 @@ fn createPipeline(device: VkDevice, render_pass: VkRenderPass, layout: VkPipelin
         .{ .stage = SHADER_STAGE_VERTEX, .module = vert },
         .{ .stage = SHADER_STAGE_FRAGMENT, .module = frag },
     };
-    const binding = VkVertexInputBindingDescription{ .binding = 0, .stride = 12 };
-    const attribute = VkVertexInputAttributeDescription{ .location = 0, .binding = 0, .format = FORMAT_R32G32B32_SFLOAT, .offset = 0 };
+    // Vertice interleaved: pos(vec3)+normal(vec3)+uv(vec2)+tangent(vec4), stride 48.
+    const binding = VkVertexInputBindingDescription{ .binding = 0, .stride = 48 };
+    const attrs = [_]VkVertexInputAttributeDescription{
+        .{ .location = 0, .binding = 0, .format = FORMAT_R32G32B32_SFLOAT, .offset = 0 },
+        .{ .location = 1, .binding = 0, .format = FORMAT_R32G32B32_SFLOAT, .offset = 12 },
+        .{ .location = 2, .binding = 0, .format = FORMAT_R32G32_SFLOAT, .offset = 24 },
+        .{ .location = 3, .binding = 0, .format = FORMAT_R32G32B32A32_SFLOAT, .offset = 32 },
+    };
     const vertex_input = VkPipelineVertexInputStateCreateInfo{
         .vertexBindingDescriptionCount = 1,
         .pVertexBindingDescriptions = @ptrCast(&binding),
-        .vertexAttributeDescriptionCount = 1,
-        .pVertexAttributeDescriptions = @ptrCast(&attribute),
+        .vertexAttributeDescriptionCount = attrs.len,
+        .pVertexAttributeDescriptions = &attrs,
     };
     const input_assembly = VkPipelineInputAssemblyStateCreateInfo{};
     const viewport_state = VkPipelineViewportStateCreateInfo{};
@@ -1615,6 +2398,101 @@ fn createPipeline(device: VkDevice, render_pass: VkRenderPass, layout: VkPipelin
         .pDynamicStates = &dynamic_states,
     };
 
+    const info = VkGraphicsPipelineCreateInfo{
+        .pStages = &stages,
+        .pVertexInputState = &vertex_input,
+        .pInputAssemblyState = &input_assembly,
+        .pViewportState = &viewport_state,
+        .pRasterizationState = &rasterization,
+        .pMultisampleState = &multisample,
+        .pDepthStencilState = &depth_stencil,
+        .pColorBlendState = &color_blend,
+        .pDynamicState = &dynamic,
+        .layout = layout,
+        .renderPass = render_pass,
+    };
+    var pipeline: VkPipeline = VK_NULL;
+    try check(vkCreateGraphicsPipelines(device, VK_NULL, 1, @ptrCast(&info), null, @ptrCast(&pipeline)));
+    return pipeline;
+}
+
+/// Render pass della shadow map: solo depth, con transizione finale a layout
+/// campionabile per il lookup nel main pass.
+fn createShadowRenderPass(device: VkDevice) !VkRenderPass {
+    const attachments = [_]VkAttachmentDescription{.{
+        .format = FORMAT_D32_SFLOAT,
+        .loadOp = 1, // CLEAR
+        .storeOp = 0, // STORE: serve per campionarla dopo
+        .initialLayout = IMAGE_LAYOUT_UNDEFINED,
+        .finalLayout = IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+    }};
+    const depth_ref = VkAttachmentReference{ .attachment = 0, .layout = IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+    const dummy_color = VkAttachmentReference{ .attachment = 0, .layout = 0 };
+    const subpass = VkSubpassDescription{
+        .colorAttachmentCount = 0,
+        .pColorAttachments = &dummy_color,
+        .pDepthStencilAttachment = &depth_ref,
+    };
+    const deps = [_]VkSubpassDependency{
+        .{
+            .srcSubpass = SUBPASS_EXTERNAL,
+            .dstSubpass = 0,
+            .srcStageMask = STAGE_FRAGMENT_SHADER,
+            .dstStageMask = STAGE_EARLY_FRAGMENT_TESTS,
+            .srcAccessMask = ACCESS_SHADER_READ,
+            .dstAccessMask = ACCESS_DEPTH_WRITE,
+        },
+        .{
+            .srcSubpass = 0,
+            .dstSubpass = SUBPASS_EXTERNAL,
+            .srcStageMask = STAGE_LATE_FRAGMENT_TESTS,
+            .dstStageMask = STAGE_FRAGMENT_SHADER,
+            .srcAccessMask = ACCESS_DEPTH_WRITE,
+            .dstAccessMask = ACCESS_SHADER_READ,
+        },
+    };
+    var rp: VkRenderPass = VK_NULL;
+    try check(vkCreateRenderPass(device, &.{
+        .attachmentCount = attachments.len,
+        .pAttachments = &attachments,
+        .pSubpasses = &subpass,
+        .dependencyCount = deps.len,
+        .pDependencies = &deps,
+    }, null, &rp));
+    return rp;
+}
+
+/// Pipeline della shadow pass: legge solo la posizione dal vertex buffer mesh
+/// (stride 48), scrive solo depth, con depth-bias contro l'acne di ombra.
+fn createShadowPipeline(device: VkDevice, render_pass: VkRenderPass, layout: VkPipelineLayout, vert: VkShaderModule, frag: VkShaderModule) !VkPipeline {
+    const stages = [_]VkPipelineShaderStageCreateInfo{
+        .{ .stage = SHADER_STAGE_VERTEX, .module = vert },
+        .{ .stage = SHADER_STAGE_FRAGMENT, .module = frag },
+    };
+    const binding = VkVertexInputBindingDescription{ .binding = 0, .stride = 48 };
+    const attribute = VkVertexInputAttributeDescription{ .location = 0, .binding = 0, .format = FORMAT_R32G32B32_SFLOAT, .offset = 0 };
+    const vertex_input = VkPipelineVertexInputStateCreateInfo{
+        .vertexBindingDescriptionCount = 1,
+        .pVertexBindingDescriptions = @ptrCast(&binding),
+        .vertexAttributeDescriptionCount = 1,
+        .pVertexAttributeDescriptions = @ptrCast(&attribute),
+    };
+    const input_assembly = VkPipelineInputAssemblyStateCreateInfo{};
+    const viewport_state = VkPipelineViewportStateCreateInfo{};
+    const rasterization = VkPipelineRasterizationStateCreateInfo{
+        .depthBiasEnable = 1,
+        .depthBiasConstantFactor = 1.25,
+        .depthBiasSlopeFactor = 1.75,
+    };
+    const multisample = VkPipelineMultisampleStateCreateInfo{};
+    const depth_stencil = VkPipelineDepthStencilStateCreateInfo{};
+    const dummy_blend = VkPipelineColorBlendAttachmentState{};
+    const color_blend = VkPipelineColorBlendStateCreateInfo{ .attachmentCount = 0, .pAttachments = &dummy_blend };
+    const dynamic_states = [_]u32{ 0, 1 }; // VIEWPORT, SCISSOR
+    const dynamic = VkPipelineDynamicStateCreateInfo{
+        .dynamicStateCount = dynamic_states.len,
+        .pDynamicStates = &dynamic_states,
+    };
     const info = VkGraphicsPipelineCreateInfo{
         .pStages = &stages,
         .pVertexInputState = &vertex_input,
@@ -1695,6 +2573,50 @@ fn createTextPipeline(device: VkDevice, render_pass: VkRenderPass, layout: VkPip
     return pipeline;
 }
 
+/// Pipeline del ray-march voxel: triangolo a schermo intero senza vertex input,
+/// niente depth/blend. Riusa il render pass principale (color+depth).
+fn createVoxelPipeline(device: VkDevice, render_pass: VkRenderPass, layout: VkPipelineLayout, vert: VkShaderModule, frag: VkShaderModule) !VkPipeline {
+    const stages = [_]VkPipelineShaderStageCreateInfo{
+        .{ .stage = SHADER_STAGE_VERTEX, .module = vert },
+        .{ .stage = SHADER_STAGE_FRAGMENT, .module = frag },
+    };
+    // Nessun vertex input: il triangolo fullscreen è generato da gl_VertexIndex.
+    const dummy_bind = VkVertexInputBindingDescription{ .binding = 0, .stride = 0 };
+    const dummy_attr = VkVertexInputAttributeDescription{ .location = 0, .binding = 0, .format = 0, .offset = 0 };
+    const vertex_input = VkPipelineVertexInputStateCreateInfo{
+        .vertexBindingDescriptionCount = 0,
+        .pVertexBindingDescriptions = @ptrCast(&dummy_bind),
+        .vertexAttributeDescriptionCount = 0,
+        .pVertexAttributeDescriptions = @ptrCast(&dummy_attr),
+    };
+    const input_assembly = VkPipelineInputAssemblyStateCreateInfo{};
+    const viewport_state = VkPipelineViewportStateCreateInfo{};
+    const rasterization = VkPipelineRasterizationStateCreateInfo{};
+    const multisample = VkPipelineMultisampleStateCreateInfo{};
+    const depth_stencil = VkPipelineDepthStencilStateCreateInfo{ .depthTestEnable = 0, .depthWriteEnable = 0 };
+    const blend_attachment = VkPipelineColorBlendAttachmentState{}; // scrive RGBA (default 0xF)
+    const color_blend = VkPipelineColorBlendStateCreateInfo{ .pAttachments = &blend_attachment };
+    const dynamic_states = [_]u32{ 0, 1 }; // VIEWPORT, SCISSOR
+    const dynamic = VkPipelineDynamicStateCreateInfo{ .dynamicStateCount = dynamic_states.len, .pDynamicStates = &dynamic_states };
+
+    const info = VkGraphicsPipelineCreateInfo{
+        .pStages = &stages,
+        .pVertexInputState = &vertex_input,
+        .pInputAssemblyState = &input_assembly,
+        .pViewportState = &viewport_state,
+        .pRasterizationState = &rasterization,
+        .pMultisampleState = &multisample,
+        .pDepthStencilState = &depth_stencil,
+        .pColorBlendState = &color_blend,
+        .pDynamicState = &dynamic,
+        .layout = layout,
+        .renderPass = render_pass,
+    };
+    var pipeline: VkPipeline = VK_NULL;
+    try check(vkCreateGraphicsPipelines(device, VK_NULL, 1, @ptrCast(&info), null, @ptrCast(&pipeline)));
+    return pipeline;
+}
+
 // ---------------------------------------------------------------------------
 // Matrice MVP per il fit ortografico (stessa geometria del renderer CPU:
 // centratura, yaw attorno a Y, pitch attorno a X, fit al 70% del viewport).
@@ -1707,6 +2629,7 @@ pub fn buildPushConstants(
     pitch: f32,
     width: u32,
     height: u32,
+    material: Material,
 ) PushConstants {
     const cos_y = @cos(yaw);
     const sin_y = @sin(yaw);
@@ -1746,8 +2669,135 @@ pub fn buildPushConstants(
         }
     }
 
+    // --- Ombre: matrice ortografica oggetto→clip della luce ----------------
+    // Key light FISSA nello spazio oggetto (dall'alto-fronte): così l'ombra
+    // resta ancorata al modello mentre la camera orbita. La shadow map è
+    // renderizzata in spazio oggetto e il lookup usa la posizione oggetto del
+    // frammento, quindi la matrice non dipende da yaw/pitch.
+    const lo = normalize3(.{ 0.35, 0.9, 0.45 }); // direzione superficie→luce
+    // Direzione della key light in spazio camera (per l'illuminazione).
+    const light_dir_cam = [4]f32{
+        r0[0] * lo[0] + r0[1] * lo[1] + r0[2] * lo[2],
+        r1[0] * lo[0] + r1[1] * lo[1] + r1[2] * lo[2],
+        r2[0] * lo[0] + r2[1] * lo[1] + r2[2] * lo[2],
+        0,
+    };
+
+    const ft = [3]f32{ -lo[0], -lo[1], -lo[2] }; // forward: luce→modello
+    const up_hint: [3]f32 = if (@abs(ft[1]) > 0.99) .{ 1, 0, 0 } else .{ 0, 1, 0 };
+    const s = normalize3(cross3(ft, up_hint)); // destra
+    const u = cross3(s, ft); // su effettivo
+    const e = if (max_size > 0) max_size * 0.75 else 1.0; // semi-estensione xy
+    const rr = if (max_size > 0) max_size else 1.0; // semi-profondità
+
+    const lrows: [4][4]f32 = .{
+        .{ s[0] / e, s[1] / e, s[2] / e, -(s[0] * center[0] + s[1] * center[1] + s[2] * center[2]) / e },
+        .{ u[0] / e, u[1] / e, u[2] / e, -(u[0] * center[0] + u[1] * center[1] + u[2] * center[2]) / e },
+        .{ ft[0] / (2 * rr), ft[1] / (2 * rr), ft[2] / (2 * rr), -(ft[0] * center[0] + ft[1] * center[1] + ft[2] * center[2]) / (2 * rr) + 0.5 },
+        .{ 0, 0, 0, 1 },
+    };
+    var light_vp: [16]f32 = undefined;
+    for (0..4) |col| {
+        for (0..4) |row| {
+            light_vp[col * 4 + row] = lrows[row][col];
+        }
+    }
+
     return .{
         .mvp = mvp,
-        .light = .{ 0.35, 0.5, 0.8, 0 },
+        // Base di rotazione oggetto→camera (senza scala) per le normali; nei `w`
+        // viaggiano roughness e metallic del materiale.
+        .nrm0 = .{ r0[0], r0[1], r0[2], material.roughness },
+        .nrm1 = .{ r1[0], r1[1], r1[2], material.metallic },
+        .nrm2 = .{ r2[0], r2[1], r2[2], 0 },
+        .material = material.base_color,
+        .light_vp = light_vp,
+        .light_dir_cam = light_dir_cam,
     };
 }
+
+/// Push constant del ray-march voxel: stessa camera ortografica di
+/// `buildPushConstants` (yaw/pitch/fit), ma espressa come raggio (origine +
+/// right·ndc.x + up·ndc.y, marcia lungo `dir`) in spazio griglia [0,1]³.
+pub fn buildVoxelPush(
+    center: [3]f32,
+    max_size: f32,
+    yaw: f32,
+    pitch: f32,
+    width: u32,
+    height: u32,
+    bbox_min: [3]f32,
+    bbox_size: [3]f32,
+    dim: u32,
+) VoxelPush {
+    const cos_y = @cos(yaw);
+    const sin_y = @sin(yaw);
+    const cos_p = @cos(pitch);
+    const sin_p = @sin(pitch);
+    const r0 = [3]f32{ cos_y, 0, -sin_y };
+    const r1 = [3]f32{ -sin_p * sin_y, cos_p, -sin_p * cos_y };
+    const r2 = [3]f32{ cos_p * sin_y, sin_p, cos_p * cos_y };
+
+    const w: f32 = @floatFromInt(width);
+    const h: f32 = @floatFromInt(height);
+    const denom = if (max_size > 0) max_size else 1.0;
+    const fit = 0.7 * @min(w, h);
+    const half_w = (w / 2.0) * denom / fit; // estensione ortografica oggetto per ndc.x
+    const half_h = (h / 2.0) * denom / fit;
+
+    // Assi camera in spazio oggetto: right=+r0, up=-r1 (la MVP inverte y),
+    // direzione di vista (nella scena) = -r2; l'occhio sta sul lato +r2.
+    const up = [3]f32{ -r1[0], -r1[1], -r1[2] };
+    const fwd = [3]f32{ -r2[0], -r2[1], -r2[2] };
+    const big_t = 1.5 * denom;
+    const eye = [3]f32{ center[0] + r2[0] * big_t, center[1] + r2[1] * big_t, center[2] + r2[2] * big_t };
+
+    const inv = [3]f32{
+        1.0 / (if (bbox_size[0] > 1e-9) bbox_size[0] else 1e-9),
+        1.0 / (if (bbox_size[1] > 1e-9) bbox_size[1] else 1e-9),
+        1.0 / (if (bbox_size[2] > 1e-9) bbox_size[2] else 1e-9),
+    };
+    const toGridDir = struct {
+        fn f(v: [3]f32, iv: [3]f32) [3]f32 {
+            return .{ v[0] * iv[0], v[1] * iv[1], v[2] * iv[2] };
+        }
+    }.f;
+
+    const origin_g = [3]f32{ (eye[0] - bbox_min[0]) * inv[0], (eye[1] - bbox_min[1]) * inv[1], (eye[2] - bbox_min[2]) * inv[2] };
+    const right_g = toGridDir(.{ r0[0] * half_w, r0[1] * half_w, r0[2] * half_w }, inv);
+    const up_g = toGridDir(.{ up[0] * half_h, up[1] * half_h, up[2] * half_h }, inv);
+    const dir_g = toGridDir(fwd, inv);
+
+    const lo = normalize3(.{ 0.35, 0.9, 0.45 }); // superficie→luce, spazio oggetto
+    const light_g = normalize3(toGridDir(lo, inv));
+
+    return .{
+        .origin = .{ origin_g[0], origin_g[1], origin_g[2], 0 },
+        .right = .{ right_g[0], right_g[1], right_g[2], 0 },
+        .up = .{ up_g[0], up_g[1], up_g[2], 0 },
+        .dir = .{ dir_g[0], dir_g[1], dir_g[2], 0 },
+        .light_g = .{ light_g[0], light_g[1], light_g[2], 0 },
+        .light_obj = .{ lo[0], lo[1], lo[2], @floatFromInt(dim) },
+    };
+}
+
+fn normalize3(v: [3]f32) [3]f32 {
+    const len = @sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (len < 1e-12) return .{ 0, 1, 0 };
+    return .{ v[0] / len, v[1] / len, v[2] / len };
+}
+
+fn cross3(a: [3]f32, b: [3]f32) [3]f32 {
+    return .{
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    };
+}
+
+/// Fattori del materiale PBR passati al renderer (glTF metallic-roughness).
+pub const Material = struct {
+    base_color: [4]f32 = .{ 1, 1, 1, 1 },
+    metallic: f32 = 1.0,
+    roughness: f32 = 1.0,
+};

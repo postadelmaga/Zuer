@@ -120,20 +120,145 @@ pub fn stageToGpu(gpa: std.mem.Allocator, decoded: *const Decoded) ?GpuStage {
             // (vale anche per il conteggio indici totale, 3 per faccia).
             if (m.vertices.len == 0 or m.vertices.len > std.math.maxInt(u32)) return null;
             if (m.faces.len > std.math.maxInt(u32) / 3) return null;
-            const vertex_bytes = std.math.mul(usize, m.vertices.len, 3 * @sizeOf(f32)) catch return null;
+            // Vertice interleaved: pos(vec3)+normal(vec3)+uv(vec2)+tangent(vec4), stride 48.
+            const vertex_bytes = std.math.mul(usize, m.vertices.len, 12 * @sizeOf(f32)) catch return null;
             const index_bytes = std.math.mul(usize, m.faces.len, 3 * @sizeOf(u32)) catch return null;
             const total = std.math.add(usize, vertex_bytes, index_bytes) catch return null;
+
+            // Normali: si usano quelle autorali del file se presenti e coerenti col
+            // conteggio vertici (rispettano gli smoothing group); altrimenti si
+            // ricostruiscono per-vertice come media pesata per area (il prodotto
+            // vettoriale non normalizzato scala con l'area della faccia).
+            const authored = m.normals.len == m.vertices.len;
+            const normals = gpa.alloc([3]f32, m.vertices.len) catch return null;
+            defer gpa.free(normals);
+            if (authored) {
+                @memcpy(normals, m.normals);
+            } else {
+                @memset(normals, .{ 0, 0, 0 });
+                for (m.faces) |face| {
+                    if (face.v1 >= m.vertices.len or face.v2 >= m.vertices.len or face.v3 >= m.vertices.len) continue;
+                    const a = m.vertices[face.v1];
+                    const b = m.vertices[face.v2];
+                    const c = m.vertices[face.v3];
+                    const e1 = [3]f32{ b[0] - a[0], b[1] - a[1], b[2] - a[2] };
+                    const e2 = [3]f32{ c[0] - a[0], c[1] - a[1], c[2] - a[2] };
+                    const fn_ = [3]f32{
+                        e1[1] * e2[2] - e1[2] * e2[1],
+                        e1[2] * e2[0] - e1[0] * e2[2],
+                        e1[0] * e2[1] - e1[1] * e2[0],
+                    };
+                    inline for (.{ face.v1, face.v2, face.v3 }) |vi| {
+                        normals[vi][0] += fn_[0];
+                        normals[vi][1] += fn_[1];
+                        normals[vi][2] += fn_[2];
+                    }
+                }
+                for (normals) |*nrm| {
+                    const len = @sqrt(nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]);
+                    if (len > 1e-12) {
+                        nrm[0] /= len;
+                        nrm[1] /= len;
+                        nrm[2] /= len;
+                    }
+                    // Normale nulla lasciata a zero: lo shader ripiega sulla geometrica.
+                }
+            }
+
+            const has_uv = m.uvs.len == m.vertices.len;
+
+            // Tangenti (vec4: xyz + w handedness) per il normal mapping. Autorali
+            // se presenti; altrimenti ricostruite da UV/posizioni (Lengyel) con
+            // ortogonalizzazione di Gram-Schmidt rispetto alla normale. Senza UV
+            // restano un default innocuo (la normal map comunque non si campiona).
+            const tangents = gpa.alloc([4]f32, m.vertices.len) catch return null;
+            defer gpa.free(tangents);
+            if (m.tangents.len == m.vertices.len) {
+                @memcpy(tangents, m.tangents);
+            } else if (has_uv) {
+                const tan = gpa.alloc([3]f32, m.vertices.len) catch return null;
+                defer gpa.free(tan);
+                const bit = gpa.alloc([3]f32, m.vertices.len) catch return null;
+                defer gpa.free(bit);
+                @memset(tan, .{ 0, 0, 0 });
+                @memset(bit, .{ 0, 0, 0 });
+                for (m.faces) |face| {
+                    if (face.v1 >= m.vertices.len or face.v2 >= m.vertices.len or face.v3 >= m.vertices.len) continue;
+                    const p0 = m.vertices[face.v1];
+                    const p1 = m.vertices[face.v2];
+                    const p2 = m.vertices[face.v3];
+                    const uv0 = m.uvs[face.v1];
+                    const uv1 = m.uvs[face.v2];
+                    const uv2 = m.uvs[face.v3];
+                    const e1 = [3]f32{ p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2] };
+                    const e2 = [3]f32{ p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2] };
+                    const du1 = [2]f32{ uv1[0] - uv0[0], uv1[1] - uv0[1] };
+                    const du2 = [2]f32{ uv2[0] - uv0[0], uv2[1] - uv0[1] };
+                    const denom = du1[0] * du2[1] - du2[0] * du1[1];
+                    const r: f32 = if (@abs(denom) > 1e-12) 1.0 / denom else 0.0;
+                    const sdir = [3]f32{
+                        (e1[0] * du2[1] - e2[0] * du1[1]) * r,
+                        (e1[1] * du2[1] - e2[1] * du1[1]) * r,
+                        (e1[2] * du2[1] - e2[2] * du1[1]) * r,
+                    };
+                    const tdir = [3]f32{
+                        (e2[0] * du1[0] - e1[0] * du2[0]) * r,
+                        (e2[1] * du1[0] - e1[1] * du2[0]) * r,
+                        (e2[2] * du1[0] - e1[2] * du2[0]) * r,
+                    };
+                    inline for (.{ face.v1, face.v2, face.v3 }) |vi| {
+                        inline for (0..3) |c| {
+                            tan[vi][c] += sdir[c];
+                            bit[vi][c] += tdir[c];
+                        }
+                    }
+                }
+                for (tangents, 0..) |*out, i| {
+                    const n = normals[i];
+                    const t = tan[i];
+                    // Gram-Schmidt: t' = normalize(t - n·(n·t))
+                    const nd = n[0] * t[0] + n[1] * t[1] + n[2] * t[2];
+                    var tx = t[0] - n[0] * nd;
+                    var ty = t[1] - n[1] * nd;
+                    var tz = t[2] - n[2] * nd;
+                    const tl = @sqrt(tx * tx + ty * ty + tz * tz);
+                    if (tl > 1e-12) {
+                        tx /= tl;
+                        ty /= tl;
+                        tz /= tl;
+                    } else {
+                        tx = 1;
+                        ty = 0;
+                        tz = 0;
+                    }
+                    // Handedness: segno di (n × t')·bitangente accumulata.
+                    const cx = n[1] * tz - n[2] * ty;
+                    const cy = n[2] * tx - n[0] * tz;
+                    const cz = n[0] * ty - n[1] * tx;
+                    const hd = cx * bit[i][0] + cy * bit[i][1] + cz * bit[i][2];
+                    out.* = .{ tx, ty, tz, if (hd < 0.0) -1.0 else 1.0 };
+                }
+            } else {
+                @memset(tangents, .{ 1, 0, 0, 1 });
+            }
+
             var buffer = zicro.gpu_memory.Buffer.allocate(gpa, total, "zuer/mesh-vtx-idx") catch return null;
 
-            buffer.write(0, std.mem.sliceAsBytes(m.vertices)) catch {
-                buffer.deinit(gpa);
-                return null;
-            };
+            // Scrittura interleaved: 12 pos + 12 normale + 8 uv + 16 tangente.
+            const vbuf = buffer.asMut();
+            for (m.vertices, 0..) |v, i| {
+                const off = i * 48;
+                @memcpy(vbuf[off..][0..12], std.mem.asBytes(&v));
+                @memcpy(vbuf[off + 12 ..][0..12], std.mem.asBytes(&normals[i]));
+                const uv: [2]f32 = if (has_uv) m.uvs[i] else .{ 0, 0 };
+                @memcpy(vbuf[off + 24 ..][0..8], std.mem.asBytes(&uv));
+                @memcpy(vbuf[off + 32 ..][0..16], std.mem.asBytes(&tangents[i]));
+            }
 
             // Gli indici sono `usize` nel decoder e i file possono dichiararne di
             // fuori range: quelli invalidi diventano triangoli degeneri (0,0,0),
             // innocui per qualsiasi consumer GPU (il render TUI già li scarta).
-            const dst = buffer.asMut()[vertex_bytes..];
+            const dst = vbuf[vertex_bytes..];
             for (m.faces, 0..) |face, i| {
                 const valid = face.v1 < m.vertices.len and face.v2 < m.vertices.len and face.v3 < m.vertices.len;
                 const idx: [3]u32 = if (valid)

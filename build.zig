@@ -37,6 +37,27 @@ pub fn build(b: *std.Build) void {
     tfrag_cmd.addArg("-o");
     const text_frag_spv = tfrag_cmd.addOutputFileArg("text.frag.spv");
 
+    // Shader della shadow pass (depth-only dal punto di vista della luce).
+    const svert_cmd = b.addSystemCommand(&.{"glslc"});
+    svert_cmd.addFileArg(b.path("src/shaders/shadow.vert"));
+    svert_cmd.addArg("-o");
+    const shadow_vert_spv = svert_cmd.addOutputFileArg("shadow.vert.spv");
+
+    const sfrag_cmd = b.addSystemCommand(&.{"glslc"});
+    sfrag_cmd.addFileArg(b.path("src/shaders/shadow.frag"));
+    sfrag_cmd.addArg("-o");
+    const shadow_frag_spv = sfrag_cmd.addOutputFileArg("shadow.frag.spv");
+
+    const vvert_cmd = b.addSystemCommand(&.{"glslc"});
+    vvert_cmd.addFileArg(b.path("src/shaders/voxel.vert"));
+    vvert_cmd.addArg("-o");
+    const voxel_vert_spv = vvert_cmd.addOutputFileArg("voxel.vert.spv");
+
+    const vfrag_cmd = b.addSystemCommand(&.{"glslc"});
+    vfrag_cmd.addFileArg(b.path("src/shaders/voxel.frag"));
+    vfrag_cmd.addArg("-o");
+    const voxel_frag_spv = vfrag_cmd.addOutputFileArg("voxel.frag.spv");
+
     const exe = b.addExecutable(.{
         .name = "zuer",
         .root_module = b.createModule(.{
@@ -55,6 +76,10 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addAnonymousImport("mesh_frag_spv", .{ .root_source_file = frag_spv });
     exe.root_module.addAnonymousImport("text_vert_spv", .{ .root_source_file = text_vert_spv });
     exe.root_module.addAnonymousImport("text_frag_spv", .{ .root_source_file = text_frag_spv });
+    exe.root_module.addAnonymousImport("shadow_vert_spv", .{ .root_source_file = shadow_vert_spv });
+    exe.root_module.addAnonymousImport("shadow_frag_spv", .{ .root_source_file = shadow_frag_spv });
+    exe.root_module.addAnonymousImport("voxel_vert_spv", .{ .root_source_file = voxel_vert_spv });
+    exe.root_module.addAnonymousImport("voxel_frag_spv", .{ .root_source_file = voxel_frag_spv });
     exe.root_module.linkSystemLibrary("vulkan", .{});
 
     b.installArtifact(exe);
@@ -75,6 +100,10 @@ pub fn build(b: *std.Build) void {
     gui_exe.root_module.addAnonymousImport("mesh_frag_spv", .{ .root_source_file = frag_spv });
     gui_exe.root_module.addAnonymousImport("text_vert_spv", .{ .root_source_file = text_vert_spv });
     gui_exe.root_module.addAnonymousImport("text_frag_spv", .{ .root_source_file = text_frag_spv });
+    gui_exe.root_module.addAnonymousImport("shadow_vert_spv", .{ .root_source_file = shadow_vert_spv });
+    gui_exe.root_module.addAnonymousImport("shadow_frag_spv", .{ .root_source_file = shadow_frag_spv });
+    gui_exe.root_module.addAnonymousImport("voxel_vert_spv", .{ .root_source_file = voxel_vert_spv });
+    gui_exe.root_module.addAnonymousImport("voxel_frag_spv", .{ .root_source_file = voxel_frag_spv });
     gui_exe.root_module.linkSystemLibrary("vulkan", .{});
     gui_exe.root_module.linkSystemLibrary("wayland-client", .{});
     // Motore di testo nativo: stb_truetype rasterizza i glifi Hack (embeddati),
@@ -100,10 +129,38 @@ pub fn build(b: *std.Build) void {
     raster_dbg.root_module.addAnonymousImport("mesh_frag_spv", .{ .root_source_file = frag_spv });
     raster_dbg.root_module.addAnonymousImport("text_vert_spv", .{ .root_source_file = text_vert_spv });
     raster_dbg.root_module.addAnonymousImport("text_frag_spv", .{ .root_source_file = text_frag_spv });
+    raster_dbg.root_module.addAnonymousImport("shadow_vert_spv", .{ .root_source_file = shadow_vert_spv });
+    raster_dbg.root_module.addAnonymousImport("shadow_frag_spv", .{ .root_source_file = shadow_frag_spv });
+    raster_dbg.root_module.addAnonymousImport("voxel_vert_spv", .{ .root_source_file = voxel_vert_spv });
+    raster_dbg.root_module.addAnonymousImport("voxel_frag_spv", .{ .root_source_file = voxel_frag_spv });
     raster_dbg.root_module.linkSystemLibrary("vulkan", .{});
     const raster_dbg_run = b.addRunArtifact(raster_dbg);
     if (b.args) |args| raster_dbg_run.addArgs(args);
     b.step("raster-debug", "Rasterizza un file su PPM (stdout)").dependOn(&raster_dbg_run.step);
+
+    // Self-test headless del percorso GPU mesh (normali + shading PBR-ish):
+    // renderizza un cubo offscreen e verifica copertura/variazione di luce.
+    const gpu_selftest = b.addExecutable(.{
+        .name = "gpu-selftest",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu_selftest.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    gpu_selftest.root_module.addImport("zicro", dep_zicro.module("zicro"));
+    gpu_selftest.root_module.addAnonymousImport("mesh_vert_spv", .{ .root_source_file = vert_spv });
+    gpu_selftest.root_module.addAnonymousImport("mesh_frag_spv", .{ .root_source_file = frag_spv });
+    gpu_selftest.root_module.addAnonymousImport("text_vert_spv", .{ .root_source_file = text_vert_spv });
+    gpu_selftest.root_module.addAnonymousImport("text_frag_spv", .{ .root_source_file = text_frag_spv });
+    gpu_selftest.root_module.addAnonymousImport("shadow_vert_spv", .{ .root_source_file = shadow_vert_spv });
+    gpu_selftest.root_module.addAnonymousImport("shadow_frag_spv", .{ .root_source_file = shadow_frag_spv });
+    gpu_selftest.root_module.addAnonymousImport("voxel_vert_spv", .{ .root_source_file = voxel_vert_spv });
+    gpu_selftest.root_module.addAnonymousImport("voxel_frag_spv", .{ .root_source_file = voxel_frag_spv });
+    gpu_selftest.root_module.linkSystemLibrary("vulkan", .{});
+    const gpu_selftest_run = b.addRunArtifact(gpu_selftest);
+    b.step("gpu-selftest", "Render headless di un cubo per validare la pipeline mesh").dependOn(&gpu_selftest_run.step);
 
     const decoder_mod = b.createModule(.{
         .root_source_file = b.path("src/decoder.zig"),
@@ -129,7 +186,7 @@ pub fn build(b: *std.Build) void {
         // stb_image è compilato dentro il plugin immagini: decodifica nativa di
         // PNG/JPEG/GIF/BMP senza dipendere da ImageMagick. -fno-sanitize=undefined
         // perché zig cc abilita UBSan di default e stb_image contiene UB benigno.
-        if (comptime std.mem.eql(u8, name, "image")) {
+        if (comptime (std.mem.eql(u8, name, "image") or std.mem.eql(u8, name, "glb"))) {
             lib.root_module.addIncludePath(b.path("vendor/stb"));
             lib.root_module.addCSourceFile(.{
                 .file = b.path("vendor/stb/stb_image_impl.c"),

@@ -1,0 +1,65 @@
+diff --git a/src/decoder.zig b/src/decoder.zig
+index d686576..0352d6d 100644
+--- a/src/decoder.zig
++++ b/src/decoder.zig
+@@ -336,8 +336,50 @@ pub fn closePluginCache(allocator: std.mem.Allocator) void {
+     plugin_cache = .empty;
+ }
+ 
++extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
++
++fn guessImageFormat(bytes: []const u8) bool {
++    if (bytes.len >= 4) {
++        // PNG: 89 50 4E 47
++        if (std.mem.eql(u8, bytes[0..4], &.{ 0x89, 0x50, 0x4E, 0x47 })) return true;
++        // GIF: GIF8
++        if (std.mem.eql(u8, bytes[0..4], "GIF8")) return true;
++        // BMP: BM
++        if (bytes[0] == 'B' and bytes[1] == 'M') return true;
++    }
++    if (bytes.len >= 3) {
++        // JPEG: FF D8 FF
++        if (std.mem.eql(u8, bytes[0..3], &.{ 0xFF, 0xD8, 0xFF })) return true;
++    }
++    if (bytes.len >= 12) {
++        // WebP: RIFFxxxxWEBP
++        if (std.mem.eql(u8, bytes[0..4], "RIFF") and std.mem.eql(u8, bytes[8..12], "WEBP")) return true;
++    }
++    return false;
++}
++
+ pub fn decode(path: []const u8, io: std.Io, allocator: std.mem.Allocator) Decoded {
+-    const max_size = 128 * 1024 * 1024;
++    var max_size: usize = 128 * 1024 * 1024;
++    if (getenv("ZUER_MAX_MB")) |val| {
++        const span = std.mem.span(val);
++        if (std.fmt.parseInt(usize, span, 10)) |mb| {
++            max_size = mb * 1024 * 1024;
++        } else |_| {}
++    }
++
++    // Pre-check file size using stat to avoid reading/allocating memory for too large files
++    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| {
++        const msg = std.fmt.allocPrint(allocator, "Impossibile ottenere informazioni sul file: {s} ({s})", .{ path, @errorName(err) }) catch "";
++        return .{ .err = msg };
++    };
++
++    if (stat.size > max_size) {
++        const mb = stat.size / (1024 * 1024);
++        const max_mb = max_size / (1024 * 1024);
++        const msg = std.fmt.allocPrint(allocator, "File troppo grande: {d} MB (limite {d} MB per questo formato).\nIl caricamento rischierebbe di esaurire la memoria.", .{ mb, max_mb }) catch "";
++        return .{ .err = msg };
++    }
++
+     const limit = std.Io.Limit.limited(max_size);
+     const content = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, limit) catch |err| {
+         const msg = std.fmt.allocPrint(allocator, "Impossibile aprire o leggere il file: {s} ({s})", .{ path, @errorName(err) }) catch "";
+@@ -361,6 +403,8 @@ pub fn decode(path: []const u8, io: std.Io, allocator: std.mem.Allocator) Decode
+         "archive"
+     else if (extIn(ext, &.{ "mp3", "wav", "flac", "ogg", "oga", "ogv", "opus", "m4a", "mp4", "m4v", "mov", "mkv", "webm", "avi" }))
+         "media"
++    else if (guessImageFormat(content))
++        "image"
+     else
+         "text";
+ 
