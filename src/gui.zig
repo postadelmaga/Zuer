@@ -1235,57 +1235,23 @@ fn rasterizeTextGpu(state: *GuiAppState, name: []const u8, opts: text_render.Ren
     state.static_h.* = @intCast(mesh.height);
 }
 
-/// Riempie un piccolo disco pieno (bordo morbido ~1px) fondendolo sul buffer RGBA.
-fn fillDot(buf: []u8, W: u32, H: u32, cx: f32, cy: f32, r: f32, rr: u8, gg: u8, bb: u8, a: u8) void {
-    const x0: i32 = @intFromFloat(@floor(cx - r - 1));
-    const x1: i32 = @intFromFloat(@ceil(cx + r + 1));
-    const y0: i32 = @intFromFloat(@floor(cy - r - 1));
-    const y1: i32 = @intFromFloat(@ceil(cy + r + 1));
-    const xw: i32 = @min(x1, @as(i32, @intCast(W)));
-    const yh: i32 = @min(y1, @as(i32, @intCast(H)));
-    var y: i32 = @max(y0, 0);
-    while (y < yh) : (y += 1) {
-        var x: i32 = @max(x0, 0);
-        while (x < xw) : (x += 1) {
-            const dx = @as(f32, @floatFromInt(x)) + 0.5 - cx;
-            const dy = @as(f32, @floatFromInt(y)) + 0.5 - cy;
-            const d = @sqrt(dx * dx + dy * dy);
-            // Copertura piena entro r-1, sfuma fino a r (anti-aliasing del bordo).
-            const cov = std.math.clamp(r - d, 0.0, 1.0);
-            if (cov <= 0.0) continue;
-            const aa: u8 = @intFromFloat(@round(@as(f32, @floatFromInt(a)) * cov));
-            blendPixel(buf, (@as(u32, @intCast(y)) * W + @as(u32, @intCast(x))) * 4, rr, gg, bb, aa);
-        }
-    }
-}
-
 /// Schermata di caricamento: sfondo completamente trasparente (si vede il vetro
-/// della finestra / blur del compositore) con uno spinner a 12 punti rotante al
-/// centro. `frame` avanza a ogni fotogramma per animarlo (la testa fa un giro in
-/// ~0.6 s a 60 Hz); la scia sfuma dietro la testa.
+/// della finestra / blur del compositore) con lo **spinner** di zicro al centro —
+/// un arco rotante che "respira", identico a egui. `frame` (contatore a ~60 Hz)
+/// fornisce la fase temporale in secondi.
 fn drawLoader(buf: []u8, W: u32, H: u32, frame: u32) void {
     const n_px: usize = @as(usize, W) * H;
     // Sfondo trasparente: solo lo spinner resta visibile sul pannello di vetro.
     @memset(buf[0 .. n_px * 4], 0);
 
-    const dots: u32 = 12;
+    const u32px: [*]u32 = @ptrCast(@alignCast(buf.ptr));
+    var canvas = paint.Canvas.initRgba8(u32px[0 .. @as(usize, W) * H], W, H);
     const cx: f32 = @as(f32, @floatFromInt(W)) / 2.0;
     const cy: f32 = @as(f32, @floatFromInt(H)) / 2.0;
-    const ring_r: f32 = @max(@as(f32, @floatFromInt(@min(W, H))) / 14.0, 18.0);
-    const dot_r: f32 = @max(ring_r / 4.0, 3.0);
-    const head: u32 = (frame / 3) % dots;
-
-    var k: u32 = 0;
-    while (k < dots) : (k += 1) {
-        const ang = (@as(f32, @floatFromInt(k)) / @as(f32, @floatFromInt(dots))) * (2.0 * std.math.pi) - std.math.pi / 2.0;
-        const px = cx + ring_r * @cos(ang);
-        const py = cy + ring_r * @sin(ang);
-        // back = distanza (in punti) dietro la testa: 0 = testa (più luminoso).
-        const back: u32 = (head + dots - k) % dots;
-        const frac = @as(f32, @floatFromInt(dots - 1 - back)) / @as(f32, @floatFromInt(dots - 1));
-        const a: u8 = @intFromFloat(@round(40.0 + frac * 205.0));
-        fillDot(buf, W, H, px, py, dot_r, 205, 210, 230, a);
-    }
+    const radius: f32 = @max(@as(f32, @floatFromInt(@min(W, H))) / 14.0, 18.0);
+    const width: f32 = @max(radius / 4.0, 3.0);
+    const phase: f32 = @as(f32, @floatFromInt(frame)) / 60.0; // clock ~60 Hz → secondi
+    canvas.drawSpinner(cx, cy, radius, width, phase, paint.Color.rgba(205, 210, 230, 1.0));
 }
 
 fn renderWorker(
