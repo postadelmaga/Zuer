@@ -152,7 +152,7 @@ fn nodeLocalMatrix(node: GltfNode) Mat4 {
         m00 * s[0], m10 * s[0], m20 * s[0], 0, // colonna 0
         m01 * s[1], m11 * s[1], m21 * s[1], 0, // colonna 1
         m02 * s[2], m12 * s[2], m22 * s[2], 0, // colonna 2
-        t[0],       t[1],       t[2],       1, // colonna 3 (traslazione)
+        t[0], t[1], t[2], 1, // colonna 3 (traslazione)
     };
 }
 
@@ -172,21 +172,27 @@ fn transformDir(m: Mat4, d: [3]f32) [3]f32 {
     };
 }
 
-/// Decodifica in RGBA8 la texture baseColor referenziata dal materiale, se
-/// embeddata nel chunk BIN via bufferView. Ritorna null (nessuna texture) per
-/// URI esterni/data-URI o formati non gestiti — il modello resta col solo
-/// colore-fattore. Sottocampiona (box filter) oltre `max_tex_dim`.
-fn decodeBaseColorTexture(
+/// Texture decodificata in RGBA8, posseduta dallo scratch allocator della cache.
+const DecodedTex = struct { pixels: []u8, w: usize, h: usize };
+
+/// Indice dell'immagine sorgente referenziata da un GltfTextureRef, o null.
+fn texSource(gltf: GltfStructure, tex_ref: GltfTextureRef) ?usize {
+    const textures = gltf.textures orelse return null;
+    if (tex_ref.index >= textures.len) return null;
+    return textures[tex_ref.index].source;
+}
+
+/// Decodifica in RGBA8 l'immagine sorgente `source` (PNG/JPEG embeddato nel chunk
+/// BIN via bufferView). Ritorna null per URI esterni/data-URI o formati non
+/// gestiti. Sottocampiona (box filter) oltre `max_tex_dim`.
+fn decodeImageSource(
     gltf: GltfStructure,
     bin_data: []const u8,
-    tex_ref: GltfTextureRef,
+    source: usize,
     allocator: std.mem.Allocator,
     out_w: *usize,
     out_h: *usize,
 ) ?[]u8 {
-    const textures = gltf.textures orelse return null;
-    if (tex_ref.index >= textures.len) return null;
-    const source = textures[tex_ref.index].source orelse return null;
     const images = gltf.images orelse return null;
     if (source >= images.len) return null;
     const bv_idx = images[source].bufferView orelse return null; // no URI esterni
@@ -206,6 +212,109 @@ fn decodeBaseColorTexture(
     if (w <= 0 or h <= 0) return null;
 
     return downscaleRgba(data, @intCast(w), @intCast(h), max_tex_dim, allocator, out_w, out_h);
+}
+
+// --- Cache texture decodificate in parallelo ------------------------------
+// Le texture embeddate (spesso 4K) si decodificano con stbi e si sotto-campionano
+// sulla CPU: un GLB texture-heavy (es. 16 texture 4096²) costava decine di secondi
+// perché fatte in sequenza sul thread di decode. Qui le decodifichiamo una sola
+// volta per immagine sorgente (i materiali possono condividerle) e in parallelo su
+// tutti i core — è lavoro puramente CPU (stbi usa il malloc di libc, thread-safe) e
+// i buffer d'uscita vengono da page_allocator (thread-safe). Ogni submesh a valle
+// ne prende una copia col proprio allocatore, quindi l'ownership resta invariata.
+
+const TexCache = std.AutoHashMapUnmanaged(usize, DecodedTex);
+
+const TexJob = struct {
+    gltf: GltfStructure,
+    bin: []const u8,
+    srcs: []const usize,
+    results: []?DecodedTex,
+    next: std.atomic.Value(usize),
+};
+
+fn texWorker(job: *TexJob) void {
+    while (true) {
+        const i = job.next.fetchAdd(1, .monotonic);
+        if (i >= job.srcs.len) break;
+        var w: usize = 0;
+        var h: usize = 0;
+        if (decodeImageSource(job.gltf, job.bin, job.srcs[i], std.heap.page_allocator, &w, &h)) |px| {
+            job.results[i] = .{ .pixels = px, .w = w, .h = h };
+        }
+    }
+}
+
+fn freeTexCache(cache: *TexCache, allocator: std.mem.Allocator) void {
+    var it = cache.valueIterator();
+    while (it.next()) |dt| std.heap.page_allocator.free(dt.pixels);
+    cache.deinit(allocator);
+}
+
+/// Decodifica in parallelo tutte le texture (baseColor/diffuse + normal) uniche
+/// referenziate dai materiali, indicizzate per immagine sorgente.
+fn buildTexCache(gltf: GltfStructure, bin_data: []const u8, allocator: std.mem.Allocator) !TexCache {
+    var cache: TexCache = .empty;
+    errdefer freeTexCache(&cache, allocator);
+
+    // Insieme delle immagini sorgente uniche da decodificare.
+    var srcset: std.AutoHashMapUnmanaged(usize, void) = .empty;
+    defer srcset.deinit(allocator);
+    if (gltf.materials) |mats| {
+        for (mats) |m| {
+            var base: ?GltfTextureRef = null;
+            if (m.pbrMetallicRoughness) |pbr| {
+                base = pbr.baseColorTexture;
+            } else if (m.extensions) |ext| {
+                if (ext.KHR_materials_pbrSpecularGlossiness) |sg| base = sg.diffuseTexture;
+            }
+            for ([_]?GltfTextureRef{ base, m.normalTexture }) |r| {
+                if (r) |tr| if (texSource(gltf, tr)) |s| try srcset.put(allocator, s, {});
+            }
+        }
+    }
+    const n = srcset.count();
+    if (n == 0) return cache;
+
+    const srcs = try allocator.alloc(usize, n);
+    defer allocator.free(srcs);
+    {
+        var it = srcset.keyIterator();
+        var i: usize = 0;
+        while (it.next()) |k| : (i += 1) srcs[i] = k.*;
+    }
+
+    const results = try allocator.alloc(?DecodedTex, n);
+    defer allocator.free(results);
+    @memset(results, null);
+
+    var job = TexJob{ .gltf = gltf, .bin = bin_data, .srcs = srcs, .results = results, .next = .init(0) };
+
+    // Spawn fino a (core−1) thread; il thread corrente drena comunque la coda,
+    // così anche con 0 spawn (o spawn fallito) tutte le texture vengono decodificate.
+    var pool: [31]?std.Thread = .{null} ** 31;
+    const cores = std.Thread.getCpuCount() catch 1;
+    const spawn_n = @min(@min(n, cores) -| 1, pool.len);
+    for (0..spawn_n) |i| pool[i] = std.Thread.spawn(.{}, texWorker, .{&job}) catch null;
+    texWorker(&job);
+    for (0..spawn_n) |i| if (pool[i]) |t| t.join();
+
+    // Popola la mappa sorgente→texture (single-thread, ownership al chiamante).
+    for (srcs, results) |s, r| {
+        if (r) |dt| try cache.put(allocator, s, dt);
+    }
+    return cache;
+}
+
+/// Preleva dalla cache la texture per `tex_ref`, duplicandola con l'allocatore del
+/// builder (ogni submesh possiede il proprio buffer). null se non decodificata.
+fn takeCachedTex(b: *Builder, tex_ref: GltfTextureRef, out_w: *usize, out_h: *usize) ?[]u8 {
+    const s = texSource(b.gltf, tex_ref) orelse return null;
+    const dt = b.tex_cache.get(s) orelse return null;
+    const px = b.allocator.dupe(u8, dt.pixels) catch return null;
+    out_w.* = dt.w;
+    out_h.* = dt.h;
+    return px;
 }
 
 /// Copia (ed eventualmente riduce con media per area) i pixel RGBA in un buffer
@@ -352,6 +461,7 @@ const Builder = struct {
     gltf: GltfStructure,
     bin: []const u8,
     allocator: std.mem.Allocator,
+    tex_cache: TexCache,
     vertices: std.ArrayList([3]f32),
     normals: std.ArrayList([3]f32),
     uvs: std.ArrayList([2]f32),
@@ -477,13 +587,13 @@ fn addPrimitive(b: *Builder, prim: GltfPrimitive, world: Mat4) !void {
                 }
                 if (had_uv) {
                     if (tex_ref) |tref| {
-                        if (decodeBaseColorTexture(b.gltf, b.bin, tref, b.allocator, &sub.tex_width, &sub.tex_height)) |px| {
+                        if (takeCachedTex(b, tref, &sub.tex_width, &sub.tex_height)) |px| {
                             sub.tex_pixels = px;
                         }
                     }
                     // Normal map (dati lineari, decodifica identica in RGBA8).
                     if (mat.normalTexture) |nref| {
-                        if (decodeBaseColorTexture(b.gltf, b.bin, nref, b.allocator, &sub.nrm_tex_width, &sub.nrm_tex_height)) |px| {
+                        if (takeCachedTex(b, nref, &sub.nrm_tex_width, &sub.nrm_tex_height)) |px| {
                             sub.nrm_tex_pixels = px;
                         }
                     }
@@ -541,10 +651,15 @@ fn addNode(b: *Builder, node_idx: usize, parent: Mat4, depth: u32) !void {
 /// trasformazioni, fonde tutte le mesh/primitive in un'unica geometria e
 /// produce un submesh per primitiva (materiale + texture propri).
 fn decodeGltfScene(gltf: GltfStructure, bin_data: []const u8, filename: []const u8, allocator: std.mem.Allocator) !MeshData {
+    // Texture decodificate in parallelo, una per immagine sorgente (vedi buildTexCache).
+    var tex_cache = try buildTexCache(gltf, bin_data, allocator);
+    defer freeTexCache(&tex_cache, allocator);
+
     var b = Builder{
         .gltf = gltf,
         .bin = bin_data,
         .allocator = allocator,
+        .tex_cache = tex_cache,
         .vertices = .empty,
         .normals = .empty,
         .uvs = .empty,
