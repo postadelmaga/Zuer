@@ -6,12 +6,26 @@
 //! compositati a CPU; il frame finale RGBA viene inviato a zrame per la presentazione.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const gpu = @import("gpu_renderer.zig");
 const voxel = @import("voxel.zig");
 const decoder_mod = @import("decoder.zig");
 const loader_mod = @import("loader.zig");
 const text_render = @import("text_render.zig");
-const player_mod = @import("decoders/player.zig");
+// player.zig does a top-level `@cImport` of the libav headers, which aren't present on a
+// CPU-only (Windows) build — so import it only when native rendering is on, with a tiny
+// stub otherwise. All real uses of the player are comptime-gated behind `native`.
+const player_mod = if (@import("build_options").gpu) @import("decoders/player.zig") else struct {
+    pub const Player = struct {
+        pub fn deinit(_: *Player) void {}
+    };
+    pub const Frame = struct {};
+};
+const clipboard = @import("clipboard.zig");
+const build_options = @import("build_options");
+/// Native rendering (Vulkan mesh renderer + libav video). Off on Windows → CPU-only
+/// viewer (text/csv/image/pdf). Comptime so the GPU/video code links only when enabled.
+const native = build_options.gpu;
 const zrame = @import("zrame");
 const zicro = @import("zicro");
 const paint = zicro.paint;
@@ -602,10 +616,14 @@ const GuiAppState = struct {
             const m = self.decoded.mesh;
             // Se il prefetch ha già preparato il buffer, riusalo (niente ricalcolo
             // di normali/tangenti qui, sul thread main): swap istantaneo.
+            // stageToGpu is Linux/memfd-only → a mesh cleanly fails to load on a CPU-only
+            // build; the GPU upload below is also comptime-excluded when !native.
             self.stage_opt.* = if (stage_override) |s| s else (loader_mod.stageToGpu(self.gpa, self.decoded) orelse return error.StageFailed);
             const stage = &self.stage_opt.*.?;
-            try self.renderer.setMesh(stage.buffer.ptr, stage.vertex_bytes, @intCast(stage.index_bytes / @sizeOf(u32)));
-            try self.renderer.setMeshMaterials(&m);
+            if (native) {
+                try self.renderer.setMesh(stage.buffer.ptr, stage.vertex_bytes, @intCast(stage.index_bytes / @sizeOf(u32)));
+                try self.renderer.setMeshMaterials(&m);
+            }
             self.mesh_center.* = m.center;
             self.mesh_max_size.* = @max(m.bbox_max[0] - m.bbox_min[0], @max(m.bbox_max[1] - m.bbox_min[1], m.bbox_max[2] - m.bbox_min[2]));
             self.mesh_material.* = .{ .base_color = m.base_color, .metallic = m.metallic, .roughness = m.roughness };
@@ -884,6 +902,7 @@ fn changePdfPage(app_state: *GuiAppState, direction: i32) void {
 /// (griglia 96³) e la carica nel renderer; le attivazioni successive riusano la
 /// griglia già caricata. Tiene il mutex: il thread di render usa lo stesso renderer.
 fn toggleVoxel(app_state: *GuiAppState) void {
+    if (!native) return; // voxel view is a GPU-only feature
     app_state.mutex.lockUncancelable(app_state.io);
     defer app_state.mutex.unlock(app_state.io);
 
@@ -947,7 +966,7 @@ fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) void
             const sel = buildSelectedText(app_state, app_state.gpa);
             app_state.mutex.unlock(app_state.io);
             if (sel) |txt| {
-                clipboardCopy(txt);
+                clipboard.copy(txt);
                 app_state.gpa.free(txt);
             }
             return;
@@ -1228,7 +1247,7 @@ fn rasterizeText(state: *GuiAppState, width: u32, text_zoom: f32) void {
     const opts = text_render.RenderOpts{ .width = @max(width, 64), .pointsize = @max(pointsize, 6) };
     const name = std.fs.path.basename(state.current_file_path);
 
-    if (state.text_gpu) {
+    if (native and state.text_gpu) {
         rasterizeTextGpu(state, name, opts);
         return;
     }
@@ -1634,7 +1653,8 @@ fn renderWorker(
         // Video: percorso a sé (come lo spinner). Guida la riproduzione in tempo
         // reale (accumulo di `frame_dt`), compone il frame corrente e vi disegna
         // sopra i controlli overlay stile YouTube, poi presenta e ricomincia.
-        if (state.video.isActive()) {
+        // `native` only: the player is libav-backed, gated out on CPU-only builds.
+        if (native and state.video.isActive()) {
             const vs = state.video;
             if (composited_rgba.len < cur_w * cur_h * 4) {
                 state.gpa.free(composited_rgba.*);
@@ -1722,7 +1742,7 @@ fn renderWorker(
                 };
             }
 
-            if (state.is_mesh.*) {
+            if (native and state.is_mesh.*) {
                 // Modalità voxel (tasto V): ray-march della griglia invece della
                 // mesh triangolata. Altrimenti pipeline PBR normale.
                 const mesh_rgba = if (state.voxel_mode.* and state.renderer.hasVoxels()) rv: {
@@ -1783,21 +1803,24 @@ fn renderWorker(
     }
 }
 
-extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
-// Copia negli appunti tramite `wl-copy` (wl-clipboard): niente supporto
-// clipboard Wayland in zrame da estendere. Il testo va sullo stdin del figlio.
-extern "c" fn pipe(fds: *[2]c_int) c_int;
-extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
-extern "c" fn close(fd: c_int) c_int;
-extern "c" fn waitpid(pid: c_int, status: ?*c_int, options: c_int) c_int;
-extern "c" fn posix_spawnp(pid: *c_int, file: [*:0]const u8, file_actions: ?*const anyopaque, attrp: ?*const anyopaque, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) c_int;
-extern "c" fn posix_spawn_file_actions_init(fa: *anyopaque) c_int;
-extern "c" fn posix_spawn_file_actions_destroy(fa: *anyopaque) c_int;
-extern "c" fn posix_spawn_file_actions_adddup2(fa: *anyopaque, fd: c_int, newfd: c_int) c_int;
-extern "c" fn posix_spawn_file_actions_addclose(fa: *anyopaque, fd: c_int) c_int;
-extern "c" var environ: [*:null]const ?[*:0]const u8;
+/// Set a process env var so decoder plugins (loaded in-process) can read it via getenv.
+/// `setenv` is POSIX; Windows' CRT spells it `_putenv_s` (which updates the CRT env that
+/// `getenv` reads).
+fn setEnvVar(name: [*:0]const u8, value: [*:0]const u8) void {
+    if (builtin.os.tag == .windows) {
+        const putenv_s = struct {
+            extern "c" fn _putenv_s(n: [*:0]const u8, v: [*:0]const u8) c_int;
+        };
+        _ = putenv_s._putenv_s(name, value);
+    } else {
+        const setenv = struct {
+            extern "c" fn setenv(n: [*:0]const u8, v: [*:0]const u8, overwrite: c_int) c_int;
+        };
+        _ = setenv.setenv(name, value, 1);
+    }
+}
 
 /// Offset di byte del `col`-esimo codepoint in una riga UTF-8 (o fine stringa).
 fn byteAtCol(s: []const u8, col: i32) usize {
@@ -1842,44 +1865,6 @@ fn buildSelectedText(state: *GuiAppState, gpa: std.mem.Allocator) ?[]u8 {
         if (row < b[0]) out.append(gpa, '\n') catch return null;
     }
     return out.toOwnedSlice(gpa) catch null;
-}
-
-/// Invia `text` a `wl-copy` (stdin) per metterlo negli appunti Wayland.
-fn clipboardCopy(text: []const u8) void {
-    if (text.len == 0) return;
-    var fds: [2]c_int = undefined;
-    if (pipe(&fds) != 0) return;
-    const rfd = fds[0];
-    const wfd = fds[1];
-
-    var fa: [256]u8 align(16) = undefined;
-    if (posix_spawn_file_actions_init(&fa) != 0) {
-        _ = close(rfd);
-        _ = close(wfd);
-        return;
-    }
-    defer _ = posix_spawn_file_actions_destroy(&fa);
-    _ = posix_spawn_file_actions_adddup2(&fa, rfd, 0); // stdin del figlio ← lettura pipe
-    _ = posix_spawn_file_actions_addclose(&fa, wfd);
-
-    const wlcopy: [*:0]const u8 = "wl-copy";
-    var argv = [_:null]?[*:0]const u8{wlcopy};
-    var pid: c_int = 0;
-    const rc = posix_spawnp(&pid, wlcopy, &fa, null, &argv, environ);
-    _ = close(rfd);
-    if (rc != 0) {
-        _ = close(wfd);
-        return;
-    }
-    var off: usize = 0;
-    while (off < text.len) {
-        const n = write(wfd, text.ptr + off, text.len - off);
-        if (n <= 0) break;
-        off += @intCast(n);
-    }
-    _ = close(wfd); // EOF: wl-copy acquisisce la selezione e passa in background
-    var status: c_int = 0;
-    _ = waitpid(pid, &status, 0);
 }
 
 /// Categoria di contenuto per scegliere proporzioni di finestra sensate: le
@@ -2049,7 +2034,7 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
 
     // Comunica ai plugin decoder che siamo in modalità GUI (quindi vogliamo la massima risoluzione possibile)
-    _ = setenv("ZUER_GUI", "1", 1);
+    setEnvVar("ZUER_GUI", "1");
 
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -2106,9 +2091,12 @@ pub fn main(init: std.process.Init) !void {
     var stage_opt: ?loader_mod.GpuStage = null;
     defer if (stage_opt) |*s| s.buffer.deinit(gpa);
 
-    // Renderer Vulkan Offscreen (nessuna estensione swapchain WSI richiesta)
-    var renderer = try gpu.Renderer.init(gpa, .{});
-    defer renderer.deinit();
+    // Renderer Vulkan Offscreen (nessuna estensione swapchain WSI richiesta). Solo con
+    // rendering nativo: su build CPU-only resta `undefined` e non viene mai usato (tutti
+    // i suoi call site sono esclusi a comptime da `native`).
+    var renderer: gpu.Renderer = undefined;
+    if (native) renderer = try gpu.Renderer.init(gpa, .{});
+    defer if (native) renderer.deinit();
 
     var mesh_center: [3]f32 = .{ 0, 0, 0 };
     var mesh_max_size: f32 = 1;
@@ -2124,7 +2112,9 @@ pub fn main(init: std.process.Init) !void {
     var static_h: u32 = 0;
 
     var video: VideoState = .{};
-    defer if (video.player) |*p| p.deinit();
+    defer if (native) {
+        if (video.player) |*p| p.deinit();
+    };
 
     var state_mutex: std.Io.Mutex = .init;
     var load_seq: u32 = 1;
@@ -2170,6 +2160,7 @@ pub fn main(init: std.process.Init) !void {
         .stage_opt = &stage_opt,
         .renderer = &renderer,
         .text_gpu = text_gpu: {
+            if (!native) break :text_gpu false; // GPU text needs the Vulkan renderer
             if (getenv("ZUER_TEXT_ENGINE")) |v| break :text_gpu std.mem.eql(u8, std.mem.span(v), "gpu");
             break :text_gpu false;
         },
@@ -2261,7 +2252,7 @@ pub fn main(init: std.process.Init) !void {
     // iniziale. Niente decode async/spinner — aprire il container è veloce — così
     // il worker parte già in riproduzione. `static_rgba` diventa il frame corrente
     // che il worker aggiorna nel tempo (vedi il ramo video di renderWorker).
-    if (win_kind == .video) {
+    if (native and win_kind == .video) {
         loading = false;
         is_text = false;
         if (setupVideo(&video, file_path, gpa)) |first| {

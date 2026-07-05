@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const dynlib = @import("dynlib.zig");
 
 pub const CsvData = struct {
     headers: [][]const u8,
@@ -524,7 +525,7 @@ pub const ExtensionsFn = *const fn () callconv(.c) SliceC;
 const LoadedPlugin = struct {
     type_name: []const u8,
     extensions: []const []const u8,
-    lib: std.DynLib,
+    lib: dynlib.Lib,
     decode_fn: DecodeFn,
 };
 
@@ -581,7 +582,7 @@ fn scanPluginDir(dir_path: []const u8, io: std.Io, allocator: std.mem.Allocator)
         const full_path = std.fs.path.join(allocator, &.{ dir_path, entry.name }) catch continue;
         defer allocator.free(full_path);
 
-        var lib = std.DynLib.open(full_path) catch continue;
+        var lib = dynlib.Lib.open(full_path) catch continue;
         const decode_fn = lib.lookup(DecodeFn, "zuer_decode") orelse {
             lib.close();
             continue;

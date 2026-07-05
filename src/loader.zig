@@ -25,8 +25,11 @@ pub const LoadedFile = struct {
 
     pub fn deinit(self: *LoadedFile) void {
         self.decoded.deinit(self.gpa);
-        if (self.gpu) |*stage| {
-            stage.buffer.deinit(self.gpa);
+        // GPU staging is Linux/memfd-only (see stageToGpu). Gating the deinit by OS keeps
+        // zicro's gpu_memory (munmap etc.) out of a non-Linux link — `self.gpu` is always
+        // null there anyway.
+        if (builtin.os.tag == .linux) {
+            if (self.gpu) |*stage| stage.buffer.deinit(self.gpa);
         }
     }
 };

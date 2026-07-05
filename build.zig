@@ -4,6 +4,15 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Native rendering = the Vulkan offscreen mesh renderer + the libav video player.
+    // Defaults on for Linux, off elsewhere: on Windows zuer-gui builds CPU-only (text/
+    // csv/image/pdf viewing via software compositing), which needs neither Vulkan nor
+    // FFmpeg import libs. Force with `-Dgpu=true|false`.
+    const gpu_enabled = b.option(bool, "gpu", "Build the Vulkan mesh renderer + libav video player") orelse
+        (target.result.os.tag == .linux);
+    const build_opts = b.addOptions();
+    build_opts.addOption(bool, "gpu", gpu_enabled);
+
     // Obtain the Zicro dependency declared in build.zig.zon
     const dep_zicro = b.dependency("zicro", .{
         .target = target,
@@ -80,9 +89,14 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addAnonymousImport("shadow_frag_spv", .{ .root_source_file = shadow_frag_spv });
     exe.root_module.addAnonymousImport("voxel_vert_spv", .{ .root_source_file = voxel_vert_spv });
     exe.root_module.addAnonymousImport("voxel_frag_spv", .{ .root_source_file = voxel_frag_spv });
-    exe.root_module.linkSystemLibrary("vulkan", .{});
+    // The TUI binary doesn't render via Vulkan (kitty/half-block are CPU); only link the
+    // loader when native rendering is on so the CPU-only target needs no Vulkan import lib.
+    if (gpu_enabled) exe.root_module.linkSystemLibrary("vulkan", .{});
 
-    b.installArtifact(exe);
+    // The TUI viewer still pulls the Vulkan renderer through tui.zig (mesh preview), so it
+    // only builds with native rendering on. The GUI (zuer-gui) is the CPU-only Windows
+    // target; making the TUI CPU-only too is a follow-up (gate tui.zig's gpu use like gui).
+    if (gpu_enabled) b.installArtifact(exe);
 
     const gui_exe = b.addExecutable(.{
         .name = "zuer-gui",
@@ -107,6 +121,7 @@ pub fn build(b: *std.Build) void {
     }).module("zicro");
     gui_exe.root_module.addImport("zicro", gui_zicro);
     gui_exe.root_module.addImport("zrame", dep_zrame.module("zrame"));
+    gui_exe.root_module.addOptions("build_options", build_opts);
     gui_exe.root_module.addAnonymousImport("mesh_vert_spv", .{ .root_source_file = vert_spv });
     gui_exe.root_module.addAnonymousImport("mesh_frag_spv", .{ .root_source_file = frag_spv });
     gui_exe.root_module.addAnonymousImport("text_vert_spv", .{ .root_source_file = text_vert_spv });
@@ -115,15 +130,21 @@ pub fn build(b: *std.Build) void {
     gui_exe.root_module.addAnonymousImport("shadow_frag_spv", .{ .root_source_file = shadow_frag_spv });
     gui_exe.root_module.addAnonymousImport("voxel_vert_spv", .{ .root_source_file = voxel_vert_spv });
     gui_exe.root_module.addAnonymousImport("voxel_frag_spv", .{ .root_source_file = voxel_frag_spv });
-    gui_exe.root_module.linkSystemLibrary("vulkan", .{});
-    gui_exe.root_module.linkSystemLibrary("wayland-client", .{});
-    // Player video nativo: il worker decodifica i frame in tempo reale con libav
-    // (src/decoders/player.zig, importato da gui.zig), quindi il gui_exe linka
-    // ffmpeg direttamente (finora era solo nel decoder .so per il poster).
-    gui_exe.root_module.linkSystemLibrary("libavformat", .{});
-    gui_exe.root_module.linkSystemLibrary("libavcodec", .{});
-    gui_exe.root_module.linkSystemLibrary("libavutil", .{});
-    gui_exe.root_module.linkSystemLibrary("libswscale", .{});
+    // Vulkan (mesh renderer) + libav (video player) only when native rendering is on.
+    // On Windows (gpu=false) zuer-gui composites text/images/pdf on the CPU and presents
+    // through zrame's GDI backend — no Vulkan/FFmpeg link needed. wayland-client is
+    // likewise Linux-only (the Windows window is GDI, owned by zrame).
+    if (gpu_enabled) {
+        gui_exe.root_module.linkSystemLibrary("vulkan", .{});
+        // Player video nativo: il worker decodifica i frame in tempo reale con libav
+        // (src/decoders/player.zig, importato da gui.zig), quindi il gui_exe linka
+        // ffmpeg direttamente (finora era solo nel decoder .so per il poster).
+        gui_exe.root_module.linkSystemLibrary("libavformat", .{});
+        gui_exe.root_module.linkSystemLibrary("libavcodec", .{});
+        gui_exe.root_module.linkSystemLibrary("libavutil", .{});
+        gui_exe.root_module.linkSystemLibrary("libswscale", .{});
+    }
+    if (target.result.os.tag == .linux) gui_exe.root_module.linkSystemLibrary("wayland-client", .{});
     // Motore di testo nativo: stb_truetype rasterizza i glifi Hack (embeddati),
     // sostituendo ImageMagick/Pango. NB: `zuer-gui` linka zrame, che ora compila
     // la propria copia di stb_truetype_impl.c per il suo motore di testo. Per
@@ -214,15 +235,24 @@ pub fn build(b: *std.Build) void {
                 .flags = &.{ "-O2", "-fno-sanitize=undefined" },
             });
         }
-        // Il plugin media decodifica video/audio nativamente con libav (ffmpeg):
-        // primo frame come poster, e in prospettiva riproduzione completa.
-        if (comptime std.mem.eql(u8, name, "media")) {
-            lib.root_module.linkSystemLibrary("libavformat", .{});
-            lib.root_module.linkSystemLibrary("libavcodec", .{});
-            lib.root_module.linkSystemLibrary("libavutil", .{});
-            lib.root_module.linkSystemLibrary("libswscale", .{});
+        // Heavy decoders that need FFmpeg (media) or external tools + POSIX temp dirs
+        // (pdf→pdftoppm, office→soffice) only build with native rendering on. On a
+        // CPU-only target (Windows) they're skipped — not installing them means they're
+        // neither compiled nor linked, so their libav/POSIX deps never reach the link.
+        const heavy = comptime (std.mem.eql(u8, name, "media") or std.mem.eql(u8, name, "pdf") or std.mem.eql(u8, name, "office"));
+        if (heavy) {
+            if (gpu_enabled) {
+                if (comptime std.mem.eql(u8, name, "media")) {
+                    lib.root_module.linkSystemLibrary("libavformat", .{});
+                    lib.root_module.linkSystemLibrary("libavcodec", .{});
+                    lib.root_module.linkSystemLibrary("libavutil", .{});
+                    lib.root_module.linkSystemLibrary("libswscale", .{});
+                }
+                b.installArtifact(lib);
+            }
+        } else {
+            b.installArtifact(lib);
         }
-        b.installArtifact(lib);
     }
 
     const run_cmd = b.addRunArtifact(exe);
