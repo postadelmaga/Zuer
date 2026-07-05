@@ -732,7 +732,11 @@ const GuiAppState = struct {
         }
         self.mutex.unlock(self.io);
 
-        const size = initialWindowSize(kind, nat_w, nat_h);
+        // Contenuto piccolo → ingrandiscilo un po' e dimensiona la finestra sul
+        // contenuto già zoomato (aderente, niente vuoto). Lo zoom pilota il worker.
+        const az = autoZoomForContent(kind, nat_w, nat_h);
+        self.zoom.* = az;
+        const size = initialWindowSize(kind, scaleDim(nat_w, az), scaleDim(nat_h, az));
         win.animateResize(size.w, size.h);
     }
 };
@@ -1598,6 +1602,35 @@ fn winKindFromDecoded(d: *const decoder_mod.Decoded) WinKind {
     };
 }
 
+/// Zoom iniziale del contenuto per evitare finestre minuscole: se la dimensione
+/// naturale del contenuto (tabella/immagine) sarebbe piccola in ENTRAMBE le
+/// dimensioni, lo si ingrandisce "un pochino" finché la dimensione vincolante
+/// raggiunge una taglia comoda, con un tetto per non sgranare. Ritorna 1.0 dove non
+/// ha senso (documento a formato fisso, mesh) o se il contenuto è già abbastanza
+/// grande. Il chiamante applica questo zoom al contenuto E dimensiona la finestra
+/// sul contenuto già ingrandito, così la finestra resta aderente (nessun vuoto).
+fn autoZoomForContent(kind: WinKind, nat_w: u32, nat_h: u32) f32 {
+    switch (kind) {
+        .table, .image => {},
+        else => return 1.0,
+    }
+    if (nat_w == 0 or nat_h == 0) return 1.0;
+    const comfort_w: f32 = 680.0;
+    const comfort_h: f32 = 480.0;
+    const max_zoom: f32 = 1.8;
+    const fw: f32 = @floatFromInt(nat_w);
+    const fh: f32 = @floatFromInt(nat_h);
+    // Solo finestre davvero piccole: se una dimensione è già comoda, non toccare.
+    if (fw >= comfort_w or fh >= comfort_h) return 1.0;
+    const z = @min(comfort_w / fw, comfort_h / fh);
+    return std.math.clamp(z, 1.0, max_zoom);
+}
+
+/// Scala una dimensione naturale per un fattore di zoom (arrotonda).
+fn scaleDim(v: u32, z: f32) u32 {
+    return @intFromFloat(@round(@as(f32, @floatFromInt(v)) * z));
+}
+
 /// Dimensione iniziale della finestra, con proporzioni intelligenti per tipo di
 /// contenuto. Per le immagini si adatta all'aspetto reale (l'immagine riempie il
 /// frame) con un tetto ZUER_MAX_WIN ("LxA", default 1600x900); per gli altri tipi
@@ -1640,8 +1673,11 @@ fn initialWindowSize(kind: WinKind, img_w: u32, img_h: u32) struct { w: u32, h: 
         // schermo. Oltre max_w la finestra si ferma e scatta lo scroll orizzontale.
         .table => {
             if (img_w != 0) {
-                const w = std.math.clamp(img_w, 480, max_w);
-                const h = std.math.clamp(img_h, 300, max_h);
+                // Floor bassi: la finestra ADERISCE al contenuto (niente vuoto sotto).
+                // Il contenuto minuscolo è già stato ingrandito da `autoZoomForContent`,
+                // quindi qui non serve gonfiare la finestra.
+                const w = std.math.clamp(img_w, 320, max_w);
+                const h = std.math.clamp(img_h, 200, max_h);
                 return .{ .w = w, .h = h };
             }
             return .{ .w = @min(max_w, 1280), .h = @min(max_h, 820) };
@@ -1908,7 +1944,10 @@ pub fn main(init: std.process.Init) !void {
     }
     const size_w = if (win_kind == .table) tbl_w else static_w;
     const size_h = if (win_kind == .table) tbl_h else static_h;
-    const win_size = initialWindowSize(win_kind, size_w, size_h);
+    // Contenuto piccolo → zoom iniziale un po' più grande, finestra aderente al
+    // contenuto zoomato (stessa euristica della navigazione).
+    zoom = autoZoomForContent(win_kind, size_w, size_h);
+    const win_size = initialWindowSize(win_kind, scaleDim(size_w, zoom), scaleDim(size_h, zoom));
     const win = try zrame.Window.init(gpa, .{
         .title = "zuer-gui",
         .app_id = "it.zuer.gui",

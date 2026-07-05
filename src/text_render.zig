@@ -69,11 +69,24 @@ fn pxHeight(pointsize: usize) f32 {
     return @as(f32, @floatFromInt(pointsize)) * 96.0 / 72.0;
 }
 
-/// Corpo del testo tabellare (celle/header csv/xlsx) in pixel: parità con
-/// ../viewer, che rende a 13.5px (default egui). `pointsize` codifica lo zoom
-/// utente (15 = zoom 1), quindi il corpo scala con lo zoom mantenendo 13.5px a 1x.
+/// Corpo base del testo tabellare (celle/header csv/xlsx) in pixel a zoom 1.
+/// 13.5 = esattamente il `TextStyle::Body` di egui in ../viewer; abbinato allo
+/// scaling per-em in glyph.zig (`.sans`) la resa è identica a viewer. Tunabile qui.
+const table_body_px_1x: f32 = 13.5;
+
+/// Corpo del testo tabellare in pixel (scala per em, come egui). `pointsize`
+/// codifica lo zoom utente (15 = zoom 1), quindi il corpo scala con lo zoom.
 fn tableTextPx(pointsize: usize) f32 {
-    return @as(f32, @floatFromInt(pointsize)) * (13.5 / 15.0);
+    return table_body_px_1x * (@as(f32, @floatFromInt(pointsize)) / 15.0);
+}
+
+/// Corpo base del testo dei documenti (testo/markdown/codice, font mono) in pixel a
+/// zoom 1: un filo più grande dei 20px storici, per una lettura più comoda. Tunabile.
+const doc_body_px_1x: f32 = 22.0;
+
+/// Corpo del testo documenti in pixel. `pointsize` codifica lo zoom (15 = zoom 1).
+fn docTextPx(pointsize: usize) f32 {
+    return doc_body_px_1x * (@as(f32, @floatFromInt(pointsize)) / 15.0);
 }
 
 /// Un tratto di testo omogeneo (stesso colore e stile) su una riga visiva.
@@ -97,7 +110,7 @@ pub fn render(gpa: std.mem.Allocator, io: std.Io, decoded: *const decoder_mod.De
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var raster = try glyph.Raster.init(gpa, pxHeight(opts.pointsize));
+    var raster = try glyph.Raster.init(gpa, docTextPx(opts.pointsize));
     defer raster.deinit();
 
     var rows: std.ArrayList(Row) = .empty;
@@ -154,7 +167,7 @@ pub fn renderDoc(gpa: std.mem.Allocator, decoded: *const decoder_mod.Decoded, na
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var raster = try glyph.Raster.init(gpa, pxHeight(opts.pointsize));
+    var raster = try glyph.Raster.init(gpa, docTextPx(opts.pointsize));
     defer raster.deinit();
 
     var rows: std.ArrayList(Row) = .empty;
@@ -236,7 +249,7 @@ pub fn buildTextMesh(gpa: std.mem.Allocator, decoded: *const decoder_mod.Decoded
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var raster = try glyph.Raster.init(gpa, pxHeight(opts.pointsize));
+    var raster = try glyph.Raster.init(gpa, docTextPx(opts.pointsize));
     defer raster.deinit();
 
     var rows: std.ArrayList(Row) = .empty;

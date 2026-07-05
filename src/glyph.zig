@@ -91,7 +91,13 @@ pub const Raster = struct {
             const p: [*c]const u8 = @ptrCast(data.ptr);
             const off = c.stbtt_GetFontOffsetForIndex(p, 0);
             if (c.stbtt_InitFont(&infos[i], p, off) == 0) return error.FontInit;
-            scale[i] = c.stbtt_ScaleForPixelHeight(&infos[i], px_height);
+            // Sans (tabelle): scala per em, come egui/ab_glyph in ../viewer — così un
+            // corpo di 13.5 rende identico a egui. Mono (codice/testo, resa a griglia):
+            // scala per altezza-pixel (ascent−descent), storicamente usata dal layout.
+            scale[i] = switch (family) {
+                .sans => c.stbtt_ScaleForMappingEmToPixels(&infos[i], px_height),
+                .mono => c.stbtt_ScaleForPixelHeight(&infos[i], px_height),
+            };
         }
 
         var asc: c_int = 0;
