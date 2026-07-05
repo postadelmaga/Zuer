@@ -60,6 +60,7 @@ vkGetDeviceProcAddr
 vkGetDeviceQueue
 vkGetImageMemoryRequirements
 vkGetPhysicalDeviceMemoryProperties
+vkGetPhysicalDeviceProperties
 vkGetPhysicalDeviceQueueFamilyProperties
 vkMapMemory
 vkQueueSubmit

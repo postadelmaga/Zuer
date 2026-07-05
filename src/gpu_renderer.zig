@@ -10,9 +10,28 @@
 //!  - zuer-gui: `renderToImage()` lascia il frame pronto, presentato da zrame.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const decoder = @import("decoder.zig");
 
 const vk = @import("renderer/vk.zig");
+
+// libc getenv, portable across Linux/Windows (std.posix.getenv is Linux-only here) — used to
+// read the ZUER_GPU device override.
+extern fn getenv([*:0]const u8) ?[*:0]const u8;
+
+/// True when `needle` occurs in `haystack`, ASCII case-insensitive. Small (device names,
+/// short override strings), so the naive O(n·m) scan is fine.
+fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or needle.len > haystack.len) return needle.len == 0;
+    var i: usize = 0;
+    outer: while (i + needle.len <= haystack.len) : (i += 1) {
+        for (needle, 0..) |c, j| {
+            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(c)) continue :outer;
+        }
+        return true;
+    }
+    return false;
+}
 
 const vert_spv = @embedFile("mesh_vert_spv");
 const frag_spv = @embedFile("mesh_frag_spv");
@@ -294,6 +313,7 @@ const vkGetDeviceProcAddr = vk.vkGetDeviceProcAddr;
 const vkGetDeviceQueue = vk.vkGetDeviceQueue;
 const vkGetImageMemoryRequirements = vk.vkGetImageMemoryRequirements;
 const vkGetPhysicalDeviceMemoryProperties = vk.vkGetPhysicalDeviceMemoryProperties;
+const vkGetPhysicalDeviceProperties = vk.vkGetPhysicalDeviceProperties;
 const vkGetPhysicalDeviceQueueFamilyProperties = vk.vkGetPhysicalDeviceQueueFamilyProperties;
 const vkMapMemory = vk.vkMapMemory;
 const vkQueueSubmit = vk.vkQueueSubmit;
@@ -437,10 +457,23 @@ pub const Renderer = struct {
         if (enum_result != VK_SUCCESS and enum_result != 5) return error.NoGpu;
         if (dev_count == 0) return error.NoGpu;
 
+        // Pick the physical device with a graphics queue. The default *preference* differs by
+        // present path: this renderer draws offscreen and, off Linux, reads the frame back to
+        // CPU and composites it in software (UpdateLayeredWindow) — for that, an INTEGRATED GPU
+        // (memory shared with the CPU) makes the readback nearly free and beats a discrete GPU
+        // whose readback crosses PCIe (dreadful under Wine + Optimus). On Linux the frame goes
+        // out zero-copy as a dmabuf, so the stronger DISCRETE GPU wins. `ZUER_GPU` overrides:
+        // a decimal index picks that enumerated device; any other value is matched (case-
+        // insensitively) as a substring of the device name (e.g. `ZUER_GPU=intel`).
+        const prefer_integrated = builtin.os.tag != .linux;
+        const override: ?[]const u8 = if (getenv("ZUER_GPU")) |p| std.mem.sliceTo(p, 0) else null;
+        const forced_index: ?u32 = if (override) |o| std.fmt.parseInt(u32, o, 10) catch null else null;
+
         var physical: VkPhysicalDevice = null;
         var queue_family: u32 = 0;
         var has_host_import = false;
-        for (devices[0..dev_count]) |pd| {
+        var best_score: i32 = std.math.minInt(i32);
+        for (devices[0..dev_count], 0..) |pd, idx| {
             var qf_count: u32 = 0;
             vkGetPhysicalDeviceQueueFamilyProperties(pd, &qf_count, null);
             var qfs: [16]VkQueueFamilyProperties = undefined;
@@ -450,12 +483,42 @@ pub const Renderer = struct {
                 if (qf.queueFlags & QUEUE_GRAPHICS != 0) break @as(u32, @intCast(i));
             } else continue;
 
-            physical = pd;
-            queue_family = family;
-            has_host_import = deviceHasExtension(gpa, pd, "VK_EXT_external_memory_host");
-            break;
+            var props: vk.VkPhysicalDeviceProperties = undefined;
+            vkGetPhysicalDeviceProperties(pd, &props);
+            const name = std.mem.sliceTo(&props.deviceName, 0);
+            const integrated = props.deviceType == vk.VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+            const discrete = props.deviceType == vk.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+            std.log.info("zuer gpu: [{d}] {s} (type {d})", .{ idx, name, props.deviceType });
+
+            // Score: explicit override wins outright; otherwise prefer the type that fits the
+            // present path, then break ties toward a real GPU over a software rasterizer.
+            var score: i32 = 0;
+            if (forced_index) |fi| {
+                if (idx == fi) score += 10_000;
+            } else if (override) |o| {
+                if (asciiContainsIgnoreCase(name, o)) score += 10_000;
+            }
+            // Off Linux (CPU-readback present) bias toward integrated. On Linux the frame
+            // goes out zero-copy as a dmabuf that must be importable by the compositor (itself
+            // usually on the integrated GPU), so DON'T bias by type — keep the enumeration
+            // order (first candidate wins on the score==0 tie), preserving prior behavior.
+            if (prefer_integrated) {
+                if (integrated) score += 100 else if (discrete) score += 50;
+            }
+
+            if (physical == null or score > best_score) {
+                physical = pd;
+                queue_family = family;
+                has_host_import = deviceHasExtension(gpa, pd, "VK_EXT_external_memory_host");
+                best_score = score;
+            }
         }
         if (physical == null) return error.NoGpu;
+        {
+            var props: vk.VkPhysicalDeviceProperties = undefined;
+            vkGetPhysicalDeviceProperties(physical, &props);
+            std.log.info("zuer gpu: using {s}", .{std.mem.sliceTo(&props.deviceName, 0)});
+        }
 
         var mem_props: VkPhysicalDeviceMemoryProperties = undefined;
         vkGetPhysicalDeviceMemoryProperties(physical, &mem_props);
@@ -1388,7 +1451,7 @@ pub const Renderer = struct {
 
         // Buffer di readback host-visible, mappato in modo persistente (due slot per pipelining).
         const rb_size = @as(u64, width) * height * 4;
-        
+
         var i: usize = 0;
         while (i < 2) : (i += 1) {
             var rb_buf: VkBuffer = VK_NULL;
@@ -1418,7 +1481,7 @@ pub const Renderer = struct {
         self.depth_mem = depth.mem;
         self.depth_view = depth.view;
         self.framebuffer = framebuffer;
-        
+
         // Mappatura compatibile a singolo buffer su slot 0
         self.readback_buf = self.readback_bufs[0];
         self.readback_mem = self.readback_mems[0];
@@ -1484,7 +1547,7 @@ pub const Renderer = struct {
         vkDestroyFramebuffer(self.device, self.framebuffer, null);
         self.destroyImage(.{ .image = self.color_image, .mem = self.color_mem, .view = self.color_view });
         self.destroyImage(.{ .image = self.depth_image, .mem = self.depth_mem, .view = self.depth_view });
-        
+
         var i: usize = 0;
         while (i < 2) : (i += 1) {
             if (self.readback_bufs[i] != VK_NULL) {

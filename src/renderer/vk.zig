@@ -136,6 +136,23 @@ pub const VkDeviceCreateInfo = extern struct {
     pEnabledFeatures: ?*const anyopaque = null,
 };
 
+// Device identity, enough to choose between GPUs (integrated vs discrete) and log the name.
+// The driver writes the *whole* VkPhysicalDeviceProperties (apiVersion..sparseProperties),
+// so we keep the fields we read at their true offsets and reserve ample tail space for the
+// limits/sparse blocks we ignore (real tail ~524B; 1024 is safe headroom).
+pub const VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: u32 = 1;
+pub const VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: u32 = 2;
+pub const VkPhysicalDeviceProperties = extern struct {
+    apiVersion: u32,
+    driverVersion: u32,
+    vendorID: u32,
+    deviceID: u32,
+    deviceType: u32,
+    deviceName: [256]u8,
+    pipelineCacheUUID: [16]u8,
+    tail: [1024]u8, // limits + sparseProperties (unused here)
+};
+
 pub const VkMemoryType = extern struct { propertyFlags: u32, heapIndex: u32 };
 pub const VkMemoryHeap = extern struct { size: u64, flags: u32 };
 pub const VkPhysicalDeviceMemoryProperties = extern struct {
@@ -588,6 +605,7 @@ pub extern "vulkan" fn vkDestroyInstance(VkInstance, ?*const anyopaque) void;
 pub extern "vulkan" fn vkEnumeratePhysicalDevices(VkInstance, *u32, ?[*]VkPhysicalDevice) VkResult;
 pub extern "vulkan" fn vkGetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice, *u32, ?[*]VkQueueFamilyProperties) void;
 pub extern "vulkan" fn vkGetPhysicalDeviceMemoryProperties(VkPhysicalDevice, *VkPhysicalDeviceMemoryProperties) void;
+pub extern "vulkan" fn vkGetPhysicalDeviceProperties(VkPhysicalDevice, *VkPhysicalDeviceProperties) void;
 pub extern "vulkan" fn vkEnumerateDeviceExtensionProperties(VkPhysicalDevice, ?[*:0]const u8, *u32, ?[*]VkExtensionProperties) VkResult;
 pub extern "vulkan" fn vkCreateDevice(VkPhysicalDevice, *const VkDeviceCreateInfo, ?*const anyopaque, *VkDevice) VkResult;
 pub extern "vulkan" fn vkDestroyDevice(VkDevice, ?*const anyopaque) void;
