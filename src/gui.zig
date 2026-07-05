@@ -279,6 +279,29 @@ const GuiAppState = struct {
         self.ld_cond.signal(self.io);
     }
 
+    /// Libera l'RGBA sorgente delle texture della mesh corrente dopo che sono
+    /// state caricate su GPU (baked su disco + pool VT): non serve più a nessuno
+    /// (il voxel usa solo la geometria) e su modelli con molte texture 2K/4K vale
+    /// decine/centinaia di MB. Azzera gli slice così `deinit` non rilibera.
+    fn freeMeshTextures(self: *GuiAppState) void {
+        if (self.decoded.* != .mesh) return;
+        const mesh = &self.decoded.mesh;
+        if (mesh.tex_pixels.len > 0) {
+            self.gpa.free(mesh.tex_pixels);
+            mesh.tex_pixels = &.{};
+        }
+        for (mesh.submeshes) |*s| {
+            if (s.tex_pixels.len > 0) {
+                self.gpa.free(s.tex_pixels);
+                s.tex_pixels = &.{};
+            }
+            if (s.nrm_tex_pixels.len > 0) {
+                self.gpa.free(s.nrm_tex_pixels);
+                s.nrm_tex_pixels = &.{};
+            }
+        }
+    }
+
     /// Installa un contenuto già decodificato nello stato condiviso (swap sotto
     /// lock). Prende possesso di `new_decoded` e, se presente, di `stage_override`
     /// (staging GPU già calcolato dal prefetch: evita di ricalcolarlo qui).
@@ -336,6 +359,10 @@ const GuiAppState = struct {
             if (native) {
                 try self.renderer.setMesh(stage.buffer.ptr, stage.vertex_bytes, @intCast(stage.index_bytes / @sizeOf(u32)));
                 try self.renderer.setMeshMaterials(&m);
+                // Le texture sono ora baked su disco (cache VT) e caricate nel pool
+                // GPU: l'RGBA sorgente (decine di MB per texture 2K) non serve più.
+                // La geometria resta viva per la voxelizzazione (tasto V).
+                self.freeMeshTextures();
             }
             self.mesh_center.* = m.center;
             self.mesh_max_size.* = @max(m.bbox_max[0] - m.bbox_min[0], @max(m.bbox_max[1] - m.bbox_min[1], m.bbox_max[2] - m.bbox_min[2]));
