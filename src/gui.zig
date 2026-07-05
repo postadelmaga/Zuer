@@ -386,6 +386,11 @@ const GuiAppState = struct {
         // così lo spinner si ferma comunque.
         self.loading.* = false;
 
+        // Refine progressivo: se il file è lo STESSO (fase full che rimpiazza la
+        // coarse), preserva la camera così una rotazione fatta durante la coarse
+        // non viene azzerata quando arriva il dettaglio pieno.
+        const same_file = std.mem.eql(u8, new_path, self.current_file_path);
+
         // 2. Libera le vecchie risorse decodificate
         self.decoded.deinit(self.gpa);
         if (self.stage_opt.*) |*s| {
@@ -459,11 +464,13 @@ const GuiAppState = struct {
             self.static_h.* = 0;
         }
 
-        self.zoom.* = 1.0;
-        self.yaw.* = 0.0;
-        self.pitch.* = 0.0;
-        self.pan_x.* = 0.0;
-        self.pan_y.* = 0.0;
+        if (!same_file) {
+            self.zoom.* = 1.0;
+            self.yaw.* = 0.0;
+            self.pitch.* = 0.0;
+            self.pan_x.* = 0.0;
+            self.pan_y.* = 0.0;
+        }
         self.scroll_y.* = 0.0;
         self.scroll_x.* = 0.0;
         resetScroll(self.sc);
@@ -1949,6 +1956,20 @@ pub fn main(init: std.process.Init) !void {
 /// stato quando è pronto (azzerando lo spinner via `applyDecoded`). Sugli errori
 /// mostra il messaggio come testo nella finestra invece di terminare il processo.
 fn decodeInitial(state: *GuiAppState, path: []const u8) void {
+    // Fase 1 (progressiva): se la cache texture coarse è calda (riapertura), una
+    // resa a bassa risoluzione quasi istantanea; poi la fase 2 raffina a pieno.
+    // decodeCoarse ritorna null se il formato non la supporta, o .err se la cache
+    // è fredda (prima apertura) → in entrambi i casi si salta alla fase full.
+    if (decoder_mod.decodeCoarse(path, state.io, state.gpa)) |coarse| {
+        if (coarse == .mesh)
+            state.applyDecoded(coarse, null, path) catch |e|
+                std.debug.print("apply coarse: {s}\n", .{@errorName(e)})
+        else {
+            var c = coarse;
+            c.deinit(state.gpa);
+        }
+    }
+
     var d = decoder_mod.decode(path, state.io, state.gpa);
     if (d == .err) {
         const msg: []const u8 = std.fmt.allocPrint(state.gpa, "Errore nel caricamento del file:\n{s}", .{d.err}) catch "";

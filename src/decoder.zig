@@ -527,6 +527,9 @@ const LoadedPlugin = struct {
     extensions: []const []const u8,
     lib: dynlib.Lib,
     decode_fn: DecodeFn,
+    /// Opzionale: prima fase progressiva (texture al tier coarse). Solo i plugin
+    /// che la esportano (es. glb) la offrono; gli altri fanno un decode solo.
+    decode_coarse_fn: ?DecodeFn = null,
 };
 
 var plugin_registry: std.ArrayList(LoadedPlugin) = .empty;
@@ -587,6 +590,7 @@ fn scanPluginDir(dir_path: []const u8, io: std.Io, allocator: std.mem.Allocator)
             lib.close();
             continue;
         };
+        const decode_coarse_fn = lib.lookup(DecodeFn, "zuer_decode_coarse");
 
         // `zuer_extensions` è opzionale: un plugin senza estensioni dichiarate
         // resta raggiungibile solo come fallback per nome (es. "text").
@@ -619,6 +623,7 @@ fn scanPluginDir(dir_path: []const u8, io: std.Io, allocator: std.mem.Allocator)
             .extensions = exts_owned,
             .lib = lib,
             .decode_fn = decode_fn,
+            .decode_coarse_fn = decode_coarse_fn,
         }) catch {
             allocator.free(type_name_dup);
             for (exts_owned) |e| allocator.free(e);
@@ -924,6 +929,17 @@ fn guessImageFormat(bytes: []const u8) bool {
 }
 
 pub fn decode(path: []const u8, io: std.Io, allocator: std.mem.Allocator) Decoded {
+    return decodeImpl(path, io, allocator, false) orelse .{ .err = "decode fallito" };
+}
+
+/// Prima fase del caricamento progressivo: texture al tier coarse (256², da cache
+/// se presente → resa quasi istantanea alla riapertura). Ritorna null se il plugin
+/// risolto non offre `zuer_decode_coarse` (l'host allora fa solo `decode`).
+pub fn decodeCoarse(path: []const u8, io: std.Io, allocator: std.mem.Allocator) ?Decoded {
+    return decodeImpl(path, io, allocator, true);
+}
+
+fn decodeImpl(path: []const u8, io: std.Io, allocator: std.mem.Allocator, coarse: bool) ?Decoded {
     var clean_path = path;
     if (std.mem.indexOfScalar(u8, path, '#')) |hash_idx| {
         clean_path = path[0..hash_idx];
@@ -966,12 +982,14 @@ pub fn decode(path: []const u8, io: std.Io, allocator: std.mem.Allocator) Decode
     var plugin = findPluginByExtension(ext);
     if (plugin == null and guessImageFormat(content)) plugin = findPluginByName("image");
     if (plugin == null) plugin = findPluginByName("text");
-    const decode_fn: ?DecodeFn = if (plugin) |p| p.decode_fn else null;
+    const decode_fn: ?DecodeFn = if (plugin) |p| (if (coarse) p.decode_coarse_fn else p.decode_fn) else null;
     plugin_cache_mutex.unlock();
 
     const decode_fn_val = decode_fn orelse {
-        const msg = std.fmt.allocPrint(allocator, "Nessun plugin decoder disponibile per '.{s}' (cartella decoders/ vuota o mancante)", .{ext}) catch "";
         allocator.free(content);
+        // In fase coarse un plugin senza `zuer_decode_coarse` → null: l'host farà il full.
+        if (coarse) return null;
+        const msg = std.fmt.allocPrint(allocator, "Nessun plugin decoder disponibile per '.{s}' (cartella decoders/ vuota o mancante)", .{ext}) catch "";
         return .{ .err = msg };
     };
 

@@ -19,6 +19,9 @@ extern fn stbi_image_free(retval_from_stbi_load: ?*anyopaque) void;
 
 // Limite di risoluzione della texture caricata sulla GPU: oltre, si sottocampiona.
 const max_tex_dim: usize = 2048;
+// Risoluzione del tier COARSE (prima fase progressiva): decode veloce + cache
+// minima su disco; la seconda fase ridecodifica a max_tex_dim per il dettaglio.
+const coarse_tex_dim: usize = 256;
 
 const GltfAccessor = struct {
     bufferView: ?usize = null,
@@ -193,6 +196,7 @@ fn decodeImageSource(
     allocator: std.mem.Allocator,
     out_w: *usize,
     out_h: *usize,
+    coarse: bool,
 ) ?[]u8 {
     const images = gltf.images orelse return null;
     if (source >= images.len) return null;
@@ -205,10 +209,10 @@ fn decodeImageSource(
     const encoded = bin_data[start .. start + bv.byteLength];
     if (encoded.len == 0 or encoded.len > std.math.maxInt(c_int)) return null;
 
-    // Cache su disco dell'RGBA già decodificato+sotto-campionato (chiave = hash dei
-    // byte codificati): salta il costoso decode stbi (~5s su modelli 4K) alle
-    // riaperture. Miss → decodifica e scrive in cache.
-    if (texcache.read_cached(allocator, encoded, out_w, out_h)) |cached| return cached;
+    // Fase COARSE: SOLO lettura della cache 256² (nessun decode stbi). Un miss
+    // ritorna null → il chiamante abortisce la fase coarse (niente doppio decode
+    // alla prima apertura); la cache 256 la popola la fase full.
+    if (coarse) return texcache.read_cached(allocator, encoded, out_w, out_h);
 
     var w: c_int = 0;
     var h: c_int = 0;
@@ -218,7 +222,14 @@ fn decodeImageSource(
     if (w <= 0 or h <= 0) return null;
 
     const rgba = downscaleRgba(data, @intCast(w), @intCast(h), max_tex_dim, allocator, out_w, out_h) orelse return null;
-    texcache.write_cached(allocator, encoded, out_w.*, out_h.*, rgba);
+    // Popola la cache coarse (256²) da questa decodifica full: sotto-campiona a 256
+    // in un buffer temporaneo e scrivilo, così la prossima apertura ha la coarse.
+    var cw: usize = 0;
+    var ch: usize = 0;
+    if (downscaleRgba(rgba.ptr, out_w.*, out_h.*, coarse_tex_dim, allocator, &cw, &ch)) |cr| {
+        texcache.write_cached(allocator, encoded, cw, ch, cr);
+        allocator.free(cr);
+    }
     return rgba;
 }
 
@@ -239,6 +250,8 @@ const TexJob = struct {
     srcs: []const usize,
     results: []?DecodedTex,
     next: std.atomic.Value(usize),
+    coarse: bool,
+    missed: std.atomic.Value(bool), // coarse: una texture non era in cache 256²
 };
 
 fn texWorker(job: *TexJob) void {
@@ -247,8 +260,12 @@ fn texWorker(job: *TexJob) void {
         if (i >= job.srcs.len) break;
         var w: usize = 0;
         var h: usize = 0;
-        if (decodeImageSource(job.gltf, job.bin, job.srcs[i], std.heap.page_allocator, &w, &h)) |px| {
+        if (decodeImageSource(job.gltf, job.bin, job.srcs[i], std.heap.page_allocator, &w, &h, job.coarse)) |px| {
             job.results[i] = .{ .pixels = px, .w = w, .h = h };
+        } else if (job.coarse) {
+            // Cache coarse mancante per questa texture: la fase coarse non è
+            // completabile senza decodificare (ciò che vogliamo evitare) → segnala.
+            job.missed.store(true, .monotonic);
         }
     }
 }
@@ -261,7 +278,7 @@ fn freeTexCache(cache: *TexCache, allocator: std.mem.Allocator) void {
 
 /// Decodifica in parallelo tutte le texture (baseColor/diffuse + normal) uniche
 /// referenziate dai materiali, indicizzate per immagine sorgente.
-fn buildTexCache(gltf: GltfStructure, bin_data: []const u8, allocator: std.mem.Allocator) !TexCache {
+fn buildTexCache(gltf: GltfStructure, bin_data: []const u8, allocator: std.mem.Allocator, coarse: bool) !TexCache {
     var cache: TexCache = .empty;
     errdefer freeTexCache(&cache, allocator);
 
@@ -296,7 +313,7 @@ fn buildTexCache(gltf: GltfStructure, bin_data: []const u8, allocator: std.mem.A
     defer allocator.free(results);
     @memset(results, null);
 
-    var job = TexJob{ .gltf = gltf, .bin = bin_data, .srcs = srcs, .results = results, .next = .init(0) };
+    var job = TexJob{ .gltf = gltf, .bin = bin_data, .srcs = srcs, .results = results, .next = .init(0), .coarse = coarse, .missed = .init(false) };
 
     // Spawn fino a (core−1) thread; il thread corrente drena comunque la coda,
     // così anche con 0 spawn (o spawn fallito) tutte le texture vengono decodificate.
@@ -306,6 +323,13 @@ fn buildTexCache(gltf: GltfStructure, bin_data: []const u8, allocator: std.mem.A
     for (0..spawn_n) |i| pool[i] = std.Thread.spawn(.{}, texWorker, .{&job}) catch null;
     texWorker(&job);
     for (0..spawn_n) |i| if (pool[i]) |t| t.join();
+
+    // Fase coarse con cache 256² incompleta: aborta (il chiamante farà il full).
+    // I risultati parziali (hit di cache) non sono ancora nella map → liberali qui.
+    if (coarse and job.missed.load(.monotonic)) {
+        for (results) |r| if (r) |dt| std.heap.page_allocator.free(dt.pixels);
+        return error.CoarseCacheIncomplete;
+    }
 
     // Popola la mappa sorgente→texture (single-thread, ownership al chiamante).
     for (srcs, results) |s, r| {
@@ -422,7 +446,7 @@ fn readFloatAccessor(
     return out;
 }
 
-pub fn decode(bytes: []const u8, filename: []const u8, allocator: std.mem.Allocator) Decoded {
+pub fn decode(bytes: []const u8, filename: []const u8, allocator: std.mem.Allocator, coarse: bool) Decoded {
     defer allocator.free(bytes);
 
     if (bytes.len < 20) return .{ .err = "File GLB troppo piccolo" };
@@ -456,7 +480,7 @@ pub fn decode(bytes: []const u8, filename: []const u8, allocator: std.mem.Alloca
     const gltf = parsed.value;
 
     // Decode meshes to MeshData
-    const mesh_data = decodeGltfScene(gltf, bin_data, filename, allocator) catch |err| {
+    const mesh_data = decodeGltfScene(gltf, bin_data, filename, allocator, coarse) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "Errore decodifica modello 3D GLB: {s}", .{@errorName(err)}) catch "Errore GLB";
         return .{ .err = msg };
     };
@@ -658,9 +682,9 @@ fn addNode(b: *Builder, node_idx: usize, parent: Mat4, depth: u32) !void {
 /// Carica l'intera scena glTF: attraversa il grafo dei nodi applicando le
 /// trasformazioni, fonde tutte le mesh/primitive in un'unica geometria e
 /// produce un submesh per primitiva (materiale + texture propri).
-fn decodeGltfScene(gltf: GltfStructure, bin_data: []const u8, filename: []const u8, allocator: std.mem.Allocator) !MeshData {
+fn decodeGltfScene(gltf: GltfStructure, bin_data: []const u8, filename: []const u8, allocator: std.mem.Allocator, coarse: bool) !MeshData {
     // Texture decodificate in parallelo, una per immagine sorgente (vedi buildTexCache).
-    var tex_cache = try buildTexCache(gltf, bin_data, allocator);
+    var tex_cache = try buildTexCache(gltf, bin_data, allocator, coarse);
     defer freeTexCache(&tex_cache, allocator);
 
     var b = Builder{
@@ -780,18 +804,15 @@ fn readIndex(bin_data: []const u8, offset: usize, index: usize, component_type: 
     }
 }
 
-export fn zuer_decode(
+fn decodeExport(
     path: decoder.SliceC,
     content: decoder.SliceC,
-    io_ptr: *const anyopaque,
     allocator_ptr: *const anyopaque,
-) callconv(.c) decoder.DecodedC {
-    _ = io_ptr;
+    coarse: bool,
+) decoder.DecodedC {
     const allocator = @as(*const std.mem.Allocator, @ptrCast(@alignCast(allocator_ptr))).*;
-    const path_slice = path.toSlice();
-    const content_slice = content.toSlice();
-    const filename = std.fs.path.basename(path_slice);
-    const decoded = decode(content_slice, filename, allocator);
+    const filename = std.fs.path.basename(path.toSlice());
+    const decoded = decode(content.toSlice(), filename, allocator, coarse);
     return decoded.toDecodedC(allocator) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "error";
         return .{
@@ -799,6 +820,28 @@ export fn zuer_decode(
             .payload = .{ .err = decoder.SliceC.fromSlice(msg) },
         };
     };
+}
+
+export fn zuer_decode(
+    path: decoder.SliceC,
+    content: decoder.SliceC,
+    io_ptr: *const anyopaque,
+    allocator_ptr: *const anyopaque,
+) callconv(.c) decoder.DecodedC {
+    _ = io_ptr;
+    return decodeExport(path, content, allocator_ptr, false);
+}
+
+// Prima fase progressiva: texture al tier coarse (256², da cache se presente →
+// resa istantanea). L'host la usa opzionalmente prima di `zuer_decode` (full).
+export fn zuer_decode_coarse(
+    path: decoder.SliceC,
+    content: decoder.SliceC,
+    io_ptr: *const anyopaque,
+    allocator_ptr: *const anyopaque,
+) callconv(.c) decoder.DecodedC {
+    _ = io_ptr;
+    return decodeExport(path, content, allocator_ptr, true);
 }
 
 const extensions = "glb";

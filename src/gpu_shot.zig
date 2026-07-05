@@ -40,8 +40,15 @@ pub fn main(init: std.process.Init) !void {
     const yaw: f32 = if (args.next()) |a| try std.fmt.parseFloat(f32, a) else 0.6;
     const pitch: f32 = if (args.next()) |a| try std.fmt.parseFloat(f32, a) else 0.35;
     const zoom: f32 = if (args.next()) |a| try std.fmt.parseFloat(f32, a) else 1.0;
+    const coarse = if (args.next()) |a| std.mem.eql(u8, a, "coarse") else false;
 
-    var decoded = decoder.decode(path, io, gpa);
+    var decoded = if (coarse)
+        (decoder.decodeCoarse(path, io, gpa) orelse {
+            std.debug.print("gpu-shot: coarse non disponibile/cache fredda\n", .{});
+            return error.NoCoarse;
+        })
+    else
+        decoder.decode(path, io, gpa);
     defer decoded.deinit(gpa);
     defer decoder.closePluginCache(gpa);
     if (decoded != .mesh) {

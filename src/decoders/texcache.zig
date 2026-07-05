@@ -6,8 +6,11 @@
 //! CODIFICATI (così si può interrogare senza decodificare); le riaperture leggono
 //! l'RGBA pronto (~lettura da page cache).
 //!
-//! Formato "RTX1": magic[4] | w u32 | h u32 | rgba (w*h*4 byte), little-endian.
-//! La dir è capata (LRU per mtime) per non crescere all'infinito.
+//! Formato "RTX2": magic[4] | w u32 | h u32 | rgba (w*h*4 byte), little-endian.
+//! Ci si tiene solo il tier COARSE (256²): ~192KB/texture → disco minimo. Il tier
+//! full non è cachato (si ridecodifica in background nella 2ª fase), così la
+//! cartella resta piccola senza bisogno di eviction. Il bump RTX1→RTX2 invalida
+//! i vecchi file full-res (che venivano scritti a 2048²).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -30,7 +33,7 @@ const O_WRONLY: c_int = 1;
 const O_CREAT: c_int = 0o100;
 const O_TRUNC: c_int = 0o1000;
 
-const magic = "RTX1";
+const magic = "RTX2";
 
 var tmp_seq: std.atomic.Value(u64) = .init(0);
 
