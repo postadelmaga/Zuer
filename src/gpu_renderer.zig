@@ -14,6 +14,14 @@ const builtin = @import("builtin");
 const decoder = @import("decoder.zig");
 
 const vk = @import("renderer/vk.zig");
+const vtex = @import("vtex.zig");
+const vtr = @import("vtex_runtime.zig");
+const VtexPool = @import("vtex_pool.zig").VtexPool;
+
+/// Slot GPU per texture baseColor virtualizzata (fase 2): il livello mip scelto
+/// deve avere ≤ VT_BUDGET tile così l'intero livello sta nel blocco del submesh
+/// nel pool condiviso. 64 tile ⇒ ~8×8 ⇒ ~1000px effettivi di baseColor.
+const VT_BUDGET: u32 = 64;
 
 // libc getenv, portable across Linux/Windows (std.posix.getenv is Linux-only here) — used to
 // read the ZUER_GPU device override.
@@ -50,6 +58,9 @@ pub const PushConstants = extern struct {
     material: [4]f32,
     light_vp: [16]f32,
     light_dir_cam: [4]f32,
+    /// Virtual texture baseColor: x=tiles_x, y=tiles_y del livello residente,
+    /// z=1 se attiva (altrimenti solo il fattore materiale), w libero.
+    vt: [4]f32 = .{ 0, 0, 0, 0 },
 };
 
 pub const ShadowPush = extern struct {
@@ -383,6 +394,9 @@ pub const Renderer = struct {
     mesh_sampler: VkSampler = VK_NULL,
     mesh_dsl: VkDescriptorSetLayout = VK_NULL,
     mesh_dpool: VkDescriptorPool = VK_NULL,
+    /// Pool tile GPU condiviso per le texture baseColor virtualizzate (ricreato a
+    /// ogni modello in `setSubmeshes`, dimensionato al numero di submesh testurati).
+    vt_pool: ?VtexPool = null,
     white_tex: ImageBundle = .{ .image = VK_NULL, .mem = VK_NULL, .view = VK_NULL },
     flat_normal_tex: ImageBundle = .{ .image = VK_NULL, .mem = VK_NULL, .view = VK_NULL },
     submeshes: []SubMeshGpu = &.{},
@@ -582,11 +596,13 @@ pub const Renderer = struct {
         // Binding 0 = texture baseColor, binding 1 = shadow map depth. Le risorse
         // effettive sono create pigramente; il DSL però è definitivo qui perché
         // il pipeline layout (e quindi la pipeline) lo referenzia.
-        // binding 0 = baseColor, 1 = shadow map, 2 = normal map.
+        // binding 0 = baseColor (pool VT sampler2DArray), 1 = shadow map,
+        // 2 = normal map, 3 = SSBO indirezione tile→slot del pool.
         const tex_bindings = [_]VkDescriptorSetLayoutBinding{
             .{ .binding = 0, .descriptorType = DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = SHADER_STAGE_FRAGMENT },
             .{ .binding = 1, .descriptorType = DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = SHADER_STAGE_FRAGMENT },
             .{ .binding = 2, .descriptorType = DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = SHADER_STAGE_FRAGMENT },
+            .{ .binding = 3, .descriptorType = DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = SHADER_STAGE_FRAGMENT },
         };
         var mesh_dsl: VkDescriptorSetLayout = VK_NULL;
         try check(vkCreateDescriptorSetLayout(device, &.{
@@ -672,6 +688,7 @@ pub const Renderer = struct {
             vkFreeMemory(self.device, self.voxel_mem, null);
         }
         self.releaseSubmeshes();
+        if (self.vt_pool) |*p| p.deinit();
         if (self.white_tex.image != VK_NULL) self.destroyImage(self.white_tex);
         if (self.flat_normal_tex.image != VK_NULL) self.destroyImage(self.flat_normal_tex);
         vkDestroyDescriptorPool(self.device, self.mesh_dpool, null);
@@ -848,29 +865,119 @@ pub const Renderer = struct {
     /// set con la propria texture baseColor (bind 0) e la shadow map (bind 1).
     /// Il pool descriptor viene ricreato dimensionato al numero di submesh.
     /// `subs` vuoto ⇒ un submesh unico bianco sull'intera geometria.
+    /// Contesto del mirror residenza→GPU: carica ogni tile resa residente dal
+    /// runtime nello slot `base + slot_locale` del pool condiviso.
+    const VtUploadCtx = struct {
+        pool: *VtexPool,
+        base: u32,
+        vt: *vtr.VirtualTexture,
+        fn hook(ctx: *anyopaque, tile: vtr.TileId, slot: u32) void {
+            _ = tile;
+            const c: *VtUploadCtx = @ptrCast(@alignCast(ctx));
+            c.pool.uploadTile(c.base + slot, c.vt.slotTexels(slot)) catch {};
+        }
+    };
+
+    /// Livello mip più fine il cui intero grid di tile sta in VT_BUDGET slot.
+    fn chooseVtLevel(baked: *const vtex.BakedTexture) usize {
+        var lvl: usize = 0;
+        for (baked.levels, 0..) |d, i| {
+            if (@as(u32, d.tiles_x) * d.tiles_y <= VT_BUDGET) lvl = i;
+        }
+        return lvl;
+    }
+
+    /// Buffer storage host-visible con `data` dentro (SSBO d'indirezione).
+    fn createStorageBuffer(self: *Renderer, data: []const u8, out_buf: *VkBuffer, out_mem: *VkDeviceMemory) !void {
+        const size: u64 = @max(data.len, 4);
+        var buf: VkBuffer = VK_NULL;
+        try check(vkCreateBuffer(self.device, &.{ .size = size, .usage = BUFFER_USAGE_STORAGE }, null, &buf));
+        errdefer vkDestroyBuffer(self.device, buf, null);
+        var req: VkMemoryRequirements = undefined;
+        vkGetBufferMemoryRequirements(self.device, buf, &req);
+        const mt = self.findMemoryType(req.memoryTypeBits, MEM_HOST_VISIBLE | MEM_HOST_COHERENT) orelse return error.NoMemoryType;
+        var mem: VkDeviceMemory = VK_NULL;
+        try check(vkAllocateMemory(self.device, &.{ .allocationSize = req.size, .memoryTypeIndex = mt }, null, &mem));
+        errdefer vkFreeMemory(self.device, mem, null);
+        try check(vkBindBufferMemory(self.device, buf, mem, 0));
+        var mapped: *anyopaque = undefined;
+        try check(vkMapMemory(self.device, mem, 0, size, 0, &mapped));
+        if (data.len > 0) {
+            const dst: [*]u8 = @ptrCast(mapped);
+            @memcpy(dst[0..data.len], data);
+        }
+        out_buf.* = buf;
+        out_mem.* = mem;
+    }
+
+    /// Bake della baseColor in tile, upload del livello scelto negli slot
+    /// `[base, base+budget)` del pool, e SSBO cell→slot per il fragment shader.
+    fn bakeVtBaseColor(self: *Renderer, g: *SubMeshGpu, pixels: []const u8, w: u32, h: u32, base: u32) !void {
+        var baked = try vtex.bakeTiles(self.gpa, pixels, w, h);
+        defer baked.deinit();
+        const level = chooseVtLevel(&baked);
+        const desc = baked.levels[level];
+
+        var src = vtr.MemTileSource.init(&baked);
+        var vt = try vtr.VirtualTexture.init(self.gpa, baked.levels, w, h, VT_BUDGET, vtr.MemTileSource.fill, &src);
+        defer vt.deinit();
+        var ctx = VtUploadCtx{ .pool = &self.vt_pool.?, .base = base, .vt = &vt };
+        vt.setResidentHook(&ctx, VtUploadCtx.hook);
+        vt.beginFrame();
+
+        const n_cells = @as(usize, desc.tiles_x) * desc.tiles_y;
+        const slots = try self.gpa.alloc(u32, n_cells);
+        defer self.gpa.free(slots);
+        for (0..desc.tiles_y) |ty| {
+            for (0..desc.tiles_x) |tx| {
+                const r = try vt.request(@intCast(level), @intCast(tx), @intCast(ty));
+                slots[ty * desc.tiles_x + tx] = base + r.slot;
+            }
+        }
+        try self.createStorageBuffer(std.mem.sliceAsBytes(slots), &g.vt_buf, &g.vt_mem);
+        g.vt_tiles_x = desc.tiles_x;
+        g.vt_tiles_y = desc.tiles_y;
+        g.vt_on = true;
+    }
+
     pub fn setSubmeshes(self: *Renderer, subs: []const decoder.SubMesh) !void {
         _ = vkDeviceWaitIdle(self.device);
         self.releaseSubmeshes();
+        if (self.vt_pool) |*p| {
+            p.deinit();
+            self.vt_pool = null;
+        }
         try self.ensureWhiteTexture();
         try self.ensureFlatNormal();
         try self.ensureShadow(); // la shadow map serve al binding 1 di ogni set
 
         const count: u32 = if (subs.len == 0) 1 else @intCast(subs.len);
 
-        // Ricrea il pool dimensionato per `count` set (3 sampler ciascuno:
-        // baseColor + shadow map + normal map).
+        // Pool tile GPU: un blocco di VT_BUDGET slot per ogni submesh con baseColor
+        // (almeno 1 slot così il sampler2DArray al binding 0 è sempre bindabile).
+        var textured: u32 = 0;
+        for (subs) |s| {
+            if (s.tex_width > 0 and s.tex_height > 0 and s.tex_pixels.len >= s.tex_width * s.tex_height * 4) textured += 1;
+        }
+        self.vt_pool = try VtexPool.init(self.device, &self.mem_props, self.queue, self.cmd, self.fence, @max(1, textured * VT_BUDGET));
+
+        // Ricrea il pool descriptor: 3 sampler + 1 SSBO per set.
         vkDestroyDescriptorPool(self.device, self.mesh_dpool, null);
         self.mesh_dpool = VK_NULL;
-        const pool_size = VkDescriptorPoolSize{ .type = DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 3 * count };
+        const pool_sizes = [_]VkDescriptorPoolSize{
+            .{ .type = DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 3 * count },
+            .{ .type = DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = count },
+        };
         try check(vkCreateDescriptorPool(self.device, &.{
             .maxSets = count,
-            .poolSizeCount = 1,
-            .pPoolSizes = @ptrCast(&pool_size),
+            .poolSizeCount = pool_sizes.len,
+            .pPoolSizes = &pool_sizes,
         }, null, &self.mesh_dpool));
 
         const out = try self.gpa.alloc(SubMeshGpu, count);
         errdefer self.gpa.free(out);
 
+        var next_base: u32 = 0;
         for (0..count) |i| {
             var g = SubMeshGpu{
                 .first_index = 0,
@@ -892,8 +999,8 @@ pub const Renderer = struct {
                 g.metallic = s.metallic;
                 g.roughness = s.roughness;
                 if (s.tex_width > 0 and s.tex_height > 0 and s.tex_pixels.len >= s.tex_width * s.tex_height * 4) {
-                    g.tex = try self.createSampledTexture(s.tex_pixels, @intCast(s.tex_width), @intCast(s.tex_height), true);
-                    g.owns_tex = true;
+                    try self.bakeVtBaseColor(&g, s.tex_pixels, @intCast(s.tex_width), @intCast(s.tex_height), next_base);
+                    next_base += VT_BUDGET;
                 }
                 if (s.nrm_tex_width > 0 and s.nrm_tex_height > 0 and s.nrm_tex_pixels.len >= s.nrm_tex_width * s.nrm_tex_height * 4) {
                     // Normal map = dati lineari (non sRGB).
@@ -901,16 +1008,22 @@ pub const Renderer = struct {
                     g.owns_nrm_tex = true;
                 }
             }
+            // Ogni set deve avere un SSBO valido al binding 3 (dummy per i submesh
+            // senza baseColor virtualizzata, vt_on=false).
+            if (g.vt_buf == VK_NULL) try self.createStorageBuffer(&[_]u8{ 0, 0, 0, 0 }, &g.vt_buf, &g.vt_mem);
             errdefer {
-                if (g.owns_tex) self.destroyImage(g.tex);
                 if (g.owns_nrm_tex) self.destroyImage(g.nrm_tex);
+                if (g.vt_buf != VK_NULL) {
+                    vkDestroyBuffer(self.device, g.vt_buf, null);
+                    vkFreeMemory(self.device, g.vt_mem, null);
+                }
             }
 
             try check(vkAllocateDescriptorSets(self.device, &.{
                 .descriptorPool = self.mesh_dpool,
                 .pSetLayouts = @ptrCast(&self.mesh_dsl),
             }, &g.dset));
-            self.writeSubmeshDescriptors(g.dset, g.tex.view, g.nrm_tex.view);
+            self.writeSubmeshDescriptors(g.dset, g.nrm_tex.view, g.vt_buf);
 
             out[i] = g;
         }
@@ -924,6 +1037,10 @@ pub const Renderer = struct {
         for (self.submeshes) |sm| {
             if (sm.owns_tex and sm.tex.image != VK_NULL) self.destroyImage(sm.tex);
             if (sm.owns_nrm_tex and sm.nrm_tex.image != VK_NULL) self.destroyImage(sm.nrm_tex);
+            if (sm.vt_buf != VK_NULL) {
+                vkDestroyBuffer(self.device, sm.vt_buf, null);
+                vkFreeMemory(self.device, sm.vt_mem, null);
+            }
         }
         if (self.submeshes.len > 0) self.gpa.free(self.submeshes);
         self.submeshes = &.{};
@@ -944,18 +1061,21 @@ pub const Renderer = struct {
         self.flat_normal_tex = try self.createSampledTexture(&flat, 1, 1, false);
     }
 
-    /// Collega al descriptor set baseColor (bind 0), shadow map (bind 1) e
-    /// normal map (bind 2), in una sola update.
-    fn writeSubmeshDescriptors(self: *Renderer, dset: VkDescriptorSet, tex_view: VkImageView, nrm_view: VkImageView) void {
+    /// Collega al descriptor set il pool VT baseColor (bind 0, sampler2DArray
+    /// condiviso), la shadow map (bind 1), la normal map (bind 2) e l'SSBO
+    /// d'indirezione tile→slot (bind 3), in una sola update.
+    fn writeSubmeshDescriptors(self: *Renderer, dset: VkDescriptorSet, nrm_view: VkImageView, vt_buf: VkBuffer) void {
         const infos = [_]VkDescriptorImageInfo{
-            .{ .sampler = self.mesh_sampler, .imageView = tex_view, .imageLayout = IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+            self.vt_pool.?.imageInfo(),
             .{ .sampler = self.shadow_sampler, .imageView = self.shadow_depth.view, .imageLayout = IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL },
             .{ .sampler = self.mesh_sampler, .imageView = nrm_view, .imageLayout = IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
         };
+        const buf_info = VkDescriptorBufferInfo{ .buffer = vt_buf, .offset = 0, .range = std.math.maxInt(u64) };
         const writes = [_]VkWriteDescriptorSet{
             .{ .dstSet = dset, .dstBinding = 0, .descriptorType = DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &infos[0] },
             .{ .dstSet = dset, .dstBinding = 1, .descriptorType = DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &infos[1] },
             .{ .dstSet = dset, .dstBinding = 2, .descriptorType = DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &infos[2] },
+            .{ .dstSet = dset, .dstBinding = 3, .descriptorType = DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &buf_info },
         };
         vkUpdateDescriptorSets(self.device, writes.len, &writes, 0, null);
     }
@@ -1149,6 +1269,7 @@ pub const Renderer = struct {
             lpc.material = sm.base_color;
             lpc.nrm0[3] = sm.roughness;
             lpc.nrm1[3] = sm.metallic;
+            lpc.vt = .{ @floatFromInt(sm.vt_tiles_x), @floatFromInt(sm.vt_tiles_y), if (sm.vt_on) 1.0 else 0.0, 0.0 };
             vkCmdPushConstants(cmd, self.pipeline_layout, SHADER_STAGE_VERTEX | SHADER_STAGE_FRAGMENT, 0, @sizeOf(PushConstants), &lpc);
             vkCmdBindDescriptorSets(cmd, 0, self.pipeline_layout, 0, 1, &[_]VkDescriptorSet{sm.dset}, 0, null);
             vkCmdDrawIndexed(cmd, sm.index_count, 1, sm.first_index, 0, 0);
@@ -1240,6 +1361,7 @@ pub const Renderer = struct {
             lpc.material = sm.base_color;
             lpc.nrm0[3] = sm.roughness;
             lpc.nrm1[3] = sm.metallic;
+            lpc.vt = .{ @floatFromInt(sm.vt_tiles_x), @floatFromInt(sm.vt_tiles_y), if (sm.vt_on) 1.0 else 0.0, 0.0 };
             vkCmdPushConstants(self.cmd, self.pipeline_layout, SHADER_STAGE_VERTEX | SHADER_STAGE_FRAGMENT, 0, @sizeOf(PushConstants), &lpc);
             vkCmdBindDescriptorSets(self.cmd, 0, self.pipeline_layout, 0, 1, &[_]VkDescriptorSet{sm.dset}, 0, null);
             vkCmdDrawIndexed(self.cmd, sm.index_count, 1, sm.first_index, 0, 0);
@@ -1503,6 +1625,12 @@ pub const Renderer = struct {
         nrm_tex: ImageBundle,
         owns_nrm_tex: bool, // false se `nrm_tex` è la flat condivisa
         dset: VkDescriptorSet,
+        // Virtual texture baseColor: SSBO cell→slot + griglia del livello residente.
+        vt_buf: VkBuffer = VK_NULL,
+        vt_mem: VkDeviceMemory = VK_NULL,
+        vt_tiles_x: u32 = 0,
+        vt_tiles_y: u32 = 0,
+        vt_on: bool = false,
     };
 
     fn createImage(self: *Renderer, width: u32, height: u32, format: u32, usage: u32, aspect: u32, with_view: bool) !ImageBundle {

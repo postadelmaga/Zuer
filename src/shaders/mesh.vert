@@ -12,6 +12,7 @@ layout(push_constant) uniform PC {
     vec4 material; // rgb = baseColor factor; a = alpha
     mat4 light_vp;
     vec4 light_dir_cam;
+    vec4 vt;
 } pc;
 
 layout(location = 0) in vec3 in_pos;

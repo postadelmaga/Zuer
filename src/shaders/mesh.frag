@@ -8,6 +8,7 @@ layout(push_constant) uniform PC {
     vec4 material; // rgb = baseColor factor
     mat4 light_vp;
     vec4 light_dir_cam; // key light in spazio camera
+    vec4 vt;            // x,y = tiles_x,tiles_y del livello; z = 1 se VT attiva
 } pc;
 
 layout(location = 0) in vec3 v_normal;
@@ -16,14 +17,34 @@ layout(location = 2) in vec4 v_shadow_coord;
 layout(location = 3) in vec4 v_tangent;
 layout(location = 0) out vec4 out_color;
 
-// baseColor sRGB (1×1 bianca se assente), shadow map depth della key light e
-// normal map tangent-space lineare (1×1 piatta se assente).
-layout(set = 0, binding = 0) uniform sampler2D baseColorTex;
+// baseColor virtualizzata: pool di tile 128² come sampler2DArray (bind 0) +
+// SSBO d'indirezione cell→slot (bind 3). shadow map depth della key light
+// (bind 1) e normal map tangent-space lineare (bind 2, 1×1 piatta se assente).
+layout(set = 0, binding = 0) uniform sampler2DArray vtPool;
 layout(set = 0, binding = 1) uniform sampler2D shadowMap;
 layout(set = 0, binding = 2) uniform sampler2D normalTex;
+layout(set = 0, binding = 3, std430) readonly buffer VtIndir { uint vtSlots[]; };
 
 const float PI = 3.14159265359;
 const float SHADOW_TEXEL = 1.0 / 1024.0;
+
+// Geometria tile del pool (deve combaciare con vtex.zig).
+const float VT_TILE = 128.0;
+const float VT_GUTTER = 2.0;
+const float VT_INNER = 124.0;
+
+// Campiona la baseColor virtuale a UV: individua la cella del livello residente,
+// ne legge lo slot fisico dall'SSBO, e campiona il texel locale dentro l'inner
+// gutter-padded della tile. Il pool è UNORM ma contiene byte sRGB → linearizza.
+vec3 sampleVTBase(vec2 uv) {
+    float txf = clamp(uv.x, 0.0, 0.999999) * pc.vt.x;
+    float tyf = clamp(uv.y, 0.0, 0.999999) * pc.vt.y;
+    uint cell = uint(tyf) * uint(pc.vt.x) + uint(txf);
+    float slot = float(vtSlots[cell]);
+    float lx = (VT_GUTTER + fract(txf) * VT_INNER) / VT_TILE;
+    float ly = (VT_GUTTER + fract(tyf) * VT_INNER) / VT_TILE;
+    return pow(texture(vtPool, vec3(lx, ly, slot)).rgb, vec3(2.2));
+}
 
 vec3 aces(vec3 x) {
     return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
@@ -106,7 +127,8 @@ void main() {
         }
     }
 
-    vec3 albedo = pc.material.rgb * texture(baseColorTex, v_uv).rgb;
+    vec3 baseTex = (pc.vt.z > 0.5) ? sampleVTBase(v_uv) : vec3(1.0);
+    vec3 albedo = pc.material.rgb * baseTex;
     float roughness = clamp(pc.nrm0.w, 0.04, 1.0);
     float metallic = clamp(pc.nrm1.w, 0.0, 1.0);
     vec3 f0 = mix(vec3(0.04), albedo, metallic);
