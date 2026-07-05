@@ -205,6 +205,9 @@ const GuiAppState = struct {
     pf_cache: *std.StringHashMapUnmanaged(Prefetched),
     pf_want: *[2]?[]u8, // percorsi (posseduti) dei vicini da tenere in cache
     pf_stop: *bool, // protetto da pf_mutex
+    pf_dirty: *bool, // richiesta nuova da processare (protetto da pf_mutex): `pf_want`
+    // è uno stato persistente, non una coda, quindi non si può usare per capire
+    // se c'è lavoro nuovo — senza questo flag il worker gira a vuoto al 100% di CPU
 
     /// Estrae dalla cache il file già decodificato per `path` (e lo rimuove),
     /// oppure `null` se non pronto. Chiamato dal thread main alla navigazione.
@@ -226,6 +229,7 @@ const GuiAppState = struct {
             if (slot.*) |old| self.gpa.free(old);
             slot.* = if (want) |w| (self.gpa.dupe(u8, w) catch null) else null;
         }
+        self.pf_dirty.* = true;
         self.pf_mutex.unlock(self.io);
         self.pf_cond.signal(self.io);
     }
@@ -521,7 +525,10 @@ const GuiAppState = struct {
         const az = layout.autoZoomForContent(kind, nat_w, nat_h);
         self.zoom.* = az;
         const size = layout.initialWindowSize(kind, layout.scaleDim(nat_w, az), layout.scaleDim(nat_h, az));
-        win.animateResize(size.w, size.h);
+        // `resizeToContent` gira anche sul loadWorker (navigazione a cache-miss):
+        // il resize va differito al thread finestra, le surface Wayland non sono
+        // thread-safe (altrimenti `xdg_surface: attached a buffer before configure`).
+        win.requestResize(size.w, size.h);
     }
 };
 
@@ -1660,6 +1667,7 @@ pub fn main(init: std.process.Init) !void {
     var pf_cache: std.StringHashMapUnmanaged(Prefetched) = .empty;
     var pf_want: [2]?[]u8 = .{ null, null };
     var pf_stop: bool = false;
+    var pf_dirty: bool = false;
 
     // Stato del loader thread della navigazione async (vedi loadWorker/postLoad).
     var ld_mutex: std.Io.Mutex = .init;
@@ -1725,6 +1733,7 @@ pub fn main(init: std.process.Init) !void {
         .pf_cache = &pf_cache,
         .pf_want = &pf_want,
         .pf_stop = &pf_stop,
+        .pf_dirty = &pf_dirty,
         .ld_mutex = &ld_mutex,
         .ld_cond = &ld_cond,
         .ld_req = &ld_req,
@@ -1953,12 +1962,16 @@ fn prefetchWorker(state: *GuiAppState) void {
     while (true) {
         // Attende una richiesta (o lo stop) e ne prende una copia dei percorsi.
         state.pf_mutex.lockUncancelable(io);
-        while (!state.pf_stop.* and state.pf_want[0] == null and state.pf_want[1] == null)
+        // Attende una richiesta NUOVA (pf_dirty), non la semplice presenza di
+        // vicini desiderati: pf_want è persistente e resterebbe sempre non-null,
+        // facendo girare il worker a vuoto. Consuma il flag qui sotto il lock.
+        while (!state.pf_stop.* and !state.pf_dirty.*)
             state.pf_cond.waitUncancelable(io, state.pf_mutex);
         if (state.pf_stop.*) {
             state.pf_mutex.unlock(io);
             break;
         }
+        state.pf_dirty.* = false;
         var want: [2]?[]u8 = .{ null, null };
         for (&want, state.pf_want) |*w, src| w.* = if (src) |s| (gpa.dupe(u8, s) catch null) else null;
         // Evince dalla cache tutto ciò che non è più tra i vicini desiderati.
