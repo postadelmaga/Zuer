@@ -17,14 +17,15 @@ const font_bold = @embedFile("assets/Hack-Bold.ttf");
 const font_italic = @embedFile("assets/Hack-Italic.ttf");
 const font_bold_italic = @embedFile("assets/Hack-BoldItalic.ttf");
 
-// Famiglia proporzionale (Liberation Sans, metrica-compatibile con Arial) per il
-// rendering "foglio di calcolo" delle tabelle. Corsivi non necessari: ripiegano
-// su regular/bold.
-const font_sans_regular = @embedFile("assets/LiberationSans-Regular.ttf");
-const font_sans_bold = @embedFile("assets/LiberationSans-Bold.ttf");
+// Famiglia proporzionale per il rendering "foglio di calcolo" delle tabelle:
+// Ubuntu-Light, lo stesso font di default di egui usato da ../viewer, così csv/xlsx
+// hanno resa identica. Ubuntu-Light non ha una faccia bold: header e corsivi
+// ripiegano sulla stessa faccia (in viewer l'header è distinto solo dal colore).
+const font_sans_regular = @embedFile("assets/Ubuntu-Light.ttf");
+const font_sans_bold = @embedFile("assets/Ubuntu-Light.ttf");
 
 /// Famiglia tipografica: `mono` (Hack, per codice/testo, resa a griglia) oppure
-/// `sans` (Liberation Sans, proporzionale, per le tabelle).
+/// `sans` (Ubuntu-Light, proporzionale, per le tabelle — parità con ../viewer).
 pub const Family = enum { mono, sans };
 
 pub const Rgb = struct {

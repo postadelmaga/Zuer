@@ -968,12 +968,15 @@ fn scrollCallback(win: *zrame.Window, axis: u32, value: i32, user: ?*anyopaque) 
     }
 }
 
-fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopaque) void {
-    const app_state: *GuiAppState = @ptrCast(@alignCast(user orelse return));
+/// Ritorna true se zuer ha "consumato" l'evento: zrame allora salta le sue azioni
+/// di default (spostamento/ridimensionamento finestra dal bordo, senza titlebar).
+/// Così un click sulla scrollbar afferra il thumb invece di spostare la finestra.
+fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopaque) bool {
+    const app_state: *GuiAppState = @ptrCast(@alignCast(user orelse return false));
     switch (event) {
         .button => |btn| {
             // 0x110 = BTN_LEFT (click sinistro), 0x111 = BTN_RIGHT (click destro)
-            if (btn.button != 0x110 and btn.button != 0x111) return;
+            if (btn.button != 0x110 and btn.button != 0x111) return false;
             const down = (btn.state == 1);
             if (!down) {
                 app_state.mutex.lockUncancelable(app_state.io);
@@ -986,7 +989,7 @@ fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopaque)
                 }
                 app_state.dragging.* = false;
                 app_state.mutex.unlock(app_state.io);
-                return;
+                return true;
             }
             // Click sinistro sulla barra delle linguette (in fondo): cambia foglio.
             if (btn.button == 0x110 and app_state.is_table.* and app_state.tab_bar.count > 0) {
@@ -1009,7 +1012,7 @@ fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopaque)
                         }
                         app_state.mutex.unlock(app_state.io);
                     }
-                    return; // click sulla barra consumato (niente selezione)
+                    return true; // click sulla barra consumato (niente selezione)
                 }
             }
             // Click sinistro: prima offri la pressione alla scrollbar (afferra il
@@ -1019,12 +1022,25 @@ fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopaque)
                 const grabbed = app_state.sc.onButtonDown(app_state.last_x.*, app_state.last_y.*);
                 if (grabbed) app_state.file_changed.* = true;
                 app_state.mutex.unlock(app_state.io);
-                if (grabbed) return;
+                if (grabbed) return true;
             }
-            // Pressione sinistra sul testo: avvia la selezione.
+            // Pressione sinistra sul testo: avvia la selezione — ma non troppo vicino al
+            // bordo, dove (se il thumb non ha già afferrato sopra) lasciamo a zrame il
+            // ridimensionamento della finestra. Senza questo, ogni click sul contenuto
+            // consuma l'evento e la finestra risulta "fissa".
             if (btn.button == 0x110 and app_state.is_text.*) {
                 const W = win.panel_w;
                 const H = win.panel_h;
+                const eb: f32 = 8.0; // banda resize di zrame (resizeEdgeAt)
+                const rx = app_state.last_x.*;
+                const ry = app_state.last_y.*;
+                const near_edge = rx < eb or ry < eb or
+                    rx > @as(f32, @floatFromInt(W)) - eb or
+                    ry > @as(f32, @floatFromInt(H)) - eb;
+                if (near_edge) {
+                    app_state.dragging.* = down;
+                    return false; // bordo libero: zrame ridimensiona
+                }
                 app_state.mutex.lockUncancelable(app_state.io);
                 if (app_state.text_lines.items.len > 0) {
                     const hit = textHit(app_state, W, H, app_state.last_x.*, app_state.last_y.*);
@@ -1034,11 +1050,14 @@ fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopaque)
                     app_state.sel_selecting.* = true;
                     app_state.file_changed.* = true;
                     app_state.mutex.unlock(app_state.io);
-                    return;
+                    return true;
                 }
                 app_state.mutex.unlock(app_state.io);
             }
             app_state.dragging.* = down;
+            // Non consumato: click nel contenuto senza elemento interattivo — lascia a
+            // zrame l'eventuale move/resize dal bordo (comportamento di default).
+            return false;
         },
         .motion => |mot| {
             // La scrollbar vede sempre il movimento: aggiorna hover/thumb e, se sta
@@ -1051,7 +1070,7 @@ fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopaque)
             if (sc_consumed) {
                 app_state.last_x.* = mot.x;
                 app_state.last_y.* = mot.y;
-                return;
+                return true;
             }
             if (app_state.sel_selecting.*) {
                 app_state.mutex.lockUncancelable(app_state.io);
@@ -1078,6 +1097,9 @@ fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopaque)
             }
             app_state.last_x.* = mot.x;
             app_state.last_y.* = mot.y;
+            // Consuma il movimento mentre selezioni/trascini, così zrame non mostra il
+            // cursore di resize sul bordo durante l'interazione.
+            return app_state.sel_selecting.* or app_state.dragging.*;
         },
         .leave => {
             // Puntatore fuori dalla finestra: spegni l'hover della scrollbar (fade)
@@ -1089,6 +1111,7 @@ fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopaque)
             app_state.mutex.unlock(app_state.io);
             app_state.last_x.* = -1;
             app_state.last_y.* = -1;
+            return false;
         },
     }
 }
@@ -1605,8 +1628,13 @@ fn initialWindowSize(kind: WinKind, img_w: u32, img_h: u32) struct { w: u32, h: 
             // Immagine async (dimensioni ignote finché non è decodificata): landscape.
             return .{ .w = @min(max_w, 1280), .h = @min(max_h, 800) };
         },
-        // Documento: proporzione ritratto tipo pagina.
-        .document => return .{ .w = @min(max_w, 860), .h = @min(max_h, 1040) },
+        // Documento: al massimo una pagina A4 (ritratto 210:297), capata allo schermo.
+        // L'altezza guida; la larghezza segue il rapporto A4, senza sbordare da max_w.
+        .document => {
+            const a4_h: u32 = @min(max_h, 1123);
+            const a4_w: u32 = @min(max_w, @as(u32, @intFromFloat(@round(@as(f32, @floatFromInt(a4_h)) * 210.0 / 297.0))));
+            return .{ .w = a4_w, .h = a4_h };
+        },
         // Tabella (csv/xls/zip): dimensiona sulla larghezza reale delle colonne
         // (img_w/img_h = dimensione naturale della griglia), con tetto sullo
         // schermo. Oltre max_w la finestra si ferma e scatta lo scroll orizzontale.

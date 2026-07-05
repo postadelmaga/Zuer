@@ -69,6 +69,13 @@ fn pxHeight(pointsize: usize) f32 {
     return @as(f32, @floatFromInt(pointsize)) * 96.0 / 72.0;
 }
 
+/// Corpo del testo tabellare (celle/header csv/xlsx) in pixel: parità con
+/// ../viewer, che rende a 13.5px (default egui). `pointsize` codifica lo zoom
+/// utente (15 = zoom 1), quindi il corpo scala con lo zoom mantenendo 13.5px a 1x.
+fn tableTextPx(pointsize: usize) f32 {
+    return @as(f32, @floatFromInt(pointsize)) * (13.5 / 15.0);
+}
+
 /// Un tratto di testo omogeneo (stesso colore e stile) su una riga visiva.
 const Run = struct {
     text: []const u8,
@@ -136,7 +143,7 @@ pub fn renderDoc(gpa: std.mem.Allocator, decoded: *const decoder_mod.Decoded, na
             }
             try out_lines.append(gpa, try line.toOwnedSlice(gpa));
         }
-        var sans = try glyph.Raster.initFamily(gpa, pxHeight(opts.pointsize), .sans);
+        var sans = try glyph.Raster.initFamily(gpa, tableTextPx(opts.pointsize), .sans);
         const row_h = sans.lineHeight() + row_extra;
         sans.deinit();
         out_metrics.* = .{ .advance = 8, .line_h = row_h, .pad_x = pad_x, .pad_y = pad_y };
@@ -433,7 +440,7 @@ fn cellIsNumeric(s: []const u8) bool {
 /// colonne ai loro ampiezza reale + margini; altezza = header + righe). Usata per
 /// dimensionare la finestra sulle colonne. Mantiene la stessa logica di `paintTable`.
 pub fn tableNaturalSize(gpa: std.mem.Allocator, c: decoder_mod.CsvData, opts: RenderOpts) !struct { w: usize, h: usize } {
-    var raster = try glyph.Raster.initFamily(gpa, pxHeight(opts.pointsize), .sans);
+    var raster = try glyph.Raster.initFamily(gpa, tableTextPx(opts.pointsize), .sans);
     defer raster.deinit();
     const row_h: i32 = raster.lineHeight() + row_extra;
     const ncols = c.headers.len;
@@ -457,7 +464,7 @@ pub fn tableNaturalSize(gpa: std.mem.Allocator, c: decoder_mod.CsvData, opts: Re
 
 /// Rende una tabella CSV con font proporzionale e chrome da foglio di calcolo.
 fn paintTable(gpa: std.mem.Allocator, c: decoder_mod.CsvData, opts: RenderOpts) !decoder_mod.ImageData {
-    var raster = try glyph.Raster.initFamily(gpa, pxHeight(opts.pointsize), .sans);
+    var raster = try glyph.Raster.initFamily(gpa, tableTextPx(opts.pointsize), .sans);
     defer raster.deinit();
 
     const ascent = raster.ascent;
