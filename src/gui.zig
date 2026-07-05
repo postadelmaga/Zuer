@@ -136,6 +136,15 @@ const GuiAppState = struct {
     // Vero mentre il decoder del file iniziale gira su un thread di background:
     // il worker mostra lo spinner di caricamento invece del contenuto.
     loading: *bool,
+    // Thread di caricamento asincrono per la navigazione a cache-miss: decodifica
+    // fuori dal thread finestra così il worker può animare lo spinner (il thread
+    // finestra resta libero di committare). `ld_gen` = latest-wins: il thread
+    // applica solo se la sua generazione è ancora quella corrente. Protetti da ld_mutex.
+    ld_mutex: *std.Io.Mutex,
+    ld_cond: *std.Io.Condition,
+    ld_req: *?[]u8, // percorso (posseduto) da caricare, null = nessuna richiesta
+    ld_gen: *u32,
+    ld_stop: *bool,
     // Incrementato a ogni load: il worker ri-rasterizza il testo solo quando
     // cambiano file, larghezza o zoom — mai per un semplice scroll.
     load_seq: *u32,
@@ -251,6 +260,22 @@ const GuiAppState = struct {
             return;
         }
         try self.applyDecoded(new_decoded, null, new_path);
+    }
+
+    /// Posta una richiesta di caricamento asincrono al `loadWorker` e accende lo
+    /// spinner. Usata dalla navigazione a cache-miss: il decode avviene fuori dal
+    /// thread finestra, che resta libero di committare i frame dello spinner.
+    fn postLoad(self: *GuiAppState, new_path: []const u8) void {
+        self.ld_mutex.lockUncancelable(self.io);
+        if (self.ld_req.*) |old| self.gpa.free(old);
+        self.ld_req.* = self.gpa.dupe(u8, new_path) catch null;
+        self.ld_gen.* +%= 1;
+        self.ld_mutex.unlock(self.io);
+        self.mutex.lockUncancelable(self.io);
+        self.loading.* = true;
+        self.file_changed.* = true;
+        self.mutex.unlock(self.io);
+        self.ld_cond.signal(self.io);
     }
 
     /// Installa un contenuto già decodificato nello stato condiviso (swap sotto
@@ -406,24 +431,23 @@ const GuiAppState = struct {
 
         self.current_file_index = next_idx;
 
-        // Cache-hit: il vicino è già decodificato (e staged) → swap istantaneo.
-        // Cache-miss (scroll più veloce del prefetch): fallback al decode sincrono.
+        // Cache-hit: il vicino è già decodificato (e staged) → swap istantaneo e
+        // sincrono (nessuno spinner: è già pronto).
         if (self.cacheTake(new_path)) |pf| {
             self.applyDecoded(pf.decoded, pf.stage, new_path) catch |err|
                 std.debug.print("Impossibile applicare il file (cache): {s}\n", .{@errorName(err)});
+            // Contenuto nuovo installato: ridimensiona la finestra sulla forma del
+            // contenuto (stessa euristica del sizing iniziale) con un'animazione.
+            self.resizeToContent();
+            // Precarica i nuovi vicini per rendere istantanea la prossima freccia.
+            self.schedulePrefetchAround();
         } else {
-            self.loadFile(new_path) catch |err| {
-                std.debug.print("Impossibile caricare il file: {s}\n", .{@errorName(err)});
-                return;
-            };
+            // Cache-miss (scroll più veloce del prefetch, o file troppo grande per
+            // il prefetch): carica in ASINCRONO col loader thread, così il worker
+            // può mostrare lo spinner e il thread finestra resta reattivo. resize +
+            // prefetch li fa `loadWorker` dopo l'apply.
+            self.postLoad(new_path);
         }
-
-        // Contenuto nuovo installato: ridimensiona la finestra sulla forma del
-        // contenuto (stessa euristica del sizing iniziale) con un'animazione.
-        self.resizeToContent();
-
-        // Precarica i nuovi vicini per rendere istantanea la prossima freccia.
-        self.schedulePrefetchAround();
     }
 
     /// Ridimensiona (con animazione) la finestra sulla forma del contenuto
@@ -1099,6 +1123,11 @@ fn renderWorker(
     // in sospeso finché un input non risveglia il loop → la mesh/immagine "appare
     // solo dopo un click". Più present ravvicinati garantiscono il commit.
     var present_pulse: u32 = 0;
+    // Soglia anti-flash dello spinner: mostralo solo se il caricamento supera
+    // ~120 ms (i file veloci/piccoli si aprono senza far lampeggiare il loader).
+    // Sotto soglia il worker continua a mostrare il contenuto PRECEDENTE.
+    var load_elapsed: f64 = 0;
+    var was_loading = false;
 
     // La primitiva scrollbar `state.sc` è condivisa coi callback input: qui la si usa
     // solo entro il lock del mutex (già preso attorno alla sezione compose).
@@ -1118,9 +1147,16 @@ fn renderWorker(
 
         state.mutex.lockUncancelable(state.io);
 
-        // Il file iniziale è ancora in decodifica su un thread di background:
-        // anima lo spinner a 60 Hz finché `applyDecoded` non azzera il flag.
-        if (state.loading.*) {
+        // Traccia da quanto dura il caricamento per la soglia anti-flash.
+        const now_loading = state.loading.*;
+        if (now_loading and !was_loading) load_elapsed = 0;
+        load_elapsed = if (now_loading) load_elapsed + frame_dt else 0;
+        was_loading = now_loading;
+
+        // Caricamento in corso da oltre la soglia: anima lo spinner a 60 Hz finché
+        // `applyDecoded` non azzera il flag. Sotto soglia si prosegue mostrando il
+        // contenuto precedente (niente lampeggio del loader sui file veloci).
+        if (now_loading and load_elapsed >= 0.12) {
             if (composited_rgba.len < cur_w * cur_h * 4) {
                 state.gpa.free(composited_rgba.*);
                 // 4-byte aligned: la fase di compose lo rilegge come []u32 per il
@@ -1512,6 +1548,13 @@ pub fn main(init: std.process.Init) !void {
     var pf_want: [2]?[]u8 = .{ null, null };
     var pf_stop: bool = false;
 
+    // Stato del loader thread della navigazione async (vedi loadWorker/postLoad).
+    var ld_mutex: std.Io.Mutex = .init;
+    var ld_cond: std.Io.Condition = .init;
+    var ld_req: ?[]u8 = null;
+    var ld_gen: u32 = 0;
+    var ld_stop: bool = false;
+
     var gui_state = GuiAppState{
         .gpa = gpa,
         .io = io,
@@ -1569,6 +1612,11 @@ pub fn main(init: std.process.Init) !void {
         .pf_cache = &pf_cache,
         .pf_want = &pf_want,
         .pf_stop = &pf_stop,
+        .ld_mutex = &ld_mutex,
+        .ld_cond = &ld_cond,
+        .ld_req = &ld_req,
+        .ld_gen = &ld_gen,
+        .ld_stop = &ld_stop,
     };
     defer {
         gpa.free(gui_state.current_file_path);
@@ -1687,6 +1735,18 @@ pub fn main(init: std.process.Init) !void {
         pf_cond.signal(io);
         prefetch_thread.join();
     }
+
+    // Loader thread della navigazione async (cache-miss): fermato e gioinato prima
+    // che lo stato condiviso venga distrutto (defer registrato dopo → esegue prima).
+    const load_thread = try std.Thread.spawn(.{}, loadWorker, .{&gui_state});
+    defer {
+        ld_mutex.lockUncancelable(io);
+        ld_stop = true;
+        ld_mutex.unlock(io);
+        ld_cond.signal(io);
+        load_thread.join();
+        if (ld_req) |x| gpa.free(x);
+    }
     // Percorso sincrono: il file iniziale è già pronto → precarica subito i
     // vicini. (Nel percorso async lo fa `decodeInitial` dopo aver installato
     // il contenuto, per non decodificare in parallelo al decode iniziale.)
@@ -1713,6 +1773,53 @@ fn decodeInitial(state: *GuiAppState, path: []const u8) void {
         std.debug.print("Impossibile applicare il file decodificato: {s}\n", .{@errorName(e)});
     // Contenuto iniziale pronto: precarica i vicini per una navigazione fluida.
     state.schedulePrefetchAround();
+}
+
+/// Thread di caricamento asincrono della navigazione: attende le richieste di
+/// `postLoad` (cache-miss), decodifica fuori dal thread finestra e installa il
+/// risultato con `applyDecoded` (che spegne lo spinner) + resize + prefetch.
+/// Latest-wins: se nel frattempo è arrivata una richiesta più recente (`ld_gen`
+/// cambiato) scarta il risultato — la nuova verrà processata al giro dopo.
+fn loadWorker(state: *GuiAppState) void {
+    const io = state.io;
+    const gpa = state.gpa;
+    while (true) {
+        state.ld_mutex.lockUncancelable(io);
+        while (!state.ld_stop.* and state.ld_req.* == null)
+            state.ld_cond.waitUncancelable(io, state.ld_mutex);
+        if (state.ld_stop.*) {
+            state.ld_mutex.unlock(io);
+            break;
+        }
+        const path = state.ld_req.*.?;
+        state.ld_req.* = null;
+        const gen = state.ld_gen.*;
+        state.ld_mutex.unlock(io);
+        defer gpa.free(path);
+
+        // Decode CPU fuori da ogni lock.
+        var d = decoder_mod.decode(path, io, gpa);
+
+        // Superseded da una navigazione più recente? scarta (la più nuova arriverà).
+        state.ld_mutex.lockUncancelable(io);
+        const stale = gen != state.ld_gen.*;
+        state.ld_mutex.unlock(io);
+        if (stale) {
+            d.deinit(gpa);
+            continue;
+        }
+
+        if (d == .err) {
+            const msg: []const u8 = std.fmt.allocPrint(gpa, "Errore nel caricamento del file:\n{s}", .{d.err}) catch "";
+            d.deinit(gpa);
+            state.applyDecoded(.{ .text = msg }, null, path) catch {};
+        } else {
+            state.applyDecoded(d, null, path) catch |e|
+                std.debug.print("Impossibile applicare il file (async): {s}\n", .{@errorName(e)});
+        }
+        state.resizeToContent();
+        state.schedulePrefetchAround();
+    }
 }
 
 /// Thread di prefetch: decodifica (e stage-a, se mesh) i file vicini indicati da
