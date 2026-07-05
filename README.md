@@ -57,8 +57,13 @@ zuer-gui ~/cartella/       # naviga i file della cartella con le frecce
 ## Windows (cross-compile da Linux)
 
 `zuer-gui.exe` gira su Windows — verificato sotto Wine, mesh 3D e video inclusi.
-Il rendering GPU passa per il loader Vulkan di sistema (o `winevulkan`), la finestra
-per il backend GDI di zrame, il testo/immagini per il compositing CPU.
+Il rendering GPU passa per il loader Vulkan di sistema (o `winevulkan`), il testo/
+immagini per il compositing CPU. La finestra è **frameless con vetro**, come su
+Wayland: pannello arrotondato, ombra decorativa e traslucenza sono dipinti
+client-side (stesso `drawChrome` di zicro) e spinti con alpha per-pixel via
+`UpdateLayeredWindow` — quindi si vedono **anche sotto Wine**. L'unico pezzo
+riservato a Windows vero è il **blur sfocato dietro** il vetro (l'acrilico DWM,
+esattamente come su Linux il blur richiede KWin).
 
 ```sh
 # zuer-gui.exe + i plugin decoder come .dll
