@@ -75,8 +75,18 @@ fn hasSvgExtension(filename: []const u8) bool {
 /// Rasterizza l'SVG con librsvg in un PNG in memoria (adattato al box
 /// max_dim×max_dim), poi lo decodifica con stb come qualsiasi altro PNG.
 fn decodeWithRsvg(path: []const u8, filename: []const u8, max_dim: usize, allocator: std.mem.Allocator) !ImageData {
+    // La rasterizzazione rsvg costa ~col quadrato del lato: a 4096 un SVG complesso
+    // può prendere decine di secondi (35 s misurati), mentre a 2048 è ~4× più veloce
+    // con qualità indistinguibile a schermo. Cappiamo quindi il lato SVG a 2048
+    // (i raster restano al max_dim pieno). Override: ZUER_SVG_MAX.
+    var svg_dim: usize = @min(max_dim, 2048);
+    if (getenv("ZUER_SVG_MAX")) |v| {
+        if (std.fmt.parseInt(usize, std.mem.span(v), 10)) |m| {
+            if (m > 0) svg_dim = m;
+        } else |_| {}
+    }
     var dim_buf: [16]u8 = undefined;
-    const dim_str = try std.fmt.bufPrint(&dim_buf, "{d}", .{max_dim});
+    const dim_str = try std.fmt.bufPrint(&dim_buf, "{d}", .{svg_dim});
 
     // Sfondo esplicito: stb scarta l'alpha e il trasparente diverrebbe nero.
     var result = try decoder.runCapture(allocator, &.{ "rsvg-convert", "--width", dim_str, "--height", dim_str, "--keep-aspect-ratio", "--format", "png", "--background-color", "#101018", path });
@@ -84,7 +94,7 @@ fn decodeWithRsvg(path: []const u8, filename: []const u8, max_dim: usize, alloca
 
     if (result.exit_code != 0 or result.stdout.len == 0) return error.RsvgFailed;
 
-    return decodeNative(result.stdout, filename, max_dim, allocator);
+    return decodeNative(result.stdout, filename, svg_dim, allocator);
 }
 
 fn decodeNative(file_bytes: []const u8, filename: []const u8, max_dim: usize, allocator: std.mem.Allocator) !ImageData {
