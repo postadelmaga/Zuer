@@ -66,12 +66,23 @@ riservato a Windows vero è il **blur sfocato dietro** il vetro (l'acrilico DWM,
 esattamente come su Linux il blur richiede KWin).
 
 ```sh
-# zuer-gui.exe + i plugin decoder come .dll
-zig build -Dtarget=x86_64-windows
+# zuer-gui.exe + i plugin decoder come .dll — SEMPRE in ReleaseFast (vedi sotto)
+zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast
 
 # DLL runtime di FFmpeg (per il video) accanto all'eseguibile — NON sono in git
 scripts/fetch-ffmpeg-dlls.sh          # → zig-out/bin/
 ```
+
+> **Compila sempre con `-Doptimize=ReleaseFast`.** Il default di `zig build` è Debug:
+> il rendering GPU resta veloce (lo fa la GPU) ma il **compositing CPU** dei frame
+> gira non ottimizzato ed è 3–4× più lento — il 3D diventa scattoso.
+
+### Variabili d'ambiente utili
+
+| Var | Effetto |
+|-----|---------|
+| `ZUER_GPU=<indice\|nome>` | forza la GPU (es. `ZUER_GPU=intel` o `ZUER_GPU=0`); zuer logga i device che vede. Off-Linux preferisce l'**integrata** (readback economico) |
+| `ZUER_OPAQUE=1` | finestra **opaca** (BitBlt veloce) invece del vetro layered: utile per testare 3D/video fluidi **sotto Wine**, dove senza DWM il vetro va composto in software. Su Windows vero il DWM compone il vetro in GPU, quindi non serve |
 
 Due capacità native, ognuna con la sua import-lib, attivabili a parte:
 
