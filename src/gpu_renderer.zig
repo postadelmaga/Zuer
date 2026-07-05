@@ -15,6 +15,7 @@ const decoder = @import("decoder.zig");
 
 const vk = @import("renderer/vk.zig");
 const vtex = @import("vtex.zig");
+const vtcache = @import("vtcache.zig");
 const VtexPool = @import("vtex_pool.zig").VtexPool;
 
 /// Slot GPU massimi per texture baseColor virtualizzata: il livello mip scelto
@@ -868,25 +869,17 @@ pub const Renderer = struct {
         }
     }
 
-    /// Carica su GPU i submesh del modello corrente: per ciascuno un descriptor
-    /// set con la propria texture baseColor (bind 0) e la shadow map (bind 1).
-    /// Il pool descriptor viene ricreato dimensionato al numero di submesh.
-    /// `subs` vuoto ⇒ un submesh unico bianco sull'intera geometria.
-    /// Larghezza in pixel del livello coarse-first `level`.
-    fn vtLevelWidth(baked: *const vtex.BakedTexture, level: usize) u32 {
-        return vtex.levelDims(baked.width, baked.height, level, baked.levels.len).w;
-    }
-
     /// Livello mip da rendere residente per una risoluzione-schermo target: il
     /// più grezzo (meno VRAM) che ha ancora ≥ `target_px` di lato, mai più fine
-    /// del più fine che sta in VT_BUDGET slot.
-    fn chooseVtLevel(baked: *const vtex.BakedTexture, target_px: u32, budget: u32) usize {
+    /// del più fine che sta in `budget` slot.
+    fn chooseVtLevel(levels: []const vtex.LevelDesc, width: u32, height: u32, target_px: u32, budget: u32) usize {
         var finest_fit: usize = 0;
-        for (baked.levels, 0..) |d, i| {
+        for (levels, 0..) |d, i| {
             if (@as(u32, d.tiles_x) * d.tiles_y <= budget) finest_fit = i;
         }
-        for (baked.levels, 0..) |d, i| {
-            if (@as(u32, d.tiles_x) * d.tiles_y <= budget and vtLevelWidth(baked, i) >= target_px) return i;
+        for (levels, 0..) |d, i| {
+            const lw = vtex.levelDims(width, height, i, levels.len).w;
+            if (@as(u32, d.tiles_x) * d.tiles_y <= budget and lw >= target_px) return i;
         }
         return finest_fit;
     }
@@ -911,17 +904,18 @@ pub const Renderer = struct {
         out_ptr.* = @ptrCast(@alignCast(mapped));
     }
 
-    /// Rende residente il livello `level` della baseColor del submesh: carica le
-    /// sue tile nel blocco del pool e riscrive l'SSBO cell→slot. Le tile fuori
-    /// livello restano nel pool ma non referenziate.
+    /// Rende residente il livello `level` della baseColor del submesh: legge le
+    /// sue tile dal file mmap-ato (l'OS pagina solo queste) nel blocco del pool e
+    /// riscrive l'SSBO cell→slot. Le tile fuori livello restano nel pool ma non
+    /// referenziate.
     fn uploadVtLevel(self: *Renderer, g: *SubMeshGpu, level: usize) void {
-        const baked = &g.baked.?;
-        const desc = baked.levels[level];
+        const m = &g.vtc.?;
+        const desc = m.levels[level];
         for (0..desc.tiles_y) |ty| {
             for (0..desc.tiles_x) |tx| {
                 const cell: u32 = @intCast(ty * desc.tiles_x + tx);
-                const page = baked.pages[vtex.tileIndex(baked.levels, level, @intCast(tx), @intCast(ty))];
-                self.vt_pool.?.uploadTile(g.vt_base + cell, page) catch {};
+                const idx = vtex.tileIndex(m.levels, level, @intCast(tx), @intCast(ty));
+                self.vt_pool.?.uploadTile(g.vt_base + cell, m.tile(@intCast(idx))) catch {};
                 g.vt_slots_ptr[cell] = g.vt_base + cell;
             }
         }
@@ -930,19 +924,21 @@ pub const Renderer = struct {
         g.vt_level = @intCast(level);
     }
 
-    /// Bake della baseColor + riserva il blocco pool e l'SSBO. Il livello viene
-    /// caricato pigramente da `updateVtLevels` in base allo zoom.
-    fn bakeVtBaseColor(self: *Renderer, g: *SubMeshGpu, pixels: []const u8, w: u32, h: u32, base: u32) !void {
-        g.baked = try vtex.bakeTiles(self.gpa, pixels, w, h);
+    /// Mappa la baseColor dalla cache su disco (bake al primo uso) + riserva il
+    /// blocco pool e l'SSBO. Nessun errore su cache non disponibile: il submesh
+    /// resta senza VT (usa il solo fattore materiale). Il livello viene caricato
+    /// da `updateVtLevels` in base allo zoom, partendo dal grezzo.
+    fn setupVtBaseColor(self: *Renderer, g: *SubMeshGpu, pixels: []const u8, w: u32, h: u32, base: u32) !void {
+        g.vtc = vtcache.openOrBake(self.gpa, pixels, w, h) catch null;
+        if (g.vtc == null) return;
         errdefer {
-            g.baked.?.deinit();
-            g.baked = null;
+            g.vtc.?.deinit();
+            g.vtc = null;
         }
         try self.createStorageBuffer(@as(u64, self.vt_budget) * 4, &g.vt_buf, &g.vt_mem, &g.vt_slots_ptr);
         g.vt_base = base;
         g.vt_on = true;
         g.vt_level = -1;
-        self.uploadVtLevel(g, chooseVtLevel(&g.baked.?, self.vtTargetPx(), self.vt_budget)); // livello iniziale
     }
 
     /// Risoluzione-schermo target per la selezione del mip: lato corto del
@@ -952,14 +948,17 @@ pub const Renderer = struct {
         return @intFromFloat(@max(64.0, short * @max(self.vt_zoom, 0.05)));
     }
 
-    /// Aggiorna il livello mip residente di ogni submesh testurato secondo lo
-    /// zoom corrente; ri-uploada solo quando il livello scelto cambia.
+    /// Aggiorna il livello mip residente di ogni submesh testurato al livello
+    /// richiesto dallo zoom corrente; ri-legge dal disco (pread) e ri-uploada
+    /// solo quando il livello cambia. Nessun re-render continuo: il costo è
+    /// pagato una tantum al cambio di zoom.
     fn updateVtLevels(self: *Renderer) void {
         const target = self.vtTargetPx();
         for (self.submeshes) |*g| {
-            if (!g.vt_on or g.baked == null) continue;
-            const level = chooseVtLevel(&g.baked.?, target, self.vt_budget);
-            if (g.vt_level != @as(i32, @intCast(level))) self.uploadVtLevel(g, level);
+            if (!g.vt_on or g.vtc == null) continue;
+            const m = &g.vtc.?;
+            const want = chooseVtLevel(m.levels, m.width, m.height, target, self.vt_budget);
+            if (g.vt_level != @as(i32, @intCast(want))) self.uploadVtLevel(g, want);
         }
     }
 
@@ -1025,8 +1024,8 @@ pub const Renderer = struct {
                 g.metallic = s.metallic;
                 g.roughness = s.roughness;
                 if (s.tex_width > 0 and s.tex_height > 0 and s.tex_pixels.len >= s.tex_width * s.tex_height * 4) {
-                    try self.bakeVtBaseColor(&g, s.tex_pixels, @intCast(s.tex_width), @intCast(s.tex_height), next_base);
-                    next_base += self.vt_budget;
+                    try self.setupVtBaseColor(&g, s.tex_pixels, @intCast(s.tex_width), @intCast(s.tex_height), next_base);
+                    if (g.vt_on) next_base += self.vt_budget; // blocco consumato solo se la cache è pronta
                 }
                 if (s.nrm_tex_width > 0 and s.nrm_tex_height > 0 and s.nrm_tex_pixels.len >= s.nrm_tex_width * s.nrm_tex_height * 4) {
                     // Normal map = dati lineari (non sRGB).
@@ -1067,9 +1066,9 @@ pub const Renderer = struct {
                 vkDestroyBuffer(self.device, sm.vt_buf, null);
                 vkFreeMemory(self.device, sm.vt_mem, null);
             }
-            if (sm.baked) |*b| {
-                var bb = b.*;
-                bb.deinit();
+            if (sm.vtc) |*m| {
+                var mm = m.*;
+                mm.deinit();
             }
         }
         if (self.submeshes.len > 0) self.gpa.free(self.submeshes);
@@ -1668,7 +1667,7 @@ pub const Renderer = struct {
         vt_tiles_y: u32 = 0,
         vt_level: i32 = -1, // livello attualmente residente (-1 = nessuno)
         vt_on: bool = false,
-        baked: ?vtex.BakedTexture = null,
+        vtc: ?vtcache.VtcMap = null, // texture baked mappata da disco (tile a richiesta)
     };
 
     fn createImage(self: *Renderer, width: u32, height: u32, format: u32, usage: u32, aspect: u32, with_view: bool) !ImageBundle {
