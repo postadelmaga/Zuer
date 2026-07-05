@@ -9,6 +9,7 @@
 //! il poster/anteprima.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const c = @cImport({
     @cInclude("libavformat/avformat.h");
@@ -17,10 +18,11 @@ pub const c = @cImport({
     @cInclude("libswscale/swscale.h");
 });
 
-// Decoder VP9 su GPU compute (libcompute_vp9): abilitato solo con build native/gpu
-// (Linux). Su build CPU-only `cvp9` è uno struct vuoto e il suo @cImport non viene
-// mai analizzato — così player.zig resta compilabile senza la libreria.
-const cvp9_enabled = @import("build_options").gpu;
+// Decoder VP9 su GPU compute (libcompute_vp9): Linux-only (la libreria non è portata su
+// Windows) e solo con il renderer Vulkan attivo. Altrove `cvp9` è uno struct vuoto e il
+// suo @cImport non viene mai analizzato — così player.zig compila senza la libreria, e i
+// VP9 li decodifica libav.
+const cvp9_enabled = builtin.os.tag == .linux and @import("build_options").gpu;
 const cvp9 = if (cvp9_enabled) @import("cvp9.zig") else struct {};
 
 pub const Frame = struct {

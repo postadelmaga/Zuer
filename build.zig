@@ -14,7 +14,7 @@ pub fn build(b: *std.Build) void {
     const vulkan_enabled = b.option(bool, "vulkan", "Link the Vulkan mesh/text renderer") orelse
         (os_tag == .linux or os_tag == .windows);
     const ffmpeg_enabled = b.option(bool, "ffmpeg", "Link the libav native video player") orelse
-        (os_tag == .linux);
+        (os_tag == .linux or os_tag == .windows);
     const build_opts = b.addOptions();
     // gui.zig/player.zig read `gpu` as "Vulkan renderer available"; `video` as "libav available".
     build_opts.addOption(bool, "gpu", vulkan_enabled);
@@ -26,6 +26,27 @@ pub fn build(b: *std.Build) void {
         fn link(bld: *std.Build, m: *std.Build.Module, tgt: std.Build.ResolvedTarget) void {
             if (tgt.result.os.tag == .windows) m.addLibraryPath(bld.path("vendor/vulkan"));
             m.linkSystemLibrary("vulkan", .{});
+        }
+    };
+
+    // Link libav (native video). Linux uses the system FFmpeg (pkg-config names have the
+    // `lib` prefix); Windows uses the vendored headers + import libs under vendor/ffmpeg
+    // (unversioned names → the versioned runtime DLLs fetched by scripts/fetch-ffmpeg-dlls.sh).
+    const LinkAv = struct {
+        fn link(bld: *std.Build, m: *std.Build.Module, tgt: std.Build.ResolvedTarget) void {
+            if (tgt.result.os.tag == .windows) {
+                m.addIncludePath(bld.path("vendor/ffmpeg/include"));
+                m.addLibraryPath(bld.path("vendor/ffmpeg/lib"));
+                m.linkSystemLibrary("avformat", .{});
+                m.linkSystemLibrary("avcodec", .{});
+                m.linkSystemLibrary("avutil", .{});
+                m.linkSystemLibrary("swscale", .{});
+            } else {
+                m.linkSystemLibrary("libavformat", .{});
+                m.linkSystemLibrary("libavcodec", .{});
+                m.linkSystemLibrary("libavutil", .{});
+                m.linkSystemLibrary("libswscale", .{});
+            }
         }
     };
 
@@ -152,13 +173,10 @@ pub fn build(b: *std.Build) void {
         // Player video nativo: il worker decodifica i frame in tempo reale con libav
         // (src/decoders/player.zig, importato da gui.zig), quindi il gui_exe linka
         // ffmpeg direttamente (finora era solo nel decoder .so per il poster).
-        gui_exe.root_module.linkSystemLibrary("libavformat", .{});
-        gui_exe.root_module.linkSystemLibrary("libavcodec", .{});
-        gui_exe.root_module.linkSystemLibrary("libavutil", .{});
-        gui_exe.root_module.linkSystemLibrary("libswscale", .{});
-        // Decoder VP9 su GPU compute (Vulkan): gli stream VP9 li decodifica
-        // questo invece di libvpx (vedi player.zig, path cvp9, gate build_options.gpu).
-        gui_exe.root_module.linkSystemLibrary("compute_vp9", .{});
+        LinkAv.link(b, gui_exe.root_module, target);
+        // Decoder VP9 su GPU compute (Vulkan): Linux-only (compute_vp9 non è portato su
+        // Windows). Altrove player.zig ripiega sul decoder VP9 di libav (gate cvp9 in player).
+        if (os_tag == .linux) gui_exe.root_module.linkSystemLibrary("compute_vp9", .{});
     }
     if (target.result.os.tag == .linux) gui_exe.root_module.linkSystemLibrary("wayland-client", .{});
     // Motore di testo nativo: stb_truetype rasterizza i glifi Hack (embeddati),
@@ -260,14 +278,11 @@ pub fn build(b: *std.Build) void {
         const needs_tools = comptime (std.mem.eql(u8, name, "pdf") or std.mem.eql(u8, name, "office"));
         if (needs_ffmpeg) {
             if (ffmpeg_enabled) {
-                lib.root_module.linkSystemLibrary("libavformat", .{});
-                lib.root_module.linkSystemLibrary("libavcodec", .{});
-                lib.root_module.linkSystemLibrary("libavutil", .{});
-                lib.root_module.linkSystemLibrary("libswscale", .{});
+                LinkAv.link(b, lib.root_module, target);
                 // media importa player.zig (poster): serve build_options per il
                 // gate cvp9 e il link della lib (il poster resta però su libav).
                 lib.root_module.addOptions("build_options", build_opts);
-                lib.root_module.linkSystemLibrary("compute_vp9", .{});
+                if (os_tag == .linux) lib.root_module.linkSystemLibrary("compute_vp9", .{});
                 b.installArtifact(lib);
             }
         } else if (needs_tools) {
