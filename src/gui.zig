@@ -17,6 +17,13 @@ const text_render = @import("text_render.zig");
 // the input handler). It owns the conditional libav import; gui.zig calls into it only
 // under `if (has_video)`.
 const videomod = @import("video.zig");
+// Content-kind classification (path/decode → WinKind) + initial window geometry/zoom.
+const layout = @import("layout.zig");
+const WinKind = layout.WinKind;
+// CPU frame compositor (image aspect-fit + text blit + selection + tab bar).
+const compose = @import("compose.zig");
+const TabBarState = compose.TabBarState;
+const max_tabs = compose.max_tabs;
 const clipboard = @import("clipboard.zig");
 const build_options = @import("build_options");
 /// Vulkan mesh/text renderer available (Linux + Windows). Comptime so the GPU code links
@@ -60,317 +67,21 @@ const text_zoom_min: f32 = 0.4;
 const text_zoom_max: f32 = 6.0;
 const scroll_step: f32 = 60.0;
 
-/// Numero massimo di linguette di cui teniamo i confini per l'hit-test. Fogli
-/// oltre questo limite si disegnano ma non sono cliccabili (workbook enormi).
-const max_tabs: usize = 64;
-
-/// Barra delle linguette dei fogli (solo workbook): immagine RGBA pronta al blit
-/// in fondo alla finestra + confini X di ogni linguetta per l'hit-test dei click.
-/// Rigenerata da `rasterizeText` a ogni cambio foglio/larghezza.
-const TabBarState = struct {
-    rgba: []u8 = &.{},
-    w: u32 = 0,
-    h: u32 = 0,
-    bounds: [max_tabs]u32 = [_]u32{0} ** max_tabs,
-    count: usize = 0,
-};
-
-/// Alpha-blend src-over di un colore sul pixel RGBA in `buf[idx..]`.
-fn blendPixel(buf: []u8, idx: usize, r: u8, g: u8, b: u8, a: u8) void {
-    const af: u32 = a;
-    const inv: u32 = 255 - af;
-    buf[idx + 0] = @intCast((@as(u32, r) * af + @as(u32, buf[idx + 0]) * inv) / 255);
-    buf[idx + 1] = @intCast((@as(u32, g) * af + @as(u32, buf[idx + 1]) * inv) / 255);
-    buf[idx + 2] = @intCast((@as(u32, b) * af + @as(u32, buf[idx + 2]) * inv) / 255);
-    buf[idx + 3] = @max(buf[idx + 3], a);
-}
-
-/// Blitta la barra delle linguette (RGBA opaca) in fondo alla finestra, sopra il
-/// contenuto, per i workbook multi-foglio. Ritagliata a W×tb.h.
-fn blitTabBar(buf: []u8, W: u32, H: u32, tb: *const TabBarState) void {
-    if (tb.count == 0 or tb.h == 0 or tb.h > H or tb.w == 0) return;
-    const y0 = H - tb.h;
-    const copy_w = @min(tb.w, W);
-    var ty: u32 = 0;
-    while (ty < tb.h) : (ty += 1) {
-        const dst_row = (y0 + ty) * W * 4;
-        const src_row = ty * tb.w * 4;
-        @memcpy(buf[dst_row .. dst_row + copy_w * 4], tb.rgba[src_row .. src_row + copy_w * 4]);
-        // Larghezza finestra > barra (transitorio in resize): riempi a nero il resto.
-        if (copy_w < W) @memset(buf[dst_row + copy_w * 4 .. dst_row + W * 4], 0);
-    }
-}
-
-/// Modalità documento per i contenuti testuali: l'immagine è già rasterizzata
-/// alla larghezza della finestra, quindi si blitta 1:1 (nessun ricampionamento
-/// che sfocherebbe il testo), ancorata in alto, con scorrimento verticale.
-/// Geometria del blit del testo nella finestra: offset di scroll (clampato) e
-/// centratura orizzontale. Condivisa da compose, selezione e scrollbar per non
-/// divergere.
-const BlitGeom = struct { off_y: u32, x_dst: u32, x_src: u32, copy_w: u32 };
-fn textBlitGeom(W: u32, H: u32, src_w: u32, src_h: u32, scroll_y: f32, scroll_x: f32) BlitGeom {
-    const max_scroll: u32 = if (src_h > H) src_h - H else 0;
-    const max_scroll_x: u32 = if (src_w > W) src_w - W else 0;
-    return .{
-        .off_y = @min(@as(u32, @intFromFloat(@max(scroll_y, 0))), max_scroll),
-        // Più stretta della finestra → centrata. Più larga → si scorre in
-        // orizzontale (x_src = offset di scroll, partendo da sinistra).
-        .x_dst = if (src_w < W) (W - src_w) / 2 else 0,
-        .x_src = if (src_w > W) @min(@as(u32, @intFromFloat(@max(scroll_x, 0))), max_scroll_x) else 0,
-        .copy_w = @min(src_w, W),
-    };
-}
-
-fn composeTextFrame(
-    composited_rgba: []u8,
-    W: u32,
-    H: u32,
-    src_rgba: []const u8,
-    src_w: u32,
-    src_h: u32,
-    scroll_y: f32,
-    scroll_x: f32,
-    // Altezza (px) della banda d'intestazione da tenere ANCORATA in cima mentre
-    // il corpo scorre: le righe [0, header_h) mostrano sempre le righe sorgente
-    // [0, header_h) (l'header della tabella), non scrollate. 0 = nessun ancoraggio
-    // (testo/codice/markdown). L'header scorre comunque in ORIZZONTALE col corpo,
-    // così le colonne restano allineate.
-    header_h: u32,
-) void {
-    const geom = textBlitGeom(W, H, src_w, src_h, scroll_y, scroll_x);
-    const off_y = geom.off_y;
-    const x_dst = geom.x_dst;
-    const x_src = geom.x_src;
-    const copy_w = geom.copy_w;
-
-    var py: u32 = 0;
-    while (py < H) : (py += 1) {
-        const idx_row = py * W * 4;
-        // Banda header ancorata: campiona la riga sorgente 1:1 (senza off_y); il
-        // corpo sotto scorre normalmente. `off_y` è già clampato a src_h - H, e
-        // l'altezza scrollabile utile resta invariata, quindi il clamp è corretto
-        // anche con l'ancoraggio (l'ultima riga dati resta raggiungibile).
-        const sy = if (py < header_h) py else py + off_y;
-
-        if (sy >= src_h or copy_w == 0) {
-            @memset(composited_rgba[idx_row .. idx_row + W * 4], 0);
-            continue;
-        }
-
-        // Clear left margin
-        if (x_dst > 0) {
-            @memset(composited_rgba[idx_row .. idx_row + x_dst * 4], 0);
-        }
-
-        // Copy and process middle part
-        var px: u32 = 0;
-        const s_row_offset = sy * src_w;
-        while (px < copy_w) : (px += 1) {
-            const dest_idx = idx_row + (x_dst + px) * 4;
-            const src_idx = (s_row_offset + x_src + px) * 4;
-
-            const sr = src_rgba[src_idx + 0];
-            const sg = src_rgba[src_idx + 1];
-            const sb = src_rgba[src_idx + 2];
-            var sa = src_rgba[src_idx + 3];
-
-            if (sr == 8 and sg == 8 and sb == 16) {
-                sa = 0;
-            }
-
-            composited_rgba[dest_idx + 0] = sr;
-            composited_rgba[dest_idx + 1] = sg;
-            composited_rgba[dest_idx + 2] = sb;
-            composited_rgba[dest_idx + 3] = sa;
-        }
-
-        // Clear right margin
-        if (x_dst + copy_w < W) {
-            @memset(composited_rgba[idx_row + (x_dst + copy_w) * 4 .. idx_row + W * 4], 0);
-        }
-    }
-}
-
-const sel_color = [3]u8{ 70, 110, 190 };
-const sel_alpha: u8 = 96;
-
-/// Numero di codepoint (= colonne monospazio) in una riga UTF-8.
-fn cpLen(s: []const u8) i32 {
-    var n: i32 = 0;
-    var i: usize = 0;
-    while (i < s.len) {
-        const seq = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
-        i += @min(@as(usize, seq), s.len - i);
-        n += 1;
-    }
-    return n;
-}
-
-/// Evidenzia la selezione (stream: dalla colonna d'ancora, righe intere in
-/// mezzo, fino all'estremo) con rettangoli translucidi sulla griglia monospazio.
-fn drawTextSelection(buf: []u8, W: u32, H: u32, src_w: u32, src_h: u32, scroll_y: f32, scroll_x: f32, m: text_render.Metrics, lines: []const []const u8, a_in: [2]i32, b_in: [2]i32) void {
-    if (lines.len == 0 or m.advance <= 0 or m.line_h <= 0) return;
-    const geom = textBlitGeom(W, H, src_w, src_h, scroll_y, scroll_x);
-    var a = a_in;
-    var b = b_in;
-    if (a[0] > b[0] or (a[0] == b[0] and a[1] > b[1])) {
-        const t = a;
-        a = b;
-        b = t;
-    }
-    const nrows: i32 = @intCast(lines.len);
-    const Wi: i32 = @intCast(W);
-    const Hi: i32 = @intCast(H);
-    const dx: i32 = @as(i32, @intCast(geom.x_dst)) - @as(i32, @intCast(geom.x_src));
-    var row: i32 = @max(a[0], 0);
-    while (row <= b[0] and row < nrows) : (row += 1) {
-        const llen = cpLen(lines[@intCast(row)]);
-        var c0: i32 = if (row == a[0]) a[1] else 0;
-        var c1: i32 = if (row == b[0]) b[1] else llen;
-        c0 = std.math.clamp(c0, 0, llen);
-        c1 = std.math.clamp(c1, 0, llen);
-        if (c1 <= c0) continue;
-        const x0 = m.pad_x + c0 * m.advance + dx;
-        const x1 = m.pad_x + c1 * m.advance + dx;
-        const y0 = m.pad_y + row * m.line_h - @as(i32, @intCast(geom.off_y));
-        const xa: u32 = @intCast(std.math.clamp(x0, 0, Wi));
-        const xb: u32 = @intCast(std.math.clamp(x1, 0, Wi));
-        const ya: u32 = @intCast(std.math.clamp(y0, 0, Hi));
-        const yb: u32 = @intCast(std.math.clamp(y0 + m.line_h, 0, Hi));
-        var py = ya;
-        while (py < yb) : (py += 1) {
-            var px = xa;
-            while (px < xb) : (px += 1) {
-                blendPixel(buf, (py * W + px) * 4, sel_color[0], sel_color[1], sel_color[2], sel_alpha);
-            }
-        }
-    }
-}
-
 /// Mappa una coordinata finestra in (riga, colonna) sulla griglia del testo,
 /// clampata al documento. Da chiamare con `state.mutex` acquisito.
 fn textHit(state: *GuiAppState, W: u32, H: u32, mx: f32, my: f32) [2]i32 {
     const m = state.text_metrics.*;
-    const geom = textBlitGeom(W, H, state.static_w.*, state.static_h.*, state.scroll_y.*, state.scroll_x.*);
+    const geom = compose.textBlitGeom(W, H, state.static_w.*, state.static_h.*, state.scroll_y.*, state.scroll_x.*);
     const sx = @as(i32, @intFromFloat(mx)) - @as(i32, @intCast(geom.x_dst)) + @as(i32, @intCast(geom.x_src));
     const sy = @as(i32, @intFromFloat(my)) + @as(i32, @intCast(geom.off_y));
     const nrows: i32 = @intCast(state.text_lines.items.len);
     var row: i32 = if (m.line_h > 0) @divFloor(sy - m.pad_y, m.line_h) else 0;
     row = std.math.clamp(row, 0, @max(nrows - 1, 0));
-    const llen: i32 = if (nrows > 0) cpLen(state.text_lines.items[@intCast(row)]) else 0;
+    const llen: i32 = if (nrows > 0) compose.cpLen(state.text_lines.items[@intCast(row)]) else 0;
     // Arrotonda alla colonna più vicina (mezza cella) per un aggancio naturale.
     var col: i32 = if (m.advance > 0) @divFloor(sx - m.pad_x + @divTrunc(m.advance, 2), m.advance) else 0;
     col = std.math.clamp(col, 0, llen);
     return .{ row, col };
-}
-
-fn composeFrame(
-    composited_rgba: []u8,
-    W: u32,
-    H: u32,
-    src_rgba: []const u8,
-    src_w: u32,
-    src_h: u32,
-    is_text: bool,
-    zoom: f32,
-    pan_x: f32,
-    pan_y: f32,
-) void {
-    // Calcolo dell'aspect ratio per l'adattamento (aspect-fit) a tutto schermo
-    const src_aspect = @as(f32, @floatFromInt(src_w)) / @as(f32, @floatFromInt(src_h));
-    const win_aspect = @as(f32, @floatFromInt(W)) / @as(f32, @floatFromInt(H));
-
-    var fit_w: u32 = 0;
-    var fit_h: u32 = 0;
-    if (src_aspect > win_aspect) {
-        fit_w = W;
-        fit_h = @intFromFloat(@round(@as(f32, @floatFromInt(W)) / src_aspect));
-    } else {
-        fit_h = H;
-        fit_w = @intFromFloat(@round(@as(f32, @floatFromInt(H)) * src_aspect));
-    }
-    fit_w = @max(fit_w, 1);
-    fit_h = @max(fit_h, 1);
-
-    const zoomed_w = @as(f32, @floatFromInt(fit_w)) * zoom;
-    const zoomed_h = @as(f32, @floatFromInt(fit_h)) * zoom;
-
-    const fit_w_zoomed = @max(@as(u32, @intFromFloat(zoomed_w)), 1);
-    const fit_h_zoomed = @max(@as(u32, @intFromFloat(zoomed_h)), 1);
-
-    const fit_x = @divFloor(@as(i32, @intCast(W)) - @as(i32, @intCast(fit_w_zoomed)), 2) + @as(i32, @intFromFloat(pan_x));
-    const fit_y = @divFloor(@as(i32, @intCast(H)) - @as(i32, @intCast(fit_h_zoomed)), 2) + @as(i32, @intFromFloat(pan_y));
-
-    const start_x: u32 = @intCast(@max(@as(i32, 0), fit_x));
-    const end_x: u32 = @intCast(@max(@as(i32, 0), @min(@as(i32, @intCast(W)), fit_x + @as(i32, @intCast(fit_w_zoomed)))));
-    const start_y: u32 = @intCast(@max(@as(i32, 0), fit_y));
-    const end_y: u32 = @intCast(@max(@as(i32, 0), @min(@as(i32, @intCast(H)), fit_y + @as(i32, @intCast(fit_h_zoomed)))));
-
-    // Clear top rows
-    if (start_y > 0) {
-        @memset(composited_rgba[0 .. start_y * W * 4], 0);
-    }
-
-    // Clear bottom rows
-    if (end_y < H) {
-        @memset(composited_rgba[end_y * W * 4 .. H * W * 4], 0);
-    }
-
-    if (start_x >= end_x or start_y >= end_y) {
-        var py = start_y;
-        while (py < end_y) : (py += 1) {
-            @memset(composited_rgba[py * W * 4 .. (py + 1) * W * 4], 0);
-        }
-        return;
-    }
-
-    const inv_w = (@as(u64, src_w) << 32) / fit_w_zoomed;
-    const inv_h = (@as(u64, src_h) << 32) / fit_h_zoomed;
-
-    var py = start_y;
-    while (py < end_y) : (py += 1) {
-        const idx_row = py * W * 4;
-
-        // Clear left margin of the row
-        if (start_x > 0) {
-            @memset(composited_rgba[idx_row .. idx_row + start_x * 4], 0);
-        }
-
-        // Clear right margin of the row
-        if (end_x < W) {
-            @memset(composited_rgba[idx_row + end_x * 4 .. idx_row + W * 4], 0);
-        }
-
-        const ry = @as(u64, @intCast(@as(i32, @intCast(py)) - fit_y));
-        const sy = @min(@as(u32, @intCast((ry * inv_h) >> 32)), src_h - 1);
-        const s_row_offset = sy * src_w;
-
-        const start_rx = @as(u64, @intCast(@as(i32, @intCast(start_x)) - fit_x));
-        var rx_fp = start_rx * inv_w;
-
-        var px = start_x;
-        while (px < end_x) : (px += 1) {
-            const idx = idx_row + px * 4;
-            const sx = @min(@as(u32, @intCast(rx_fp >> 32)), src_w - 1);
-            rx_fp += inv_w;
-
-            const s_idx = (s_row_offset + sx) * 4;
-
-            const sr = src_rgba[s_idx + 0];
-            const sg = src_rgba[s_idx + 1];
-            const sb = src_rgba[s_idx + 2];
-            var sa = src_rgba[s_idx + 3];
-
-            if (is_text and sr == 8 and sg == 8 and sb == 16) {
-                sa = 0;
-            }
-
-            composited_rgba[idx + 0] = sr;
-            composited_rgba[idx + 1] = sg;
-            composited_rgba[idx + 2] = sb;
-            composited_rgba[idx + 3] = sa;
-        }
-    }
 }
 
 /// Un file già decodificato (e, se mesh, già "staged" su memfd) tenuto in cache
@@ -726,7 +437,7 @@ const GuiAppState = struct {
         // `decoded`/`static_*` concorrentemente): le immagini hanno static_w/h
         // note, le tabelle richiedono la misura naturale della griglia.
         self.mutex.lockUncancelable(self.io);
-        const kind = winKindFromDecoded(self.decoded);
+        const kind = layout.winKindFromDecoded(self.decoded);
         var nat_w: u32 = 0;
         var nat_h: u32 = 0;
         switch (kind) {
@@ -755,9 +466,9 @@ const GuiAppState = struct {
 
         // Contenuto piccolo → ingrandiscilo un po' e dimensiona la finestra sul
         // contenuto già zoomato (aderente, niente vuoto). Lo zoom pilota il worker.
-        const az = autoZoomForContent(kind, nat_w, nat_h);
+        const az = layout.autoZoomForContent(kind, nat_w, nat_h);
         self.zoom.* = az;
-        const size = initialWindowSize(kind, scaleDim(nat_w, az), scaleDim(nat_h, az));
+        const size = layout.initialWindowSize(kind, layout.scaleDim(nat_w, az), layout.scaleDim(nat_h, az));
         win.animateResize(size.w, size.h);
     }
 };
@@ -1461,7 +1172,7 @@ fn renderWorker(
                 // Letterbox trasparente (vetro) + frame scalato per adattarsi.
                 @memset(composited_rgba.*[0 .. @as(usize, cur_w) * cur_h * 4], 0);
                 const fit = fitZoom(cur_w, cur_h, state.static_w.*, state.static_h.*);
-                composeFrame(composited_rgba.*, cur_w, cur_h, state.static_rgba.*, state.static_w.*, state.static_h.*, false, fit, 0.0, 0.0);
+                compose.composeFrame(composited_rgba.*, cur_w, cur_h, state.static_rgba.*, state.static_w.*, state.static_h.*, false, fit, 0.0, 0.0);
                 if (vs.controls > 0.01) videomod.drawVideoControls(composited_rgba.*, cur_w, cur_h, vs);
                 win.presentRgba(cur_w, cur_h, composited_rgba.*);
                 vid_pw = cur_w;
@@ -1543,7 +1254,7 @@ fn renderWorker(
                         break;
                     };
                 };
-                composeFrame(composited_rgba.*, cur_w, cur_h, mesh_rgba, cur_w, cur_h, false, 1.0, 0.0, 0.0);
+                compose.composeFrame(composited_rgba.*, cur_w, cur_h, mesh_rgba, cur_w, cur_h, false, 1.0, 0.0, 0.0);
                 last_yaw = yaw.*;
                 last_pitch = pitch.*;
                 last_zoom = zoom.*;
@@ -1555,9 +1266,9 @@ fn renderWorker(
                     const hb = m.pad_y + m.line_h;
                     break :blk if (hb > 0) @min(@as(u32, @intCast(hb)), cur_h) else 0;
                 } else 0;
-                composeTextFrame(composited_rgba.*, cur_w, cur_h, state.static_rgba.*, state.static_w.*, state.static_h.*, state.scroll_y.*, state.scroll_x.*, header_band);
+                compose.composeTextFrame(composited_rgba.*, cur_w, cur_h, state.static_rgba.*, state.static_w.*, state.static_h.*, state.scroll_y.*, state.scroll_x.*, header_band);
                 if (state.sel_active.*) {
-                    drawTextSelection(composited_rgba.*, cur_w, cur_h, state.static_w.*, state.static_h.*, state.scroll_y.*, state.scroll_x.*, state.text_metrics.*, state.text_lines.items, state.sel_a.*, state.sel_b.*);
+                    compose.drawTextSelection(composited_rgba.*, cur_w, cur_h, state.static_w.*, state.static_h.*, state.scroll_y.*, state.scroll_x.*, state.text_metrics.*, state.text_lines.items, state.sel_a.*, state.sel_b.*);
                 }
                 // Scrollbar flottanti egui, disegnate dal Canvas straight di zicro
                 // direttamente sul frame RGBA8 (rilettura []u8 → []u32 aliasata).
@@ -1566,9 +1277,9 @@ fn renderWorker(
                 var sc_canvas = paint.Canvas.initRgba8(u32px[0 .. @as(usize, cur_w) * cur_h], cur_w, cur_h);
                 state.sc.draw(&sc_canvas);
                 // Barra delle linguette in fondo (workbook multi-foglio), sopra tutto.
-                blitTabBar(composited_rgba.*, cur_w, cur_h, state.tab_bar);
+                compose.blitTabBar(composited_rgba.*, cur_w, cur_h, state.tab_bar);
             } else {
-                composeFrame(composited_rgba.*, cur_w, cur_h, state.static_rgba.*, state.static_w.*, state.static_h.*, false, zoom.*, state.pan_x.*, state.pan_y.*);
+                compose.composeFrame(composited_rgba.*, cur_w, cur_h, state.static_rgba.*, state.static_w.*, state.static_h.*, false, zoom.*, state.pan_x.*, state.pan_y.*);
             }
 
             win.presentRgba(cur_w, cur_h, composited_rgba.*);
@@ -1642,7 +1353,7 @@ fn buildSelectedText(state: *GuiAppState, gpa: std.mem.Allocator) ?[]u8 {
     var row: i32 = std.math.clamp(a[0], 0, nrows - 1);
     while (row <= b[0] and row < nrows) : (row += 1) {
         const line = lines[@intCast(row)];
-        const llen = cpLen(line);
+        const llen = compose.cpLen(line);
         const c0 = std.math.clamp(if (row == a[0]) a[1] else 0, 0, llen);
         const c1 = std.math.clamp(if (row == b[0]) b[1] else llen, 0, llen);
         const bs = byteAtCol(line, c0);
@@ -1651,138 +1362,6 @@ fn buildSelectedText(state: *GuiAppState, gpa: std.mem.Allocator) ?[]u8 {
         if (row < b[0]) out.append(gpa, '\n') catch return null;
     }
     return out.toOwnedSlice(gpa) catch null;
-}
-
-/// Categoria di contenuto per scegliere proporzioni di finestra sensate: le
-/// immagini seguono l'aspetto reale, i documenti sono ritratto (pagina), le
-/// tabelle (csv/xls/zip) e le mesh hanno viewport più larghi/quadri.
-const WinKind = enum { image, mesh, document, table, video, generic };
-
-fn extLowerEql(ext: []const u8, comptime lit: []const u8) bool {
-    if (ext.len != lit.len) return false;
-    for (ext, lit) |c, l| if (std.ascii.toLower(c) != l) return false;
-    return true;
-}
-
-/// Riconoscimento del tipo dall'estensione (percorso async: prima del decode).
-fn winKindFromExt(path: []const u8) WinKind {
-    var clean = path;
-    if (std.mem.indexOfScalar(u8, path, '#')) |h| clean = path[0..h];
-    const base = std.fs.path.basename(clean);
-    const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse return .generic;
-    const ext = base[dot + 1 ..];
-    inline for (.{ "png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "avif", "heic", "ico" }) |e| {
-        if (extLowerEql(ext, e)) return .image;
-    }
-    inline for (.{ "obj", "stl", "glb", "gltf", "ply", "fbx", "dae", "3ds" }) |e| {
-        if (extLowerEql(ext, e)) return .mesh;
-    }
-    inline for (.{ "mp4", "mkv", "webm", "mov", "avi", "m4v", "wmv", "flv", "mpg", "mpeg", "ts" }) |e| {
-        if (extLowerEql(ext, e)) return .video;
-    }
-    inline for (.{ "csv", "tsv", "xlsx", "xls", "ods", "zip", "jar", "apk", "cbz", "epub", "xpi", "whl" }) |e| {
-        if (extLowerEql(ext, e)) return .table;
-    }
-    // I PDF vengono resi come immagine di pagina, ma con proporzioni ritratto.
-    if (extLowerEql(ext, "pdf")) return .document;
-    return .document; // testo/markdown/codice e sconosciuti: documento (ritratto)
-}
-
-fn winKindFromDecoded(d: *const decoder_mod.Decoded) WinKind {
-    return switch (d.*) {
-        .image => .image,
-        .mesh => .mesh,
-        .csv, .workbook => .table,
-        .text, .markdown => .document,
-        .err => .generic,
-    };
-}
-
-/// Zoom iniziale del contenuto per evitare finestre minuscole: se la dimensione
-/// naturale del contenuto (tabella/immagine) sarebbe piccola in ENTRAMBE le
-/// dimensioni, lo si ingrandisce "un pochino" finché la dimensione vincolante
-/// raggiunge una taglia comoda, con un tetto per non sgranare. Ritorna 1.0 dove non
-/// ha senso (documento a formato fisso, mesh) o se il contenuto è già abbastanza
-/// grande. Il chiamante applica questo zoom al contenuto E dimensiona la finestra
-/// sul contenuto già ingrandito, così la finestra resta aderente (nessun vuoto).
-fn autoZoomForContent(kind: WinKind, nat_w: u32, nat_h: u32) f32 {
-    switch (kind) {
-        .table, .image, .video => {},
-        else => return 1.0,
-    }
-    if (nat_w == 0 or nat_h == 0) return 1.0;
-    const comfort_w: f32 = 680.0;
-    const comfort_h: f32 = 480.0;
-    const max_zoom: f32 = 1.8;
-    const fw: f32 = @floatFromInt(nat_w);
-    const fh: f32 = @floatFromInt(nat_h);
-    // Solo finestre davvero piccole: se una dimensione è già comoda, non toccare.
-    if (fw >= comfort_w or fh >= comfort_h) return 1.0;
-    const z = @min(comfort_w / fw, comfort_h / fh);
-    return std.math.clamp(z, 1.0, max_zoom);
-}
-
-/// Scala una dimensione naturale per un fattore di zoom (arrotonda).
-fn scaleDim(v: u32, z: f32) u32 {
-    return @intFromFloat(@round(@as(f32, @floatFromInt(v)) * z));
-}
-
-/// Dimensione iniziale della finestra, con proporzioni intelligenti per tipo di
-/// contenuto. Per le immagini si adatta all'aspetto reale (l'immagine riempie il
-/// frame) con un tetto ZUER_MAX_WIN ("LxA", default 1600x900); per gli altri tipi
-/// usa proporzioni fisse sensate (ritratto per documenti, largo per tabelle,
-/// quadro per mesh).
-fn initialWindowSize(kind: WinKind, img_w: u32, img_h: u32) struct { w: u32, h: u32 } {
-    var max_w: u32 = 1600;
-    var max_h: u32 = 900;
-    if (getenv("ZUER_MAX_WIN")) |val| {
-        const s = std.mem.span(val);
-        if (std.mem.indexOfScalar(u8, s, 'x')) |sep| {
-            max_w = std.fmt.parseInt(u32, s[0..sep], 10) catch max_w;
-            max_h = std.fmt.parseInt(u32, s[sep + 1 ..], 10) catch max_h;
-        }
-    }
-
-    switch (kind) {
-        // Immagini e video: si adattano all'aspetto reale del frame.
-        .image, .video => {
-            // Aspetto reale noto (percorso sincrono): adatta con tetto.
-            if (img_w != 0 and img_h != 0) {
-                const fw: f32 = @floatFromInt(img_w);
-                const fh: f32 = @floatFromInt(img_h);
-                const scale = @min(1.0, @min(@as(f32, @floatFromInt(max_w)) / fw, @as(f32, @floatFromInt(max_h)) / fh));
-                const w: u32 = @intFromFloat(@round(fw * scale));
-                const h: u32 = @intFromFloat(@round(fh * scale));
-                return .{ .w = @max(w, 320), .h = @max(h, 200) };
-            }
-            // Immagine async (dimensioni ignote finché non è decodificata): landscape.
-            return .{ .w = @min(max_w, 1280), .h = @min(max_h, 800) };
-        },
-        // Documento: al massimo una pagina A4 (ritratto 210:297), capata allo schermo.
-        // L'altezza guida; la larghezza segue il rapporto A4, senza sbordare da max_w.
-        .document => {
-            const a4_h: u32 = @min(max_h, 1123);
-            const a4_w: u32 = @min(max_w, @as(u32, @intFromFloat(@round(@as(f32, @floatFromInt(a4_h)) * 210.0 / 297.0))));
-            return .{ .w = a4_w, .h = a4_h };
-        },
-        // Tabella (csv/xls/zip): dimensiona sulla larghezza reale delle colonne
-        // (img_w/img_h = dimensione naturale della griglia), con tetto sullo
-        // schermo. Oltre max_w la finestra si ferma e scatta lo scroll orizzontale.
-        .table => {
-            if (img_w != 0) {
-                // Floor bassi: la finestra ADERISCE al contenuto (niente vuoto sotto).
-                // Il contenuto minuscolo è già stato ingrandito da `autoZoomForContent`,
-                // quindi qui non serve gonfiare la finestra.
-                const w = std.math.clamp(img_w, 320, max_w);
-                const h = std.math.clamp(img_h, 200, max_h);
-                return .{ .w = w, .h = h };
-            }
-            return .{ .w = @min(max_w, 1280), .h = @min(max_h, 820) };
-        },
-        // Mesh 3D: viewport quasi quadrato.
-        .mesh => return .{ .w = @min(max_w, 1000), .h = @min(max_h, 900) },
-        .generic => return .{ .w = 1280, .h = 720 },
-    }
 }
 
 /// Risolve l'argomento iniziale in un percorso di file. Se `arg` è una CARTELLA,
@@ -2030,7 +1609,7 @@ pub fn main(init: std.process.Init) !void {
     // Proporzioni intelligenti per tipo di contenuto: nel percorso sincrono il
     // tipo è già noto dal decoded; in quello async (spinner) si stima
     // dall'estensione, così la finestra nasce già con la forma giusta.
-    const win_kind: WinKind = if (loading) winKindFromExt(file_path) else winKindFromDecoded(&decoded);
+    const win_kind: WinKind = if (loading) layout.winKindFromExt(file_path) else layout.winKindFromDecoded(&decoded);
 
     // Video: apri il player nativo (libav) e usa il primo frame come poster
     // iniziale. Niente decode async/spinner — aprire il container è veloce — così
@@ -2067,8 +1646,8 @@ pub fn main(init: std.process.Init) !void {
     const size_h = if (win_kind == .table) tbl_h else static_h;
     // Contenuto piccolo → zoom iniziale un po' più grande, finestra aderente al
     // contenuto zoomato (stessa euristica della navigazione).
-    zoom = autoZoomForContent(win_kind, size_w, size_h);
-    const win_size = initialWindowSize(win_kind, scaleDim(size_w, zoom), scaleDim(size_h, zoom));
+    zoom = layout.autoZoomForContent(win_kind, size_w, size_h);
+    const win_size = layout.initialWindowSize(win_kind, layout.scaleDim(size_w, zoom), layout.scaleDim(size_h, zoom));
     const win = try zrame.Window.init(gpa, .{
         .title = "zuer-gui",
         .app_id = "it.zuer.gui",
