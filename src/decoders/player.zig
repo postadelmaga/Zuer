@@ -17,6 +17,12 @@ pub const c = @cImport({
     @cInclude("libswscale/swscale.h");
 });
 
+// Decoder VP9 su GPU compute (libcompute_vp9): abilitato solo con build native/gpu
+// (Linux). Su build CPU-only `cvp9` è uno struct vuoto e il suo @cImport non viene
+// mai analizzato — così player.zig resta compilabile senza la libreria.
+const cvp9_enabled = @import("build_options").gpu;
+const cvp9 = if (cvp9_enabled) @import("cvp9.zig") else struct {};
+
 pub const Frame = struct {
     width: usize,
     height: usize,
@@ -67,7 +73,19 @@ pub const Player = struct {
     sws_dst_w: c_int = 0,
     sws_dst_h: c_int = 0,
 
+    // Decoder VP9 su GPU (libcompute_vp9). `is_vp9` = stiamo instradando i packet a
+    // cvp9 invece che a libavcodec. Il contesto avcodec resta comunque aperto come
+    // fallback (es. se un seek non riesce a ricreare il contesto cvp9).
+    cvp9_ctx: if (cvp9_enabled) ?cvp9.Ctx else void = if (cvp9_enabled) null else {},
+    is_vp9: bool = false,
+
     pub fn open(path: [*:0]const u8) Error!Player {
+        return openEx(path, true);
+    }
+
+    /// `allow_cvp9` = consenti il decoder GPU per gli stream VP9. Il poster
+    /// (`firstVideoFrame`) passa false: un solo frame non giustifica un contesto GPU.
+    pub fn openEx(path: [*:0]const u8, allow_cvp9: bool) Error!Player {
         var fmt_ctx: [*c]c.AVFormatContext = null;
         if (c.avformat_open_input(&fmt_ctx, path, null, null) != 0) return Error.OpenFailed;
         errdefer c.avformat_close_input(&fmt_ctx);
@@ -111,6 +129,23 @@ pub const Player = struct {
             duration_s = @as(f64, @floatFromInt(stream.*.duration)) * time_base;
         }
 
+        // VP9 → prova il decoder GPU compute; se il backend non parte, resta libav.
+        var cvp9_ctx: if (cvp9_enabled) ?cvp9.Ctx else void = if (cvp9_enabled) null else {};
+        var is_vp9 = false;
+        if (comptime cvp9_enabled) {
+            const is_vp9_stream = stream.*.codecpar.*.codec_id == c.AV_CODEC_ID_VP9;
+            const forced_libav = std.c.getenv("ZUER_VP9_LIBAV") != null;
+            if (allow_cvp9 and is_vp9_stream and !forced_libav) {
+                if (cvp9.Ctx.create()) |cx| {
+                    cvp9_ctx = cx;
+                    is_vp9 = true;
+                    std.log.info("[cvp9] VP9 via GPU compute, backend {s}", .{cx.backendName()});
+                } else {
+                    std.log.warn("[cvp9] init fallita, VP9 via libav (libvpx)", .{});
+                }
+            }
+        }
+
         return .{
             .fmt_ctx = fmt_ctx,
             .codec_ctx = codec_ctx,
@@ -119,10 +154,15 @@ pub const Player = struct {
             .video_stream = stream_idx,
             .time_base = time_base,
             .duration_s = duration_s,
+            .cvp9_ctx = cvp9_ctx,
+            .is_vp9 = is_vp9,
         };
     }
 
     pub fn deinit(self: *Player) void {
+        if (comptime cvp9_enabled) {
+            if (self.cvp9_ctx) |cx| cx.destroy();
+        }
         if (self.sws) |s| c.sws_freeContext(s);
         var p: [*c]c.AVPacket = self.packet;
         c.av_packet_free(&p);
@@ -139,9 +179,19 @@ pub const Player = struct {
         return @as(f64, @floatFromInt(ts)) * self.time_base;
     }
 
+    /// Secondi da un timestamp grezzo nella time_base dello stream (per i frame cvp9,
+    /// il cui PTS è quello del packet che abbiamo sottomesso).
+    fn rawPtsSeconds(self: *Player, ts: i64) f64 {
+        if (ts == c.AV_NOPTS_VALUE) return 0;
+        return @as(f64, @floatFromInt(ts)) * self.time_base;
+    }
+
     /// Decodifica il prossimo frame video, scalato a `max_dim`, con il suo PTS.
     /// Ritorna `null` a fine stream. Il chiamante possiede `Frame.pixels`.
     pub fn nextFrame(self: *Player, max_dim: usize, allocator: std.mem.Allocator) Error!?Frame {
+        if (comptime cvp9_enabled) {
+            if (self.is_vp9) return self.nextFrameCvp9(max_dim, allocator);
+        }
         while (true) {
             const rr = c.av_read_frame(self.fmt_ctx, self.packet);
             if (rr < 0) {
@@ -160,6 +210,55 @@ pub const Player = struct {
             if (r < 0) return Error.NoFrameDecoded;
             return try self.scaleCurrent(max_dim, allocator);
         }
+    }
+
+    /// Percorso VP9 su GPU: sottomette i packet grezzi a cvp9 e raccoglie i frame
+    /// I420 in ordine di presentazione (pipeline: alcuni frame possono essere in
+    /// volo). A fine stream drena i frame residui in modo bloccante.
+    fn nextFrameCvp9(self: *Player, max_dim: usize, allocator: std.mem.Allocator) Error!?Frame {
+        var f: cvp9.Frame = undefined;
+        while (true) {
+            // Un frame potrebbe essere già pronto dalla pipeline.
+            if (self.cvp9_ctx.?.getFrame(&f) == .ok) return try self.scaleI420(f, max_dim, allocator);
+            const rr = c.av_read_frame(self.fmt_ctx, self.packet);
+            if (rr < 0) {
+                // Fine file: drena i frame ancora in volo (pipeline poco profonda),
+                // con un tetto di tentativi così un frame bloccato non appende il worker.
+                var tries: u32 = 0;
+                while (tries < 256) : (tries += 1) {
+                    switch (self.cvp9_ctx.?.getFrame(&f)) {
+                        .ok => return try self.scaleI420(f, max_dim, allocator),
+                        .none => return null,
+                        .again => std.Thread.yield() catch {},
+                    }
+                }
+                return null;
+            }
+            defer c.av_packet_unref(self.packet);
+            if (self.packet.*.stream_index != self.video_stream) continue;
+            self.cvp9_ctx.?.decode(self.packet.*.data, @intCast(self.packet.*.size), self.packet.*.pts);
+        }
+    }
+
+    /// Converte un frame I420 di cvp9 in RGB24 impacchettato scalato a `max_dim`.
+    fn scaleI420(self: *Player, f: cvp9.Frame, max_dim: usize, allocator: std.mem.Allocator) Error!Frame {
+        const src_w: c_int = @intCast(f.width);
+        const src_h: c_int = @intCast(f.height);
+        const dims = fitDims(src_w, src_h, max_dim);
+        try self.ensureSws(src_w, src_h, c.AV_PIX_FMT_YUV420P, dims.w, dims.h);
+
+        const w: usize = @intCast(dims.w);
+        const h: usize = @intCast(dims.h);
+        const pixels = try allocator.alloc(u8, w * h * 3);
+        errdefer allocator.free(pixels);
+
+        var src_data = [_][*c]u8{ f.y, f.u, f.v, null };
+        var src_linesize = [_]c_int{ @intCast(f.stride_y), @intCast(f.stride_uv), @intCast(f.stride_uv), 0 };
+        var dst_data = [_][*c]u8{ pixels.ptr, null, null, null };
+        var dst_linesize = [_]c_int{ @intCast(w * 3), 0, 0, 0 };
+        _ = c.sws_scale(self.sws, &src_data[0], &src_linesize[0], 0, src_h, &dst_data[0], &dst_linesize[0]);
+
+        return .{ .width = w, .height = h, .pixels = pixels, .pts_s = self.rawPtsSeconds(f.pts) };
     }
 
     /// (Ri)crea il contesto swscale se dimensioni/formato sorgente o la
@@ -210,6 +309,20 @@ pub const Player = struct {
         else
             @intFromFloat(seconds * @as(f64, c.AV_TIME_BASE));
         _ = c.av_seek_frame(self.fmt_ctx, self.video_stream, ts, c.AVSEEK_FLAG_BACKWARD);
+        if (comptime cvp9_enabled) {
+            if (self.is_vp9) {
+                // cvp9 non ha una flush: ricrea il contesto per azzerare i frame di
+                // riferimento (dal keyframe il decode riparte pulito). Se la ricreazione
+                // fallisce, ripiega su libav (il contesto avcodec è già aperto).
+                if (self.cvp9_ctx) |cx| cx.destroy();
+                self.cvp9_ctx = cvp9.Ctx.create();
+                if (self.cvp9_ctx == null) {
+                    self.is_vp9 = false;
+                    c.avcodec_flush_buffers(self.codec_ctx);
+                }
+                return;
+            }
+        }
         c.avcodec_flush_buffers(self.codec_ctx);
     }
 };
@@ -217,7 +330,9 @@ pub const Player = struct {
 /// Scorciatoia one-shot: primo frame video del file in RGB24 scalato a
 /// `max_dim`. Usata per poster/anteprima.
 pub fn firstVideoFrame(path: [*:0]const u8, max_dim: usize, allocator: std.mem.Allocator) Error!Frame {
-    var player = try Player.open(path);
+    // Poster via libav (allow_cvp9 = false): un singolo frame non giustifica il
+    // costo di un contesto GPU cvp9.
+    var player = try Player.openEx(path, false);
     defer player.deinit();
     return (try player.nextFrame(max_dim, allocator)) orelse Error.NoFrameDecoded;
 }

@@ -6,11 +6,46 @@ const AppAction = state_mod.AppAction;
 const decoder_mod = @import("decoder.zig");
 const Decoded = decoder_mod.Decoded;
 
-/// Copia GPU-ready di un file decodificato: un `zicro.gpu_memory.Buffer` (memfd)
-/// esportabile a un processo/API GPU via `buffer.exportHandle()` senza copie.
+const page_align = std.heap.page_size_min;
+
+/// CPU-backed staging buffer for platforms without memfd (Windows). It mirrors the slice
+/// of `zicro.gpu_memory.Buffer`'s surface that the loader + renderer use (`ptr`, `asMut`,
+/// `write`, `deinit`), so `GpuStage` is source-identical across platforms. The renderer's
+/// `setMesh` imports this page-aligned host pointer zero-copy where the driver allows, and
+/// otherwise falls back to a one-time copy — no memfd/cross-process sharing needed for the
+/// in-process GUI renderer.
+const CpuStageBuffer = struct {
+    ptr: []align(page_align) u8,
+
+    fn allocate(gpa: std.mem.Allocator, size: usize) !CpuStageBuffer {
+        return .{ .ptr = try gpa.alignedAlloc(u8, comptime std.mem.Alignment.fromByteUnits(page_align), size) };
+    }
+    pub fn asMut(self: *CpuStageBuffer) []u8 {
+        return self.ptr;
+    }
+    pub fn write(self: *CpuStageBuffer, offset: usize, data: []const u8) !void {
+        if (offset + data.len > self.ptr.len) return error.WriteOutOfBounds;
+        @memcpy(self.ptr[offset .. offset + data.len], data);
+    }
+    pub fn deinit(self: *CpuStageBuffer, gpa: std.mem.Allocator) void {
+        gpa.free(self.ptr);
+    }
+};
+
+/// memfd (exportable, zero-copy across processes) on Linux; a plain page-aligned CPU
+/// allocation on platforms without memfd. Same API on both.
+pub const StageBuffer = if (builtin.os.tag == .linux) zicro.gpu_memory.Buffer else CpuStageBuffer;
+
+fn stageAlloc(gpa: std.mem.Allocator, size: usize, name: []const u8) !StageBuffer {
+    if (builtin.os.tag == .linux) return zicro.gpu_memory.Buffer.allocate(gpa, size, name);
+    return CpuStageBuffer.allocate(gpa, size);
+}
+
+/// Copia GPU-ready di un file decodificato: un `StageBuffer` (memfd su Linux, buffer CPU
+/// page-aligned altrove) da cui il renderer carica la geometria.
 /// Layout: immagini = pixel RGB8 raw; mesh = vertici f32 xyz seguiti da indici u32.
 pub const GpuStage = struct {
-    buffer: zicro.gpu_memory.Buffer,
+    buffer: StageBuffer,
     vertex_bytes: usize = 0,
     index_bytes: usize = 0,
 };
@@ -25,12 +60,9 @@ pub const LoadedFile = struct {
 
     pub fn deinit(self: *LoadedFile) void {
         self.decoded.deinit(self.gpa);
-        // GPU staging is Linux/memfd-only (see stageToGpu). Gating the deinit by OS keeps
-        // zicro's gpu_memory (munmap etc.) out of a non-Linux link — `self.gpu` is always
-        // null there anyway.
-        if (builtin.os.tag == .linux) {
-            if (self.gpu) |*stage| stage.buffer.deinit(self.gpa);
-        }
+        // `StageBuffer.deinit` is per-OS (memfd unmap on Linux, plain free elsewhere); both
+        // are safe to call. zicro's gpu_memory already gates its munmap by OS.
+        if (self.gpu) |*stage| stage.buffer.deinit(self.gpa);
     }
 };
 
@@ -106,12 +138,14 @@ pub const LoaderModule = struct {
 /// Fallire qui non è un errore: il viewer TUI funziona comunque, senza copia GPU.
 /// Pubblica perché riusata da zuer-gui per alimentare lo stesso renderer.
 pub fn stageToGpu(gpa: std.mem.Allocator, decoded: *const Decoded) ?GpuStage {
-    if (builtin.os.tag != .linux) return null;
-
     switch (decoded.*) {
         .image => |img| {
+            // Images are GPU-staged only on Linux (the TUI's zero-copy GPU present path).
+            // The GUI composites images on the CPU, so there's no need to double them into a
+            // staging buffer on Windows.
+            if (builtin.os.tag != .linux) return null;
             if (img.pixels.len == 0) return null;
-            var buffer = zicro.gpu_memory.Buffer.allocate(gpa, img.pixels.len, "zuer/image-rgb8") catch return null;
+            var buffer = stageAlloc(gpa, img.pixels.len, "zuer/image-rgb8") catch return null;
             buffer.write(0, img.pixels) catch {
                 buffer.deinit(gpa);
                 return null;
@@ -245,7 +279,7 @@ pub fn stageToGpu(gpa: std.mem.Allocator, decoded: *const Decoded) ?GpuStage {
                 @memset(tangents, .{ 1, 0, 0, 1 });
             }
 
-            var buffer = zicro.gpu_memory.Buffer.allocate(gpa, total, "zuer/mesh-vtx-idx") catch return null;
+            var buffer = stageAlloc(gpa, total, "zuer/mesh-vtx-idx") catch return null;
 
             // Scrittura interleaved: 12 pos + 12 normale + 8 uv + 16 tangente.
             const vbuf = buffer.asMut();

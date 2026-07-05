@@ -4,14 +4,30 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Native rendering = the Vulkan offscreen mesh renderer + the libav video player.
-    // Defaults on for Linux, off elsewhere: on Windows zuer-gui builds CPU-only (text/
-    // csv/image/pdf viewing via software compositing), which needs neither Vulkan nor
-    // FFmpeg import libs. Force with `-Dgpu=true|false`.
-    const gpu_enabled = b.option(bool, "gpu", "Build the Vulkan mesh renderer + libav video player") orelse
-        (target.result.os.tag == .linux);
+    // Two independent native capabilities, each with its own import-lib requirement:
+    //  -Dvulkan: the offscreen Vulkan mesh/text renderer. Works on Linux (system loader)
+    //            and Windows (vendored vulkan-1 import lib → runs on Wine's winevulkan).
+    //  -Dffmpeg: the libav-backed native video player. Linux-only until FFmpeg Windows
+    //            import libs are vendored (video files just don't open elsewhere).
+    // On Windows zuer-gui is otherwise CPU-only (text/csv/image composited in software).
+    const os_tag = target.result.os.tag;
+    const vulkan_enabled = b.option(bool, "vulkan", "Link the Vulkan mesh/text renderer") orelse
+        (os_tag == .linux or os_tag == .windows);
+    const ffmpeg_enabled = b.option(bool, "ffmpeg", "Link the libav native video player") orelse
+        (os_tag == .linux);
     const build_opts = b.addOptions();
-    build_opts.addOption(bool, "gpu", gpu_enabled);
+    // gui.zig/player.zig read `gpu` as "Vulkan renderer available"; `video` as "libav available".
+    build_opts.addOption(bool, "gpu", vulkan_enabled);
+    build_opts.addOption(bool, "video", ffmpeg_enabled);
+
+    // Link the Vulkan loader into a module: system loader on Linux, the vendored
+    // vulkan-1 import lib on Windows (vk.zig's `extern "vulkan"` emits `-lvulkan`).
+    const LinkVk = struct {
+        fn link(bld: *std.Build, m: *std.Build.Module, tgt: std.Build.ResolvedTarget) void {
+            if (tgt.result.os.tag == .windows) m.addLibraryPath(bld.path("vendor/vulkan"));
+            m.linkSystemLibrary("vulkan", .{});
+        }
+    };
 
     // Obtain the Zicro dependency declared in build.zig.zon
     const dep_zicro = b.dependency("zicro", .{
@@ -89,14 +105,13 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addAnonymousImport("shadow_frag_spv", .{ .root_source_file = shadow_frag_spv });
     exe.root_module.addAnonymousImport("voxel_vert_spv", .{ .root_source_file = voxel_vert_spv });
     exe.root_module.addAnonymousImport("voxel_frag_spv", .{ .root_source_file = voxel_frag_spv });
-    // The TUI binary doesn't render via Vulkan (kitty/half-block are CPU); only link the
-    // loader when native rendering is on so the CPU-only target needs no Vulkan import lib.
-    if (gpu_enabled) exe.root_module.linkSystemLibrary("vulkan", .{});
-
-    // The TUI viewer still pulls the Vulkan renderer through tui.zig (mesh preview), so it
-    // only builds with native rendering on. The GUI (zuer-gui) is the CPU-only Windows
-    // target; making the TUI CPU-only too is a follow-up (gate tui.zig's gpu use like gui).
-    if (gpu_enabled) b.installArtifact(exe);
+    // The TUI pulls the Vulkan renderer through tui.zig (mesh preview).
+    if (vulkan_enabled) LinkVk.link(b, exe.root_module, target);
+    // Its GPU present forwards a memfd across processes (Linux kitty graphics protocol),
+    // so the TUI is Linux-only for now; on other targets it isn't installed (mesh in the
+    // *GUI* still works via a plain CPU staging buffer). Making the TUI cross-platform is
+    // a follow-up (gate tui.zig's exportHandle present path).
+    if (vulkan_enabled and os_tag == .linux) b.installArtifact(exe);
 
     const gui_exe = b.addExecutable(.{
         .name = "zuer-gui",
@@ -130,12 +145,10 @@ pub fn build(b: *std.Build) void {
     gui_exe.root_module.addAnonymousImport("shadow_frag_spv", .{ .root_source_file = shadow_frag_spv });
     gui_exe.root_module.addAnonymousImport("voxel_vert_spv", .{ .root_source_file = voxel_vert_spv });
     gui_exe.root_module.addAnonymousImport("voxel_frag_spv", .{ .root_source_file = voxel_frag_spv });
-    // Vulkan (mesh renderer) + libav (video player) only when native rendering is on.
-    // On Windows (gpu=false) zuer-gui composites text/images/pdf on the CPU and presents
-    // through zrame's GDI backend — no Vulkan/FFmpeg link needed. wayland-client is
-    // likewise Linux-only (the Windows window is GDI, owned by zrame).
-    if (gpu_enabled) {
-        gui_exe.root_module.linkSystemLibrary("vulkan", .{});
+    // Vulkan mesh/text renderer: Linux + Windows (vendored import lib). On Windows this
+    // presents through zrame's GDI backend after an offscreen render+readback.
+    if (vulkan_enabled) LinkVk.link(b, gui_exe.root_module, target);
+    if (ffmpeg_enabled) {
         // Player video nativo: il worker decodifica i frame in tempo reale con libav
         // (src/decoders/player.zig, importato da gui.zig), quindi il gui_exe linka
         // ffmpeg direttamente (finora era solo nel decoder .so per il poster).
@@ -143,6 +156,9 @@ pub fn build(b: *std.Build) void {
         gui_exe.root_module.linkSystemLibrary("libavcodec", .{});
         gui_exe.root_module.linkSystemLibrary("libavutil", .{});
         gui_exe.root_module.linkSystemLibrary("libswscale", .{});
+        // Decoder VP9 su GPU compute (Vulkan): gli stream VP9 li decodifica
+        // questo invece di libvpx (vedi player.zig, path cvp9, gate build_options.gpu).
+        gui_exe.root_module.linkSystemLibrary("compute_vp9", .{});
     }
     if (target.result.os.tag == .linux) gui_exe.root_module.linkSystemLibrary("wayland-client", .{});
     // Motore di testo nativo: stb_truetype rasterizza i glifi Hack (embeddati),
@@ -175,7 +191,7 @@ pub fn build(b: *std.Build) void {
     raster_dbg.root_module.addAnonymousImport("shadow_frag_spv", .{ .root_source_file = shadow_frag_spv });
     raster_dbg.root_module.addAnonymousImport("voxel_vert_spv", .{ .root_source_file = voxel_vert_spv });
     raster_dbg.root_module.addAnonymousImport("voxel_frag_spv", .{ .root_source_file = voxel_frag_spv });
-    raster_dbg.root_module.linkSystemLibrary("vulkan", .{});
+    LinkVk.link(b, raster_dbg.root_module, target);
     const raster_dbg_run = b.addRunArtifact(raster_dbg);
     if (b.args) |args| raster_dbg_run.addArgs(args);
     b.step("raster-debug", "Rasterizza un file su PPM (stdout)").dependOn(&raster_dbg_run.step);
@@ -200,7 +216,7 @@ pub fn build(b: *std.Build) void {
     gpu_selftest.root_module.addAnonymousImport("shadow_frag_spv", .{ .root_source_file = shadow_frag_spv });
     gpu_selftest.root_module.addAnonymousImport("voxel_vert_spv", .{ .root_source_file = voxel_vert_spv });
     gpu_selftest.root_module.addAnonymousImport("voxel_frag_spv", .{ .root_source_file = voxel_frag_spv });
-    gpu_selftest.root_module.linkSystemLibrary("vulkan", .{});
+    LinkVk.link(b, gpu_selftest.root_module, target);
     const gpu_selftest_run = b.addRunArtifact(gpu_selftest);
     b.step("gpu-selftest", "Render headless di un cubo per validare la pipeline mesh").dependOn(&gpu_selftest_run.step);
 
@@ -235,21 +251,27 @@ pub fn build(b: *std.Build) void {
                 .flags = &.{ "-O2", "-fno-sanitize=undefined" },
             });
         }
-        // Heavy decoders that need FFmpeg (media) or external tools + POSIX temp dirs
-        // (pdf→pdftoppm, office→soffice) only build with native rendering on. On a
-        // CPU-only target (Windows) they're skipped — not installing them means they're
-        // neither compiled nor linked, so their libav/POSIX deps never reach the link.
-        const heavy = comptime (std.mem.eql(u8, name, "media") or std.mem.eql(u8, name, "pdf") or std.mem.eql(u8, name, "office"));
-        if (heavy) {
-            if (gpu_enabled) {
-                if (comptime std.mem.eql(u8, name, "media")) {
-                    lib.root_module.linkSystemLibrary("libavformat", .{});
-                    lib.root_module.linkSystemLibrary("libavcodec", .{});
-                    lib.root_module.linkSystemLibrary("libavutil", .{});
-                    lib.root_module.linkSystemLibrary("libswscale", .{});
-                }
+        // The media decoder needs FFmpeg (+ compute_vp9); pdf/office shell out to external
+        // tools and use POSIX temp dirs (mkdtemp). Both groups are Linux-only for now — on
+        // a CPU-only target they're simply not installed, so their libav/POSIX deps never
+        // reach the link. The core plugins (text/csv/markdown/mesh/image/glb/archive) build
+        // everywhere.
+        const needs_ffmpeg = comptime std.mem.eql(u8, name, "media");
+        const needs_tools = comptime (std.mem.eql(u8, name, "pdf") or std.mem.eql(u8, name, "office"));
+        if (needs_ffmpeg) {
+            if (ffmpeg_enabled) {
+                lib.root_module.linkSystemLibrary("libavformat", .{});
+                lib.root_module.linkSystemLibrary("libavcodec", .{});
+                lib.root_module.linkSystemLibrary("libavutil", .{});
+                lib.root_module.linkSystemLibrary("libswscale", .{});
+                // media importa player.zig (poster): serve build_options per il
+                // gate cvp9 e il link della lib (il poster resta però su libav).
+                lib.root_module.addOptions("build_options", build_opts);
+                lib.root_module.linkSystemLibrary("compute_vp9", .{});
                 b.installArtifact(lib);
             }
+        } else if (needs_tools) {
+            if (os_tag == .linux) b.installArtifact(lib);
         } else {
             b.installArtifact(lib);
         }
@@ -292,6 +314,8 @@ pub fn build(b: *std.Build) void {
     player_dbg.root_module.linkSystemLibrary("libavcodec", .{});
     player_dbg.root_module.linkSystemLibrary("libavutil", .{});
     player_dbg.root_module.linkSystemLibrary("libswscale", .{});
+    player_dbg.root_module.addOptions("build_options", build_opts);
+    player_dbg.root_module.linkSystemLibrary("compute_vp9", .{});
     const player_run = b.addRunArtifact(player_dbg);
     if (b.args) |args| player_run.addArgs(args);
     b.step("player-test", "Itera i frame video di un file (libav)").dependOn(&player_run.step);

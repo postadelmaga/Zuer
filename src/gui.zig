@@ -12,10 +12,10 @@ const voxel = @import("voxel.zig");
 const decoder_mod = @import("decoder.zig");
 const loader_mod = @import("loader.zig");
 const text_render = @import("text_render.zig");
-// player.zig does a top-level `@cImport` of the libav headers, which aren't present on a
-// CPU-only (Windows) build — so import it only when native rendering is on, with a tiny
-// stub otherwise. All real uses of the player are comptime-gated behind `native`.
-const player_mod = if (@import("build_options").gpu) @import("decoders/player.zig") else struct {
+// player.zig does a top-level `@cImport` of the libav headers, which aren't present when
+// the video player is off (e.g. Windows) — so import it only when `video` is on, with a
+// tiny stub otherwise. All real uses of the player are comptime-gated behind `has_video`.
+const player_mod = if (@import("build_options").video) @import("decoders/player.zig") else struct {
     pub const Player = struct {
         pub fn deinit(_: *Player) void {}
     };
@@ -23,9 +23,12 @@ const player_mod = if (@import("build_options").gpu) @import("decoders/player.zi
 };
 const clipboard = @import("clipboard.zig");
 const build_options = @import("build_options");
-/// Native rendering (Vulkan mesh renderer + libav video). Off on Windows → CPU-only
-/// viewer (text/csv/image/pdf). Comptime so the GPU/video code links only when enabled.
+/// Vulkan mesh/text renderer available (Linux + Windows). Comptime so the GPU code links
+/// only when enabled. Distinct from `has_video`: on Windows Vulkan is on but video is off.
 const native = build_options.gpu;
+/// libav-backed native video player available. Linux-only for now (needs FFmpeg import
+/// libs elsewhere). Gates every reference to the real `player_mod` API.
+const has_video = build_options.video;
 const zrame = @import("zrame");
 const zicro = @import("zicro");
 const paint = zicro.paint;
@@ -1653,8 +1656,8 @@ fn renderWorker(
         // Video: percorso a sé (come lo spinner). Guida la riproduzione in tempo
         // reale (accumulo di `frame_dt`), compone il frame corrente e vi disegna
         // sopra i controlli overlay stile YouTube, poi presenta e ricomincia.
-        // `native` only: the player is libav-backed, gated out on CPU-only builds.
-        if (native and state.video.isActive()) {
+        // `has_video` only: the player is libav-backed, gated out when video is off.
+        if (has_video and state.video.isActive()) {
             const vs = state.video;
             if (composited_rgba.len < cur_w * cur_h * 4) {
                 state.gpa.free(composited_rgba.*);
@@ -2112,7 +2115,7 @@ pub fn main(init: std.process.Init) !void {
     var static_h: u32 = 0;
 
     var video: VideoState = .{};
-    defer if (native) {
+    defer if (has_video) {
         if (video.player) |*p| p.deinit();
     };
 
@@ -2252,7 +2255,7 @@ pub fn main(init: std.process.Init) !void {
     // iniziale. Niente decode async/spinner — aprire il container è veloce — così
     // il worker parte già in riproduzione. `static_rgba` diventa il frame corrente
     // che il worker aggiorna nel tempo (vedi il ramo video di renderWorker).
-    if (native and win_kind == .video) {
+    if (has_video and win_kind == .video) {
         loading = false;
         is_text = false;
         if (setupVideo(&video, file_path, gpa)) |first| {
