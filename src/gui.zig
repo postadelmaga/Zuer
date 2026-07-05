@@ -1366,6 +1366,7 @@ fn renderWorker(
                         break;
                     };
                 } else rm: {
+                    state.renderer.vt_zoom = zoom.*; // pilota il mip dinamico delle texture virtuali
                     const pc = gpu.buildPushConstants(state.mesh_center.*, state.mesh_max_size.* / zoom.*, yaw.*, pitch.*, cur_w, cur_h, state.mesh_material.*);
                     break :rm state.renderer.render(cur_w, cur_h, &pc) catch {
                         state.mutex.unlock(state.io);

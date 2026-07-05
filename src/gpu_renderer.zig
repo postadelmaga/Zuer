@@ -15,13 +15,15 @@ const decoder = @import("decoder.zig");
 
 const vk = @import("renderer/vk.zig");
 const vtex = @import("vtex.zig");
-const vtr = @import("vtex_runtime.zig");
 const VtexPool = @import("vtex_pool.zig").VtexPool;
 
-/// Slot GPU per texture baseColor virtualizzata (fase 2): il livello mip scelto
-/// deve avere ≤ VT_BUDGET tile così l'intero livello sta nel blocco del submesh
-/// nel pool condiviso. 64 tile ⇒ ~8×8 ⇒ ~1000px effettivi di baseColor.
-const VT_BUDGET: u32 = 64;
+/// Slot GPU massimi per texture baseColor virtualizzata: il livello mip scelto
+/// deve avere ≤ budget tile così l'intero livello sta nel blocco del submesh nel
+/// pool condiviso. 128 ⇒ ~11×11 ⇒ ~1400px effettivi. Il budget effettivo
+/// (`Renderer.vt_budget`) viene ridotto a runtime se ci sono molti submesh
+/// testurati, per non superare il limite di layer dell'array image (~2048).
+const VT_BUDGET: u32 = 128;
+const VT_MAX_SLOTS: u32 = 2048;
 
 // libc getenv, portable across Linux/Windows (std.posix.getenv is Linux-only here) — used to
 // read the ZUER_GPU device override.
@@ -397,6 +399,11 @@ pub const Renderer = struct {
     /// Pool tile GPU condiviso per le texture baseColor virtualizzate (ricreato a
     /// ogni modello in `setSubmeshes`, dimensionato al numero di submesh testurati).
     vt_pool: ?VtexPool = null,
+    /// Zoom camera corrente (impostato dal chiamante prima di render): pilota la
+    /// scelta del livello mip residente delle texture virtuali.
+    vt_zoom: f32 = 1.0,
+    /// Budget slot effettivo per submesh (≤ VT_BUDGET, ridotto se molti testurati).
+    vt_budget: u32 = VT_BUDGET,
     white_tex: ImageBundle = .{ .image = VK_NULL, .mem = VK_NULL, .view = VK_NULL },
     flat_normal_tex: ImageBundle = .{ .image = VK_NULL, .mem = VK_NULL, .view = VK_NULL },
     submeshes: []SubMeshGpu = &.{},
@@ -865,31 +872,28 @@ pub const Renderer = struct {
     /// set con la propria texture baseColor (bind 0) e la shadow map (bind 1).
     /// Il pool descriptor viene ricreato dimensionato al numero di submesh.
     /// `subs` vuoto ⇒ un submesh unico bianco sull'intera geometria.
-    /// Contesto del mirror residenza→GPU: carica ogni tile resa residente dal
-    /// runtime nello slot `base + slot_locale` del pool condiviso.
-    const VtUploadCtx = struct {
-        pool: *VtexPool,
-        base: u32,
-        vt: *vtr.VirtualTexture,
-        fn hook(ctx: *anyopaque, tile: vtr.TileId, slot: u32) void {
-            _ = tile;
-            const c: *VtUploadCtx = @ptrCast(@alignCast(ctx));
-            c.pool.uploadTile(c.base + slot, c.vt.slotTexels(slot)) catch {};
-        }
-    };
-
-    /// Livello mip più fine il cui intero grid di tile sta in VT_BUDGET slot.
-    fn chooseVtLevel(baked: *const vtex.BakedTexture) usize {
-        var lvl: usize = 0;
-        for (baked.levels, 0..) |d, i| {
-            if (@as(u32, d.tiles_x) * d.tiles_y <= VT_BUDGET) lvl = i;
-        }
-        return lvl;
+    /// Larghezza in pixel del livello coarse-first `level`.
+    fn vtLevelWidth(baked: *const vtex.BakedTexture, level: usize) u32 {
+        return vtex.levelDims(baked.width, baked.height, level, baked.levels.len).w;
     }
 
-    /// Buffer storage host-visible con `data` dentro (SSBO d'indirezione).
-    fn createStorageBuffer(self: *Renderer, data: []const u8, out_buf: *VkBuffer, out_mem: *VkDeviceMemory) !void {
-        const size: u64 = @max(data.len, 4);
+    /// Livello mip da rendere residente per una risoluzione-schermo target: il
+    /// più grezzo (meno VRAM) che ha ancora ≥ `target_px` di lato, mai più fine
+    /// del più fine che sta in VT_BUDGET slot.
+    fn chooseVtLevel(baked: *const vtex.BakedTexture, target_px: u32, budget: u32) usize {
+        var finest_fit: usize = 0;
+        for (baked.levels, 0..) |d, i| {
+            if (@as(u32, d.tiles_x) * d.tiles_y <= budget) finest_fit = i;
+        }
+        for (baked.levels, 0..) |d, i| {
+            if (@as(u32, d.tiles_x) * d.tiles_y <= budget and vtLevelWidth(baked, i) >= target_px) return i;
+        }
+        return finest_fit;
+    }
+
+    /// Buffer storage host-visible di `size` byte, mappato persistente (l'SSBO
+    /// d'indirezione, riscritto in-place a ogni cambio livello).
+    fn createStorageBuffer(self: *Renderer, size: u64, out_buf: *VkBuffer, out_mem: *VkDeviceMemory, out_ptr: *[*]u32) !void {
         var buf: VkBuffer = VK_NULL;
         try check(vkCreateBuffer(self.device, &.{ .size = size, .usage = BUFFER_USAGE_STORAGE }, null, &buf));
         errdefer vkDestroyBuffer(self.device, buf, null);
@@ -902,42 +906,61 @@ pub const Renderer = struct {
         try check(vkBindBufferMemory(self.device, buf, mem, 0));
         var mapped: *anyopaque = undefined;
         try check(vkMapMemory(self.device, mem, 0, size, 0, &mapped));
-        if (data.len > 0) {
-            const dst: [*]u8 = @ptrCast(mapped);
-            @memcpy(dst[0..data.len], data);
-        }
         out_buf.* = buf;
         out_mem.* = mem;
+        out_ptr.* = @ptrCast(@alignCast(mapped));
     }
 
-    /// Bake della baseColor in tile, upload del livello scelto negli slot
-    /// `[base, base+budget)` del pool, e SSBO cell→slot per il fragment shader.
-    fn bakeVtBaseColor(self: *Renderer, g: *SubMeshGpu, pixels: []const u8, w: u32, h: u32, base: u32) !void {
-        var baked = try vtex.bakeTiles(self.gpa, pixels, w, h);
-        defer baked.deinit();
-        const level = chooseVtLevel(&baked);
+    /// Rende residente il livello `level` della baseColor del submesh: carica le
+    /// sue tile nel blocco del pool e riscrive l'SSBO cell→slot. Le tile fuori
+    /// livello restano nel pool ma non referenziate.
+    fn uploadVtLevel(self: *Renderer, g: *SubMeshGpu, level: usize) void {
+        const baked = &g.baked.?;
         const desc = baked.levels[level];
-
-        var src = vtr.MemTileSource.init(&baked);
-        var vt = try vtr.VirtualTexture.init(self.gpa, baked.levels, w, h, VT_BUDGET, vtr.MemTileSource.fill, &src);
-        defer vt.deinit();
-        var ctx = VtUploadCtx{ .pool = &self.vt_pool.?, .base = base, .vt = &vt };
-        vt.setResidentHook(&ctx, VtUploadCtx.hook);
-        vt.beginFrame();
-
-        const n_cells = @as(usize, desc.tiles_x) * desc.tiles_y;
-        const slots = try self.gpa.alloc(u32, n_cells);
-        defer self.gpa.free(slots);
         for (0..desc.tiles_y) |ty| {
             for (0..desc.tiles_x) |tx| {
-                const r = try vt.request(@intCast(level), @intCast(tx), @intCast(ty));
-                slots[ty * desc.tiles_x + tx] = base + r.slot;
+                const cell: u32 = @intCast(ty * desc.tiles_x + tx);
+                const page = baked.pages[vtex.tileIndex(baked.levels, level, @intCast(tx), @intCast(ty))];
+                self.vt_pool.?.uploadTile(g.vt_base + cell, page) catch {};
+                g.vt_slots_ptr[cell] = g.vt_base + cell;
             }
         }
-        try self.createStorageBuffer(std.mem.sliceAsBytes(slots), &g.vt_buf, &g.vt_mem);
         g.vt_tiles_x = desc.tiles_x;
         g.vt_tiles_y = desc.tiles_y;
+        g.vt_level = @intCast(level);
+    }
+
+    /// Bake della baseColor + riserva il blocco pool e l'SSBO. Il livello viene
+    /// caricato pigramente da `updateVtLevels` in base allo zoom.
+    fn bakeVtBaseColor(self: *Renderer, g: *SubMeshGpu, pixels: []const u8, w: u32, h: u32, base: u32) !void {
+        g.baked = try vtex.bakeTiles(self.gpa, pixels, w, h);
+        errdefer {
+            g.baked.?.deinit();
+            g.baked = null;
+        }
+        try self.createStorageBuffer(@as(u64, self.vt_budget) * 4, &g.vt_buf, &g.vt_mem, &g.vt_slots_ptr);
+        g.vt_base = base;
         g.vt_on = true;
+        g.vt_level = -1;
+        self.uploadVtLevel(g, chooseVtLevel(&g.baked.?, self.vtTargetPx(), self.vt_budget)); // livello iniziale
+    }
+
+    /// Risoluzione-schermo target per la selezione del mip: lato corto del
+    /// framebuffer scalato dallo zoom corrente (impostato da `vt_zoom`).
+    fn vtTargetPx(self: *const Renderer) u32 {
+        const short: f32 = @floatFromInt(@min(@max(self.width, 1), @max(self.height, 1)));
+        return @intFromFloat(@max(64.0, short * @max(self.vt_zoom, 0.05)));
+    }
+
+    /// Aggiorna il livello mip residente di ogni submesh testurato secondo lo
+    /// zoom corrente; ri-uploada solo quando il livello scelto cambia.
+    fn updateVtLevels(self: *Renderer) void {
+        const target = self.vtTargetPx();
+        for (self.submeshes) |*g| {
+            if (!g.vt_on or g.baked == null) continue;
+            const level = chooseVtLevel(&g.baked.?, target, self.vt_budget);
+            if (g.vt_level != @as(i32, @intCast(level))) self.uploadVtLevel(g, level);
+        }
     }
 
     pub fn setSubmeshes(self: *Renderer, subs: []const decoder.SubMesh) !void {
@@ -959,7 +982,10 @@ pub const Renderer = struct {
         for (subs) |s| {
             if (s.tex_width > 0 and s.tex_height > 0 and s.tex_pixels.len >= s.tex_width * s.tex_height * 4) textured += 1;
         }
-        self.vt_pool = try VtexPool.init(self.device, &self.mem_props, self.queue, self.cmd, self.fence, @max(1, textured * VT_BUDGET));
+        // Budget effettivo: riduci se molti submesh testurati, per non superare
+        // il limite di layer dell'array image del pool.
+        self.vt_budget = @max(1, @min(VT_BUDGET, VT_MAX_SLOTS / @max(1, textured)));
+        self.vt_pool = try VtexPool.init(self.device, &self.mem_props, self.queue, self.cmd, self.fence, @max(1, textured * self.vt_budget));
 
         // Ricrea il pool descriptor: 3 sampler + 1 SSBO per set.
         vkDestroyDescriptorPool(self.device, self.mesh_dpool, null);
@@ -1000,7 +1026,7 @@ pub const Renderer = struct {
                 g.roughness = s.roughness;
                 if (s.tex_width > 0 and s.tex_height > 0 and s.tex_pixels.len >= s.tex_width * s.tex_height * 4) {
                     try self.bakeVtBaseColor(&g, s.tex_pixels, @intCast(s.tex_width), @intCast(s.tex_height), next_base);
-                    next_base += VT_BUDGET;
+                    next_base += self.vt_budget;
                 }
                 if (s.nrm_tex_width > 0 and s.nrm_tex_height > 0 and s.nrm_tex_pixels.len >= s.nrm_tex_width * s.nrm_tex_height * 4) {
                     // Normal map = dati lineari (non sRGB).
@@ -1010,7 +1036,7 @@ pub const Renderer = struct {
             }
             // Ogni set deve avere un SSBO valido al binding 3 (dummy per i submesh
             // senza baseColor virtualizzata, vt_on=false).
-            if (g.vt_buf == VK_NULL) try self.createStorageBuffer(&[_]u8{ 0, 0, 0, 0 }, &g.vt_buf, &g.vt_mem);
+            if (g.vt_buf == VK_NULL) try self.createStorageBuffer(4, &g.vt_buf, &g.vt_mem, &g.vt_slots_ptr);
             errdefer {
                 if (g.owns_nrm_tex) self.destroyImage(g.nrm_tex);
                 if (g.vt_buf != VK_NULL) {
@@ -1040,6 +1066,10 @@ pub const Renderer = struct {
             if (sm.vt_buf != VK_NULL) {
                 vkDestroyBuffer(self.device, sm.vt_buf, null);
                 vkFreeMemory(self.device, sm.vt_mem, null);
+            }
+            if (sm.baked) |*b| {
+                var bb = b.*;
+                bb.deinit();
             }
         }
         if (self.submeshes.len > 0) self.gpa.free(self.submeshes);
@@ -1212,6 +1242,7 @@ pub const Renderer = struct {
         try self.ensureTarget(width, height);
         try self.ensureShadow();
         if (self.submeshes.len == 0) try self.setSubmeshes(&[_]decoder.SubMesh{});
+        self.updateVtLevels(); // mip dinamico secondo lo zoom corrente
 
         const cmd = self.frame_cmds[slot];
         const fence = self.frame_fences[slot];
@@ -1306,6 +1337,7 @@ pub const Renderer = struct {
         // Rete di sicurezza: senza submesh non verrebbe disegnato nulla. Ne
         // sintetizza uno bianco sull'intera geometria (materiale di default).
         if (self.submeshes.len == 0) try self.setSubmeshes(&[_]decoder.SubMesh{});
+        self.updateVtLevels(); // mip dinamico secondo lo zoom corrente
 
         try check(vkBeginCommandBuffer(self.cmd, &.{}));
 
@@ -1625,12 +1657,18 @@ pub const Renderer = struct {
         nrm_tex: ImageBundle,
         owns_nrm_tex: bool, // false se `nrm_tex` è la flat condivisa
         dset: VkDescriptorSet,
-        // Virtual texture baseColor: SSBO cell→slot + griglia del livello residente.
+        // Virtual texture baseColor (mip dinamico): le tile baked restano vive per
+        // ri-uploadare il livello scelto dallo zoom; SSBO cell→slot mappato per
+        // riscriverlo in-place; blocco [vt_base, vt_base+budget) nel pool.
         vt_buf: VkBuffer = VK_NULL,
         vt_mem: VkDeviceMemory = VK_NULL,
+        vt_slots_ptr: [*]u32 = undefined, // SSBO mappato (budget entry)
+        vt_base: u32 = 0,
         vt_tiles_x: u32 = 0,
         vt_tiles_y: u32 = 0,
+        vt_level: i32 = -1, // livello attualmente residente (-1 = nessuno)
         vt_on: bool = false,
+        baked: ?vtex.BakedTexture = null,
     };
 
     fn createImage(self: *Renderer, width: u32, height: u32, format: u32, usage: u32, aspect: u32, with_view: bool) !ImageBundle {
