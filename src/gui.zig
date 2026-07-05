@@ -283,27 +283,92 @@ const GuiAppState = struct {
         self.ld_cond.signal(self.io);
     }
 
-    /// Libera l'RGBA sorgente delle texture della mesh corrente dopo che sono
-    /// state caricate su GPU (baked su disco + pool VT): non serve più a nessuno
-    /// (il voxel usa solo la geometria) e su modelli con molte texture 2K/4K vale
-    /// decine/centinaia di MB. Azzera gli slice così `deinit` non rilibera.
-    fn freeMeshTextures(self: *GuiAppState) void {
+    /// Libera i dati CPU della mesh dopo l'upload su GPU: sono tutti duplicati
+    /// altrove e non più necessari alla visualizzazione, ma su modelli grossi
+    /// valgono centinaia di MB. Azzera gli slice così `deinit` non rilibera.
+    ///  - Geometria (vertici/facce/normali/uv/tangenti): interamente interleaved
+    ///    nel buffer staging (il vertex buffer GPU, che resta vivo). Il voxel la
+    ///    ricostruisce da lì on-demand (`voxelizeFromStage`).
+    ///  - Texture (tex_pixels/nrm): baked su disco (cache VT) + pool GPU.
+    /// Conserva i metadati dei submesh (range indici + base_color): minuscoli e
+    /// usati dalla voxelizzazione per il colore di fallback.
+    fn freeMeshCpuData(self: *GuiAppState) void {
         if (self.decoded.* != .mesh) return;
         const mesh = &self.decoded.mesh;
-        if (mesh.tex_pixels.len > 0) {
-            self.gpa.free(mesh.tex_pixels);
-            mesh.tex_pixels = &.{};
-        }
-        for (mesh.submeshes) |*s| {
-            if (s.tex_pixels.len > 0) {
-                self.gpa.free(s.tex_pixels);
-                s.tex_pixels = &.{};
+        const free = struct {
+            fn s(gpa: std.mem.Allocator, slice: anytype) @TypeOf(slice) {
+                if (slice.len > 0) gpa.free(slice);
+                return slice[0..0];
             }
-            if (s.nrm_tex_pixels.len > 0) {
-                self.gpa.free(s.nrm_tex_pixels);
-                s.nrm_tex_pixels = &.{};
+        }.s;
+        mesh.vertices = free(self.gpa, mesh.vertices);
+        mesh.faces = free(self.gpa, mesh.faces);
+        mesh.normals = free(self.gpa, mesh.normals);
+        mesh.uvs = free(self.gpa, mesh.uvs);
+        mesh.tangents = free(self.gpa, mesh.tangents);
+        mesh.tex_pixels = free(self.gpa, mesh.tex_pixels);
+        for (mesh.submeshes) |*sm| {
+            sm.tex_pixels = free(self.gpa, sm.tex_pixels);
+            sm.nrm_tex_pixels = free(self.gpa, sm.nrm_tex_pixels);
+        }
+    }
+
+    /// Ricostruisce la geometria dal buffer staging (il vertex buffer GPU: vertici
+    /// interleaved pos+normal+uv+tangent a stride 48, poi indici u32) e la
+    /// voxelizza. Così la geometria CPU può essere liberata dopo l'upload
+    /// (`freeMeshCpuData`) e rigenerata solo quando serve (tasto V). Colore dai
+    /// base_color dei submesh (le texture sorgente sono già liberate).
+    fn voxelizeFromStage(self: *GuiAppState, dim: u32) ?voxel.Grid {
+        const stage = self.stage_opt.* orelse return null;
+        if (self.decoded.* != .mesh) return null;
+        const buf = stage.buffer.ptr;
+        const stride: usize = 48;
+        const vcount = stage.vertex_bytes / stride;
+        const icount = stage.index_bytes / 4;
+        if (vcount == 0 or icount < 3 or (vcount * stride) > buf.len) return null;
+
+        const rdF = struct {
+            fn f(b: []const u8, o: usize) f32 {
+                return @bitCast(std.mem.readInt(u32, b[o..][0..4], .little));
+            }
+        }.f;
+
+        const verts = self.gpa.alloc([3]f32, vcount) catch return null;
+        defer self.gpa.free(verts);
+        const uvs = self.gpa.alloc([2]f32, vcount) catch return null;
+        defer self.gpa.free(uvs);
+        var bbmin = [3]f32{ std.math.floatMax(f32), std.math.floatMax(f32), std.math.floatMax(f32) };
+        var bbmax = [3]f32{ -std.math.floatMax(f32), -std.math.floatMax(f32), -std.math.floatMax(f32) };
+        for (0..vcount) |i| {
+            const o = i * stride;
+            const p = [3]f32{ rdF(buf, o), rdF(buf, o + 4), rdF(buf, o + 8) };
+            verts[i] = p;
+            uvs[i] = .{ rdF(buf, o + 24), rdF(buf, o + 28) };
+            inline for (0..3) |k| {
+                bbmin[k] = @min(bbmin[k], p[k]);
+                bbmax[k] = @max(bbmax[k], p[k]);
             }
         }
+
+        const nfaces = icount / 3;
+        const faces = self.gpa.alloc(decoder_mod.Face, nfaces) catch return null;
+        defer self.gpa.free(faces);
+        const ibase = stage.vertex_bytes;
+        for (0..nfaces) |f| {
+            faces[f] = .{
+                .v1 = std.mem.readInt(u32, buf[ibase + (f * 3 + 0) * 4 ..][0..4], .little),
+                .v2 = std.mem.readInt(u32, buf[ibase + (f * 3 + 1) * 4 ..][0..4], .little),
+                .v3 = std.mem.readInt(u32, buf[ibase + (f * 3 + 2) * 4 ..][0..4], .little),
+            };
+        }
+
+        var m = self.decoded.mesh; // copia scalari + puntatore submesh (metadati vivi)
+        m.vertices = verts;
+        m.faces = faces;
+        m.uvs = uvs;
+        m.bbox_min = bbmin;
+        m.bbox_max = bbmax;
+        return voxel.voxelize(self.gpa, m, dim);
     }
 
     /// Installa un contenuto già decodificato nello stato condiviso (swap sotto
@@ -363,10 +428,10 @@ const GuiAppState = struct {
             if (native) {
                 try self.renderer.setMesh(stage.buffer.ptr, stage.vertex_bytes, @intCast(stage.index_bytes / @sizeOf(u32)));
                 try self.renderer.setMeshMaterials(&m);
-                // Le texture sono ora baked su disco (cache VT) e caricate nel pool
-                // GPU: l'RGBA sorgente (decine di MB per texture 2K) non serve più.
-                // La geometria resta viva per la voxelizzazione (tasto V).
-                self.freeMeshTextures();
+                // Geometria e texture sono ora su GPU (vertex buffer + pool VT) e
+                // su disco: libera i duplicati CPU (centinaia di MB su modelli
+                // grossi). Il voxel li rigenera on-demand da `voxelizeFromStage`.
+                self.freeMeshCpuData();
             }
             self.mesh_center.* = m.center;
             self.mesh_max_size.* = @max(m.bbox_max[0] - m.bbox_min[0], @max(m.bbox_max[1] - m.bbox_min[1], m.bbox_max[2] - m.bbox_min[2]));
@@ -653,7 +718,7 @@ fn toggleVoxel(app_state: *GuiAppState) void {
     defer app_state.mutex.unlock(app_state.io);
 
     if (!app_state.voxel_mode.* and app_state.voxel_dim.* == 0 and app_state.decoded.* == .mesh) {
-        var grid = voxel.voxelize(app_state.gpa, app_state.decoded.mesh, 96) orelse {
+        var grid = app_state.voxelizeFromStage(96) orelse {
             std.debug.print("[voxel] voxelizzazione fallita\n", .{});
             return;
         };
