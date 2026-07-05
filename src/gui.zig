@@ -1614,6 +1614,12 @@ fn renderWorker(
     var vid_pw: u32 = 0;
     var vid_ph: u32 = 0;
     var vid_prev_ctrl: f32 = -1;
+    // Dopo un cambio contenuto (navigazione) ripresenta per qualche frame: il
+    // frame staged viene committato dal thread finestra solo su un suo "wake", e
+    // se il primo redraw è differito (entrambi gli slot buffer occupati) resterebbe
+    // in sospeso finché un input non risveglia il loop → la mesh/immagine "appare
+    // solo dopo un click". Più present ravvicinati garantiscono il commit.
+    var present_pulse: u32 = 0;
 
     // La primitiva scrollbar `state.sc` è condivisa coi callback input: qui la si usa
     // solo entro il lock del mutex (già preso attorno alla sezione compose).
@@ -1702,6 +1708,9 @@ fn renderWorker(
         const mesh_moved = state.is_mesh.* and
             (yaw.* != last_yaw or pitch.* != last_pitch or zoom.* != last_zoom);
         var need_render = size_changed or state.file_changed.* or mesh_moved;
+        // Un cambio contenuto arma qualche present di rinforzo (vedi present_pulse).
+        if (state.file_changed.*) present_pulse = 4;
+        if (present_pulse > 0) need_render = true;
         var text_animating = false;
 
         if (state.is_text.*) {
@@ -1790,6 +1799,7 @@ fn renderWorker(
             }
 
             win.presentRgba(cur_w, cur_h, composited_rgba.*);
+            if (present_pulse > 0) present_pulse -= 1;
         }
 
         state.mutex.unlock(state.io);
@@ -1799,7 +1809,7 @@ fn renderWorker(
         // dt restituito alimenta l'animazione delle scrollbar al giro successivo.
         // Clamp: il pacer inattivo (l'altro ramo) porta un `last` vecchio → dt enorme
         // al primo tick dopo un cambio di ritmo; limitalo così i fade non scattano.
-        frame_dt = @min(0.1, @as(f32, @floatCast(if (mesh_moved or text_animating)
+        frame_dt = @min(0.1, @as(f32, @floatCast(if (mesh_moved or text_animating or present_pulse > 0)
             pacer_60.tick()
         else
             pacer_20.tick())));
