@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const CsvData = struct {
     headers: [][]const u8,
@@ -550,8 +551,15 @@ pub fn closePluginCache(allocator: std.mem.Allocator) void {
     plugin_registry_scanned = false;
 }
 
-const plugin_prefix = "libdecoder_";
-const plugin_suffix = ".so";
+// A dynamic library's on-disk name is target-specific: `libdecoder_x.so` on Linux,
+// `libdecoder_x.dylib` on macOS, `decoder_x.dll` on Windows (no `lib` prefix). Match the
+// naming Zig's build emits so plugin discovery works on every platform.
+const plugin_prefix = if (builtin.os.tag == .windows) "decoder_" else "libdecoder_";
+const plugin_suffix = switch (builtin.os.tag) {
+    .windows => ".dll",
+    .macos => ".dylib",
+    else => ".so",
+};
 
 /// Scansiona una directory alla ricerca di plugin `libdecoder_*.so` e li
 /// registra interrogando `zuer_extensions`. Un plugin già registrato con lo
@@ -656,21 +664,8 @@ fn findPluginByExtension(ext: []const u8) ?*const LoadedPlugin {
     return null;
 }
 
+// `getenv` is in the C runtime on every platform we target.
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
-extern "c" fn pipe(fds: *[2]c_int) c_int;
-extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
-extern "c" fn close(fd: c_int) c_int;
-extern "c" fn open(path: [*:0]const u8, flags: c_int) c_int;
-extern "c" fn waitpid(pid: c_int, status: ?*c_int, options: c_int) c_int;
-// posix_spawn: fork+exec+ricerca PATH in modo sicuro anche in processi
-// multi-thread (niente malloc nel figlio forkato → niente deadlock, a
-// differenza di fork()+execvp manuale).
-extern "c" fn posix_spawnp(pid: *c_int, file: [*:0]const u8, file_actions: ?*const anyopaque, attrp: ?*const anyopaque, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) c_int;
-extern "c" fn posix_spawn_file_actions_init(fa: *anyopaque) c_int;
-extern "c" fn posix_spawn_file_actions_destroy(fa: *anyopaque) c_int;
-extern "c" fn posix_spawn_file_actions_adddup2(fa: *anyopaque, fd: c_int, newfd: c_int) c_int;
-extern "c" fn posix_spawn_file_actions_addclose(fa: *anyopaque, fd: c_int) c_int;
-extern "c" var environ: [*:null]const ?[*:0]const u8;
 
 pub const RunResult = struct {
     stdout: []u8,
@@ -681,82 +676,211 @@ pub const RunResult = struct {
     }
 };
 
-/// Esegue un comando catturandone lo stdout, con fork/exec/pipe diretti — senza
-/// dipendere da `std.Io`. `std.process.run` NON funziona dentro i plugin `.so`:
-/// l'`io` dell'host non attraversa il confine DynLib e la run si blocca. Questo
-/// helper libc-based è invece indipendente dal contesto e va bene nei plugin.
+/// Esegue un comando catturandone lo stdout, senza dipendere da `std.Io`
+/// (`std.process.run` si blocca dentro i plugin dinamici: l'`io` dell'host non
+/// attraversa il confine DynLib). L'implementazione è per-OS: `posix_spawn` +
+/// pipe su Unix, `CreateProcessW` + pipe anonima su Windows.
 pub fn runCapture(allocator: std.mem.Allocator, argv: []const []const u8) !RunResult {
-    if (argv.len == 0) return error.EmptyArgv;
-
-    // argv null-terminato costruito PRIMA della fork: nel figlio non si può
-    // allocare in sicurezza (processo multi-thread → solo funzioni async-signal-safe).
-    const argvZ = try allocator.allocSentinel(?[*:0]const u8, argv.len, null);
-    defer {
-        for (argvZ[0..argv.len]) |a| if (a) |p| allocator.free(std.mem.span(p));
-        allocator.free(argvZ);
-    }
-    for (argv, 0..) |a, i| argvZ[i] = (try allocator.dupeZ(u8, a)).ptr;
-
-    var fds: [2]c_int = undefined;
-    if (pipe(&fds) != 0) return error.PipeFailed;
-    const read_fd = fds[0];
-    const write_fd = fds[1];
-    defer _ = close(read_fd);
-
-    // file_actions: stdout del figlio → estremo di scrittura della pipe, e
-    // chiusura dell'estremo di lettura. Buffer sovradimensionato per l'opaco
-    // posix_spawn_file_actions_t (glibc ~80 byte).
-    var fa: [256]u8 align(16) = undefined;
-    if (posix_spawn_file_actions_init(&fa) != 0) {
-        _ = close(write_fd);
-        return error.SpawnInit;
-    }
-    defer _ = posix_spawn_file_actions_destroy(&fa);
-    _ = posix_spawn_file_actions_adddup2(&fa, write_fd, 1);
-    _ = posix_spawn_file_actions_addclose(&fa, read_fd);
-
-    var pid: c_int = 0;
-    const rc = posix_spawnp(&pid, argvZ[0].?, &fa, null, argvZ.ptr, environ);
-    _ = close(write_fd);
-    if (rc != 0) return if (rc == 2) error.CommandNotFound else error.SpawnFailed; // 2 = ENOENT
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var buf: [65536]u8 = undefined;
-    while (true) {
-        const n = read(read_fd, &buf, buf.len);
-        if (n <= 0) break;
-        try out.appendSlice(allocator, buf[0..@intCast(n)]);
-    }
-
-    var status: c_int = 0;
-    _ = waitpid(pid, &status, 0);
-    // WIFEXITED / WEXITSTATUS espansi a mano (glibc): byte basso = segnale.
-    const code: u8 = if ((status & 0x7f) == 0) @intCast((status >> 8) & 0xff) else 1;
-    return .{ .stdout = try out.toOwnedSlice(allocator), .exit_code = code };
+    return sub.runCapture(allocator, argv);
 }
 
-/// Legge un intero file con open/read/close libc (niente `std.Io`): come
-/// runCapture, evita che l'io dell'host — usato dentro un plugin `.so` sul
-/// thread worker del loader — si blocchi. Il chiamante possiede il buffer.
+/// Legge un intero file senza `std.Io` (open/read/close libc su Unix,
+/// CreateFileW/ReadFile su Windows): come runCapture, evita che l'io dell'host
+/// si blocchi dentro un plugin dinamico. Il chiamante possiede il buffer.
 pub fn readFileLibc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-    const path_z = try allocator.dupeZ(u8, path);
-    defer allocator.free(path_z);
-
-    const fd = open(path_z.ptr, 0); // O_RDONLY
-    if (fd < 0) return error.OpenFailed;
-    defer _ = close(fd);
-
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var buf: [65536]u8 = undefined;
-    while (out.items.len < max_bytes) {
-        const n = read(fd, &buf, buf.len);
-        if (n < 0) return error.ReadFailed;
-        if (n == 0) break;
-        try out.appendSlice(allocator, buf[0..@intCast(n)]);
-    }
-    return out.toOwnedSlice(allocator);
+    return sub.readFile(allocator, path, max_bytes);
 }
+
+/// Per-OS subprocess + raw file-read backend. Only the selected arm is analyzed, so the
+/// POSIX externs never reach a Windows link and vice-versa.
+const sub = switch (builtin.os.tag) {
+    .windows => struct {
+        const HANDLE = ?*anyopaque;
+        const SECURITY_ATTRIBUTES = extern struct { nLength: u32, lpSecurityDescriptor: ?*anyopaque, bInheritHandle: i32 };
+        const STARTUPINFOW = extern struct {
+            cb: u32,
+            lpReserved: ?[*:0]u16 = null,
+            lpDesktop: ?[*:0]u16 = null,
+            lpTitle: ?[*:0]u16 = null,
+            dwX: u32 = 0,
+            dwY: u32 = 0,
+            dwXSize: u32 = 0,
+            dwYSize: u32 = 0,
+            dwXCountChars: u32 = 0,
+            dwYCountChars: u32 = 0,
+            dwFillAttribute: u32 = 0,
+            dwFlags: u32 = 0,
+            wShowWindow: u16 = 0,
+            cbReserved2: u16 = 0,
+            lpReserved2: ?*u8 = null,
+            hStdInput: HANDLE = null,
+            hStdOutput: HANDLE = null,
+            hStdError: HANDLE = null,
+        };
+        const PROCESS_INFORMATION = extern struct { hProcess: HANDLE, hThread: HANDLE, dwProcessId: u32, dwThreadId: u32 };
+        extern "kernel32" fn CreatePipe(hReadPipe: *HANDLE, hWritePipe: *HANDLE, lpPipeAttributes: ?*const SECURITY_ATTRIBUTES, nSize: u32) callconv(.winapi) i32;
+        extern "kernel32" fn SetHandleInformation(hObject: HANDLE, dwMask: u32, dwFlags: u32) callconv(.winapi) i32;
+        extern "kernel32" fn CreateProcessW(lpApplicationName: ?[*:0]const u16, lpCommandLine: ?[*:0]u16, lpProcessAttributes: ?*anyopaque, lpThreadAttributes: ?*anyopaque, bInheritHandles: i32, dwCreationFlags: u32, lpEnvironment: ?*anyopaque, lpCurrentDirectory: ?[*:0]const u16, lpStartupInfo: *const STARTUPINFOW, lpProcessInformation: *PROCESS_INFORMATION) callconv(.winapi) i32;
+        extern "kernel32" fn ReadFile(hFile: HANDLE, lpBuffer: [*]u8, nNumberOfBytesToRead: u32, lpNumberOfBytesRead: *u32, lpOverlapped: ?*anyopaque) callconv(.winapi) i32;
+        extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) i32;
+        extern "kernel32" fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: u32) callconv(.winapi) u32;
+        extern "kernel32" fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *u32) callconv(.winapi) i32;
+        extern "kernel32" fn CreateFileW(lpFileName: [*:0]const u16, dwDesiredAccess: u32, dwShareMode: u32, lpSecurityAttributes: ?*anyopaque, dwCreationDisposition: u32, dwFlagsAndAttributes: u32, hTemplateFile: HANDLE) callconv(.winapi) HANDLE;
+        const HANDLE_FLAG_INHERIT: u32 = 0x00000001;
+        const STARTF_USESTDHANDLES: u32 = 0x00000100;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        const GENERIC_READ: u32 = 0x80000000;
+        const FILE_SHARE_READ: u32 = 0x00000001;
+        const OPEN_EXISTING: u32 = 3;
+        const INVALID_HANDLE: HANDLE = @ptrFromInt(std.math.maxInt(usize));
+
+        fn runCapture(allocator: std.mem.Allocator, argv: []const []const u8) !RunResult {
+            if (argv.len == 0) return error.EmptyArgv;
+            // Build a single, quoted command line (CreateProcess takes a string, not argv).
+            var cmd: std.ArrayList(u8) = .empty;
+            defer cmd.deinit(allocator);
+            for (argv, 0..) |a, i| {
+                if (i != 0) try cmd.append(allocator, ' ');
+                try cmd.append(allocator, '"');
+                for (a) |ch| {
+                    if (ch == '"') try cmd.append(allocator, '\\');
+                    try cmd.append(allocator, ch);
+                }
+                try cmd.append(allocator, '"');
+            }
+            const cmd_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, cmd.items);
+            defer allocator.free(cmd_w);
+
+            const sa = SECURITY_ATTRIBUTES{ .nLength = @sizeOf(SECURITY_ATTRIBUTES), .lpSecurityDescriptor = null, .bInheritHandle = 1 };
+            var h_read: HANDLE = null;
+            var h_write: HANDLE = null;
+            if (CreatePipe(&h_read, &h_write, &sa, 0) == 0) return error.PipeFailed;
+            defer _ = CloseHandle(h_read);
+            _ = SetHandleInformation(h_read, HANDLE_FLAG_INHERIT, 0); // parent end not inherited
+
+            var si = STARTUPINFOW{ .cb = @sizeOf(STARTUPINFOW), .dwFlags = STARTF_USESTDHANDLES, .hStdOutput = h_write, .hStdError = h_write };
+            var pi: PROCESS_INFORMATION = undefined;
+            const ok = CreateProcessW(null, cmd_w, null, null, 1, CREATE_NO_WINDOW, null, null, &si, &pi);
+            _ = CloseHandle(h_write); // parent keeps only the read end
+            if (ok == 0) return error.CommandNotFound;
+            defer _ = CloseHandle(pi.hProcess);
+            defer _ = CloseHandle(pi.hThread);
+
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(allocator);
+            var buf: [65536]u8 = undefined;
+            while (true) {
+                var got: u32 = 0;
+                if (ReadFile(h_read, &buf, buf.len, &got, null) == 0 or got == 0) break;
+                try out.appendSlice(allocator, buf[0..got]);
+            }
+            _ = WaitForSingleObject(pi.hProcess, 0xFFFFFFFF);
+            var code: u32 = 1;
+            _ = GetExitCodeProcess(pi.hProcess, &code);
+            return .{ .stdout = try out.toOwnedSlice(allocator), .exit_code = @truncate(code) };
+        }
+
+        fn readFile(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+            const path_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, path);
+            defer allocator.free(path_w);
+            const h = CreateFileW(path_w.ptr, GENERIC_READ, FILE_SHARE_READ, null, OPEN_EXISTING, 0, null);
+            if (h == INVALID_HANDLE) return error.OpenFailed;
+            defer _ = CloseHandle(h);
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(allocator);
+            var buf: [65536]u8 = undefined;
+            while (out.items.len < max_bytes) {
+                var got: u32 = 0;
+                if (ReadFile(h, &buf, buf.len, &got, null) == 0) return error.ReadFailed;
+                if (got == 0) break;
+                try out.appendSlice(allocator, buf[0..got]);
+            }
+            return out.toOwnedSlice(allocator);
+        }
+    },
+    else => struct {
+        extern "c" fn pipe(fds: *[2]c_int) c_int;
+        extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
+        extern "c" fn close(fd: c_int) c_int;
+        extern "c" fn open(path: [*:0]const u8, flags: c_int) c_int;
+        extern "c" fn waitpid(pid: c_int, status: ?*c_int, options: c_int) c_int;
+        // posix_spawn: fork+exec+ricerca PATH in modo sicuro anche in processi
+        // multi-thread (niente malloc nel figlio forkato → niente deadlock).
+        extern "c" fn posix_spawnp(pid: *c_int, file: [*:0]const u8, file_actions: ?*const anyopaque, attrp: ?*const anyopaque, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) c_int;
+        extern "c" fn posix_spawn_file_actions_init(fa: *anyopaque) c_int;
+        extern "c" fn posix_spawn_file_actions_destroy(fa: *anyopaque) c_int;
+        extern "c" fn posix_spawn_file_actions_adddup2(fa: *anyopaque, fd: c_int, newfd: c_int) c_int;
+        extern "c" fn posix_spawn_file_actions_addclose(fa: *anyopaque, fd: c_int) c_int;
+        extern "c" var environ: [*:null]const ?[*:0]const u8;
+
+        fn runCapture(allocator: std.mem.Allocator, argv: []const []const u8) !RunResult {
+            if (argv.len == 0) return error.EmptyArgv;
+
+            // argv null-terminato costruito PRIMA della fork: nel figlio non si può
+            // allocare in sicurezza (multi-thread → solo funzioni async-signal-safe).
+            const argvZ = try allocator.allocSentinel(?[*:0]const u8, argv.len, null);
+            defer {
+                for (argvZ[0..argv.len]) |a| if (a) |p| allocator.free(std.mem.span(p));
+                allocator.free(argvZ);
+            }
+            for (argv, 0..) |a, i| argvZ[i] = (try allocator.dupeZ(u8, a)).ptr;
+
+            var fds: [2]c_int = undefined;
+            if (pipe(&fds) != 0) return error.PipeFailed;
+            const read_fd = fds[0];
+            const write_fd = fds[1];
+            defer _ = close(read_fd);
+
+            var fa: [256]u8 align(16) = undefined;
+            if (posix_spawn_file_actions_init(&fa) != 0) {
+                _ = close(write_fd);
+                return error.SpawnInit;
+            }
+            defer _ = posix_spawn_file_actions_destroy(&fa);
+            _ = posix_spawn_file_actions_adddup2(&fa, write_fd, 1);
+            _ = posix_spawn_file_actions_addclose(&fa, read_fd);
+
+            var pid: c_int = 0;
+            const rc = posix_spawnp(&pid, argvZ[0].?, &fa, null, argvZ.ptr, environ);
+            _ = close(write_fd);
+            if (rc != 0) return if (rc == 2) error.CommandNotFound else error.SpawnFailed; // 2 = ENOENT
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(allocator);
+            var buf: [65536]u8 = undefined;
+            while (true) {
+                const n = read(read_fd, &buf, buf.len);
+                if (n <= 0) break;
+                try out.appendSlice(allocator, buf[0..@intCast(n)]);
+            }
+
+            var status: c_int = 0;
+            _ = waitpid(pid, &status, 0);
+            // WIFEXITED / WEXITSTATUS espansi a mano (glibc): byte basso = segnale.
+            const code: u8 = if ((status & 0x7f) == 0) @intCast((status >> 8) & 0xff) else 1;
+            return .{ .stdout = try out.toOwnedSlice(allocator), .exit_code = code };
+        }
+
+        fn readFile(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+            const path_z = try allocator.dupeZ(u8, path);
+            defer allocator.free(path_z);
+
+            const fd = open(path_z.ptr, 0); // O_RDONLY
+            if (fd < 0) return error.OpenFailed;
+            defer _ = close(fd);
+
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(allocator);
+            var buf: [65536]u8 = undefined;
+            while (out.items.len < max_bytes) {
+                const n = read(fd, &buf, buf.len);
+                if (n < 0) return error.ReadFailed;
+                if (n == 0) break;
+                try out.appendSlice(allocator, buf[0..@intCast(n)]);
+            }
+            return out.toOwnedSlice(allocator);
+        }
+    },
+};
 
 /// Budget di dimensione file di default, proporzionale alla memoria disponibile:
 /// metà di MemAvailable (il file viene letto in RAM e il decoder vi alloca sopra).

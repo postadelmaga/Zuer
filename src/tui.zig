@@ -185,6 +185,25 @@ pub const TuiSink = struct {
     };
 
     fn getTerminalSize() TermSize {
+        if (@import("builtin").os.tag == .windows) {
+            // GetConsoleScreenBufferInfo: the visible window rect gives rows/cols. The
+            // console has no pixel geometry, so cell_w/cell_h stay 0 (half-block path).
+            const win = struct {
+                const COORD = extern struct { x: i16, y: i16 };
+                const SMALL_RECT = extern struct { left: i16, top: i16, right: i16, bottom: i16 };
+                const CSBI = extern struct { size: COORD, cursor: COORD, attrs: u16, window: SMALL_RECT, max: COORD };
+                extern "kernel32" fn GetStdHandle(n: u32) callconv(.winapi) ?*anyopaque;
+                extern "kernel32" fn GetConsoleScreenBufferInfo(h: ?*anyopaque, info: *CSBI) callconv(.winapi) i32;
+            };
+            var info: win.CSBI = undefined;
+            const h = win.GetStdHandle(0xFFFFFFF5); // STD_OUTPUT_HANDLE
+            if (win.GetConsoleScreenBufferInfo(h, &info) != 0) {
+                const cols: u16 = @intCast(@max(info.window.right - info.window.left + 1, 0));
+                const rows: u16 = @intCast(@max(info.window.bottom - info.window.top + 1, 0));
+                if (rows >= 8 and cols >= 20) return .{ .rows = rows, .cols = cols, .cell_w = 0, .cell_h = 0 };
+            }
+            return .{ .rows = 24, .cols = 80 };
+        }
         var ws: std.posix.winsize = undefined;
         const rc = std.posix.system.ioctl(std.posix.STDOUT_FILENO, std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
         // Alcuni pty (es. `script`, CI) rispondono con 0×0: si ripiega sul default
