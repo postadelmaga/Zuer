@@ -1,5 +1,6 @@
 const std = @import("std");
 const decoder = @import("decoder");
+const texcache = @import("texcache.zig");
 const MeshData = decoder.MeshData;
 const Face = decoder.Face;
 const Decoded = decoder.Decoded;
@@ -204,6 +205,11 @@ fn decodeImageSource(
     const encoded = bin_data[start .. start + bv.byteLength];
     if (encoded.len == 0 or encoded.len > std.math.maxInt(c_int)) return null;
 
+    // Cache su disco dell'RGBA già decodificato+sotto-campionato (chiave = hash dei
+    // byte codificati): salta il costoso decode stbi (~5s su modelli 4K) alle
+    // riaperture. Miss → decodifica e scrive in cache.
+    if (texcache.read_cached(allocator, encoded, out_w, out_h)) |cached| return cached;
+
     var w: c_int = 0;
     var h: c_int = 0;
     var channels: c_int = 0;
@@ -211,7 +217,9 @@ fn decodeImageSource(
     defer stbi_image_free(data);
     if (w <= 0 or h <= 0) return null;
 
-    return downscaleRgba(data, @intCast(w), @intCast(h), max_tex_dim, allocator, out_w, out_h);
+    const rgba = downscaleRgba(data, @intCast(w), @intCast(h), max_tex_dim, allocator, out_w, out_h) orelse return null;
+    texcache.write_cached(allocator, encoded, out_w.*, out_h.*, rgba);
+    return rgba;
 }
 
 // --- Cache texture decodificate in parallelo ------------------------------
