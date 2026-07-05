@@ -11,10 +11,34 @@ const voxel = @import("voxel.zig");
 const decoder_mod = @import("decoder.zig");
 const loader_mod = @import("loader.zig");
 const text_render = @import("text_render.zig");
+const player_mod = @import("decoders/player.zig");
 const zrame = @import("zrame");
 const zicro = @import("zicro");
 const paint = zicro.paint;
 const zscroll = zicro.scroll;
+
+/// Stato del player video nativo (libav). Il *worker* è l'unico a toccare il
+/// `Player` (decodifica, seek); il thread finestra comunica solo via flag sotto
+/// `mutex` (play/pausa, `seek_to`, attività del mouse per l'auto-hide dei controlli).
+const VideoState = struct {
+    player: ?player_mod.Player = null,
+    playing: bool = true,
+    pos_s: f64 = 0, // posizione di riproduzione corrente (secondi)
+    dur_s: f64 = 0, // durata totale (0 se ignota)
+    shown_pts: f64 = 0, // PTS del frame attualmente in `static_rgba`
+    // Controlli overlay (stile YouTube): `controls` = alpha di fade (0..1),
+    // `idle_s` = secondi dall'ultimo movimento del mouse (guida l'auto-hide).
+    // La temporizzazione è ad accumulo di `frame_dt`: nessun orologio a muro.
+    controls: f32 = 0,
+    idle_s: f64 = 999,
+    // Seek richiesto dall'input (secondi, <0 = nessuno) e stato scrubbing.
+    seek_to: f64 = -1,
+    scrubbing: bool = false,
+
+    fn isActive(self: *const VideoState) bool {
+        return self.player != null;
+    }
+};
 
 // evdev key codes standard per Linux
 const KEY_ESC: u32 = 1;
@@ -34,6 +58,7 @@ const KEY_5: u32 = 6;
 const KEY_C: u32 = 46;
 const KEY_V: u32 = 47;
 const KEY_F: u32 = 33;
+const KEY_SPACE: u32 = 57;
 const KEY_LEFTCTRL: u32 = 29;
 const KEY_RIGHTCTRL: u32 = 97;
 const KEY_LEFTSHIFT: u32 = 42;
@@ -395,6 +420,8 @@ const GuiAppState = struct {
     // Motore di resa testo: false = CPU (composizione diretta), true = atlante
     // GPU (ZUER_TEXT_ENGINE=gpu). Stessa resa, percorso diverso.
     text_gpu: bool,
+    // Player video nativo (null = nessun video). Solo il worker tocca il Player.
+    video: *VideoState,
 
     // Variabili di stato rendering
     is_mesh: *bool,
@@ -893,6 +920,27 @@ fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) void
     }
     if (pressed) {
         const is_text = app_state.is_text.*;
+        // Video: Spazio = play/pausa, ←/→ = seek ∓5 s (stile YouTube). ESC/F
+        // cadono al comportamento comune (chiudi / fullscreen).
+        if (app_state.video.isActive()) {
+            const vid = app_state.video;
+            if (key == KEY_SPACE) {
+                app_state.mutex.lockUncancelable(app_state.io);
+                vid.playing = !vid.playing;
+                vid.idle_s = 0;
+                app_state.mutex.unlock(app_state.io);
+                return;
+            } else if (key == KEY_RIGHT or key == KEY_LEFT) {
+                app_state.mutex.lockUncancelable(app_state.io);
+                var t = vid.pos_s + (if (key == KEY_RIGHT) @as(f64, 5) else -5);
+                if (t < 0) t = 0;
+                if (vid.dur_s > 0 and t > vid.dur_s - 0.1) t = vid.dur_s - 0.1;
+                vid.seek_to = t;
+                vid.idle_s = 0;
+                app_state.mutex.unlock(app_state.io);
+                return;
+            }
+        }
         // Ctrl+C: copia la selezione negli appunti.
         if (key == KEY_C and app_state.ctrl_down.* and is_text) {
             app_state.mutex.lockUncancelable(app_state.io);
@@ -982,6 +1030,38 @@ fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopaque)
             // 0x110 = BTN_LEFT (click sinistro), 0x111 = BTN_RIGHT (click destro)
             if (btn.button != 0x110 and btn.button != 0x111) return false;
             const down = (btn.state == 1);
+            // Video: controlli overlay. Click sinistro su play/pausa o timeline;
+            // il rilascio termina lo scrubbing. Click sul corpo → non consumato
+            // (zrame muove/ridimensiona la finestra come al solito).
+            if (app_state.video.isActive() and btn.button == 0x110) {
+                const vid = app_state.video;
+                if (!down) {
+                    if (vid.scrubbing) {
+                        app_state.mutex.lockUncancelable(app_state.io);
+                        vid.scrubbing = false;
+                        vid.idle_s = 0;
+                        app_state.mutex.unlock(app_state.io);
+                        return true;
+                    }
+                } else switch (videoControlsHit(win.panel_w, win.panel_h, app_state.last_x.*, app_state.last_y.*)) {
+                    .toggle => {
+                        app_state.mutex.lockUncancelable(app_state.io);
+                        vid.playing = !vid.playing;
+                        vid.idle_s = 0;
+                        app_state.mutex.unlock(app_state.io);
+                        return true;
+                    },
+                    .timeline => {
+                        app_state.mutex.lockUncancelable(app_state.io);
+                        vid.scrubbing = true;
+                        vid.seek_to = videoTimelineFrac(win.panel_w, app_state.last_x.*) * (if (vid.dur_s > 0) vid.dur_s else 0);
+                        vid.idle_s = 0;
+                        app_state.mutex.unlock(app_state.io);
+                        return true;
+                    },
+                    .none => {},
+                }
+            }
             if (!down) {
                 app_state.mutex.lockUncancelable(app_state.io);
                 _ = app_state.sc.onButtonUp();
@@ -1064,6 +1144,20 @@ fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopaque)
             return false;
         },
         .motion => |mot| {
+            // Video: ogni movimento rivela i controlli (azzera l'idle); durante lo
+            // scrubbing il movimento cerca sulla timeline. Consuma solo mentre
+            // scrubba, così sul corpo la finestra resta trascinabile/ridimensionabile.
+            if (app_state.video.isActive()) {
+                const vid = app_state.video;
+                app_state.mutex.lockUncancelable(app_state.io);
+                vid.idle_s = 0;
+                const scrub = vid.scrubbing;
+                if (scrub) vid.seek_to = videoTimelineFrac(win.panel_w, mot.x) * (if (vid.dur_s > 0) vid.dur_s else 0);
+                app_state.mutex.unlock(app_state.io);
+                app_state.last_x.* = mot.x;
+                app_state.last_y.* = mot.y;
+                return scrub;
+            }
             // La scrollbar vede sempre il movimento: aggiorna hover/thumb e, se sta
             // trascinando il cursore, muove l'offset. Se lo consuma (sopra la barra o
             // in drag), non facciamo selezione/pan.
@@ -1235,6 +1329,50 @@ fn rasterizeTextGpu(state: *GuiAppState, name: []const u8, opts: text_render.Ren
     state.static_h.* = @intCast(mesh.height);
 }
 
+/// Lato maggiore massimo a cui decodifichiamo i frame video: la finestra li scala
+/// per adattarli, quindi 1920 basta per ogni schermo comune senza sprecare CPU.
+const video_max_dim: usize = 1920;
+
+const VideoFirst = struct { rgba: []u8, w: u32, h: u32 };
+
+/// Apre il player video, decodifica il primo frame (poster) in RGBA e inizializza
+/// `video` (durata, posizione, temporizzazione, `playing`). Il chiamante prende
+/// possesso di `.rgba` (→ `static_rgba`) e di `video.player` (chiuso da main).
+fn setupVideo(video: *VideoState, path: []const u8, gpa: std.mem.Allocator) !VideoFirst {
+    var clean: []const u8 = path;
+    if (std.mem.indexOfScalar(u8, path, '#')) |h| clean = path[0..h];
+    const path_z = try gpa.dupeZ(u8, clean);
+    defer gpa.free(path_z);
+
+    var p = try player_mod.Player.open(path_z.ptr);
+    errdefer p.deinit();
+    const frame = (try p.nextFrame(video_max_dim, gpa)) orelse return error.NoFrameDecoded;
+    defer gpa.free(frame.pixels);
+
+    const w: u32 = @intCast(frame.width);
+    const h: u32 = @intCast(frame.height);
+    const rgba = try gpa.alloc(u8, @as(usize, w) * h * 4);
+    rgbToRgba(frame.pixels, rgba, @as(usize, w) * h);
+
+    video.dur_s = p.duration_s;
+    video.pos_s = frame.pts_s;
+    video.shown_pts = frame.pts_s;
+    video.playing = true;
+    video.player = p;
+    return .{ .rgba = rgba, .w = w, .h = h };
+}
+
+/// Espande RGB24 impacchettato in RGBA8 opaco (alpha=255).
+fn rgbToRgba(src: []const u8, dst: []u8, npx: usize) void {
+    var i: usize = 0;
+    while (i < npx) : (i += 1) {
+        dst[i * 4 + 0] = src[i * 3 + 0];
+        dst[i * 4 + 1] = src[i * 3 + 1];
+        dst[i * 4 + 2] = src[i * 3 + 2];
+        dst[i * 4 + 3] = 255;
+    }
+}
+
 /// Schermata di caricamento: sfondo completamente trasparente (si vede il vetro
 /// della finestra / blur del compositore) con lo **spinner** di zicro al centro —
 /// un arco rotante che "respira", identico a egui. `frame` (contatore a ~60 Hz)
@@ -1252,6 +1390,176 @@ fn drawLoader(buf: []u8, W: u32, H: u32, frame: u32) void {
     const width: f32 = @max(radius / 4.0, 3.0);
     const phase: f32 = @as(f32, @floatFromInt(frame)) / 60.0; // clock ~60 Hz → secondi
     canvas.drawSpinner(cx, cy, radius, width, phase, paint.Color.rgba(205, 210, 230, 1.0));
+}
+
+/// Zoom "contain": scala il frame così che stia interamente nella finestra
+/// mantenendo l'aspetto (il lato limitante tocca il bordo).
+fn fitZoom(cw: u32, ch: u32, sw: u32, sh: u32) f32 {
+    if (sw == 0 or sh == 0) return 1.0;
+    const fcw: f32 = @floatFromInt(cw);
+    const fch: f32 = @floatFromInt(ch);
+    return @min(fcw / @as(f32, @floatFromInt(sw)), fch / @as(f32, @floatFromInt(sh)));
+}
+
+/// Sostituisce il frame corrente in `static_rgba` con `fr` (RGB→RGBA), riallocando
+/// solo se cambia la dimensione. Prende possesso di `fr.pixels` (lo libera).
+fn updateVideoFrame(state: *GuiAppState, fr: player_mod.Frame) void {
+    const w: u32 = @intCast(fr.width);
+    const h: u32 = @intCast(fr.height);
+    const need = @as(usize, w) * h * 4;
+    if (state.static_rgba.*.len != need) {
+        state.gpa.free(state.static_rgba.*);
+        state.static_rgba.* = state.gpa.alloc(u8, need) catch {
+            state.static_rgba.* = &.{};
+            state.static_w.* = 0;
+            state.static_h.* = 0;
+            state.gpa.free(fr.pixels);
+            return;
+        };
+    }
+    rgbToRgba(fr.pixels, state.static_rgba.*, @as(usize, w) * h);
+    state.static_w.* = w;
+    state.static_h.* = h;
+    state.gpa.free(fr.pixels);
+}
+
+/// Avanza la riproduzione di `dt` secondi: applica un seek pendente, fa avanzare
+/// `pos_s`, gestisce il loop a fine video e decodifica in avanti finché il frame
+/// mostrato raggiunge `pos_s` (recupero, con tetto di iterazioni per non stallare).
+/// Ritorna `true` se ha aggiornato il frame in `static_rgba` (→ serve ricomporre).
+fn advanceVideo(state: *GuiAppState, vs: *VideoState, dt: f32) bool {
+    if (vs.seek_to >= 0) {
+        if (vs.player) |*p| p.seek(vs.seek_to);
+        vs.pos_s = vs.seek_to;
+        vs.shown_pts = vs.seek_to - 1.0; // forza il decode del prossimo frame
+        vs.seek_to = -1;
+    } else if (vs.playing) {
+        vs.pos_s += dt;
+    }
+    if (vs.dur_s > 0 and vs.pos_s >= vs.dur_s) {
+        if (vs.player) |*p| p.seek(0);
+        vs.pos_s = 0;
+        vs.shown_pts = -1;
+    }
+    var decoded_any = false;
+    var guard: u32 = 0;
+    while (vs.shown_pts < vs.pos_s and guard < 8) : (guard += 1) {
+        const p = &(vs.player.?);
+        const maybe = p.nextFrame(video_max_dim, state.gpa) catch null;
+        if (maybe) |fr| {
+            updateVideoFrame(state, fr);
+            vs.shown_pts = fr.pts_s;
+            decoded_any = true;
+        } else {
+            p.seek(0); // EOF → loop
+            vs.pos_s = 0;
+            vs.shown_pts = 0;
+            break;
+        }
+    }
+    return decoded_any;
+}
+
+/// Triangolo "play" pieno (punta a destra) fuso sul buffer RGBA, alpha `a`.
+fn fillPlayTriangle(buf: []u8, W: u32, H: u32, cx: f32, cy: f32, s: f32, a: f32) void {
+    const half = s / 2.0;
+    const left = cx - s * 0.35;
+    const right = cx + s * 0.45;
+    const alpha: u8 = @intFromFloat(@round(255.0 * std.math.clamp(a, 0.0, 1.0)));
+    var y: i32 = @intFromFloat(@floor(cy - half));
+    const y1: i32 = @intFromFloat(@ceil(cy + half));
+    const wi: i32 = @intCast(W);
+    const hi: i32 = @intCast(H);
+    while (y < y1) : (y += 1) {
+        if (y < 0 or y >= hi) continue;
+        const fy = @as(f32, @floatFromInt(y)) + 0.5;
+        const dy = @abs(fy - cy);
+        if (dy > half) continue;
+        const frac = 1.0 - dy / half; // 1 al centro, 0 agli estremi
+        const xr = left + (right - left) * frac;
+        var x: i32 = @intFromFloat(@floor(left));
+        const xend: i32 = @intFromFloat(@ceil(xr));
+        while (x < xend) : (x += 1) {
+            if (x < 0 or x >= wi) continue;
+            const off = (@as(usize, @intCast(y)) * W + @as(usize, @intCast(x))) * 4;
+            blendPixel(buf, off, 255, 255, 255, alpha);
+        }
+    }
+}
+
+/// Controlli overlay stile YouTube: scrim sfumato in basso, timeline (primitiva
+/// `fillProgressBar` di zicro) con knob scrubber e pulsante play/pausa. Tutto
+/// modulato dall'alpha di fade `vs.controls`.
+fn drawVideoControls(buf: []u8, W: u32, H: u32, vs: *VideoState) void {
+    const a = std.math.clamp(vs.controls, 0.0, 1.0);
+    const fw: f32 = @floatFromInt(W);
+    const fh: f32 = @floatFromInt(H);
+    const u32px: [*]u32 = @ptrCast(@alignCast(buf.ptr));
+    var canvas = paint.Canvas.initRgba8(u32px[0 .. @as(usize, W) * H], W, H);
+
+    // Scrim: banda scura che sfuma da trasparente (in alto) a scuro (in basso).
+    const scrim_h = @min(fh, 120.0);
+    const bands: u32 = 12;
+    var i: u32 = 0;
+    while (i < bands) : (i += 1) {
+        const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(bands));
+        const by = fh - scrim_h + t * scrim_h;
+        const bh = scrim_h / @as(f32, @floatFromInt(bands)) + 1.0;
+        canvas.fillRoundedRect(0, by, fw, bh, 0, paint.Color.rgba(0, 0, 0, 0.5 * t * t * a));
+    }
+
+    // Timeline (progress bar) + knob dello scrubber.
+    const margin: f32 = 18.0;
+    const tl_h: f32 = 5.0;
+    const tl_y = fh - 44.0;
+    const tl_w = fw - margin * 2.0;
+    const prog: f32 = if (vs.dur_s > 0) @floatCast(std.math.clamp(vs.pos_s / vs.dur_s, 0.0, 1.0)) else 0.0;
+    canvas.fillProgressBar(margin, tl_y, tl_w, tl_h, tl_h / 2.0, prog, paint.Color.rgba(255, 255, 255, 0.28 * a), paint.Color.rgba(237, 45, 45, 0.95 * a));
+    const knob_x = margin + tl_w * prog;
+    const knob_r: f32 = if (vs.scrubbing) 9.0 else 7.0;
+    canvas.fillRoundedRect(knob_x - knob_r, tl_y + tl_h / 2.0 - knob_r, knob_r * 2.0, knob_r * 2.0, knob_r, paint.Color.rgba(255, 255, 255, a));
+
+    // Pulsante play/pausa (riga sotto la timeline, a sinistra).
+    const btn_cx = margin + 8.0;
+    const btn_cy = fh - 18.0;
+    const s: f32 = 16.0;
+    if (vs.playing) {
+        const bw: f32 = 4.0;
+        const gap: f32 = 3.0;
+        canvas.fillRoundedRect(btn_cx - gap - bw, btn_cy - s / 2.0, bw, s, 1.5, paint.Color.rgba(255, 255, 255, a));
+        canvas.fillRoundedRect(btn_cx + gap, btn_cy - s / 2.0, bw, s, 1.5, paint.Color.rgba(255, 255, 255, a));
+    } else {
+        fillPlayTriangle(buf, W, H, btn_cx, btn_cy, s, a);
+    }
+}
+
+/// Hit-test dei controlli video (coordinate finestra). Ritorna l'azione del click.
+const VideoHit = enum { none, toggle, timeline };
+fn videoControlsHit(W: u32, H: u32, x: f32, y: f32) VideoHit {
+    const fw: f32 = @floatFromInt(W);
+    const fh: f32 = @floatFromInt(H);
+    const margin: f32 = 18.0;
+    // Timeline: banda generosa attorno alla barra (facile da agganciare).
+    const tl_y = fh - 44.0;
+    if (y >= tl_y - 12.0 and y <= tl_y + 16.0 and x >= margin - 6.0 and x <= fw - margin + 6.0) {
+        return .timeline;
+    }
+    // Pulsante play/pausa.
+    const btn_cx = margin + 8.0;
+    const btn_cy = fh - 18.0;
+    if (x >= btn_cx - 16.0 and x <= btn_cx + 16.0 and y >= btn_cy - 16.0 and y <= btn_cy + 16.0) {
+        return .toggle;
+    }
+    return .none;
+}
+
+/// Frazione 0..1 della timeline corrispondente all'ascissa `x` (per il seek).
+fn videoTimelineFrac(W: u32, x: f32) f32 {
+    const fw: f32 = @floatFromInt(W);
+    const margin: f32 = 18.0;
+    const tl_w = fw - margin * 2.0;
+    if (tl_w <= 0) return 0;
+    return std.math.clamp((x - margin) / tl_w, 0.0, 1.0);
 }
 
 fn renderWorker(
@@ -1279,6 +1587,11 @@ fn renderWorker(
     var pacer_20 = zicro.time.Pacer.hz(state.io, 20.0);
     // Fotogramma dello spinner di caricamento (animazione a 60 Hz).
     var spin_frame: u32 = 0;
+    // Tracking del ramo video per il gate "presenta solo se cambia qualcosa":
+    // dimensioni e alpha dei controlli all'ultimo present.
+    var vid_pw: u32 = 0;
+    var vid_ph: u32 = 0;
+    var vid_prev_ctrl: f32 = -1;
 
     // La primitiva scrollbar `state.sc` è condivisa coi callback input: qui la si usa
     // solo entro il lock del mutex (già preso attorno alla sezione compose).
@@ -1315,6 +1628,49 @@ fn renderWorker(
             state.mutex.unlock(state.io);
             spin_frame +%= 1;
             _ = pacer_60.tick();
+            continue;
+        }
+
+        // Video: percorso a sé (come lo spinner). Guida la riproduzione in tempo
+        // reale (accumulo di `frame_dt`), compone il frame corrente e vi disegna
+        // sopra i controlli overlay stile YouTube, poi presenta e ricomincia.
+        if (state.video.isActive()) {
+            const vs = state.video;
+            if (composited_rgba.len < cur_w * cur_h * 4) {
+                state.gpa.free(composited_rgba.*);
+                composited_rgba.* = state.gpa.alignedAlloc(u8, .@"4", cur_w * cur_h * 4) catch {
+                    state.mutex.unlock(state.io);
+                    break;
+                };
+            }
+            const new_frame = advanceVideo(state, vs, frame_dt);
+            // Auto-hide: controlli visibili in pausa, durante lo scrubbing o entro
+            // 2.5 s dall'ultimo movimento del mouse; poi sfumano (fade ~8/s).
+            vs.idle_s += frame_dt;
+            const want: f32 = if (!vs.playing or vs.scrubbing or vs.idle_s < 2.5) 1.0 else 0.0;
+            vs.controls += (want - vs.controls) * @min(1.0, frame_dt * 8.0);
+            if (want == 0.0 and vs.controls < 0.02) vs.controls = 0;
+            // Presenta solo se è cambiato qualcosa: nuovo frame, resize, oppure
+            // l'alpha dei controlli si sta muovendo. In pausa a controlli fermi
+            // non ricomponiamo (niente 60 Hz sprecati sullo stesso fotogramma).
+            const size_ch = (cur_w != vid_pw or cur_h != vid_ph);
+            const ctrl_ch = @abs(vs.controls - vid_prev_ctrl) > 0.002;
+            if (new_frame or size_ch or ctrl_ch or vs.scrubbing) {
+                // Letterbox trasparente (vetro) + frame scalato per adattarsi.
+                @memset(composited_rgba.*[0 .. @as(usize, cur_w) * cur_h * 4], 0);
+                const fit = fitZoom(cur_w, cur_h, state.static_w.*, state.static_h.*);
+                composeFrame(composited_rgba.*, cur_w, cur_h, state.static_rgba.*, state.static_w.*, state.static_h.*, false, fit, 0.0, 0.0);
+                if (vs.controls > 0.01) drawVideoControls(composited_rgba.*, cur_w, cur_h, vs);
+                win.presentRgba(cur_w, cur_h, composited_rgba.*);
+                vid_pw = cur_w;
+                vid_ph = cur_h;
+                vid_prev_ctrl = vs.controls;
+            }
+            state.mutex.unlock(state.io);
+            // 60 Hz mentre riproduce, scrubba o l'alpha dei controlli anima; a
+            // riposo (in pausa, controlli fermi) 20 Hz per non scaldare la CPU.
+            const busy = vs.playing or vs.scrubbing or ctrl_ch;
+            frame_dt = @min(0.1, @as(f32, @floatCast(if (busy) pacer_60.tick() else pacer_20.tick())));
             continue;
         }
 
@@ -1529,7 +1885,7 @@ fn clipboardCopy(text: []const u8) void {
 /// Categoria di contenuto per scegliere proporzioni di finestra sensate: le
 /// immagini seguono l'aspetto reale, i documenti sono ritratto (pagina), le
 /// tabelle (csv/xls/zip) e le mesh hanno viewport più larghi/quadri.
-const WinKind = enum { image, mesh, document, table, generic };
+const WinKind = enum { image, mesh, document, table, video, generic };
 
 fn extLowerEql(ext: []const u8, comptime lit: []const u8) bool {
     if (ext.len != lit.len) return false;
@@ -1549,6 +1905,9 @@ fn winKindFromExt(path: []const u8) WinKind {
     }
     inline for (.{ "obj", "stl", "glb", "gltf", "ply", "fbx", "dae", "3ds" }) |e| {
         if (extLowerEql(ext, e)) return .mesh;
+    }
+    inline for (.{ "mp4", "mkv", "webm", "mov", "avi", "m4v", "wmv", "flv", "mpg", "mpeg", "ts" }) |e| {
+        if (extLowerEql(ext, e)) return .video;
     }
     inline for (.{ "csv", "tsv", "xlsx", "xls", "ods", "zip", "jar", "apk", "cbz", "epub", "xpi", "whl" }) |e| {
         if (extLowerEql(ext, e)) return .table;
@@ -1577,7 +1936,7 @@ fn winKindFromDecoded(d: *const decoder_mod.Decoded) WinKind {
 /// sul contenuto già ingrandito, così la finestra resta aderente (nessun vuoto).
 fn autoZoomForContent(kind: WinKind, nat_w: u32, nat_h: u32) f32 {
     switch (kind) {
-        .table, .image => {},
+        .table, .image, .video => {},
         else => return 1.0,
     }
     if (nat_w == 0 or nat_h == 0) return 1.0;
@@ -1614,7 +1973,8 @@ fn initialWindowSize(kind: WinKind, img_w: u32, img_h: u32) struct { w: u32, h: 
     }
 
     switch (kind) {
-        .image => {
+        // Immagini e video: si adattano all'aspetto reale del frame.
+        .image, .video => {
             // Aspetto reale noto (percorso sincrono): adatta con tetto.
             if (img_w != 0 and img_h != 0) {
                 const fw: f32 = @floatFromInt(img_w);
@@ -1763,6 +2123,9 @@ pub fn main(init: std.process.Init) !void {
     var static_w: u32 = 0;
     var static_h: u32 = 0;
 
+    var video: VideoState = .{};
+    defer if (video.player) |*p| p.deinit();
+
     var state_mutex: std.Io.Mutex = .init;
     var load_seq: u32 = 1;
     var file_changed = false;
@@ -1810,6 +2173,7 @@ pub fn main(init: std.process.Init) !void {
             if (getenv("ZUER_TEXT_ENGINE")) |v| break :text_gpu std.mem.eql(u8, std.mem.span(v), "gpu");
             break :text_gpu false;
         },
+        .video = &video,
         .is_mesh = &is_mesh,
         .is_text = &is_text,
         .is_table = &is_table,
@@ -1892,6 +2256,22 @@ pub fn main(init: std.process.Init) !void {
     // tipo è già noto dal decoded; in quello async (spinner) si stima
     // dall'estensione, così la finestra nasce già con la forma giusta.
     const win_kind: WinKind = if (loading) winKindFromExt(file_path) else winKindFromDecoded(&decoded);
+
+    // Video: apri il player nativo (libav) e usa il primo frame come poster
+    // iniziale. Niente decode async/spinner — aprire il container è veloce — così
+    // il worker parte già in riproduzione. `static_rgba` diventa il frame corrente
+    // che il worker aggiorna nel tempo (vedi il ramo video di renderWorker).
+    if (win_kind == .video) {
+        loading = false;
+        is_text = false;
+        if (setupVideo(&video, file_path, gpa)) |first| {
+            static_rgba = first.rgba;
+            static_w = first.w;
+            static_h = first.h;
+        } else |e| {
+            std.debug.print("Video non apribile ({s})\n", .{@errorName(e)});
+        }
+    }
     // Per le tabelle (percorso sincrono) la finestra si dimensiona sulla larghezza
     // reale delle colonne, non su un valore fisso.
     var tbl_w: u32 = 0;

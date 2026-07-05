@@ -117,6 +117,13 @@ pub fn build(b: *std.Build) void {
     gui_exe.root_module.addAnonymousImport("voxel_frag_spv", .{ .root_source_file = voxel_frag_spv });
     gui_exe.root_module.linkSystemLibrary("vulkan", .{});
     gui_exe.root_module.linkSystemLibrary("wayland-client", .{});
+    // Player video nativo: il worker decodifica i frame in tempo reale con libav
+    // (src/decoders/player.zig, importato da gui.zig), quindi il gui_exe linka
+    // ffmpeg direttamente (finora era solo nel decoder .so per il poster).
+    gui_exe.root_module.linkSystemLibrary("libavformat", .{});
+    gui_exe.root_module.linkSystemLibrary("libavcodec", .{});
+    gui_exe.root_module.linkSystemLibrary("libavutil", .{});
+    gui_exe.root_module.linkSystemLibrary("libswscale", .{});
     // Motore di testo nativo: stb_truetype rasterizza i glifi Hack (embeddati),
     // sostituendo ImageMagick/Pango. NB: `zuer-gui` linka zrame, che ora compila
     // la propria copia di stb_truetype_impl.c per il suo motore di testo. Per
