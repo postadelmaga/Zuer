@@ -35,7 +35,8 @@ const float VT_INNER = 124.0;
 
 // Campiona la baseColor virtuale a UV: individua la cella del livello residente,
 // ne legge lo slot fisico dall'SSBO, e campiona il texel locale dentro l'inner
-// gutter-padded della tile. Il pool è UNORM ma contiene byte sRGB → linearizza.
+// gutter-padded della tile. Il pool è in formato sRGB → l'hardware linearizza in
+// modo esatto (e prima del filtraggio bilineare), come il path baseColor diretto.
 vec3 sampleVTBase(vec2 uv) {
     float txf = clamp(uv.x, 0.0, 0.999999) * pc.vt.x;
     float tyf = clamp(uv.y, 0.0, 0.999999) * pc.vt.y;
@@ -43,7 +44,7 @@ vec3 sampleVTBase(vec2 uv) {
     float slot = float(vtSlots[cell]);
     float lx = (VT_GUTTER + fract(txf) * VT_INNER) / VT_TILE;
     float ly = (VT_GUTTER + fract(tyf) * VT_INNER) / VT_TILE;
-    return pow(texture(vtPool, vec3(lx, ly, slot)).rgb, vec3(2.2));
+    return texture(vtPool, vec3(lx, ly, slot)).rgb;
 }
 
 vec3 aces(vec3 x) {

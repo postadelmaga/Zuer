@@ -59,7 +59,7 @@ pub const VtexPool = struct {
         // Image array device-local: capacity layer, RGBA8, sampled + transfer.
         var image: vk.VkImage = vk.VK_NULL;
         try vk.check(vk.vkCreateImage(device, &.{
-            .format = vk.FORMAT_R8G8B8A8_UNORM,
+            .format = vk.FORMAT_R8G8B8A8_SRGB,
             .extent = .{ .width = tile_size, .height = tile_size, .depth = 1 },
             .arrayLayers = capacity,
             .usage = vk.IMAGE_USAGE_SAMPLED | vk.IMAGE_USAGE_TRANSFER_DST | vk.IMAGE_USAGE_TRANSFER_SRC,
@@ -79,7 +79,7 @@ pub const VtexPool = struct {
         try vk.check(vk.vkCreateImageView(device, &.{
             .image = image,
             .viewType = IMAGE_VIEW_TYPE_2D_ARRAY,
-            .format = vk.FORMAT_R8G8B8A8_UNORM,
+            .format = vk.FORMAT_R8G8B8A8_SRGB,
             .subresourceRange = .{ .aspectMask = vk.ASPECT_COLOR, .layerCount = capacity },
         }, null, &view));
         errdefer vk.vkDestroyImageView(device, view, null);

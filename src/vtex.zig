@@ -96,6 +96,22 @@ pub const BakedTexture = struct {
 /// Downsample box 2×2 (dimensioni dispari clampano la seconda riga/colonna) —
 /// stessa convenzione floor-halving di `levelDims`, così baker e shader
 /// concordano sulla dimensione di ogni livello.
+/// LUT sRGB(byte)→lineare, per il downsample corretto dei mip baseColor.
+const srgb_to_linear: [256]f32 = blk: {
+    @setEvalBranchQuota(20000);
+    var t: [256]f32 = undefined;
+    for (0..256) |i| {
+        const c = @as(f32, @floatFromInt(i)) / 255.0;
+        t[i] = if (c <= 0.04045) c / 12.92 else std.math.pow(f32, (c + 0.055) / 1.055, 2.4);
+    }
+    break :blk t;
+};
+
+fn linearToSrgb8(l: f32) u8 {
+    const c = if (l <= 0.0031308) l * 12.92 else 1.055 * std.math.pow(f32, l, 1.0 / 2.4) - 0.055;
+    return @intFromFloat(std.math.clamp(c * 255.0 + 0.5, 0.0, 255.0));
+}
+
 fn downsample(gpa: std.mem.Allocator, rgba: []const u8, w: u32, h: u32) !struct { img: []u8, w: u32, h: u32 } {
     const nw = @max(w / 2, 1);
     const nh = @max(h / 2, 1);
@@ -106,13 +122,20 @@ fn downsample(gpa: std.mem.Allocator, rgba: []const u8, w: u32, h: u32) !struct 
         for (0..nw) |x| {
             const x0 = x * 2;
             const x1 = @min(x * 2 + 1, w - 1);
-            for (0..4) |c| {
-                const sum = @as(u32, rgba[(y0 * w + x0) * 4 + c]) +
-                    rgba[(y0 * w + x1) * 4 + c] +
-                    rgba[(y1 * w + x0) * 4 + c] +
-                    rgba[(y1 * w + x1) * 4 + c];
-                out[(y * nw + x) * 4 + c] = @intCast(sum / 4);
+            const p00 = (y0 * w + x0) * 4;
+            const p01 = (y0 * w + x1) * 4;
+            const p10 = (y1 * w + x0) * 4;
+            const p11 = (y1 * w + x1) * 4;
+            const o = (y * nw + x) * 4;
+            // RGB: media in spazio lineare (evitare l'oscuramento della media
+            // in spazio gamma), poi ri-codifica sRGB.
+            inline for (0..3) |c| {
+                const lin = (srgb_to_linear[rgba[p00 + c]] + srgb_to_linear[rgba[p01 + c]] +
+                    srgb_to_linear[rgba[p10 + c]] + srgb_to_linear[rgba[p11 + c]]) * 0.25;
+                out[o + c] = linearToSrgb8(lin);
             }
+            // Alpha: lineare per definizione, media diretta.
+            out[o + 3] = @intCast((@as(u32, rgba[p00 + 3]) + rgba[p01 + 3] + rgba[p10 + 3] + rgba[p11 + 3]) / 4);
         }
     }
     return .{ .img = out, .w = nw, .h = nh };

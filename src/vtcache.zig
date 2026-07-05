@@ -28,7 +28,9 @@ const O_CREAT: c_int = 0o100;
 const O_TRUNC: c_int = 0o1000;
 const SEEK_END: c_int = 2;
 
-const magic = "VTC1";
+// VTC2: i mip sono ora downsamplati in spazio lineare (VTC1 li aveva in gamma,
+// leggermente scuri) → il bump invalida le cache vecchie forzando il re-bake.
+const magic = "VTC2";
 
 /// Texture baked su disco, letta a tile via `pread`. Tiene aperto l'fd + un
 /// buffer scratch da una tile; header/livelli sono in RAM (piccoli). RAM di
