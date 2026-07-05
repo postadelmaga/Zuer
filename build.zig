@@ -238,6 +238,32 @@ pub fn build(b: *std.Build) void {
     const gpu_selftest_run = b.addRunArtifact(gpu_selftest);
     b.step("gpu-selftest", "Render headless di un cubo per validare la pipeline mesh").dependOn(&gpu_selftest_run.step);
 
+    // gpu-shot: screenshot headless di una mesh reale (decode+VT) in un PPM,
+    // per ispezionare colori/geometria senza display. Stesso cablaggio del selftest.
+    const gpu_shot = b.addExecutable(.{
+        .name = "gpu-shot",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu_shot.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    gpu_shot.root_module.addImport("zicro", dep_zicro.module("zicro"));
+    gpu_shot.root_module.addAnonymousImport("mesh_vert_spv", .{ .root_source_file = vert_spv });
+    gpu_shot.root_module.addAnonymousImport("mesh_frag_spv", .{ .root_source_file = frag_spv });
+    gpu_shot.root_module.addAnonymousImport("text_vert_spv", .{ .root_source_file = text_vert_spv });
+    gpu_shot.root_module.addAnonymousImport("text_frag_spv", .{ .root_source_file = text_frag_spv });
+    gpu_shot.root_module.addAnonymousImport("shadow_vert_spv", .{ .root_source_file = shadow_vert_spv });
+    gpu_shot.root_module.addAnonymousImport("shadow_frag_spv", .{ .root_source_file = shadow_frag_spv });
+    gpu_shot.root_module.addAnonymousImport("voxel_vert_spv", .{ .root_source_file = voxel_vert_spv });
+    gpu_shot.root_module.addAnonymousImport("voxel_frag_spv", .{ .root_source_file = voxel_frag_spv });
+    LinkVk.link(b, gpu_shot.root_module, target);
+    b.installArtifact(gpu_shot);
+    const gpu_shot_run = b.addRunArtifact(gpu_shot);
+    if (b.args) |a| gpu_shot_run.addArgs(a);
+    b.step("gpu-shot", "Screenshot headless PPM di una mesh (decode+VT)").dependOn(&gpu_shot_run.step);
+
     const decoder_mod = b.createModule(.{
         .root_source_file = b.path("src/decoder.zig"),
         .target = target,

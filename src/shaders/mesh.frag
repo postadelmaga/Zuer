@@ -33,17 +33,23 @@ const float VT_TILE = 128.0;
 const float VT_GUTTER = 2.0;
 const float VT_INNER = 124.0;
 
-// Campiona la baseColor virtuale a UV: individua la cella del livello residente,
-// ne legge lo slot fisico dall'SSBO, e campiona il texel locale dentro l'inner
-// gutter-padded della tile. Il pool è in formato sRGB → l'hardware linearizza in
-// modo esatto (e prima del filtraggio bilineare), come il path baseColor diretto.
+// Campiona la baseColor virtuale a UV. pc.vt.xy = larghezza/altezza in texel del
+// livello residente. Il baker copia i texel sorgente 1:1 nell'inner (124) delle
+// tile, quindi si mappa uv→texel sorgente con la larghezza REALE (non tiles·124,
+// che disallineerebbe il bilineare quando la larghezza non è multiplo di 124 →
+// per gli atlanti a swatch becca lo swatch vicino). tiles_x = ceil(w/124). Il
+// pool è sRGB → l'hardware linearizza in modo esatto, prima del bilineare.
 vec3 sampleVTBase(vec2 uv) {
-    float txf = clamp(uv.x, 0.0, 0.999999) * pc.vt.x;
-    float tyf = clamp(uv.y, 0.0, 0.999999) * pc.vt.y;
-    uint cell = uint(tyf) * uint(pc.vt.x) + uint(txf);
+    float sx = clamp(uv.x, 0.0, 0.999999) * pc.vt.x; // coord texel sorgente [0,w)
+    float sy = clamp(uv.y, 0.0, 0.999999) * pc.vt.y;
+    uint tiles_x = uint(ceil(pc.vt.x / VT_INNER));
+    uint cx = uint(sx / VT_INNER);
+    uint cy = uint(sy / VT_INNER);
+    uint cell = cy * tiles_x + cx;
     float slot = float(vtSlots[cell]);
-    float lx = (VT_GUTTER + fract(txf) * VT_INNER) / VT_TILE;
-    float ly = (VT_GUTTER + fract(tyf) * VT_INNER) / VT_TILE;
+    // texel locale nell'inner (gutter-offset); il +0.5 dei centri texel è già in sx.
+    float lx = (VT_GUTTER + sx - float(cx) * VT_INNER) / VT_TILE;
+    float ly = (VT_GUTTER + sy - float(cy) * VT_INNER) / VT_TILE;
     return texture(vtPool, vec3(lx, ly, slot)).rgb;
 }
 

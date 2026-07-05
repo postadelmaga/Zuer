@@ -61,8 +61,10 @@ pub const PushConstants = extern struct {
     material: [4]f32,
     light_vp: [16]f32,
     light_dir_cam: [4]f32,
-    /// Virtual texture baseColor: x=tiles_x, y=tiles_y del livello residente,
-    /// z=1 se attiva (altrimenti solo il fattore materiale), w libero.
+    /// Virtual texture baseColor: x=larghezza, y=altezza (in texel) del livello
+    /// residente, z=1 se attiva (altrimenti solo il fattore materiale), w libero.
+    /// Lo shader deriva tiles_x=ceil(w/inner) e mappa uv→texel con la larghezza
+    /// reale (allineamento esatto dei centri texel anche se w non è multiplo di 124).
     vt: [4]f32 = .{ 0, 0, 0, 0 },
 };
 
@@ -921,6 +923,9 @@ pub const Renderer = struct {
         }
         g.vt_tiles_x = desc.tiles_x;
         g.vt_tiles_y = desc.tiles_y;
+        const dims = vtex.levelDims(m.width, m.height, level, m.levels.len);
+        g.vt_level_w = dims.w;
+        g.vt_level_h = dims.h;
         g.vt_level = @intCast(level);
     }
 
@@ -1299,7 +1304,7 @@ pub const Renderer = struct {
             lpc.material = sm.base_color;
             lpc.nrm0[3] = sm.roughness;
             lpc.nrm1[3] = sm.metallic;
-            lpc.vt = .{ @floatFromInt(sm.vt_tiles_x), @floatFromInt(sm.vt_tiles_y), if (sm.vt_on) 1.0 else 0.0, 0.0 };
+            lpc.vt = .{ @floatFromInt(sm.vt_level_w), @floatFromInt(sm.vt_level_h), if (sm.vt_on) 1.0 else 0.0, 0.0 };
             vkCmdPushConstants(cmd, self.pipeline_layout, SHADER_STAGE_VERTEX | SHADER_STAGE_FRAGMENT, 0, @sizeOf(PushConstants), &lpc);
             vkCmdBindDescriptorSets(cmd, 0, self.pipeline_layout, 0, 1, &[_]VkDescriptorSet{sm.dset}, 0, null);
             vkCmdDrawIndexed(cmd, sm.index_count, 1, sm.first_index, 0, 0);
@@ -1392,7 +1397,7 @@ pub const Renderer = struct {
             lpc.material = sm.base_color;
             lpc.nrm0[3] = sm.roughness;
             lpc.nrm1[3] = sm.metallic;
-            lpc.vt = .{ @floatFromInt(sm.vt_tiles_x), @floatFromInt(sm.vt_tiles_y), if (sm.vt_on) 1.0 else 0.0, 0.0 };
+            lpc.vt = .{ @floatFromInt(sm.vt_level_w), @floatFromInt(sm.vt_level_h), if (sm.vt_on) 1.0 else 0.0, 0.0 };
             vkCmdPushConstants(self.cmd, self.pipeline_layout, SHADER_STAGE_VERTEX | SHADER_STAGE_FRAGMENT, 0, @sizeOf(PushConstants), &lpc);
             vkCmdBindDescriptorSets(self.cmd, 0, self.pipeline_layout, 0, 1, &[_]VkDescriptorSet{sm.dset}, 0, null);
             vkCmdDrawIndexed(self.cmd, sm.index_count, 1, sm.first_index, 0, 0);
@@ -1665,6 +1670,8 @@ pub const Renderer = struct {
         vt_base: u32 = 0,
         vt_tiles_x: u32 = 0,
         vt_tiles_y: u32 = 0,
+        vt_level_w: u32 = 0, // larghezza in texel del livello residente (per mappare uv→texel esatto)
+        vt_level_h: u32 = 0,
         vt_level: i32 = -1, // livello attualmente residente (-1 = nessuno)
         vt_on: bool = false,
         vtc: ?vtcache.VtcMap = null, // texture baked mappata da disco (tile a richiesta)
