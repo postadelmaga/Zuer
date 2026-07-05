@@ -2005,6 +2005,23 @@ fn loadWorker(state: *GuiAppState) void {
         state.ld_mutex.unlock(io);
         defer gpa.free(path);
 
+        // Fase 1 progressiva: se la cache texture 256² è calda (già visto), una
+        // resa blurry quasi istantanea → tornando a un modello con le frecce lo
+        // spinner si ferma subito invece di attendere il decode full. Se stale o
+        // non disponibile, si salta.
+        if (decoder_mod.decodeCoarse(path, io, gpa)) |coarse| {
+            state.ld_mutex.lockUncancelable(io);
+            const stale_c = gen != state.ld_gen.*;
+            state.ld_mutex.unlock(io);
+            if (!stale_c and coarse == .mesh)
+                state.applyDecoded(coarse, null, path) catch |e|
+                    std.debug.print("apply coarse (async): {s}\n", .{@errorName(e)})
+            else {
+                var c = coarse;
+                c.deinit(gpa);
+            }
+        }
+
         // Decode CPU fuori da ogni lock.
         var d = decoder_mod.decode(path, io, gpa);
 
