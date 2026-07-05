@@ -22,6 +22,7 @@ const layout = @import("layout.zig");
 const WinKind = layout.WinKind;
 // CPU frame compositor (image aspect-fit + text blit + selection + tab bar).
 const compose = @import("compose.zig");
+const glyph = @import("glyph.zig");
 const TabBarState = compose.TabBarState;
 const max_tabs = compose.max_tabs;
 const clipboard = @import("clipboard.zig");
@@ -1087,6 +1088,81 @@ fn fitZoom(cw: u32, ch: u32, sw: u32, sh: u32) f32 {
     return @min(fcw / @as(f32, @floatFromInt(sw)), fch / @as(f32, @floatFromInt(sh)));
 }
 
+/// Fonde un pixel RGB `(r,g,b)` con copertura `a` sopra il buffer RGBA (alpha
+/// straight): tiene il canale alpha al massimo tra esistente e copertura.
+fn blendLabelPx(buf: []u8, idx: usize, r: u8, g: u8, b: u8, a: u8) void {
+    if (a == 0) return;
+    const av: u32 = a;
+    const inv: u32 = 255 - av;
+    buf[idx + 0] = @intCast((@as(u32, buf[idx + 0]) * inv + @as(u32, r) * av) / 255);
+    buf[idx + 1] = @intCast((@as(u32, buf[idx + 1]) * inv + @as(u32, g) * av) / 255);
+    buf[idx + 2] = @intCast((@as(u32, buf[idx + 2]) * inv + @as(u32, b) * av) / 255);
+    buf[idx + 3] = @max(buf[idx + 3], a);
+}
+
+/// Disegna il nome file in alto a destra: pill scura semi-trasparente + testo
+/// monospazio (Hack) bianco. Right-aligned con margine; se il nome è più largo
+/// della finestra si ancora a sinistra. Chiamato dal worker su ogni frame reso.
+fn drawFilenameLabel(buf: []u8, W: u32, H: u32, raster: *glyph.Raster, name: []const u8) void {
+    if (name.len == 0 or W == 0 or H == 0) return;
+    var view = std.unicode.Utf8View.init(name) catch return;
+
+    const cell = raster.advance;
+    var n: i32 = 0;
+    {
+        var it = view.iterator();
+        while (it.nextCodepoint()) |_| n += 1;
+    }
+    if (n == 0 or cell <= 0) return;
+
+    const asc = raster.ascent;
+    const line_h = asc - raster.descent;
+    const pad_x: i32 = 8;
+    const pad_y: i32 = 3;
+    const margin: i32 = 12;
+    const box_w = n * cell + pad_x * 2;
+    const box_h = line_h + pad_y * 2;
+    const wi: i32 = @intCast(W);
+    var box_x = wi - margin - box_w;
+    if (box_x < margin) box_x = margin;
+    const box_y: i32 = margin;
+
+    // Sfondo pill scuro via il Canvas straight di zicro (buffer 4-allineato).
+    const u32px: [*]u32 = @ptrCast(@alignCast(buf.ptr));
+    var canvas = paint.Canvas.initRgba8(u32px[0 .. @as(usize, W) * H], W, H);
+    canvas.fillRoundedRect(@floatFromInt(box_x), @floatFromInt(box_y), @floatFromInt(box_w), @floatFromInt(box_h), 6.0, paint.Color.rgba(16, 18, 26, 0.62));
+
+    // Testo monospazio bianco.
+    const hi: i32 = @intCast(H);
+    const baseline = box_y + pad_y + asc;
+    var pen_x = box_x + pad_x;
+    var it = view.iterator();
+    while (it.nextCodepoint()) |cp| {
+        const gph = raster.getGlyph(.regular, cp) catch {
+            pen_x += cell;
+            continue;
+        };
+        if (gph.bitmap.len != 0) {
+            const gx0 = pen_x + gph.xoff;
+            const gy0 = baseline + gph.yoff;
+            var gy: i32 = 0;
+            while (gy < gph.h) : (gy += 1) {
+                const py = gy0 + gy;
+                if (py < 0 or py >= hi) continue;
+                var gx: i32 = 0;
+                while (gx < gph.w) : (gx += 1) {
+                    const px = gx0 + gx;
+                    if (px < 0 or px >= wi) continue;
+                    const cov = gph.bitmap[@intCast(gy * gph.w + gx)];
+                    if (cov == 0) continue;
+                    blendLabelPx(buf, @intCast((py * wi + px) * 4), 235, 238, 245, cov);
+                }
+            }
+        }
+        pen_x += cell;
+    }
+}
+
 fn renderWorker(
     win: *zrame.Window,
     state: *GuiAppState,
@@ -1128,6 +1204,11 @@ fn renderWorker(
     // Sotto soglia il worker continua a mostrare il contenuto PRECEDENTE.
     var load_elapsed: f64 = 0;
     var was_loading = false;
+
+    // Rasterizzatore monospazio (Hack) per la label del nome file in alto a destra.
+    // Creato una volta e riusato; null se l'init fallisce (label semplicemente omessa).
+    var name_raster: ?glyph.Raster = glyph.Raster.init(state.gpa, 13.0) catch null;
+    defer if (name_raster) |*r| r.deinit();
 
     // La primitiva scrollbar `state.sc` è condivisa coi callback input: qui la si usa
     // solo entro il lock del mutex (già preso attorno alla sezione compose).
@@ -1210,6 +1291,7 @@ fn renderWorker(
                 const fit = fitZoom(cur_w, cur_h, state.static_w.*, state.static_h.*);
                 compose.composeFrame(composited_rgba.*, cur_w, cur_h, state.static_rgba.*, state.static_w.*, state.static_h.*, false, fit, 0.0, 0.0);
                 if (vs.controls > 0.01) videomod.drawVideoControls(composited_rgba.*, cur_w, cur_h, vs);
+                if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, cur_w, cur_h, r, std.fs.path.basename(state.current_file_path));
                 win.presentRgba(cur_w, cur_h, composited_rgba.*);
                 vid_pw = cur_w;
                 vid_ph = cur_h;
@@ -1317,6 +1399,9 @@ fn renderWorker(
             } else {
                 compose.composeFrame(composited_rgba.*, cur_w, cur_h, state.static_rgba.*, state.static_w.*, state.static_h.*, false, zoom.*, state.pan_x.*, state.pan_y.*);
             }
+
+            // Nome file in alto a destra (monospazio), sopra ogni contenuto.
+            if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, cur_w, cur_h, r, std.fs.path.basename(state.current_file_path));
 
             win.presentRgba(cur_w, cur_h, composited_rgba.*);
             if (present_pulse > 0) present_pulse -= 1;
