@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dynlib = @import("dynlib.zig");
+const meshcache = @import("meshcache.zig");
 
 pub const CsvData = struct {
     headers: [][]const u8,
@@ -964,6 +965,17 @@ fn decodeImpl(path: []const u8, io: std.Io, allocator: std.mem.Allocator, coarse
         return .{ .err = msg };
     }
 
+    const mtime_ns: i128 = stat.mtime.nanoseconds;
+
+    // Fase coarse: se esiste una mesh coarse cachata (geometria + texture 256²)
+    // valida per questo file (mtime combaciante), ricostruiscila senza leggere né
+    // ridecodificare i decine di MB del sorgente → ritorno quasi istantaneo. Miss
+    // → si prosegue col decode coarse normale (che popolerà anche questa cache).
+    if (coarse) {
+        if (meshcache.readCoarse(allocator, clean_path, mtime_ns)) |m|
+            return .{ .mesh = m };
+    }
+
     const limit = std.Io.Limit.limited(max_size);
     const content = std.Io.Dir.cwd().readFileAlloc(io, clean_path, allocator, limit) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "Impossibile aprire o leggere il file: {s} ({s})", .{ clean_path, @errorName(err) }) catch "";
@@ -1005,6 +1017,12 @@ fn decodeImpl(path: []const u8, io: std.Io, allocator: std.mem.Allocator, coarse
         const msg = std.fmt.allocPrint(allocator, "Errore conversione struttura C in plugin: {s}", .{@errorName(err)}) catch "";
         return .{ .err = msg };
     };
+
+    // Popola/aggiorna la cache mesh coarse dal decode full (texture downscalate a
+    // 256²) → la prossima apertura/ritorno usa il fast-path sopra, senza toccare
+    // il file né il decoder. Best-effort, non blocca il ritorno.
+    if (!coarse and decoded_data == .mesh)
+        meshcache.writeCoarse(allocator, clean_path, mtime_ns, &decoded_data.mesh);
 
     return decoded_data;
 }
