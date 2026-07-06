@@ -520,6 +520,12 @@ const GuiAppState = struct {
     }
 
     fn navigate(self: *GuiAppState, direction: i2) void {
+        // Direttiva UX: mentre un modello sta caricando (spinner, non ancora
+        // visibile) ignora le nuove frecce, così non si accumulano navigazioni e
+        // non si "impalla". Esc resta prioritario (gestito prima nel key handler:
+        // chiude). Appena il modello è visibile `loading` torna false (lo azzera
+        // applyDecoded, anche sulla fase coarse ~0.5s) → frecce reattive all'istante.
+        if (self.loading.*) return;
         if (self.file_list.items.len <= 1) return;
         const current_idx = self.current_file_index orelse return;
 
