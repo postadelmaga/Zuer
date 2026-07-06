@@ -283,6 +283,15 @@ const GuiAppState = struct {
         self.ld_cond.signal(self.io);
     }
 
+    /// True se una navigazione più recente è arrivata dopo che il worker ha preso
+    /// `gen` (spam di frecce): il lavoro in corso è ormai superato e va scartato,
+    /// così il worker non spreca coarse+full+upload su modelli già oltrepassati.
+    fn navSuperseded(self: *GuiAppState, gen: u32) bool {
+        self.ld_mutex.lockUncancelable(self.io);
+        defer self.ld_mutex.unlock(self.io);
+        return gen != self.ld_gen.*;
+    }
+
     /// Libera i dati CPU della mesh dopo l'upload su GPU: sono tutti duplicati
     /// altrove e non più necessari alla visualizzazione, ma su modelli grossi
     /// valgono centinaia di MB. Azzera gli slice così `deinit` non rilibera.
@@ -2005,15 +2014,17 @@ fn loadWorker(state: *GuiAppState) void {
         state.ld_mutex.unlock(io);
         defer gpa.free(path);
 
-        // Fase 1 progressiva: se la cache texture 256² è calda (già visto), una
-        // resa blurry quasi istantanea → tornando a un modello con le frecce lo
-        // spinner si ferma subito invece di attendere il decode full. Se stale o
-        // non disponibile, si salta.
+        // Spam di frecce: se è GIÀ arrivata una navigazione più recente, salta
+        // questa per intero (niente decode né upload) → la più recente verrà presa
+        // al giro dopo. Evita di impegnare il worker su modelli oltrepassati.
+        if (state.navSuperseded(gen)) continue;
+
+        // Fase 1 progressiva: se la cache mesh coarse è calda (già visto), una resa
+        // blurry quasi istantanea → tornando a un modello con le frecce lo spinner
+        // si ferma subito invece di attendere il decode full. Se superata nel
+        // frattempo o non disponibile, si scarta.
         if (decoder_mod.decodeCoarse(path, io, gpa)) |coarse| {
-            state.ld_mutex.lockUncancelable(io);
-            const stale_c = gen != state.ld_gen.*;
-            state.ld_mutex.unlock(io);
-            if (!stale_c and coarse == .mesh)
+            if (!state.navSuperseded(gen) and coarse == .mesh)
                 state.applyDecoded(coarse, null, path) catch |e|
                     std.debug.print("apply coarse (async): {s}\n", .{@errorName(e)})
             else {
@@ -2022,14 +2033,16 @@ fn loadWorker(state: *GuiAppState) void {
             }
         }
 
+        // Prima del full decode (l'operazione più costosa, ~secondi): se nel
+        // frattempo l'utente ha già navigato oltre, saltalo e vai alla più recente.
+        // È qui che si evita il "si impalla" dello spam frecce.
+        if (state.navSuperseded(gen)) continue;
+
         // Decode CPU fuori da ogni lock.
         var d = decoder_mod.decode(path, io, gpa);
 
         // Superseded da una navigazione più recente? scarta (la più nuova arriverà).
-        state.ld_mutex.lockUncancelable(io);
-        const stale = gen != state.ld_gen.*;
-        state.ld_mutex.unlock(io);
-        if (stale) {
+        if (state.navSuperseded(gen)) {
             d.deinit(gpa);
             continue;
         }
