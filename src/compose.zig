@@ -209,6 +209,13 @@ pub fn composeFrame(
     pan_x: f32,
     pan_y: f32,
 ) void {
+    // Sorgente vuota (es. video non apribile → dims 0): riempi lo sfondo e
+    // basta — l'aspect 0/0 darebbe NaN e il panic di @intFromFloat qui sotto.
+    if (src_w == 0 or src_h == 0) {
+        @memset(composited_rgba[0 .. @as(usize, H) * W * 4], 0);
+        return;
+    }
+
     // Calcolo dell'aspect ratio per l'adattamento (aspect-fit) a tutto schermo
     const src_aspect = @as(f32, @floatFromInt(src_w)) / @as(f32, @floatFromInt(src_h));
     const win_aspect = @as(f32, @floatFromInt(W)) / @as(f32, @floatFromInt(H));
@@ -259,6 +266,12 @@ pub fn composeFrame(
 
     const inv_w = (@as(u64, src_w) << 32) / fit_w_zoomed;
     const inv_h = (@as(u64, src_h) << 32) / fit_h_zoomed;
+
+    // Loop caldo per-pixel (ricampionamento del frame ogni present): gli indici sono
+    // già clampati (`@min` con src_w-1/src_h-1), quindi disattiviamo i controlli di
+    // sicurezza runtime così anche la build ReleaseSafe scala alla velocità di
+    // ReleaseFast — determinante per reggere i 30/60 fps del video senza scatti.
+    @setRuntimeSafety(false);
 
     var py = start_y;
     while (py < end_y) : (py += 1) {
