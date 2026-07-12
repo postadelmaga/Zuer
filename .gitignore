@@ -1,5 +1,7 @@
 .zig-cache/
 zig-out/
+Zuer-Setup*.exe
+installer/associations.nsh
 zig-pkg/
 __pycache__/
 *.pyc

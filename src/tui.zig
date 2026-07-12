@@ -320,11 +320,11 @@ pub const TuiSink = struct {
                     try self.renderText(writer, text, state.scroll_offset, content_height);
                 },
                 .csv => |csv| {
-                    try self.renderCsv(writer, csv, state.scroll_offset, state.filter_text, content_height, size.cols);
+                    try self.renderCsv(writer, csv, state.scroll_offset, state.filter_text, content_height);
                 },
                 .workbook => |w| {
                     // TUI: mostra il foglio attivo (default il primo) come tabella.
-                    try self.renderCsv(writer, w.activeCsv(), state.scroll_offset, state.filter_text, content_height, size.cols);
+                    try self.renderCsv(writer, w.activeCsv(), state.scroll_offset, state.filter_text, content_height);
                 },
                 .markdown => |md| {
                     try self.renderMarkdown(writer, md.content, state.scroll_offset, content_height);
@@ -348,8 +348,7 @@ pub const TuiSink = struct {
         try stdout_writer.flush();
     }
 
-    fn renderText(self: *TuiSink, writer: anytype, text: []const u8, offset: usize, height: usize) !void {
-        _ = self;
+    fn renderText(_: *TuiSink, writer: anytype, text: []const u8, offset: usize, height: usize) !void {
         var line_it = std.mem.splitScalar(u8, text, '\n');
         var line_idx: usize = 0;
         var printed: usize = 0;
@@ -365,7 +364,7 @@ pub const TuiSink = struct {
         }
     }
 
-    fn renderCsv(self: *TuiSink, writer: anytype, csv: CsvData, offset: usize, filter: []const u8, height: usize, term_width: usize) !void {
+    fn renderCsv(self: *TuiSink, writer: anytype, csv: CsvData, offset: usize, filter: []const u8, height: usize) !void {
         // Compute column widths
         var col_widths = try self.gpa.alloc(usize, csv.headers.len);
         defer self.gpa.free(col_widths);
@@ -431,7 +430,9 @@ pub const TuiSink = struct {
             }
 
             if (matched_rows >= offset) {
-                if (printed >= height - 2) break;
+                // -| : su terminali minuscoli (height < 2) la sottrazione normale
+                // andrebbe in underflow e la guardia non scatterebbe mai.
+                if (printed >= height -| 2) break;
 
                 // Color alternate rows for premium look
                 const row_color = if (printed % 2 == 0) "" else "\x1B[2m";
@@ -441,20 +442,16 @@ pub const TuiSink = struct {
                     if (i >= col_widths.len) break;
                     const width = col_widths[i];
 
-                    var cell_buf = std.ArrayList(u8).empty;
-                    defer cell_buf.deinit(self.gpa);
-
-                    // Replace tabs/newlines in cells
-                    for (cell) |c| {
-                        if (c == '\t' or c == '\n' or c == '\r') {
-                            try cell_buf.append(self.gpa, ' ');
-                        } else {
-                            try cell_buf.append(self.gpa, c);
-                        }
+                    // Sanifica la cella in un buffer fisso: la larghezza colonna è già
+                    // limitata a 30, quindi bastano i primi `width` byte — zero
+                    // allocazioni per cella. Il clamp a cell_buf.len è una cintura di
+                    // sicurezza se il limite di larghezza dovesse cambiare.
+                    var cell_buf: [30]u8 = undefined;
+                    const clean_len = @min(cell.len, @min(width, cell_buf.len));
+                    for (cell[0..clean_len], cell_buf[0..clean_len]) |c, *out| {
+                        out.* = if (c == '\t' or c == '\n' or c == '\r') ' ' else c;
                     }
-
-                    const clean_cell = cell_buf.items;
-                    const trimmed = if (clean_cell.len > width) clean_cell[0..width] else clean_cell;
+                    const trimmed = cell_buf[0..clean_len];
                     try writer.print("{s}", .{trimmed});
                     if (trimmed.len < width) {
                         var k: usize = 0;
@@ -473,12 +470,9 @@ pub const TuiSink = struct {
         if (printed == 0) {
             try writer.writeAll("\r\n   \x1B[90m(Nessuna riga corrispondente al filtro)\x1B[0m\r\n");
         }
-
-        _ = term_width;
     }
 
-    fn renderMarkdown(self: *TuiSink, writer: anytype, content: []const u8, offset: usize, height: usize) !void {
-        _ = self;
+    fn renderMarkdown(_: *TuiSink, writer: anytype, content: []const u8, offset: usize, height: usize) !void {
         var line_it = std.mem.splitScalar(u8, content, '\n');
         var line_idx: usize = 0;
         var printed: usize = 0;

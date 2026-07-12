@@ -24,6 +24,7 @@ const impl = switch (builtin.os.tag) {
         extern "kernel32" fn GlobalAlloc(uFlags: u32, dwBytes: usize) callconv(.winapi) HANDLE;
         extern "kernel32" fn GlobalLock(hMem: HANDLE) callconv(.winapi) ?*anyopaque;
         extern "kernel32" fn GlobalUnlock(hMem: HANDLE) callconv(.winapi) i32;
+        extern "kernel32" fn GlobalFree(hMem: HANDLE) callconv(.winapi) HANDLE;
         const CF_UNICODETEXT: u32 = 13;
         const GMEM_MOVEABLE: u32 = 0x0002;
 
@@ -32,21 +33,30 @@ const impl = switch (builtin.os.tag) {
             const utf16 = std.unicode.utf8ToUtf16LeAllocZ(gpa, text) catch return;
             defer gpa.free(utf16);
             const bytes = (utf16.len + 1) * 2; // include the null terminator
+            // The clipboard owns `h` only once SetClipboardData succeeds: every
+            // earlier failure path must GlobalFree it or the allocation leaks.
             const h = GlobalAlloc(GMEM_MOVEABLE, bytes) orelse return;
-            const dst = GlobalLock(h) orelse return;
+            const dst = GlobalLock(h) orelse {
+                _ = GlobalFree(h);
+                return;
+            };
             const d: [*]u16 = @ptrCast(@alignCast(dst));
             @memcpy(d[0..utf16.len], utf16[0..utf16.len]);
             d[utf16.len] = 0;
             _ = GlobalUnlock(h);
-            if (OpenClipboard(null) == 0) return;
+            if (OpenClipboard(null) == 0) {
+                _ = GlobalFree(h);
+                return;
+            }
             defer _ = CloseClipboard();
             _ = EmptyClipboard();
-            // On success the clipboard owns `h` (do not free it).
-            _ = SetClipboardData(CF_UNICODETEXT, h);
+            if (SetClipboardData(CF_UNICODETEXT, h) == null) _ = GlobalFree(h);
         }
     },
     else => struct {
         extern "c" fn pipe(fds: *[2]c_int) c_int;
+        extern "c" fn pipe2(fds: *[2]c_int, flags: c_int) c_int;
+        extern "c" fn fcntl(fd: c_int, cmd: c_int, arg: c_int) c_int;
         extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
         extern "c" fn close(fd: c_int) c_int;
         extern "c" fn waitpid(pid: c_int, status: ?*c_int, options: c_int) c_int;
@@ -57,9 +67,24 @@ const impl = switch (builtin.os.tag) {
         extern "c" fn posix_spawn_file_actions_addclose(fa: *anyopaque, fd: c_int) c_int;
         extern "c" var environ: [*:null]const ?[*:0]const u8;
 
+        /// pipe con O_CLOEXEC: senza, un figlio spawnato in parallelo da un altro
+        /// thread erediterebbe il write-end e wl-copy non vedrebbe mai l'EOF.
+        /// L'adddup2 del figlio giusto azzera CLOEXEC sul fd duplicato.
+        /// Su Linux `pipe2` è atomica; altrove fallback `pipe` + `fcntl`.
+        fn pipeCloexec(fds: *[2]c_int) c_int {
+            if (builtin.os.tag == .linux) {
+                return pipe2(fds, 0o2000000); // O_CLOEXEC (Linux)
+            } else {
+                if (pipe(fds) != 0) return -1;
+                _ = fcntl(fds[0], 2, 1); // F_SETFD, FD_CLOEXEC
+                _ = fcntl(fds[1], 2, 1);
+                return 0;
+            }
+        }
+
         fn copy(text: []const u8) void {
             var fds: [2]c_int = undefined;
-            if (pipe(&fds) != 0) return;
+            if (pipeCloexec(&fds) != 0) return;
             const rfd = fds[0];
             const wfd = fds[1];
 

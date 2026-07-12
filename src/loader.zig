@@ -102,7 +102,10 @@ pub const LoaderModule = struct {
 
             switch (parsed.value) {
                 .load_file => |path| {
-                    var decoded = decoder_mod.decode(path, ctx.io, ctx.gpa);
+                    // Decodifica con `self.gpa`: è l'allocator con cui LoadedFile
+                    // (e il `deinit` sotto) libereranno il risultato — deve essere
+                    // lo stesso per l'intero ciclo di vita del decoded.
+                    var decoded = decoder_mod.decode(path, ctx.io, self.gpa);
 
                     if (decoded == .err) {
                         // Notify that decoding failed

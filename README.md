@@ -73,6 +73,37 @@ zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast
 scripts/fetch-ffmpeg-dlls.sh          # → zig-out/bin/
 ```
 
+### Installer (`.exe`)
+
+Un unico setup Windows, compilabile **da Linux** con NSIS (`makensis`):
+
+```sh
+scripts/build-windows-installer.sh                  # → Zuer-Setup.exe (FFmpeg full BtbN, ~38 MB)
+scripts/build-windows-installer.sh --ffmpeg-trimmed # FFmpeg minimale stile VLC (installer ~pochi MB)
+scripts/build-windows-installer.sh --no-ffmpeg      # installer minuscolo, senza video
+```
+
+`--ffmpeg-trimmed` compila (`scripts/build-ffmpeg-trimmed.sh`) un FFmpeg
+`--disable-everything` con solo i demuxer/decoder che servono a zuer: le DLL
+passano da ~131 MB a pochi MB. Compila lo **stesso commit** delle import-lib
+vendored (avformat 63) → header e `vendor/ffmpeg/lib` restano validi as-is.
+
+> `mingw-w64` (e opzionalmente `nasm` per le SIMD x86) servono **solo qui, sul
+> PC che costruisce l'installer**, per compilare le DLL una volta. **L'utente
+> finale non installa nulla**: dentro `Zuer-Setup.exe` le DLL sono già compilate
+> e pronte — un singolo `.exe` autosufficiente, come qualsiasi setup Windows.
+
+Lo script cross-compila in ReleaseFast, impacchetta `zuer-gui.exe` + i decoder
+`.dll` (+ opzionalmente le DLL FFmpeg), genera un'icona e produce un installer
+**per-utente** (nessun admin/UAC): copia in `%LOCALAPPDATA%\Programs\Zuer`,
+aggiunge un collegamento nel menu Start e una voce in **App e funzionalità** per
+la disinstallazione. Registra le **associazioni** per tutte le estensioni note ai
+decoder inclusi (testo/codice, csv, markdown, mesh, immagini, glb, archivi,
+media): Zuer compare in "Apri con" e tra le **App predefinite** di Windows —
+senza rubare i default esistenti (l'utente lo elegge default dal pannello). Le
+estensioni sono rigenerate a ogni build da `src/decoders/*.zig`, quindi restano
+in sync (office/pdf sono Linux-only → non associati su Windows).
+
 > **Compila sempre con `-Doptimize=ReleaseFast`.** Il default di `zig build` è Debug:
 > il rendering GPU resta veloce (lo fa la GPU) ma il **compositing CPU** dei frame
 > gira non ottimizzato ed è 3–4× più lento — il 3D diventa scattoso.

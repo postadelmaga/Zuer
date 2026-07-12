@@ -5,9 +5,8 @@
 //! `zicro.gpu_memory`) viene importato zero-copy con VK_EXT_external_memory_host
 //! quando il driver lo permette, altrimenti copiato una volta sola.
 //!
-//! Due presentazioni sopra lo stesso core:
-//!  - TUI: `render()` → pixel RGBA in un buffer host-visible (readback);
-//!  - zuer-gui: `renderToImage()` lascia il frame pronto, presentato da zrame.
+//! Tutte le presentazioni (TUI e zuer-gui) passano da `render()`: pixel RGBA
+//! in un buffer host-visible (readback pipelined su due slot).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -407,7 +406,6 @@ pub const Renderer = struct {
     vt_zoom: f32 = 1.0,
     /// Budget slot effettivo per submesh (≤ VT_BUDGET, ridotto se molti testurati).
     vt_budget: u32 = VT_BUDGET,
-    white_tex: ImageBundle = .{ .image = VK_NULL, .mem = VK_NULL, .view = VK_NULL },
     flat_normal_tex: ImageBundle = .{ .image = VK_NULL, .mem = VK_NULL, .view = VK_NULL },
     submeshes: []SubMeshGpu = &.{},
 
@@ -699,7 +697,6 @@ pub const Renderer = struct {
         }
         self.releaseSubmeshes();
         if (self.vt_pool) |*p| p.deinit();
-        if (self.white_tex.image != VK_NULL) self.destroyImage(self.white_tex);
         if (self.flat_normal_tex.image != VK_NULL) self.destroyImage(self.flat_normal_tex);
         vkDestroyDescriptorPool(self.device, self.mesh_dpool, null);
         vkDestroyDescriptorSetLayout(self.device, self.mesh_dsl, null);
@@ -913,14 +910,23 @@ pub const Renderer = struct {
     fn uploadVtLevel(self: *Renderer, g: *SubMeshGpu, level: usize) void {
         const m = &g.vtc.?;
         const desc = m.levels[level];
+        const total: u32 = @as(u32, desc.tiles_x) * desc.tiles_y;
+        const pool = &self.vt_pool.?;
+
+        // Tutte le tile del livello in un unico batch: un solo submit + fence
+        // (contro un round-trip GPU per tile). In caso di errore non si tocca lo
+        // stato: il livello resta non residente e verrà ritentato al prossimo frame.
+        pool.uploadTilesBegin(g.vt_base, total) catch return;
         for (0..desc.tiles_y) |ty| {
             for (0..desc.tiles_x) |tx| {
                 const cell: u32 = @intCast(ty * desc.tiles_x + tx);
                 const idx = vtex.tileIndex(m.levels, level, @intCast(tx), @intCast(ty));
-                self.vt_pool.?.uploadTile(g.vt_base + cell, m.tile(@intCast(idx))) catch {};
-                g.vt_slots_ptr[cell] = g.vt_base + cell;
+                pool.uploadTilesStage(cell, g.vt_base + cell, m.tile(@intCast(idx)));
             }
         }
+        pool.uploadTilesEnd() catch return;
+
+        for (0..total) |cell| g.vt_slots_ptr[cell] = g.vt_base + @as(u32, @intCast(cell));
         g.vt_tiles_x = desc.tiles_x;
         g.vt_tiles_y = desc.tiles_y;
         const dims = vtex.levelDims(m.width, m.height, level, m.levels.len);
@@ -974,7 +980,6 @@ pub const Renderer = struct {
             p.deinit();
             self.vt_pool = null;
         }
-        try self.ensureWhiteTexture();
         try self.ensureFlatNormal();
         try self.ensureShadow(); // la shadow map serve al binding 1 di ogni set
 
@@ -1005,7 +1010,13 @@ pub const Renderer = struct {
         }, null, &self.mesh_dpool));
 
         const out = try self.gpa.alloc(SubMeshGpu, count);
-        errdefer self.gpa.free(out);
+        var done: usize = 0;
+        errdefer {
+            // Rilascia le risorse dei submesh già completati (le texture/buffer
+            // dell'iterazione in corso sono coperte dall'errdefer su `g`).
+            for (out[0..done]) |*sm| self.releaseSubmeshGpu(sm);
+            self.gpa.free(out);
+        }
 
         var next_base: u32 = 0;
         for (0..count) |i| {
@@ -1015,12 +1026,11 @@ pub const Renderer = struct {
                 .base_color = .{ 1, 1, 1, 1 },
                 .metallic = 1,
                 .roughness = 1,
-                .tex = self.white_tex,
-                .owns_tex = false,
                 .nrm_tex = self.flat_normal_tex,
                 .owns_nrm_tex = false,
                 .dset = VK_NULL,
             };
+            errdefer self.releaseSubmeshGpu(&g);
             if (subs.len > 0) {
                 const s = subs[i];
                 g.first_index = @intCast(s.first_index);
@@ -1041,13 +1051,6 @@ pub const Renderer = struct {
             // Ogni set deve avere un SSBO valido al binding 3 (dummy per i submesh
             // senza baseColor virtualizzata, vt_on=false).
             if (g.vt_buf == VK_NULL) try self.createStorageBuffer(4, &g.vt_buf, &g.vt_mem, &g.vt_slots_ptr);
-            errdefer {
-                if (g.owns_nrm_tex) self.destroyImage(g.nrm_tex);
-                if (g.vt_buf != VK_NULL) {
-                    vkDestroyBuffer(self.device, g.vt_buf, null);
-                    vkFreeMemory(self.device, g.vt_mem, null);
-                }
-            }
 
             try check(vkAllocateDescriptorSets(self.device, &.{
                 .descriptorPool = self.mesh_dpool,
@@ -1056,35 +1059,32 @@ pub const Renderer = struct {
             self.writeSubmeshDescriptors(g.dset, g.nrm_tex.view, g.vt_buf);
 
             out[i] = g;
+            done += 1;
         }
 
         self.submeshes = out;
     }
 
+    /// Rilascia le risorse possedute da un singolo SubMeshGpu (texture, SSBO,
+    /// mmap della cache VT). Il descriptor set si libera con il pool.
+    fn releaseSubmeshGpu(self: *Renderer, sm: *SubMeshGpu) void {
+        if (sm.owns_nrm_tex and sm.nrm_tex.image != VK_NULL) self.destroyImage(sm.nrm_tex);
+        if (sm.vt_buf != VK_NULL) {
+            vkDestroyBuffer(self.device, sm.vt_buf, null);
+            vkFreeMemory(self.device, sm.vt_mem, null);
+        }
+        if (sm.vtc) |*m| m.deinit();
+        sm.vtc = null;
+        sm.vt_buf = VK_NULL;
+        sm.owns_nrm_tex = false;
+    }
+
     /// Distrugge le texture possedute dai submesh e libera l'array. I descriptor
     /// set si liberano con la ricreazione del pool (fatta dal chiamante).
     fn releaseSubmeshes(self: *Renderer) void {
-        for (self.submeshes) |sm| {
-            if (sm.owns_tex and sm.tex.image != VK_NULL) self.destroyImage(sm.tex);
-            if (sm.owns_nrm_tex and sm.nrm_tex.image != VK_NULL) self.destroyImage(sm.nrm_tex);
-            if (sm.vt_buf != VK_NULL) {
-                vkDestroyBuffer(self.device, sm.vt_buf, null);
-                vkFreeMemory(self.device, sm.vt_mem, null);
-            }
-            if (sm.vtc) |*m| {
-                var mm = m.*;
-                mm.deinit();
-            }
-        }
+        for (self.submeshes) |*sm| self.releaseSubmeshGpu(sm);
         if (self.submeshes.len > 0) self.gpa.free(self.submeshes);
         self.submeshes = &.{};
-    }
-
-    /// Texture 1×1 bianca condivisa (per i submesh senza baseColor propria).
-    fn ensureWhiteTexture(self: *Renderer) !void {
-        if (self.white_tex.image != VK_NULL) return;
-        const white = [_]u8{ 255, 255, 255, 255 };
-        self.white_tex = try self.createSampledTexture(&white, 1, 1, true);
     }
 
     /// Normal map 1×1 "piatta" (+Z = (0.5,0.5,1.0)) condivisa: per i submesh senza
@@ -1207,6 +1207,14 @@ pub const Renderer = struct {
     /// readback: ritorna i pixel RGBA (validi fino alla prossima chiamata).
     /// Ottimizzato con double buffering per non bloccare la CPU (asynchronous readback).
     pub fn render(self: *Renderer, width: u32, height: u32, pc: *const PushConstants) ![]const u8 {
+        if (self.mesh_buf == VK_NULL) return error.NoMesh;
+        if (width == 0 or height == 0) return error.EmptyTarget;
+        // Il target va (ri)creato PRIMA di leggere frame_index: su un resize
+        // destroyTarget azzera frame_index e le fence, e slot/prev_slot calcolati
+        // sul valore vecchio farebbero attendere/riusare la fence sbagliata.
+        try self.ensureTarget(width, height);
+        try self.ensureShadow();
+
         const slot = self.frame_index % 2;
         const prev_slot = (self.frame_index + 1) % 2;
 
@@ -1311,118 +1319,26 @@ pub const Renderer = struct {
         }
         vkCmdEndRenderPass(cmd);
 
-        vkCmdCopyImageToBuffer(cmd, self.color_image, IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback_buf, 1, &[_]VkBufferImageCopy{.{
+        recordReadback(cmd, self.color_image, readback_buf, width, height);
+
+        try check(vkEndCommandBuffer(cmd));
+        try check(vkQueueSubmit(self.queue, 1, &[_]VkSubmitInfo{.{ .pCommandBuffers = @ptrCast(&cmd) }}, fence));
+    }
+
+    /// Registra la copia color→buffer di readback + la barrier transfer→host
+    /// (identica per frame mesh, voxel e testo).
+    fn recordReadback(cmd: VkCommandBuffer, image: VkImage, buf: VkBuffer, width: u32, height: u32) void {
+        vkCmdCopyImageToBuffer(cmd, image, IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &[_]VkBufferImageCopy{.{
             .imageSubresource = .{ .aspectMask = ASPECT_COLOR },
             .imageExtent = .{ .width = width, .height = height, .depth = 1 },
         }});
         const host_barrier = [_]VkBufferMemoryBarrier{.{
             .srcAccessMask = ACCESS_TRANSFER_WRITE,
             .dstAccessMask = ACCESS_HOST_READ,
-            .buffer = readback_buf,
+            .buffer = buf,
             .size = @as(u64, width) * height * 4,
         }};
         vkCmdPipelineBarrier(cmd, STAGE_TRANSFER, STAGE_HOST, 0, 0, null, 1, &host_barrier, 0, null);
-
-        try check(vkEndCommandBuffer(cmd));
-        try check(vkQueueSubmit(self.queue, 1, &[_]VkSubmitInfo{.{ .pCommandBuffers = @ptrCast(&cmd) }}, fence));
-    }
-
-    /// Come `render()` ma senza readback: lascia l'immagine color in layout
-    /// TRANSFER_SRC_OPTIMAL per il blit su swapchain (zuer-gui).
-    pub fn renderToImage(self: *Renderer, width: u32, height: u32, pc: *const PushConstants) !void {
-        try self.recordAndSubmit(width, height, pc, false);
-    }
-
-    fn recordAndSubmit(self: *Renderer, width: u32, height: u32, pc: *const PushConstants, do_readback: bool) !void {
-        if (self.mesh_buf == VK_NULL) return error.NoMesh;
-        if (width == 0 or height == 0) return error.EmptyTarget;
-        try self.ensureTarget(width, height);
-        try self.ensureShadow();
-        // Rete di sicurezza: senza submesh non verrebbe disegnato nulla. Ne
-        // sintetizza uno bianco sull'intera geometria (materiale di default).
-        if (self.submeshes.len == 0) try self.setSubmeshes(&[_]decoder.SubMesh{});
-        self.updateVtLevels(); // mip dinamico secondo lo zoom corrente
-
-        try check(vkBeginCommandBuffer(self.cmd, &.{}));
-
-        // --- Shadow pass: depth della scena dal punto di vista della key light.
-        const shadow_clear = [_]VkClearValue{.{ .depth_stencil = .{ .depth = 1.0, .stencil = 0 } }};
-        vkCmdBeginRenderPass(self.cmd, &.{
-            .renderPass = self.shadow_pass,
-            .framebuffer = self.shadow_fb,
-            .renderArea = .{ .offset = .{ .x = 0, .y = 0 }, .extent = .{ .width = SHADOW_SIZE, .height = SHADOW_SIZE } },
-            .clearValueCount = 1,
-            .pClearValues = &shadow_clear,
-        }, 0);
-        vkCmdBindPipeline(self.cmd, 0, self.shadow_pipeline);
-        vkCmdSetViewport(self.cmd, 0, 1, &[_]VkViewport{.{ .x = 0, .y = 0, .width = @floatFromInt(SHADOW_SIZE), .height = @floatFromInt(SHADOW_SIZE) }});
-        vkCmdSetScissor(self.cmd, 0, 1, &[_]VkRect2D{.{ .offset = .{ .x = 0, .y = 0 }, .extent = .{ .width = SHADOW_SIZE, .height = SHADOW_SIZE } }});
-        const shadow_push = ShadowPush{ .light_vp = pc.light_vp };
-        vkCmdPushConstants(self.cmd, self.shadow_pipeline_layout, SHADER_STAGE_VERTEX, 0, @sizeOf(ShadowPush), &shadow_push);
-        vkCmdBindVertexBuffers(self.cmd, 0, 1, &[_]VkBuffer{self.mesh_buf}, &[_]u64{0});
-        vkCmdBindIndexBuffer(self.cmd, self.mesh_buf, self.mesh_vertex_bytes, 1);
-        vkCmdDrawIndexed(self.cmd, self.mesh_index_count, 1, 0, 0, 0);
-        vkCmdEndRenderPass(self.cmd);
-
-        const clears = [_]VkClearValue{
-            .{ .color = .{ 0, 0, 0, 0 } },
-            .{ .depth_stencil = .{ .depth = 1.0, .stencil = 0 } },
-        };
-        vkCmdBeginRenderPass(self.cmd, &.{
-            .renderPass = self.render_pass,
-            .framebuffer = self.framebuffer,
-            .renderArea = .{ .offset = .{ .x = 0, .y = 0 }, .extent = .{ .width = width, .height = height } },
-            .clearValueCount = clears.len,
-            .pClearValues = &clears,
-        }, 0);
-
-        vkCmdBindPipeline(self.cmd, 0, self.pipeline);
-        vkCmdSetViewport(self.cmd, 0, 1, &[_]VkViewport{.{
-            .x = 0,
-            .y = 0,
-            .width = @floatFromInt(width),
-            .height = @floatFromInt(height),
-        }});
-        vkCmdSetScissor(self.cmd, 0, 1, &[_]VkRect2D{.{
-            .offset = .{ .x = 0, .y = 0 },
-            .extent = .{ .width = width, .height = height },
-        }});
-        vkCmdBindVertexBuffers(self.cmd, 0, 1, &[_]VkBuffer{self.mesh_buf}, &[_]u64{0});
-        vkCmdBindIndexBuffer(self.cmd, self.mesh_buf, self.mesh_vertex_bytes, 1); // UINT32
-
-        // Un draw per submesh: stessa geometria, ma materiale (baseColor factor,
-        // roughness, metallic nei .w) e texture propri, iniettati per intervallo.
-        for (self.submeshes) |sm| {
-            var lpc = pc.*;
-            lpc.material = sm.base_color;
-            lpc.nrm0[3] = sm.roughness;
-            lpc.nrm1[3] = sm.metallic;
-            lpc.vt = .{ @floatFromInt(sm.vt_level_w), @floatFromInt(sm.vt_level_h), if (sm.vt_on) 1.0 else 0.0, 0.0 };
-            vkCmdPushConstants(self.cmd, self.pipeline_layout, SHADER_STAGE_VERTEX | SHADER_STAGE_FRAGMENT, 0, @sizeOf(PushConstants), &lpc);
-            vkCmdBindDescriptorSets(self.cmd, 0, self.pipeline_layout, 0, 1, &[_]VkDescriptorSet{sm.dset}, 0, null);
-            vkCmdDrawIndexed(self.cmd, sm.index_count, 1, sm.first_index, 0, 0);
-        }
-        vkCmdEndRenderPass(self.cmd);
-
-        if (do_readback) {
-            vkCmdCopyImageToBuffer(self.cmd, self.color_image, IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, self.readback_buf, 1, &[_]VkBufferImageCopy{.{
-                .imageSubresource = .{ .aspectMask = ASPECT_COLOR },
-                .imageExtent = .{ .width = width, .height = height, .depth = 1 },
-            }});
-            const host_barrier = [_]VkBufferMemoryBarrier{.{
-                .srcAccessMask = ACCESS_TRANSFER_WRITE,
-                .dstAccessMask = ACCESS_HOST_READ,
-                .buffer = self.readback_buf,
-                .size = @as(u64, width) * height * 4,
-            }};
-            vkCmdPipelineBarrier(self.cmd, STAGE_TRANSFER, STAGE_HOST, 0, 0, null, 1, &host_barrier, 0, null);
-        }
-
-        try check(vkEndCommandBuffer(self.cmd));
-        try check(vkQueueSubmit(self.queue, 1, &[_]VkSubmitInfo{.{ .pCommandBuffers = @ptrCast(&self.cmd) }}, self.fence));
-        // Prima il check del wait: resettare una fence ancora in-flight è UB.
-        try check(vkWaitForFences(self.device, 1, @ptrCast(&self.fence), 1, 2 * std.time.ns_per_s));
-        try check(vkResetFences(self.device, 1, @ptrCast(&self.fence)));
     }
 
     // --- Rendering voxel (ray-march di una texture 3D) --------------------
@@ -1498,16 +1414,11 @@ pub const Renderer = struct {
     /// Renderizza la griglia voxel e ne fa il readback (RGBA, valido fino alla
     /// prossima chiamata).
     pub fn renderVoxel(self: *Renderer, width: u32, height: u32, pc: *const VoxelPush) ![]const u8 {
-        try self.recordVoxel(width, height, pc, true);
+        try self.recordVoxel(width, height, pc);
         return self.readback_ptr.?[0 .. @as(usize, width) * height * 4];
     }
 
-    /// Come `renderVoxel` ma senza readback (per il blit su swapchain).
-    pub fn renderVoxelToImage(self: *Renderer, width: u32, height: u32, pc: *const VoxelPush) !void {
-        try self.recordVoxel(width, height, pc, false);
-    }
-
-    fn recordVoxel(self: *Renderer, width: u32, height: u32, pc: *const VoxelPush, do_readback: bool) !void {
+    fn recordVoxel(self: *Renderer, width: u32, height: u32, pc: *const VoxelPush) !void {
         if (self.voxel_dim == 0) return error.NoVoxels;
         if (width == 0 or height == 0) return error.EmptyTarget;
         try self.ensureTarget(width, height);
@@ -1538,19 +1449,7 @@ pub const Renderer = struct {
         vkCmdDraw(cmd, 3, 1, 0, 0);
         vkCmdEndRenderPass(cmd);
 
-        if (do_readback) {
-            vkCmdCopyImageToBuffer(cmd, self.color_image, IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback_buf, 1, &[_]VkBufferImageCopy{.{
-                .imageSubresource = .{ .aspectMask = ASPECT_COLOR },
-                .imageExtent = .{ .width = width, .height = height, .depth = 1 },
-            }});
-            const host_barrier = [_]VkBufferMemoryBarrier{.{
-                .srcAccessMask = ACCESS_TRANSFER_WRITE,
-                .dstAccessMask = ACCESS_HOST_READ,
-                .buffer = readback_buf,
-                .size = @as(u64, width) * height * 4,
-            }};
-            vkCmdPipelineBarrier(cmd, STAGE_TRANSFER, STAGE_HOST, 0, 0, null, 1, &host_barrier, 0, null);
-        }
+        recordReadback(cmd, self.color_image, readback_buf, width, height);
 
         try check(vkEndCommandBuffer(cmd));
         try check(vkQueueSubmit(self.queue, 1, &[_]VkSubmitInfo{.{ .pCommandBuffers = @ptrCast(&cmd) }}, fence));
@@ -1656,8 +1555,6 @@ pub const Renderer = struct {
         base_color: [4]f32,
         metallic: f32,
         roughness: f32,
-        tex: ImageBundle,
-        owns_tex: bool, // false se `tex` è la bianca condivisa
         nrm_tex: ImageBundle,
         owns_nrm_tex: bool, // false se `nrm_tex` è la flat condivisa
         dset: VkDescriptorSet,
@@ -1739,6 +1636,11 @@ pub const Renderer = struct {
 
         self.width = 0;
         self.height = 0;
+        // Riparte il ciclo pipelined da zero: senza il reset, una fence rimasta
+        // signaled dal target precedente verrebbe ri-submittata (invalido) e le
+        // attese successive tornerebbero prima che la GPU abbia finito.
+        // I chiamanti hanno già fatto vkDeviceWaitIdle, quindi il reset è sicuro.
+        _ = vkResetFences(self.device, 2, @ptrCast(&self.frame_fences));
         self.frame_index = 0;
     }
 
@@ -1936,17 +1838,7 @@ pub const Renderer = struct {
         if (vertex_count > 0) vkCmdDraw(self.cmd, vertex_count, 1, 0, 0);
         vkCmdEndRenderPass(self.cmd);
 
-        vkCmdCopyImageToBuffer(self.cmd, self.color_image, IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, self.readback_buf, 1, &[_]VkBufferImageCopy{.{
-            .imageSubresource = .{ .aspectMask = ASPECT_COLOR },
-            .imageExtent = .{ .width = out_w, .height = out_h, .depth = 1 },
-        }});
-        const host_barrier = [_]VkBufferMemoryBarrier{.{
-            .srcAccessMask = ACCESS_TRANSFER_WRITE,
-            .dstAccessMask = ACCESS_HOST_READ,
-            .buffer = self.readback_buf,
-            .size = @as(u64, out_w) * out_h * 4,
-        }};
-        vkCmdPipelineBarrier(self.cmd, STAGE_TRANSFER, STAGE_HOST, 0, 0, null, 1, &host_barrier, 0, null);
+        recordReadback(self.cmd, self.color_image, self.readback_buf, out_w, out_h);
 
         try check(vkEndCommandBuffer(self.cmd));
         try check(vkQueueSubmit(self.queue, 1, &[_]VkSubmitInfo{.{ .pCommandBuffers = @ptrCast(&self.cmd) }}, self.fence));

@@ -1,7 +1,6 @@
 //! Self-test headless del percorso GPU mesh: costruisce un cubo, lo stagia con
 //! il vero `loader.stageToGpu` (normali smooth + interleave pos/normale) e lo
-//! renderizza offscreen con `gpu_renderer` (stride 24, push constant a 128 byte,
-//! shader PBR-ish). Verifica che il frame abbia copertura e variazione di
+//! renderizza offscreen con `gpu_renderer` (stride 48, shader PBR-ish). Verifica che il frame abbia copertura e variazione di
 //! luminanza non banali — così la pipeline è validabile senza Wayland/display.
 //! Uso: `zig build gpu-selftest`. Exit 0 = ok, 1 = fallito.
 
@@ -50,7 +49,7 @@ pub fn main() !void {
 
     // Verifica il layout atteso: 48 byte/vertice (pos+normal+uv+tangent), 12/triangolo.
     if (stage.vertex_bytes != vertices.len * 48) {
-        std.debug.print("[selftest] vertex_bytes={d}, atteso {d}\n", .{ stage.vertex_bytes, vertices.len * 32 });
+        std.debug.print("[selftest] vertex_bytes={d}, atteso {d}\n", .{ stage.vertex_bytes, vertices.len * 48 });
         return error.BadLayout;
     }
 

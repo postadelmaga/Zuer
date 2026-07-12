@@ -124,23 +124,51 @@ pub const Terminal = struct {
         const buf = self.pending[self.pending_pos..self.pending_len];
 
         if (buf[0] == 27) { // Escape code
-            if (buf.len >= 3 and buf[1] == '[') {
-                self.pending_pos += 3;
-                switch (buf[2]) {
-                    'A' => return .{ .key_down = .up },
-                    'B' => return .{ .key_down = .down },
-                    'C' => return .{ .key_down = .right },
-                    'D' => return .{ .key_down = .left },
-                    else => return .{ .key_down = .escape },
-                }
-            }
-            if (buf.len >= 2) {
-                // Alt+tasto o sequenza sconosciuta: scarta anche il byte seguente.
-                self.pending_pos += 2;
-            } else {
+            if (buf.len == 1 or buf[1] == 27) {
+                // Solo l'Esc "puro" (nessun byte a seguire) o ESC ESC valgono come Esc:
+                // consumiamo un byte alla volta, così ESC ESC produce due eventi Esc.
                 self.pending_pos += 1;
+                return .{ .key_down = .escape };
             }
-            return .{ .key_down = .escape };
+            if (buf[1] == '[') {
+                if (buf.len >= 3) switch (buf[2]) {
+                    'A' => {
+                        self.pending_pos += 3;
+                        return .{ .key_down = .up };
+                    },
+                    'B' => {
+                        self.pending_pos += 3;
+                        return .{ .key_down = .down };
+                    },
+                    'C' => {
+                        self.pending_pos += 3;
+                        return .{ .key_down = .right };
+                    },
+                    'D' => {
+                        self.pending_pos += 3;
+                        return .{ .key_down = .left };
+                    },
+                    else => {
+                        // Sequenza CSI non gestita (Delete ESC[3~, PgUp ESC[5~, Home ESC[H,
+                        // frecce con modificatori ESC[1;5C…): consuma parametri e intermedi
+                        // fino al byte finale (0x40-0x7E) compreso, poi ignorala — non è
+                        // un Esc e non deve lasciare byte spuri nel buffer.
+                        // Limite noto: se la sequenza arriva spezzata su due read
+                        // (rarissimo: il terminale consegna il tasto in un colpo solo)
+                        // la coda emergerà come char spuri, ignorati dalla TUI.
+                        var i = self.pending_pos + 2;
+                        while (i < self.pending_len and (self.pending[i] < 0x40 or self.pending[i] > 0x7E)) : (i += 1) {}
+                        self.pending_pos = @min(i + 1, self.pending_len);
+                        return null;
+                    },
+                };
+                // "ESC [" troncato: scartalo senza scambiarlo per un Esc.
+                self.pending_pos += 2;
+                return null;
+            }
+            // Alt+tasto o introduttore sconosciuto (es. ESC O): scarta e ignora.
+            self.pending_pos += 2;
+            return null;
         }
 
         self.pending_pos += 1;

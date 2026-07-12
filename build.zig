@@ -41,11 +41,13 @@ pub fn build(b: *std.Build) void {
                 m.linkSystemLibrary("avcodec", .{});
                 m.linkSystemLibrary("avutil", .{});
                 m.linkSystemLibrary("swscale", .{});
+                m.linkSystemLibrary("swresample", .{}); // resample audio → f32 (player audio)
             } else {
                 m.linkSystemLibrary("libavformat", .{});
                 m.linkSystemLibrary("libavcodec", .{});
                 m.linkSystemLibrary("libavutil", .{});
                 m.linkSystemLibrary("libswscale", .{});
+                m.linkSystemLibrary("libswresample", .{});
             }
         }
     };
@@ -59,6 +61,30 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+
+    // I quattro eseguibili con pipeline Vulkan importano lo stesso set di shader
+    // SPIR-V: raccolti in una struct con un helper, per non ripetere gli import.
+    const ShaderSpv = struct {
+        mesh_vert: std.Build.LazyPath,
+        mesh_frag: std.Build.LazyPath,
+        text_vert: std.Build.LazyPath,
+        text_frag: std.Build.LazyPath,
+        shadow_vert: std.Build.LazyPath,
+        shadow_frag: std.Build.LazyPath,
+        voxel_vert: std.Build.LazyPath,
+        voxel_frag: std.Build.LazyPath,
+
+        fn addTo(self: @This(), m: *std.Build.Module) void {
+            m.addAnonymousImport("mesh_vert_spv", .{ .root_source_file = self.mesh_vert });
+            m.addAnonymousImport("mesh_frag_spv", .{ .root_source_file = self.mesh_frag });
+            m.addAnonymousImport("text_vert_spv", .{ .root_source_file = self.text_vert });
+            m.addAnonymousImport("text_frag_spv", .{ .root_source_file = self.text_frag });
+            m.addAnonymousImport("shadow_vert_spv", .{ .root_source_file = self.shadow_vert });
+            m.addAnonymousImport("shadow_frag_spv", .{ .root_source_file = self.shadow_frag });
+            m.addAnonymousImport("voxel_vert_spv", .{ .root_source_file = self.voxel_vert });
+            m.addAnonymousImport("voxel_frag_spv", .{ .root_source_file = self.voxel_frag });
+        }
+    };
 
     // Shader GLSL → SPIR-V come build step: glslc gira solo quando i sorgenti
     // shader cambiano (output cached), quindi non pesa sulle build incrementali.
@@ -104,6 +130,17 @@ pub fn build(b: *std.Build) void {
     vfrag_cmd.addArg("-o");
     const voxel_frag_spv = vfrag_cmd.addOutputFileArg("voxel.frag.spv");
 
+    const shaders = ShaderSpv{
+        .mesh_vert = vert_spv,
+        .mesh_frag = frag_spv,
+        .text_vert = text_vert_spv,
+        .text_frag = text_frag_spv,
+        .shadow_vert = shadow_vert_spv,
+        .shadow_frag = shadow_frag_spv,
+        .voxel_vert = voxel_vert_spv,
+        .voxel_frag = voxel_frag_spv,
+    };
+
     const exe = b.addExecutable(.{
         .name = "zuer",
         .root_module = b.createModule(.{
@@ -118,14 +155,12 @@ pub fn build(b: *std.Build) void {
 
     // Add Zicro module import
     exe.root_module.addImport("zicro", dep_zicro.module("zicro"));
-    exe.root_module.addAnonymousImport("mesh_vert_spv", .{ .root_source_file = vert_spv });
-    exe.root_module.addAnonymousImport("mesh_frag_spv", .{ .root_source_file = frag_spv });
-    exe.root_module.addAnonymousImport("text_vert_spv", .{ .root_source_file = text_vert_spv });
-    exe.root_module.addAnonymousImport("text_frag_spv", .{ .root_source_file = text_frag_spv });
-    exe.root_module.addAnonymousImport("shadow_vert_spv", .{ .root_source_file = shadow_vert_spv });
-    exe.root_module.addAnonymousImport("shadow_frag_spv", .{ .root_source_file = shadow_frag_spv });
-    exe.root_module.addAnonymousImport("voxel_vert_spv", .{ .root_source_file = voxel_vert_spv });
-    exe.root_module.addAnonymousImport("voxel_frag_spv", .{ .root_source_file = voxel_frag_spv });
+    shaders.addTo(exe.root_module);
+    // TinySoundFont anche nella TUI: costo ~nullo (oggetto C cached) e
+    // src/midi_player.zig resta importabile da entrambi i frontend. Il DeviceOut
+    // di zicro su Linux richiede ALSA: la TUI è comunque installata solo su Linux.
+    addTsf(b, exe.root_module);
+    if (os_tag == .linux) exe.root_module.linkSystemLibrary("asound", .{});
     // The TUI pulls the Vulkan renderer through tui.zig (mesh preview).
     if (vulkan_enabled) LinkVk.link(b, exe.root_module, target);
     // Its GPU present forwards a memfd across processes (Linux kitty graphics protocol),
@@ -158,14 +193,7 @@ pub fn build(b: *std.Build) void {
     gui_exe.root_module.addImport("zicro", gui_zicro);
     gui_exe.root_module.addImport("zrame", dep_zrame.module("zrame"));
     gui_exe.root_module.addOptions("build_options", build_opts);
-    gui_exe.root_module.addAnonymousImport("mesh_vert_spv", .{ .root_source_file = vert_spv });
-    gui_exe.root_module.addAnonymousImport("mesh_frag_spv", .{ .root_source_file = frag_spv });
-    gui_exe.root_module.addAnonymousImport("text_vert_spv", .{ .root_source_file = text_vert_spv });
-    gui_exe.root_module.addAnonymousImport("text_frag_spv", .{ .root_source_file = text_frag_spv });
-    gui_exe.root_module.addAnonymousImport("shadow_vert_spv", .{ .root_source_file = shadow_vert_spv });
-    gui_exe.root_module.addAnonymousImport("shadow_frag_spv", .{ .root_source_file = shadow_frag_spv });
-    gui_exe.root_module.addAnonymousImport("voxel_vert_spv", .{ .root_source_file = voxel_vert_spv });
-    gui_exe.root_module.addAnonymousImport("voxel_frag_spv", .{ .root_source_file = voxel_frag_spv });
+    shaders.addTo(gui_exe.root_module);
     // Vulkan mesh/text renderer: Linux + Windows (vendored import lib). On Windows this
     // presents through zrame's GDI backend after an offscreen render+readback.
     if (vulkan_enabled) LinkVk.link(b, gui_exe.root_module, target);
@@ -178,7 +206,15 @@ pub fn build(b: *std.Build) void {
         // Windows). Altrove player.zig ripiega sul decoder VP9 di libav (gate cvp9 in player).
         if (os_tag == .linux) gui_exe.root_module.linkSystemLibrary("compute_vp9", .{});
     }
-    if (target.result.os.tag == .linux) gui_exe.root_module.linkSystemLibrary("wayland-client", .{});
+    if (target.result.os.tag == .linux) {
+        gui_exe.root_module.linkSystemLibrary("wayland-client", .{});
+        gui_exe.root_module.linkSystemLibrary("asound", .{}); // backend audio zicro (ALSA)
+    }
+    // Backend audio zicro su Windows (waveOut/winmm).
+    if (target.result.os.tag == .windows) gui_exe.root_module.linkSystemLibrary("winmm", .{});
+    // Player MIDI nativo (src/midi_player.zig): synth TinySoundFont + parser
+    // TinyMidiLoader, vendorizzati in vendor/tsf.
+    addTsf(b, gui_exe.root_module);
     // Motore di testo nativo: stb_truetype rasterizza i glifi Hack (embeddati),
     // sostituendo ImageMagick/Pango. NB: `zuer-gui` linka zrame, che ora compila
     // la propria copia di stb_truetype_impl.c per il suo motore di testo. Per
@@ -187,6 +223,13 @@ pub fn build(b: *std.Build) void {
     gui_exe.root_module.addIncludePath(b.path("vendor/stb"));
 
     b.installArtifact(gui_exe);
+
+    // Step veloce per il dev loop: `zig build gui` compila SOLO la GUI Linux
+    // (zuer-gui), saltando la TUI `zuer` e i ~10 plugin decoder (che cambiano di
+    // rado e restano in zig-out/bin dalla build completa precedente). Da usare
+    // iterando sul codice GUI; per aggiornare i plugin o la TUI usare `zig build`.
+    const gui_step = b.step("gui", "Compila solo la GUI Linux (zuer-gui), salta TUI e plugin");
+    gui_step.dependOn(&b.addInstallArtifact(gui_exe, .{}).step);
 
     // Tool di sviluppo: rasterizza un file col percorso reale di text_render e
     // ne scrive il PPM, per verificare la resa headless (zig build raster-debug).
@@ -201,14 +244,7 @@ pub fn build(b: *std.Build) void {
     });
     addStbTruetype(b, raster_dbg.root_module);
     // Anche il percorso GPU (gpu_renderer + shader) per confrontare CPU vs atlante.
-    raster_dbg.root_module.addAnonymousImport("mesh_vert_spv", .{ .root_source_file = vert_spv });
-    raster_dbg.root_module.addAnonymousImport("mesh_frag_spv", .{ .root_source_file = frag_spv });
-    raster_dbg.root_module.addAnonymousImport("text_vert_spv", .{ .root_source_file = text_vert_spv });
-    raster_dbg.root_module.addAnonymousImport("text_frag_spv", .{ .root_source_file = text_frag_spv });
-    raster_dbg.root_module.addAnonymousImport("shadow_vert_spv", .{ .root_source_file = shadow_vert_spv });
-    raster_dbg.root_module.addAnonymousImport("shadow_frag_spv", .{ .root_source_file = shadow_frag_spv });
-    raster_dbg.root_module.addAnonymousImport("voxel_vert_spv", .{ .root_source_file = voxel_vert_spv });
-    raster_dbg.root_module.addAnonymousImport("voxel_frag_spv", .{ .root_source_file = voxel_frag_spv });
+    shaders.addTo(raster_dbg.root_module);
     LinkVk.link(b, raster_dbg.root_module, target);
     const raster_dbg_run = b.addRunArtifact(raster_dbg);
     if (b.args) |args| raster_dbg_run.addArgs(args);
@@ -226,14 +262,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     gpu_selftest.root_module.addImport("zicro", dep_zicro.module("zicro"));
-    gpu_selftest.root_module.addAnonymousImport("mesh_vert_spv", .{ .root_source_file = vert_spv });
-    gpu_selftest.root_module.addAnonymousImport("mesh_frag_spv", .{ .root_source_file = frag_spv });
-    gpu_selftest.root_module.addAnonymousImport("text_vert_spv", .{ .root_source_file = text_vert_spv });
-    gpu_selftest.root_module.addAnonymousImport("text_frag_spv", .{ .root_source_file = text_frag_spv });
-    gpu_selftest.root_module.addAnonymousImport("shadow_vert_spv", .{ .root_source_file = shadow_vert_spv });
-    gpu_selftest.root_module.addAnonymousImport("shadow_frag_spv", .{ .root_source_file = shadow_frag_spv });
-    gpu_selftest.root_module.addAnonymousImport("voxel_vert_spv", .{ .root_source_file = voxel_vert_spv });
-    gpu_selftest.root_module.addAnonymousImport("voxel_frag_spv", .{ .root_source_file = voxel_frag_spv });
+    shaders.addTo(gpu_selftest.root_module);
     LinkVk.link(b, gpu_selftest.root_module, target);
     const gpu_selftest_run = b.addRunArtifact(gpu_selftest);
     b.step("gpu-selftest", "Render headless di un cubo per validare la pipeline mesh").dependOn(&gpu_selftest_run.step);
@@ -250,16 +279,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
     gpu_shot.root_module.addImport("zicro", dep_zicro.module("zicro"));
-    gpu_shot.root_module.addAnonymousImport("mesh_vert_spv", .{ .root_source_file = vert_spv });
-    gpu_shot.root_module.addAnonymousImport("mesh_frag_spv", .{ .root_source_file = frag_spv });
-    gpu_shot.root_module.addAnonymousImport("text_vert_spv", .{ .root_source_file = text_vert_spv });
-    gpu_shot.root_module.addAnonymousImport("text_frag_spv", .{ .root_source_file = text_frag_spv });
-    gpu_shot.root_module.addAnonymousImport("shadow_vert_spv", .{ .root_source_file = shadow_vert_spv });
-    gpu_shot.root_module.addAnonymousImport("shadow_frag_spv", .{ .root_source_file = shadow_frag_spv });
-    gpu_shot.root_module.addAnonymousImport("voxel_vert_spv", .{ .root_source_file = voxel_vert_spv });
-    gpu_shot.root_module.addAnonymousImport("voxel_frag_spv", .{ .root_source_file = voxel_frag_spv });
+    shaders.addTo(gpu_shot.root_module);
     LinkVk.link(b, gpu_shot.root_module, target);
-    b.installArtifact(gpu_shot);
+    // Niente installArtifact: è un tool di sviluppo, lo step `gpu-shot` lo
+    // compila già on demand senza pesare su ogni `zig build`.
     const gpu_shot_run = b.addRunArtifact(gpu_shot);
     if (b.args) |a| gpu_shot_run.addArgs(a);
     b.step("gpu-shot", "Screenshot headless PPM di una mesh (decode+VT)").dependOn(&gpu_shot_run.step);
@@ -309,6 +332,9 @@ pub fn build(b: *std.Build) void {
                 // gate cvp9 e il link della lib (il poster resta però su libav).
                 lib.root_module.addOptions("build_options", build_opts);
                 if (os_tag == .linux) lib.root_module.linkSystemLibrary("compute_vp9", .{});
+                // TinyMidiLoader (vendor/tsf): la scheda MIDI mostra la durata
+                // reale parsando il file con tml (vedi parseMidi in media.zig).
+                addTsf(b, lib.root_module);
                 b.installArtifact(lib);
             }
         } else if (needs_tools) {
@@ -342,24 +368,45 @@ pub fn build(b: *std.Build) void {
     b.step("decode-test", "Decodifica un file e stampa il risultato").dependOn(&decode_run.step);
 
     // Tool di sviluppo: itera i frame di un video col motore player.zig (libav).
-    const player_dbg = b.addExecutable(.{
-        .name = "player-test",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/player_probe.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
+    // Stesso gating di gui_exe: LinkAv sceglie pkg-config (Linux) o vendor/ffmpeg
+    // (Windows), compute_vp9 resta Linux-only; senza -Dffmpeg lo step fallisce
+    // in configurazione con un messaggio chiaro.
+    if (ffmpeg_enabled) {
+        const player_dbg = b.addExecutable(.{
+            .name = "player-test",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/player_probe.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        LinkAv.link(b, player_dbg.root_module, target);
+        player_dbg.root_module.addOptions("build_options", build_opts);
+        if (os_tag == .linux) player_dbg.root_module.linkSystemLibrary("compute_vp9", .{});
+        const player_run = b.addRunArtifact(player_dbg);
+        if (b.args) |args| player_run.addArgs(args);
+        b.step("player-test", "Itera i frame video di un file (libav)").dependOn(&player_run.step);
+    } else {
+        const fail = b.addFail("player-test richiede libav: ricompila senza -Dffmpeg=false");
+        b.step("player-test", "Itera i frame video di un file (libav)").dependOn(&fail.step);
+    }
+}
+
+/// Compila TinySoundFont + TinyMidiLoader (vendor/tsf) nel modulo e ne espone
+/// gli header a @cImport. Come stb: -fno-sanitize=undefined perché tsf.h usa
+/// il classico offsetof "a mano" su puntatore nullo (UB benigno che UBSan
+/// altrimenti intercetterebbe a runtime). tsf usa le funzioni math C → libm
+/// esplicita dove non è già dentro libc (su Windows sta nel CRT).
+fn addTsf(b: *std.Build, mod: *std.Build.Module) void {
+    mod.addIncludePath(b.path("vendor/tsf"));
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/tsf/tsf_impl.c"),
+        .flags = &.{ "-O2", "-fno-sanitize=undefined" },
     });
-    player_dbg.root_module.linkSystemLibrary("libavformat", .{});
-    player_dbg.root_module.linkSystemLibrary("libavcodec", .{});
-    player_dbg.root_module.linkSystemLibrary("libavutil", .{});
-    player_dbg.root_module.linkSystemLibrary("libswscale", .{});
-    player_dbg.root_module.addOptions("build_options", build_opts);
-    player_dbg.root_module.linkSystemLibrary("compute_vp9", .{});
-    const player_run = b.addRunArtifact(player_dbg);
-    if (b.args) |args| player_run.addArgs(args);
-    b.step("player-test", "Itera i frame video di un file (libav)").dependOn(&player_run.step);
+    if (mod.resolved_target) |t| {
+        if (t.result.os.tag != .windows) mod.linkSystemLibrary("m", .{});
+    }
 }
 
 /// Compila stb_truetype nel modulo e ne espone gli header a @cImport.

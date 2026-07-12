@@ -4,9 +4,10 @@
 //! Un'unica image array 2D device-local di `capacity` slot fisici, RGBA8,
 //! `tile_size` di lato. `uploadTile` porta una tile (streamata o generata) in uno
 //! slot (staging → layer, lasciato in SHADER_READ_ONLY così è subito
-//! campionabile dal fragment shader). Il gestore di residenza CPU
-//! (`vtex_runtime.VirtualTexture`) decide quale tile virtuale vive in quale slot;
-//! questo è solo lo store fisico che lo shader campiona come `sampler2DArray`.
+//! campionabile dal fragment shader). Il gestore di residenza CPU (la logica di
+//! upload per livello in `gpu_renderer.uploadVtLevel`) decide quale tile
+//! virtuale vive in quale slot; questo è solo lo store fisico che lo shader
+//! campiona come `sampler2DArray`.
 //!
 //! Rispetto all'originale non dipende dall'astrazione `Gpu` di Zengine: prende
 //! gli handle grezzi (device/queue/cmd/fence) e riusa il command buffer + fence
@@ -36,15 +37,19 @@ pub const VtexPool = struct {
     queue: vk.VkQueue,
     cmd: vk.VkCommandBuffer,
     fence: vk.VkFence,
+    mem_props: vk.VkPhysicalDeviceMemoryProperties, // copia: serve per ricreare lo staging
 
     capacity: u32,
     image: vk.VkImage,
     mem: vk.VkDeviceMemory,
     view: vk.VkImageView, // view 2D_ARRAY su tutti gli slot
     sampler: vk.VkSampler, // lineare, clamp-to-edge (i gutter assorbono la cucitura)
-    staging: vk.VkBuffer, // una tile, host-visible, mappata persistente
+    staging: vk.VkBuffer, // `staging_tiles` tile, host-visible, mappato persistente
     staging_mem: vk.VkDeviceMemory,
     staging_ptr: [*]u8,
+    staging_tiles: u32, // capienza dello staging, in tile (cresce a richiesta)
+    batch_first: u32 = 0, // range slot del batch in corso (uploadTilesBegin/End)
+    batch_count: u32 = 0,
 
     pub fn init(
         device: vk.VkDevice,
@@ -107,6 +112,7 @@ pub const VtexPool = struct {
             .queue = queue,
             .cmd = cmd,
             .fence = fence,
+            .mem_props = mem_props.*,
             .capacity = capacity,
             .image = image,
             .mem = mem,
@@ -115,6 +121,7 @@ pub const VtexPool = struct {
             .staging = staging,
             .staging_mem = staging_mem,
             .staging_ptr = @ptrCast(mapped),
+            .staging_tiles = 1,
         };
 
         // Porta TUTTI i layer in SHADER_READ_ONLY una volta, così il pool è
@@ -140,17 +147,41 @@ pub const VtexPool = struct {
     /// Carica una tile (`tile_bytes` RGBA8) nello slot `slot`. Sincrono: riusa il
     /// command buffer + fence del Renderer, come `createSampledTexture`.
     pub fn uploadTile(self: *VtexPool, slot: u32, bytes: []const u8) !void {
-        std.debug.assert(slot < self.capacity);
-        std.debug.assert(bytes.len == tile_bytes);
-        @memcpy(self.staging_ptr[0..tile_bytes], bytes);
+        try self.uploadTilesBegin(slot, 1);
+        self.uploadTilesStage(0, slot, bytes);
+        try self.uploadTilesEnd();
+    }
 
+    /// Inizia un upload batched di `count` tile verso gli slot contigui
+    /// [first, first+count): un solo command buffer, submit e fence per l'intero
+    /// batch (contro un round-trip GPU per tile). Seguire con `uploadTilesStage`
+    /// per ogni tile e chiudere con `uploadTilesEnd`.
+    pub fn uploadTilesBegin(self: *VtexPool, first: u32, count: u32) !void {
+        std.debug.assert(count >= 1 and first + count <= self.capacity);
+        try self.ensureStaging(count);
         try vk.check(vk.vkBeginCommandBuffer(self.cmd, &.{}));
-        self.barrier(slot, vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, vk.ACCESS_SHADER_READ, vk.ACCESS_TRANSFER_WRITE, vk.STAGE_TOP, vk.STAGE_TRANSFER);
+        self.barrier(first, count, vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, vk.ACCESS_SHADER_READ, vk.ACCESS_TRANSFER_WRITE, vk.STAGE_FRAGMENT_SHADER, vk.STAGE_TRANSFER);
+        self.batch_first = first;
+        self.batch_count = count;
+    }
+
+    /// Registra la tile `i` del batch (staging offset i*tile_bytes) verso `slot`.
+    pub fn uploadTilesStage(self: *VtexPool, i: u32, slot: u32, bytes: []const u8) void {
+        std.debug.assert(i < self.batch_count);
+        std.debug.assert(slot >= self.batch_first and slot < self.batch_first + self.batch_count);
+        std.debug.assert(bytes.len == tile_bytes);
+        const off = @as(u64, i) * tile_bytes;
+        @memcpy(self.staging_ptr[@intCast(off)..][0..tile_bytes], bytes);
         vk.vkCmdCopyBufferToImage(self.cmd, self.staging, self.image, vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &[_]vk.VkBufferImageCopy{.{
+            .bufferOffset = off,
             .imageSubresource = .{ .aspectMask = vk.ASPECT_COLOR, .baseArrayLayer = slot, .layerCount = 1 },
             .imageExtent = .{ .width = tile_size, .height = tile_size, .depth = 1 },
         }});
-        self.barrier(slot, vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, vk.ACCESS_TRANSFER_WRITE, vk.ACCESS_SHADER_READ, vk.STAGE_TRANSFER, vk.STAGE_FRAGMENT_SHADER);
+    }
+
+    /// Chiude il batch: barrier di ritorno a SHADER_READ_ONLY e submit sincrono.
+    pub fn uploadTilesEnd(self: *VtexPool) !void {
+        self.barrier(self.batch_first, self.batch_count, vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, vk.ACCESS_TRANSFER_WRITE, vk.ACCESS_SHADER_READ, vk.STAGE_TRANSFER, vk.STAGE_FRAGMENT_SHADER);
         try self.submitSync();
     }
 
@@ -159,24 +190,50 @@ pub const VtexPool = struct {
         std.debug.assert(slot < self.capacity);
         std.debug.assert(out.len == tile_bytes);
         try vk.check(vk.vkBeginCommandBuffer(self.cmd, &.{}));
-        self.barrier(slot, vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, vk.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vk.ACCESS_SHADER_READ, vk.ACCESS_TRANSFER_READ, vk.STAGE_TOP, vk.STAGE_TRANSFER);
+        self.barrier(slot, 1, vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, vk.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vk.ACCESS_SHADER_READ, vk.ACCESS_TRANSFER_READ, vk.STAGE_FRAGMENT_SHADER, vk.STAGE_TRANSFER);
         vk.vkCmdCopyImageToBuffer(self.cmd, self.image, vk.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, self.staging, 1, &[_]vk.VkBufferImageCopy{.{
             .imageSubresource = .{ .aspectMask = vk.ASPECT_COLOR, .baseArrayLayer = slot, .layerCount = 1 },
             .imageExtent = .{ .width = tile_size, .height = tile_size, .depth = 1 },
         }});
-        self.barrier(slot, vk.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, vk.ACCESS_TRANSFER_READ, vk.ACCESS_SHADER_READ, vk.STAGE_TRANSFER, vk.STAGE_FRAGMENT_SHADER);
+        self.barrier(slot, 1, vk.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, vk.ACCESS_TRANSFER_READ, vk.ACCESS_SHADER_READ, vk.STAGE_TRANSFER, vk.STAGE_FRAGMENT_SHADER);
         try self.submitSync();
         @memcpy(out, self.staging_ptr[0..tile_bytes]);
     }
 
-    fn barrier(self: *VtexPool, slot: u32, old: u32, new: u32, src_access: u32, dst_access: u32, src_stage: u32, dst_stage: u32) void {
+    /// Garantisce che lo staging contenga almeno `tiles` tile; se serve lo ricrea
+    /// più grande (nessun submit in volo: ogni upload è sincrono via `submitSync`).
+    fn ensureStaging(self: *VtexPool, tiles: u32) !void {
+        if (self.staging_tiles >= tiles) return;
+        const size = @as(u64, tiles) * tile_bytes;
+        var buf: vk.VkBuffer = vk.VK_NULL;
+        try vk.check(vk.vkCreateBuffer(self.device, &.{ .size = size, .usage = vk.BUFFER_USAGE_TRANSFER_SRC | vk.BUFFER_USAGE_TRANSFER_DST }, null, &buf));
+        errdefer vk.vkDestroyBuffer(self.device, buf, null);
+        var req: vk.VkMemoryRequirements = undefined;
+        vk.vkGetBufferMemoryRequirements(self.device, buf, &req);
+        const mt = findMemoryType(&self.mem_props, req.memoryTypeBits, vk.MEM_HOST_VISIBLE | vk.MEM_HOST_COHERENT) orelse return error.NoMemoryType;
+        var mem: vk.VkDeviceMemory = vk.VK_NULL;
+        try vk.check(vk.vkAllocateMemory(self.device, &.{ .allocationSize = req.size, .memoryTypeIndex = mt }, null, &mem));
+        errdefer vk.vkFreeMemory(self.device, mem, null);
+        try vk.check(vk.vkBindBufferMemory(self.device, buf, mem, 0));
+        var mapped: *anyopaque = undefined;
+        try vk.check(vk.vkMapMemory(self.device, mem, 0, size, 0, &mapped));
+
+        vk.vkDestroyBuffer(self.device, self.staging, null);
+        vk.vkFreeMemory(self.device, self.staging_mem, null);
+        self.staging = buf;
+        self.staging_mem = mem;
+        self.staging_ptr = @ptrCast(mapped);
+        self.staging_tiles = tiles;
+    }
+
+    fn barrier(self: *VtexPool, first: u32, count: u32, old: u32, new: u32, src_access: u32, dst_access: u32, src_stage: u32, dst_stage: u32) void {
         const b = [_]vk.VkImageMemoryBarrier{.{
             .srcAccessMask = src_access,
             .dstAccessMask = dst_access,
             .oldLayout = old,
             .newLayout = new,
             .image = self.image,
-            .subresourceRange = .{ .aspectMask = vk.ASPECT_COLOR, .baseArrayLayer = slot, .layerCount = 1 },
+            .subresourceRange = .{ .aspectMask = vk.ASPECT_COLOR, .baseArrayLayer = first, .layerCount = count },
         }};
         vk.vkCmdPipelineBarrier(self.cmd, src_stage, dst_stage, 0, 0, null, 0, null, 1, &b);
     }
