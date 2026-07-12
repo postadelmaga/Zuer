@@ -252,16 +252,14 @@ pub fn layoutDoc(gpa: std.mem.Allocator, decoded: *const decoder_mod.Decoded, na
 /// `compose.textBlitGeom` — la stessa geometria di selezione e hit-test, così i
 /// tre non possono divergere. Costo per frame: O(glifi visibili).
 pub fn paintDocViewport(dl: *DocLayout, buf: []u8, W: u32, H: u32, off_y: u32, x_src: u32, x_dst: u32) !void {
-    // Fondo: key trasparente ovunque (margini oltre il documento = vetro).
+    // Fondo: key trasparente ovunque (margini oltre il documento = vetro). Il
+    // buffer è allineato a 4 (composited_rgba), quindi si riempie a word: un
+    // `@memset` u32 al posto del loop scalare byte-per-byte. Byte order R,G,B,A
+    // → in little-endian la word è r | g<<8 | b<<16 | 0<<24.
     {
-        const n: usize = @as(usize, W) * H * 4;
-        var i: usize = 0;
-        while (i + 4 <= n) : (i += 4) {
-            buf[i + 0] = bg.r;
-            buf[i + 1] = bg.g;
-            buf[i + 2] = bg.b;
-            buf[i + 3] = 0;
-        }
+        const key: u32 = @as(u32, bg.r) | (@as(u32, bg.g) << 8) | (@as(u32, bg.b) << 16);
+        const words: []u32 = @as([*]u32, @ptrCast(@alignCast(buf.ptr)))[0 .. @as(usize, W) * H];
+        @memset(words, key);
     }
     const line_h = dl.raster.lineHeight();
     const advance = dl.raster.advance;

@@ -286,15 +286,18 @@ pub fn resetScroll(sc: *zscroll.Scroll) void {
 }
 
 /// Espande un buffer RGB compatto (`w`×`h`×3) in RGBA opaco (alpha 255).
-/// Il chiamante possiede e libera lo slice restituito.
+/// Il chiamante possiede e libera lo slice restituito. Scrive un pixel per volta
+/// come word u32 (`r | g<<8 | b<<16 | 0xff<<24`, byte order R,G,B,A) invece di 4
+/// scritture byte: buffer allineato a 4 così la vista []u32 è valida.
 pub fn rgbToRgba(gpa: std.mem.Allocator, pixels: []const u8, w: u32, h: u32) ![]u8 {
     const n: usize = @as(usize, w) * h;
-    const rgba = try gpa.alloc(u8, n * 4);
+    const rgba = try gpa.alignedAlloc(u8, .@"4", n * 4);
+    const words: []u32 = @as([*]u32, @ptrCast(@alignCast(rgba.ptr)))[0..n];
     for (0..n) |i| {
-        rgba[i * 4 + 0] = pixels[i * 3 + 0];
-        rgba[i * 4 + 1] = pixels[i * 3 + 1];
-        rgba[i * 4 + 2] = pixels[i * 3 + 2];
-        rgba[i * 4 + 3] = 255;
+        words[i] = @as(u32, pixels[i * 3 + 0]) |
+            (@as(u32, pixels[i * 3 + 1]) << 8) |
+            (@as(u32, pixels[i * 3 + 2]) << 16) |
+            (@as(u32, 0xff) << 24);
     }
     return rgba;
 }

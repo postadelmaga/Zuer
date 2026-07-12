@@ -164,7 +164,10 @@ fn rasterizeTextGpu(state: *GuiAppState, name: []const u8, opts: text_render.Ren
     defer state.renderer_mutex.unlock(state.io);
 
     // Il readback è riusato dalla chiamata successiva: copiane una proprietà.
-    const rgba = state.gpa.dupe(u8, rgba_src) catch return;
+    // Allineato a 4: `composeTextFrame` aliasa `static_rgba` come []u32 (color-key
+    // a word), quindi il buffer deve essere word-aligned come gli altri percorsi.
+    const rgba = state.gpa.alignedAlloc(u8, .@"4", rgba_src.len) catch return;
+    @memcpy(rgba, rgba_src);
     state.gpa.free(state.shared.static_rgba);
     state.shared.static_rgba = rgba;
     state.shared.static_w = @intCast(mesh.width);

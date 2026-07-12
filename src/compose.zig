@@ -109,26 +109,17 @@ pub fn composeTextFrame(
             @memset(composited_rgba[idx_row .. idx_row + x_dst * 4], 0);
         }
 
-        // Copy and process middle part
+        // Copia + color-key a word: ogni pixel è una word u32 (byte order R,G,B,A,
+        // entrambi i buffer allineati a 4). Se RGB == la key (8,8,16) l'alpha va a
+        // 0 (resta vetro), altrimenti la word passa invariata — un confronto e una
+        // scrittura per pixel invece di 4 letture + 4 scritture byte.
+        const key_rgb: u32 = 8 | (8 << 8) | (16 << 16); // R,G,B della key; alpha ignorato
+        const dst_words: [*]u32 = @ptrCast(@alignCast(composited_rgba.ptr + idx_row + x_dst * 4));
+        const src_words: [*]const u32 = @ptrCast(@alignCast(src_rgba.ptr + (sy * src_w + x_src) * 4));
         var px: u32 = 0;
-        const s_row_offset = sy * src_w;
         while (px < copy_w) : (px += 1) {
-            const dest_idx = idx_row + (x_dst + px) * 4;
-            const src_idx = (s_row_offset + x_src + px) * 4;
-
-            const sr = src_rgba[src_idx + 0];
-            const sg = src_rgba[src_idx + 1];
-            const sb = src_rgba[src_idx + 2];
-            var sa = src_rgba[src_idx + 3];
-
-            if (sr == 8 and sg == 8 and sb == 16) {
-                sa = 0;
-            }
-
-            composited_rgba[dest_idx + 0] = sr;
-            composited_rgba[dest_idx + 1] = sg;
-            composited_rgba[dest_idx + 2] = sb;
-            composited_rgba[dest_idx + 3] = sa;
+            const w = src_words[px];
+            dst_words[px] = if ((w & 0x00FF_FFFF) == key_rgb) (w & 0x00FF_FFFF) else w;
         }
 
         // Clear right margin
