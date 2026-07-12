@@ -69,10 +69,16 @@ fn decodeObj(bytes: []const u8, filename: []const u8, allocator: std.mem.Allocat
                 const idx_str = part_it.next() orelse continue;
                 const idx = std.fmt.parseInt(isize, idx_str, 10) catch continue;
 
-                const u_idx: usize = if (idx > 0)
-                    @as(usize, @intCast(idx - 1))
+                // Indice 1-based; negativo = relativo alla fine della lista.
+                // 0 o fuori range (es. "f -10" prima di 10 vertici) → token
+                // scartato: un OBJ corrotto non deve far crashare il parser.
+                if (idx == 0) continue;
+                const rel: isize = if (idx > 0)
+                    idx - 1
                 else
-                    @as(usize, @intCast(@as(isize, @intCast(vertices.items.len)) + idx));
+                    @as(isize, @intCast(vertices.items.len)) + idx;
+                if (rel < 0) continue;
+                const u_idx: usize = @intCast(rel);
 
                 v_indices.append(allocator, u_idx) catch {};
             }
@@ -245,4 +251,10 @@ const extensions = "obj,stl";
 
 export fn zuer_extensions() callconv(.c) decoder.SliceC {
     return decoder.SliceC.fromSlice(extensions);
+}
+
+/// Versione dell'ABI plugin con cui questo decoder è compilato: l'host la
+/// confronta con la propria `decoder.abi_version` e scarta i mismatch.
+export fn zuer_abi_version() callconv(.c) u32 {
+    return decoder.abi_version;
 }

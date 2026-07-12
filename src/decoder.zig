@@ -80,6 +80,31 @@ pub const SubMesh = struct {
     nrm_tex_pixels: []const u8 = &.{},
 };
 
+/// Libera le texture dei submesh tenendo conto della condivisione: i glTF
+/// spesso riusano lo stesso atlas su molti submesh e il decoder li fa puntare
+/// a UN solo buffer (niente N copie da decine di MB) — ogni puntatore va
+/// quindi liberato una volta sola, alla sua prima occorrenza.
+pub fn freeSubmeshTextures(subs: []const SubMesh, allocator: std.mem.Allocator) void {
+    for (subs, 0..) |s, i| {
+        if (s.tex_pixels.len > 0 and firstTexOccurrence(subs, i, false, s.tex_pixels.ptr))
+            allocator.free(s.tex_pixels);
+        if (s.nrm_tex_pixels.len > 0 and firstTexOccurrence(subs, i, true, s.nrm_tex_pixels.ptr))
+            allocator.free(s.nrm_tex_pixels);
+    }
+}
+
+/// True se (i, campo) è la prima occorrenza di `ptr` scandendo i submesh in
+/// ordine (per ciascuno: prima baseColor, poi normal map).
+fn firstTexOccurrence(subs: []const SubMesh, i: usize, is_nrm: bool, ptr: [*]const u8) bool {
+    for (subs[0 .. i + 1], 0..) |p, j| {
+        if (p.tex_pixels.len > 0 and p.tex_pixels.ptr == ptr)
+            return j == i and !is_nrm;
+        if (p.nrm_tex_pixels.len > 0 and p.nrm_tex_pixels.ptr == ptr)
+            return j == i and is_nrm;
+    }
+    return false;
+}
+
 pub const MeshData = struct {
     num_vertices: usize,
     num_faces: usize,
@@ -115,10 +140,7 @@ pub const MeshData = struct {
         if (self.uvs.len > 0) allocator.free(self.uvs);
         if (self.tangents.len > 0) allocator.free(self.tangents);
         if (self.tex_pixels.len > 0) allocator.free(self.tex_pixels);
-        for (self.submeshes) |s| {
-            if (s.tex_pixels.len > 0) allocator.free(s.tex_pixels);
-            if (s.nrm_tex_pixels.len > 0) allocator.free(s.nrm_tex_pixels);
-        }
+        freeSubmeshTextures(self.submeshes, allocator);
         if (self.submeshes.len > 0) allocator.free(self.submeshes);
     }
 };
@@ -128,6 +150,11 @@ pub const ImageData = struct {
     height: usize,
     pixels: []const u8, // RGB 24-bit
     name: []const u8,
+    // Numero totale di pagine del documento sorgente (PDF e simili), in forma
+    // STRUTTURATA: la GUI lo usa per la navigazione PgUp/PgDown invece di
+    // parsare la label di presentazione ("(pagina N di M)", fragile perché
+    // legata a formato/lingua). 0 = non paginato / sconosciuto.
+    total_pages: u32 = 0,
 
     pub fn deinit(self: *ImageData, allocator: std.mem.Allocator) void {
         allocator.free(self.pixels);
@@ -251,6 +278,7 @@ pub const Decoded = union(enum) {
                             .height = i.height,
                             .pixels = SliceC.fromSlice(i.pixels),
                             .name = SliceC.fromSlice(i.name),
+                            .total_pages = i.total_pages,
                         },
                     },
                 };
@@ -389,6 +417,10 @@ pub const ImageDataC = extern struct {
     height: usize,
     pixels: SliceC,
     name: SliceC,
+    // Pagine totali del documento (0 = non paginato/sconosciuto). In CODA alla
+    // struct: gli offset dei campi preesistenti non cambiano. Il layout resta
+    // comunque una modifica ABI (dimensione della struct) → abi_version bumpata.
+    total_pages: u32 = 0,
 };
 
 pub const DecodedTag = enum(u32) {
@@ -495,6 +527,7 @@ pub const DecodedC = extern struct {
                         .height = i.height,
                         .pixels = i.pixels.toSlice(),
                         .name = i.name.toSlice(),
+                        .total_pages = i.total_pages,
                     },
                 };
             },
@@ -510,6 +543,19 @@ pub const DecodedC = extern struct {
     }
 };
 
+/// Versione dell'ABI plugin (layout di `DecodedC` e firma di `DecodeFn`).
+/// Va incrementata a ogni modifica incompatibile del contratto C: l'host
+/// scarta i plugin compilati contro una versione diversa (un .so stantio con
+/// un layout `DecodedC` vecchio corromperebbe la memoria).
+/// v2: aggiunto `total_pages: u32` in coda a `ImageDataC`.
+pub const abi_version: u32 = 2;
+
+/// Ogni plugin esporta `zuer_abi_version` (ritorna l'`abi_version` con cui è
+/// stato compilato); l'host la verifica al caricamento e scarta i mismatch.
+pub const AbiVersionFn = *const fn () callconv(.c) u32;
+
+/// Contratto di ownership: il plugin prende possesso di `content` e lo libera
+/// lui (con l'allocator passato), anche nei percorsi d'errore.
 pub const DecodeFn = *const fn (
     path: SliceC,
     content: SliceC,
@@ -523,6 +569,12 @@ pub const DecodeFn = *const fn (
 /// aggiungere un formato significa solo installare un nuovo .so.
 pub const ExtensionsFn = *const fn () callconv(.c) SliceC;
 
+/// Opzionale: quanti byte di `content` servono davvero al plugin. 0 = solo il
+/// percorso (es. pdf: rilegge lui dal path); N = bastano i primi N byte (es.
+/// media: header sniffing — un MKV multi-GB non va caricato in RAM per il
+/// poster). Assente = l'host passa l'intero file (default storico).
+pub const ContentPrefixFn = *const fn () callconv(.c) usize;
+
 const LoadedPlugin = struct {
     type_name: []const u8,
     extensions: []const []const u8,
@@ -531,6 +583,8 @@ const LoadedPlugin = struct {
     /// Opzionale: prima fase progressiva (texture al tier coarse). Solo i plugin
     /// che la esportano (es. glb) la offrono; gli altri fanno un decode solo.
     decode_coarse_fn: ?DecodeFn = null,
+    /// Byte di contenuto richiesti (vedi ContentPrefixFn); maxInt = file intero.
+    content_prefix: usize = std.math.maxInt(usize),
 };
 
 var plugin_registry: std.ArrayList(LoadedPlugin) = .empty;
@@ -587,11 +641,28 @@ fn scanPluginDir(dir_path: []const u8, io: std.Io, allocator: std.mem.Allocator)
         defer allocator.free(full_path);
 
         var lib = dynlib.Lib.open(full_path) catch continue;
+        // Verifica dell'ABI: un plugin senza `zuer_abi_version` o compilato
+        // contro un'altra versione del contratto C va scartato subito (il
+        // layout di `DecodedC` potrebbe non combaciare → corruzione di memoria).
+        const abi_ok = if (lib.lookup(AbiVersionFn, "zuer_abi_version")) |abi_fn| blk: {
+            const v = abi_fn();
+            if (v != abi_version)
+                std.debug.print("zuer: plugin {s} ignorato: ABI v{d} != v{d}\n", .{ entry.name, v, abi_version });
+            break :blk v == abi_version;
+        } else blk: {
+            std.debug.print("zuer: plugin {s} ignorato: manca zuer_abi_version (atteso ABI v{d})\n", .{ entry.name, abi_version });
+            break :blk false;
+        };
+        if (!abi_ok) {
+            lib.close();
+            continue;
+        }
         const decode_fn = lib.lookup(DecodeFn, "zuer_decode") orelse {
             lib.close();
             continue;
         };
         const decode_coarse_fn = lib.lookup(DecodeFn, "zuer_decode_coarse");
+        const content_prefix: usize = if (lib.lookup(ContentPrefixFn, "zuer_content_prefix")) |f| f() else std.math.maxInt(usize);
 
         // `zuer_extensions` è opzionale: un plugin senza estensioni dichiarate
         // resta raggiungibile solo come fallback per nome (es. "text").
@@ -625,6 +696,7 @@ fn scanPluginDir(dir_path: []const u8, io: std.Io, allocator: std.mem.Allocator)
             .lib = lib,
             .decode_fn = decode_fn,
             .decode_coarse_fn = decode_coarse_fn,
+            .content_prefix = content_prefix,
         }) catch {
             allocator.free(type_name_dup);
             for (exts_owned) |e| allocator.free(e);
@@ -683,12 +755,23 @@ pub const RunResult = struct {
     }
 };
 
+/// Timeout di default per i tool esterni lanciati con `runCapture`.
+pub const default_run_timeout_ms: u32 = 60_000;
+
 /// Esegue un comando catturandone lo stdout, senza dipendere da `std.Io`
 /// (`std.process.run` si blocca dentro i plugin dinamici: l'`io` dell'host non
 /// attraversa il confine DynLib). L'implementazione è per-OS: `posix_spawn` +
-/// pipe su Unix, `CreateProcessW` + pipe anonima su Windows.
+/// pipe su Unix, `CreateProcessW` + pipe anonima su Windows. Deadline
+/// complessiva di `default_run_timeout_ms`: un tool appeso non può bloccare il
+/// worker per sempre (vedi `runCaptureTimeout` per un valore esplicito).
 pub fn runCapture(allocator: std.mem.Allocator, argv: []const []const u8) !RunResult {
-    return sub.runCapture(allocator, argv);
+    return sub.runCapture(allocator, argv, default_run_timeout_ms);
+}
+
+/// Come `runCapture`, con deadline complessiva esplicita: alla scadenza il
+/// processo viene terminato (SIGKILL / TerminateProcess) e ritorna `error.Timeout`.
+pub fn runCaptureTimeout(allocator: std.mem.Allocator, argv: []const []const u8, timeout_ms: u32) !RunResult {
+    return sub.runCapture(allocator, argv, timeout_ms);
 }
 
 /// Legge un intero file senza `std.Io` (open/read/close libc su Unix,
@@ -696,6 +779,19 @@ pub fn runCapture(allocator: std.mem.Allocator, argv: []const []const u8) !RunRe
 /// si blocchi dentro un plugin dinamico. Il chiamante possiede il buffer.
 pub fn readFileLibc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     return sub.readFile(allocator, path, max_bytes);
+}
+
+/// Legge gli ultimi `n` byte del file (o meno, se è più corto), senza `std.Io`.
+/// Per le strutture che i formati mettono in coda (ultima pagina Ogg, `moov`
+/// dei MP4 non-faststart) quando l'host ha passato solo un prefisso.
+pub fn readFileTailLibc(allocator: std.mem.Allocator, path: []const u8, n: usize) ![]u8 {
+    return sub.readFileTail(allocator, path, n);
+}
+
+/// Dimensione del file senza `std.Io` (per i plugin che ricevono solo un
+/// prefisso di contenuto ma mostrano la dimensione reale).
+pub fn fileSizeLibc(allocator: std.mem.Allocator, path: []const u8) ?u64 {
+    return sub.fileSize(allocator, path) catch null;
 }
 
 /// Per-OS subprocess + raw file-read backend. Only the selected arm is analyzed, so the
@@ -732,6 +828,10 @@ const sub = switch (builtin.os.tag) {
         extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) i32;
         extern "kernel32" fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: u32) callconv(.winapi) u32;
         extern "kernel32" fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *u32) callconv(.winapi) i32;
+        extern "kernel32" fn PeekNamedPipe(hNamedPipe: HANDLE, lpBuffer: ?[*]u8, nBufferSize: u32, lpBytesRead: ?*u32, lpTotalBytesAvail: ?*u32, lpBytesLeftThisMessage: ?*u32) callconv(.winapi) i32;
+        extern "kernel32" fn TerminateProcess(hProcess: HANDLE, uExitCode: u32) callconv(.winapi) i32;
+        extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
+        extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
         extern "kernel32" fn CreateFileW(lpFileName: [*:0]const u16, dwDesiredAccess: u32, dwShareMode: u32, lpSecurityAttributes: ?*anyopaque, dwCreationDisposition: u32, dwFlagsAndAttributes: u32, hTemplateFile: HANDLE) callconv(.winapi) HANDLE;
         const HANDLE_FLAG_INHERIT: u32 = 0x00000001;
         const STARTF_USESTDHANDLES: u32 = 0x00000100;
@@ -740,19 +840,40 @@ const sub = switch (builtin.os.tag) {
         const FILE_SHARE_READ: u32 = 0x00000001;
         const OPEN_EXISTING: u32 = 3;
         const INVALID_HANDLE: HANDLE = @ptrFromInt(std.math.maxInt(usize));
+        const WAIT_OBJECT_0: u32 = 0;
+        const WAIT_TIMEOUT: u32 = 0x00000102;
 
-        fn runCapture(allocator: std.mem.Allocator, argv: []const []const u8) !RunResult {
+        fn runCapture(allocator: std.mem.Allocator, argv: []const []const u8, timeout_ms: u32) !RunResult {
             if (argv.len == 0) return error.EmptyArgv;
             // Build a single, quoted command line (CreateProcess takes a string, not argv).
+            // Quoting Win32 (regole di CommandLineToArgvW): le run di backslash che
+            // precedono una virgoletta — o la `"` di chiusura dell'argomento — vanno
+            // raddoppiate, poi la virgoletta letterale si escapa con un backslash;
+            // altrimenti un argomento che termina con `\` fonderebbe i successivi.
             var cmd: std.ArrayList(u8) = .empty;
             defer cmd.deinit(allocator);
             for (argv, 0..) |a, i| {
                 if (i != 0) try cmd.append(allocator, ' ');
                 try cmd.append(allocator, '"');
+                var bs: usize = 0;
                 for (a) |ch| {
-                    if (ch == '"') try cmd.append(allocator, '\\');
-                    try cmd.append(allocator, ch);
+                    if (ch == '\\') {
+                        bs += 1;
+                        continue;
+                    }
+                    if (ch == '"') {
+                        // 2n+1 backslash: i letterali raddoppiati + l'escape della virgoletta.
+                        try cmd.appendNTimes(allocator, '\\', bs * 2 + 1);
+                        try cmd.append(allocator, '"');
+                    } else {
+                        // Backslash non seguiti da virgoletta: letterali, nessun raddoppio.
+                        try cmd.appendNTimes(allocator, '\\', bs);
+                        try cmd.append(allocator, ch);
+                    }
+                    bs = 0;
                 }
+                // Backslash in coda: raddoppiati, o escaperebbero la `"` di chiusura.
+                try cmd.appendNTimes(allocator, '\\', bs * 2);
                 try cmd.append(allocator, '"');
             }
             const cmd_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, cmd.items);
@@ -765,7 +886,10 @@ const sub = switch (builtin.os.tag) {
             defer _ = CloseHandle(h_read);
             _ = SetHandleInformation(h_read, HANDLE_FLAG_INHERIT, 0); // parent end not inherited
 
-            var si = STARTUPINFOW{ .cb = @sizeOf(STARTUPINFOW), .dwFlags = STARTF_USESTDHANDLES, .hStdOutput = h_write, .hStdError = h_write };
+            // stderr NON sulla stessa pipe dello stdout parsato (un warning del
+            // tool romperebbe il parse): con STARTF_USESTDHANDLES un handle null
+            // equivale a "nessuno stderr" per il figlio.
+            var si = STARTUPINFOW{ .cb = @sizeOf(STARTUPINFOW), .dwFlags = STARTF_USESTDHANDLES, .hStdOutput = h_write, .hStdError = null };
             var pi: PROCESS_INFORMATION = undefined;
             const ok = CreateProcessW(null, cmd_w, null, null, 1, CREATE_NO_WINDOW, null, null, &si, &pi);
             _ = CloseHandle(h_write); // parent keeps only the read end
@@ -776,12 +900,39 @@ const sub = switch (builtin.os.tag) {
             var out: std.ArrayList(u8) = .empty;
             errdefer out.deinit(allocator);
             var buf: [65536]u8 = undefined;
+            // Lettura con deadline complessiva: una ReadFile bloccante su un figlio
+            // appeso non raggiungerebbe mai il wait, quindi si sonda la pipe con
+            // PeekNamedPipe e si legge solo quando ci sono byte disponibili; alla
+            // scadenza il figlio viene terminato e si ritorna errore.
+            const deadline: u64 = GetTickCount64() + timeout_ms;
             while (true) {
-                var got: u32 = 0;
-                if (ReadFile(h_read, &buf, buf.len, &got, null) == 0 or got == 0) break;
-                try out.appendSlice(allocator, buf[0..got]);
+                var avail: u32 = 0;
+                if (PeekNamedPipe(h_read, null, 0, null, &avail, null) == 0) break; // pipe chiusa → EOF
+                if (avail > 0) {
+                    var got: u32 = 0;
+                    if (ReadFile(h_read, &buf, @min(avail, buf.len), &got, null) == 0 or got == 0) break;
+                    try out.appendSlice(allocator, buf[0..got]);
+                    continue;
+                }
+                // Niente dati: figlio già uscito → fine; ancora vivo → si controlla
+                // la deadline e si attende un attimo prima di risondare.
+                if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) break;
+                if (GetTickCount64() >= deadline) {
+                    _ = TerminateProcess(pi.hProcess, 1);
+                    _ = WaitForSingleObject(pi.hProcess, 5000);
+                    return error.Timeout;
+                }
+                Sleep(10);
             }
-            _ = WaitForSingleObject(pi.hProcess, 0xFFFFFFFF);
+            // Attesa finale col budget residuo: copre il figlio che ha chiuso lo
+            // stdout ma non esce; su WAIT_TIMEOUT lo si termina e si ritorna errore.
+            const now = GetTickCount64();
+            const wait_ms: u32 = if (deadline > now) @intCast(@min(deadline - now, std.math.maxInt(u32))) else 0;
+            if (WaitForSingleObject(pi.hProcess, wait_ms) == WAIT_TIMEOUT) {
+                _ = TerminateProcess(pi.hProcess, 1);
+                _ = WaitForSingleObject(pi.hProcess, 5000);
+                return error.Timeout;
+            }
             var code: u32 = 1;
             _ = GetExitCodeProcess(pi.hProcess, &code);
             return .{ .stdout = try out.toOwnedSlice(allocator), .exit_code = @truncate(code) };
@@ -804,13 +955,54 @@ const sub = switch (builtin.os.tag) {
             }
             return out.toOwnedSlice(allocator);
         }
+
+        extern "kernel32" fn GetFileSizeEx(hFile: HANDLE, lpFileSize: *i64) callconv(.winapi) i32;
+        extern "kernel32" fn SetFilePointerEx(hFile: HANDLE, liDistanceToMove: i64, lpNewFilePointer: ?*i64, dwMoveMethod: u32) callconv(.winapi) i32;
+
+        fn fileSize(allocator: std.mem.Allocator, path: []const u8) !u64 {
+            const path_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, path);
+            defer allocator.free(path_w);
+            const h = CreateFileW(path_w.ptr, GENERIC_READ, FILE_SHARE_READ, null, OPEN_EXISTING, 0, null);
+            if (h == INVALID_HANDLE) return error.OpenFailed;
+            defer _ = CloseHandle(h);
+            var size: i64 = 0;
+            if (GetFileSizeEx(h, &size) == 0 or size < 0) return error.ReadFailed;
+            return @intCast(size);
+        }
+
+        fn readFileTail(allocator: std.mem.Allocator, path: []const u8, n: usize) ![]u8 {
+            const path_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, path);
+            defer allocator.free(path_w);
+            const h = CreateFileW(path_w.ptr, GENERIC_READ, FILE_SHARE_READ, null, OPEN_EXISTING, 0, null);
+            if (h == INVALID_HANDLE) return error.OpenFailed;
+            defer _ = CloseHandle(h);
+            var size: i64 = 0;
+            if (GetFileSizeEx(h, &size) == 0 or size < 0) return error.ReadFailed;
+            const want: usize = @min(n, @as(usize, @intCast(size)));
+            if (SetFilePointerEx(h, size - @as(i64, @intCast(want)), null, 0) == 0) return error.ReadFailed; // FILE_BEGIN
+            const buf = try allocator.alloc(u8, want);
+            errdefer allocator.free(buf);
+            var off: usize = 0;
+            while (off < want) {
+                var got: u32 = 0;
+                const chunk: u32 = @intCast(@min(want - off, 1 << 20));
+                if (ReadFile(h, buf.ptr + off, chunk, &got, null) == 0 or got == 0) return error.ReadFailed;
+                off += got;
+            }
+            return buf;
+        }
     },
     else => struct {
         extern "c" fn pipe(fds: *[2]c_int) c_int;
+        extern "c" fn pipe2(fds: *[2]c_int, flags: c_int) c_int;
+        extern "c" fn fcntl(fd: c_int, cmd: c_int, arg: c_int) c_int;
         extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
         extern "c" fn close(fd: c_int) c_int;
         extern "c" fn open(path: [*:0]const u8, flags: c_int) c_int;
         extern "c" fn waitpid(pid: c_int, status: ?*c_int, options: c_int) c_int;
+        extern "c" fn kill(pid: c_int, sig: c_int) c_int;
+        extern "c" fn poll(fds: [*]PollFd, nfds: c_ulong, timeout: c_int) c_int;
+        extern "c" fn clock_gettime(clk_id: c_int, tp: *Timespec) c_int;
         // posix_spawn: fork+exec+ricerca PATH in modo sicuro anche in processi
         // multi-thread (niente malloc nel figlio forkato → niente deadlock).
         extern "c" fn posix_spawnp(pid: *c_int, file: [*:0]const u8, file_actions: ?*const anyopaque, attrp: ?*const anyopaque, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) c_int;
@@ -818,9 +1010,40 @@ const sub = switch (builtin.os.tag) {
         extern "c" fn posix_spawn_file_actions_destroy(fa: *anyopaque) c_int;
         extern "c" fn posix_spawn_file_actions_adddup2(fa: *anyopaque, fd: c_int, newfd: c_int) c_int;
         extern "c" fn posix_spawn_file_actions_addclose(fa: *anyopaque, fd: c_int) c_int;
+        extern "c" fn posix_spawn_file_actions_addopen(fa: *anyopaque, fd: c_int, path: [*:0]const u8, oflag: c_int, mode: c_uint) c_int;
         extern "c" var environ: [*:null]const ?[*:0]const u8;
 
-        fn runCapture(allocator: std.mem.Allocator, argv: []const []const u8) !RunResult {
+        const PollFd = extern struct { fd: c_int, events: c_short, revents: c_short };
+        const POLLIN: c_short = 0x001;
+        const Timespec = extern struct { sec: c_long, nsec: c_long };
+        const CLOCK_MONOTONIC: c_int = if (builtin.os.tag.isDarwin()) 6 else 1;
+
+        /// Millisecondi di clock monotonico via libc (niente `std.Io`, che non
+        /// attraversa il confine dei plugin dinamici). Per le deadline.
+        fn nowMs() i64 {
+            var ts: Timespec = .{ .sec = 0, .nsec = 0 };
+            _ = clock_gettime(CLOCK_MONOTONIC, &ts);
+            return @as(i64, @intCast(ts.sec)) * 1000 + @as(i64, @intCast(@divTrunc(ts.nsec, 1_000_000)));
+        }
+
+        /// pipe con O_CLOEXEC: senza, un figlio spawnato in parallelo da un ALTRO
+        /// thread eredita il write-end e l'EOF sul read-end non arriva finché
+        /// anche quello non esce (deadlock del loop di lettura). L'`adddup2` del
+        /// figlio giusto azzera CLOEXEC sul fd duplicato, quindi basta questo.
+        /// Su Linux `pipe2` è atomica; su Darwin (niente pipe2) fallback
+        /// `pipe` + `fcntl(FD_CLOEXEC)`, best-effort.
+        fn pipeCloexec(fds: *[2]c_int) c_int {
+            if (builtin.os.tag == .linux) {
+                return pipe2(fds, 0o2000000); // O_CLOEXEC (Linux)
+            } else {
+                if (pipe(fds) != 0) return -1;
+                _ = fcntl(fds[0], 2, 1); // F_SETFD, FD_CLOEXEC
+                _ = fcntl(fds[1], 2, 1);
+                return 0;
+            }
+        }
+
+        fn runCapture(allocator: std.mem.Allocator, argv: []const []const u8, timeout_ms: u32) !RunResult {
             if (argv.len == 0) return error.EmptyArgv;
 
             // argv null-terminato costruito PRIMA della fork: nel figlio non si può
@@ -833,10 +1056,13 @@ const sub = switch (builtin.os.tag) {
             for (argv, 0..) |a, i| argvZ[i] = (try allocator.dupeZ(u8, a)).ptr;
 
             var fds: [2]c_int = undefined;
-            if (pipe(&fds) != 0) return error.PipeFailed;
+            if (pipeCloexec(&fds) != 0) return error.PipeFailed;
             const read_fd = fds[0];
             const write_fd = fds[1];
-            defer _ = close(read_fd);
+            var read_fd_open = true;
+            defer if (read_fd_open) {
+                _ = close(read_fd);
+            };
 
             var fa: [256]u8 align(16) = undefined;
             if (posix_spawn_file_actions_init(&fa) != 0) {
@@ -845,16 +1071,43 @@ const sub = switch (builtin.os.tag) {
             }
             defer _ = posix_spawn_file_actions_destroy(&fa);
             _ = posix_spawn_file_actions_adddup2(&fa, write_fd, 1);
+            // stderr del figlio su /dev/null: il terminale dell'host è in
+            // raw-mode e i warning dei tool esterni lo sporcherebbero.
+            _ = posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", 1, 0); // O_WRONLY
             _ = posix_spawn_file_actions_addclose(&fa, read_fd);
 
             var pid: c_int = 0;
             const rc = posix_spawnp(&pid, argvZ[0].?, &fa, null, argvZ.ptr, environ);
             _ = close(write_fd);
             if (rc != 0) return if (rc == 2) error.CommandNotFound else error.SpawnFailed; // 2 = ENOENT
+
+            // Da qui il figlio esiste: su OGNI percorso d'errore va reaped (niente
+            // zombie). Si chiude prima il read-end e si manda SIGKILL, così il
+            // waitpid non può bloccarsi su un figlio che sta ancora scrivendo.
+            var reaped = false;
+            errdefer if (!reaped) {
+                if (read_fd_open) {
+                    _ = close(read_fd);
+                    read_fd_open = false;
+                }
+                _ = kill(pid, 9); // SIGKILL
+                _ = waitpid(pid, null, 0);
+            };
+
             var out: std.ArrayList(u8) = .empty;
             errdefer out.deinit(allocator);
             var buf: [65536]u8 = undefined;
+            // Loop di lettura con deadline complessiva via poll(): un tool esterno
+            // appeso non può bloccare il worker per sempre — alla scadenza
+            // l'errdefer sopra termina e reap-a il figlio.
+            const deadline: i64 = nowMs() + timeout_ms;
+            var pfd = [1]PollFd{.{ .fd = read_fd, .events = POLLIN, .revents = 0 }};
             while (true) {
+                const remaining = deadline - nowMs();
+                if (remaining <= 0) return error.Timeout;
+                const pr = poll(&pfd, 1, @intCast(@min(remaining, std.math.maxInt(c_int))));
+                if (pr == 0) continue; // scaduto il tratto: si ricontrolla la deadline
+                if (pr < 0) continue; // EINTR e simili: la deadline limita comunque il loop
                 const n = read(read_fd, &buf, buf.len);
                 if (n <= 0) break;
                 try out.appendSlice(allocator, buf[0..@intCast(n)]);
@@ -862,6 +1115,7 @@ const sub = switch (builtin.os.tag) {
 
             var status: c_int = 0;
             _ = waitpid(pid, &status, 0);
+            reaped = true;
             // WIFEXITED / WEXITSTATUS espansi a mano (glibc): byte basso = segnale.
             const code: u8 = if ((status & 0x7f) == 0) @intCast((status >> 8) & 0xff) else 1;
             return .{ .stdout = try out.toOwnedSlice(allocator), .exit_code = code };
@@ -886,13 +1140,59 @@ const sub = switch (builtin.os.tag) {
             }
             return out.toOwnedSlice(allocator);
         }
+
+        extern "c" fn lseek(fd: c_int, offset: i64, whence: c_int) i64;
+
+        fn fileSize(allocator: std.mem.Allocator, path: []const u8) !u64 {
+            const path_z = try allocator.dupeZ(u8, path);
+            defer allocator.free(path_z);
+            const fd = open(path_z.ptr, 0);
+            if (fd < 0) return error.OpenFailed;
+            defer _ = close(fd);
+            const size = lseek(fd, 0, 2); // SEEK_END
+            if (size < 0) return error.ReadFailed;
+            return @intCast(size);
+        }
+
+        fn readFileTail(allocator: std.mem.Allocator, path: []const u8, n: usize) ![]u8 {
+            const path_z = try allocator.dupeZ(u8, path);
+            defer allocator.free(path_z);
+            const fd = open(path_z.ptr, 0);
+            if (fd < 0) return error.OpenFailed;
+            defer _ = close(fd);
+            const size = lseek(fd, 0, 2); // SEEK_END
+            if (size < 0) return error.ReadFailed;
+            const want: usize = @min(n, @as(usize, @intCast(size)));
+            if (lseek(fd, size - @as(i64, @intCast(want)), 0) < 0) return error.ReadFailed; // SEEK_SET
+            const buf = try allocator.alloc(u8, want);
+            errdefer allocator.free(buf);
+            var off: usize = 0;
+            while (off < want) {
+                const r = read(fd, buf.ptr + off, want - off);
+                if (r <= 0) return error.ReadFailed;
+                off += @intCast(r);
+            }
+            return buf;
+        }
     },
 };
 
+/// Cache pigra di `defaultMaxSize`: 0 = non ancora calcolato. Evita di aprire
+/// e analizzare /proc/meminfo a OGNI decode (×2 per navigazione + prefetch).
+var default_max_size_cache: std.atomic.Value(usize) = .init(0);
+
 /// Budget di dimensione file di default, proporzionale alla memoria disponibile:
 /// metà di MemAvailable (il file viene letto in RAM e il decoder vi alloca sopra).
-/// Fallback a 128 MB se /proc/meminfo non è leggibile.
+/// Fallback a 128 MB se /proc/meminfo non è leggibile. Calcolato una sola volta.
 fn defaultMaxSize(io: std.Io, allocator: std.mem.Allocator) usize {
+    const cached = default_max_size_cache.load(.monotonic);
+    if (cached != 0) return cached;
+    const computed = computeDefaultMaxSize(io, allocator);
+    default_max_size_cache.store(computed, .monotonic);
+    return computed;
+}
+
+fn computeDefaultMaxSize(io: std.Io, allocator: std.mem.Allocator) usize {
     const fallback: usize = 128 * 1024 * 1024;
     // /proc/meminfo riporta dimensione 0 in stat, quindi un reader posizionale
     // (readFileAlloc) legge zero byte e si finisce sempre nel fallback: serve un
@@ -930,7 +1230,9 @@ fn guessImageFormat(bytes: []const u8) bool {
 }
 
 pub fn decode(path: []const u8, io: std.Io, allocator: std.mem.Allocator) Decoded {
-    return decodeImpl(path, io, allocator, false) orelse .{ .err = "decode fallito" };
+    // Il messaggio va duplicato sull'allocator: `Decoded.deinit` libera `err`
+    // incondizionatamente e un free su un letterale statico è UB.
+    return decodeImpl(path, io, allocator, false) orelse .{ .err = allocator.dupe(u8, "decode fallito") catch "" };
 }
 
 /// Prima fase del caricamento progressivo: texture al tier coarse (256², da cache
@@ -976,34 +1278,110 @@ fn decodeImpl(path: []const u8, io: std.Io, allocator: std.mem.Allocator, coarse
             return .{ .mesh = m };
     }
 
-    const limit = std.Io.Limit.limited(max_size);
-    const content = std.Io.Dir.cwd().readFileAlloc(io, clean_path, allocator, limit) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "Impossibile aprire o leggere il file: {s} ({s})", .{ clean_path, @errorName(err) }) catch "";
-        return .{ .err = msg };
-    };
-    errdefer allocator.free(content);
-
-    // Risolve il decoder dal registro: prima per estensione dichiarata dai
-    // plugin stessi, poi immagine per byte magici, infine "text" come fallback.
+    // Risolve il decoder dal registro PRIMA di leggere il contenuto: prima per
+    // estensione dichiarata dai plugin stessi, poi immagine per byte magici
+    // (basta un piccolo prefisso), infine "text" come fallback. Così la fase
+    // coarse di un plugin senza `zuer_decode_coarse` ritorna subito null senza
+    // pagare la lettura dell'intero file, e la lettura completa avviene solo
+    // quando un decode verrà davvero eseguito.
     const ext = getExtension(clean_path);
 
-    while (!plugin_cache_mutex.tryLock()) {
-        std.Thread.yield() catch {};
+    var ext_fn: ?DecodeFn = null;
+    var ext_found = false;
+    var ext_prefix: usize = std.math.maxInt(usize);
+    var image_fn: ?DecodeFn = null;
+    var image_found = false;
+    var image_prefix: usize = std.math.maxInt(usize);
+    var text_fn: ?DecodeFn = null;
+    {
+        while (!plugin_cache_mutex.tryLock()) {
+            std.Thread.yield() catch {};
+        }
+        defer plugin_cache_mutex.unlock();
+        ensureRegistryLocked(io, allocator);
+        if (findPluginByExtension(ext)) |p| {
+            ext_found = true;
+            ext_fn = if (coarse) p.decode_coarse_fn else p.decode_fn;
+            ext_prefix = p.content_prefix;
+        } else {
+            if (findPluginByName("image")) |p| {
+                image_found = true;
+                image_fn = if (coarse) p.decode_coarse_fn else p.decode_fn;
+                image_prefix = p.content_prefix;
+            }
+            if (findPluginByName("text")) |p| {
+                text_fn = if (coarse) p.decode_coarse_fn else p.decode_fn;
+            }
+        }
     }
-    ensureRegistryLocked(io, allocator);
-    var plugin = findPluginByExtension(ext);
-    if (plugin == null and guessImageFormat(content)) plugin = findPluginByName("image");
-    if (plugin == null) plugin = findPluginByName("text");
-    const decode_fn: ?DecodeFn = if (plugin) |p| (if (coarse) p.decode_coarse_fn else p.decode_fn) else null;
-    plugin_cache_mutex.unlock();
 
+    // Fase coarse senza alcun candidato con `zuer_decode_coarse` → null subito,
+    // senza toccare il file: l'host farà solo il decode full.
+    if (coarse and ext_fn == null and image_fn == null and text_fn == null) return null;
+
+    var decode_fn: ?DecodeFn = ext_fn;
+    var content_prefix: usize = ext_prefix;
+    if (!ext_found) {
+        // Estensione ignota al registro: servono i primi byte per riconoscere
+        // un'immagine con nome sbagliato/assente. Prefisso, non l'intero file.
+        var probe_buf: [16]u8 = undefined;
+        var probe_len: usize = 0;
+        {
+            var file = std.Io.Dir.cwd().openFile(io, clean_path, .{}) catch |err| {
+                const msg = std.fmt.allocPrint(allocator, "Impossibile aprire o leggere il file: {s} ({s})", .{ clean_path, @errorName(err) }) catch "";
+                return .{ .err = msg };
+            };
+            defer file.close(io);
+            var rbuf: [64]u8 = undefined;
+            var reader = file.readerStreaming(io, &rbuf);
+            probe_len = reader.interface.readSliceShort(&probe_buf) catch 0;
+        }
+        if (image_found and guessImageFormat(probe_buf[0..probe_len])) {
+            decode_fn = image_fn;
+            content_prefix = image_prefix;
+        } else {
+            decode_fn = text_fn;
+            content_prefix = std.math.maxInt(usize);
+        }
+    }
+
+    // In fase coarse un plugin senza `zuer_decode_coarse` → null: l'host farà il full.
+    if (coarse and decode_fn == null) return null;
     const decode_fn_val = decode_fn orelse {
-        allocator.free(content);
-        // In fase coarse un plugin senza `zuer_decode_coarse` → null: l'host farà il full.
-        if (coarse) return null;
         const msg = std.fmt.allocPrint(allocator, "Nessun plugin decoder disponibile per '.{s}' (cartella decoders/ vuota o mancante)", .{ext}) catch "";
         return .{ .err = msg };
     };
+
+    // Legge solo quanto dichiarato dal plugin (`zuer_content_prefix`): 0 = il
+    // plugin lavora dal path (pdf), N = bastano i primi N byte (media: header
+    // sniffing — un video multi-GB non va caricato in RAM per il poster).
+    // Default (nessun export): file intero, comportamento storico.
+    const file_size: usize = @intCast(stat.size); // ≤ max_size, già verificato
+    const to_read = @min(content_prefix, file_size);
+    const content: []u8 = if (to_read == 0) &.{} else if (to_read < file_size) blk: {
+        // Prefisso parziale: si legge esattamente to_read byte dall'inizio.
+        const buf = allocator.alloc(u8, to_read) catch return .{ .err = "Out of memory" };
+        var file = std.Io.Dir.cwd().openFile(io, clean_path, .{}) catch |err| {
+            allocator.free(buf);
+            const msg = std.fmt.allocPrint(allocator, "Impossibile aprire o leggere il file: {s} ({s})", .{ clean_path, @errorName(err) }) catch "";
+            return .{ .err = msg };
+        };
+        defer file.close(io);
+        var rbuf: [4096]u8 = undefined;
+        var reader = file.readerStreaming(io, &rbuf);
+        reader.interface.readSliceAll(buf) catch |err| {
+            // File cambiato/troncato tra stat e read: errore pulito, niente prefisso a metà.
+            allocator.free(buf);
+            const msg = std.fmt.allocPrint(allocator, "Impossibile leggere il file: {s} ({s})", .{ clean_path, @errorName(err) }) catch "";
+            return .{ .err = msg };
+        };
+        break :blk buf;
+    } else std.Io.Dir.cwd().readFileAlloc(io, clean_path, allocator, std.Io.Limit.limited(max_size)) catch |err| {
+        const msg = std.fmt.allocPrint(allocator, "Impossibile aprire o leggere il file: {s} ({s})", .{ clean_path, @errorName(err) }) catch "";
+        return .{ .err = msg };
+    };
+    // Da qui in poi `content` appartiene al plugin (vedi contratto in DecodeFn):
+    // lo libera lui, anche in caso di errore.
 
     const decoded_c = decode_fn_val(
         SliceC.fromSlice(path),

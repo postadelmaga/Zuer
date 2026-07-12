@@ -204,9 +204,11 @@ fn decodeImageSource(
     const bufferViews = gltf.bufferViews orelse return null;
     if (bv_idx >= bufferViews.len) return null;
     const bv = bufferViews[bv_idx];
+    // Offset/lunghezze arrivano dal JSON (usize ostili): somma controllata.
     const start = bv.byteOffset orelse 0;
-    if (start + bv.byteLength > bin_data.len) return null;
-    const encoded = bin_data[start .. start + bv.byteLength];
+    const end = std.math.add(usize, start, bv.byteLength) catch return null;
+    if (end > bin_data.len) return null;
+    const encoded = bin_data[start..end];
     if (encoded.len == 0 or encoded.len > std.math.maxInt(c_int)) return null;
 
     // Fase COARSE: SOLO lettura della cache 256² (nessun decode stbi). Un miss
@@ -270,6 +272,57 @@ fn texWorker(job: *TexJob) void {
     }
 }
 
+/// Budget di worker thread per la decodifica texture, CONDIVISO tra tutte le
+/// chiamate concorrenti a `buildTexCache`: il decode in primo piano e il
+/// prefetch dei vicini girano su thread diversi e possono sovrapporsi, e prima
+/// ognuno spawnava fino a (core−1) thread PER SÉ — su una CPU a pochi core
+/// (es. 2C/4T) due decode insieme arrivavano a 6+ thread CPU-bound contro 4
+/// hardware thread, mettendo in ginocchio anche il thread finestra per minuti
+/// (percepito come "si impalla" navigando in rapida successione tra modelli
+/// testurizzati). Inizializzato pigro a cores-1: un solo decode in volo si
+/// comporta come prima (nessuna regressione), più decode concorrenti si
+/// spartiscono lo stesso budget invece di sommare i propri.
+var texworker_budget: std.atomic.Value(i32) = .init(-1); // -1 = non inizializzato
+
+/// Riserva fino a `want` slot dal budget condiviso (satura a 0). Ritorna
+/// quanti se ne sono ottenuti davvero (≤ want) — mai negativo, mai in attesa:
+/// se il budget è esaurito la decode chiamante lavora comunque in linea (vedi
+/// `texWorker(&job)` in `buildTexCache`), solo senza aiuto extra.
+fn reserveTexWorkers(want: usize) usize {
+    if (want == 0) return 0;
+    var cur = texworker_budget.load(.monotonic);
+    if (cur < 0) {
+        const cores = std.Thread.getCpuCount() catch 1;
+        const initial: i32 = @intCast(@max(0, @as(isize, @intCast(cores)) - 1));
+        // Init lazy ATOMICA: solo chi vince il cmpxchg dalla sentinella -1
+        // pubblica il valore; chi perde riparte da quello del vincitore (già
+        // eventualmente decrementato). Lo store incondizionato di prima poteva
+        // RESETTARE il budget mentre un altro decode aveva slot riservati →
+        // oversubscription CPU.
+        if (texworker_budget.cmpxchgStrong(-1, initial, .monotonic, .monotonic)) |actual| {
+            cur = actual;
+        } else {
+            cur = initial;
+        }
+    }
+    var reserved: usize = 0;
+    while (reserved < want and cur > 0) {
+        if (texworker_budget.cmpxchgWeak(cur, cur - 1, .monotonic, .monotonic)) |actual| {
+            cur = actual;
+        } else {
+            reserved += 1;
+            cur -= 1;
+        }
+    }
+    return reserved;
+}
+
+/// Restituisce al budget condiviso gli slot riservati da `reserveTexWorkers`.
+fn releaseTexWorkers(n: usize) void {
+    if (n == 0) return;
+    _ = texworker_budget.fetchAdd(@intCast(n), .monotonic);
+}
+
 fn freeTexCache(cache: *TexCache, allocator: std.mem.Allocator) void {
     var it = cache.valueIterator();
     while (it.next()) |dt| std.heap.page_allocator.free(dt.pixels);
@@ -315,11 +368,17 @@ fn buildTexCache(gltf: GltfStructure, bin_data: []const u8, allocator: std.mem.A
 
     var job = TexJob{ .gltf = gltf, .bin = bin_data, .srcs = srcs, .results = results, .next = .init(0), .coarse = coarse, .missed = .init(false) };
 
-    // Spawn fino a (core−1) thread; il thread corrente drena comunque la coda,
-    // così anche con 0 spawn (o spawn fallito) tutte le texture vengono decodificate.
+    // Spawn fino a un budget condiviso da TUTTE le decode in volo (contro
+    // (core−1) thread PER CHIAMATA: il decode in primo piano e il prefetch dei
+    // vicini girano su thread diversi e possono sovrapporsi, moltiplicando gli
+    // spawn — su una CPU a pochi core questo mette in ginocchio anche il thread
+    // finestra per minuti, percepito come "si impalla"). Il thread corrente
+    // drena comunque la coda, così anche con 0 spawn (budget esaurito) tutte le
+    // texture vengono decodificate, solo più lentamente.
     var pool: [31]?std.Thread = .{null} ** 31;
-    const cores = std.Thread.getCpuCount() catch 1;
-    const spawn_n = @min(@min(n, cores) -| 1, pool.len);
+    const want = @min(n -| 1, pool.len);
+    const spawn_n = reserveTexWorkers(want);
+    defer releaseTexWorkers(spawn_n);
     for (0..spawn_n) |i| pool[i] = std.Thread.spawn(.{}, texWorker, .{&job}) catch null;
     texWorker(&job);
     for (0..spawn_n) |i| if (pool[i]) |t| t.join();
@@ -338,12 +397,24 @@ fn buildTexCache(gltf: GltfStructure, bin_data: []const u8, allocator: std.mem.A
     return cache;
 }
 
-/// Preleva dalla cache la texture per `tex_ref`, duplicandola con l'allocatore del
-/// builder (ogni submesh possiede il proprio buffer). null se non decodificata.
+/// Preleva dalla cache la texture per `tex_ref`. La copia con l'allocatore del
+/// builder avviene UNA volta per immagine sorgente e viene condivisa da tutti i
+/// submesh che la referenziano (i glTF riusano lo stesso atlas su decine di
+/// primitive: N copie da ~16 MB diventano una). L'ownership del buffer condiviso
+/// è del primo submesh in ordine; `decoder.freeSubmeshTextures` libera ogni
+/// puntatore una sola volta. null se non decodificata.
 fn takeCachedTex(b: *Builder, tex_ref: GltfTextureRef, out_w: *usize, out_h: *usize) ?[]u8 {
     const s = texSource(b.gltf, tex_ref) orelse return null;
+    if (b.shared_tex.get(s)) |st| {
+        out_w.* = st.w;
+        out_h.* = st.h;
+        return st.pixels;
+    }
     const dt = b.tex_cache.get(s) orelse return null;
     const px = b.allocator.dupe(u8, dt.pixels) catch return null;
+    // Se la memoizzazione fallisce il submesh possiede la copia da solo:
+    // corretto comunque (solo meno condivisione).
+    b.shared_tex.put(b.allocator, s, .{ .pixels = px, .w = dt.w, .h = dt.h }) catch {};
     out_w.* = dt.w;
     out_h.* = dt.h;
     return px;
@@ -427,18 +498,22 @@ fn readFloatAccessor(
     const bv_idx = acc.bufferView orelse return null;
     if (bv_idx >= bufferViews.len) return null;
     const bv = bufferViews[bv_idx];
-    const base = (bv.byteOffset orelse 0) + (acc.byteOffset orelse 0);
+    // Offset e stride arrivano dal JSON (usize ostili): l'aritmetica va fatta
+    // con somme/moltiplicazioni controllate, e si valida a monte che l'ULTIMO
+    // elemento stia dentro il BIN (così il loop non ha bisogno di controlli).
+    const base = std.math.add(usize, bv.byteOffset orelse 0, acc.byteOffset orelse 0) catch return null;
     const stride = bv.byteStride orelse (comps * 4);
+    if (expected_count == 0) return null;
+    const span = std.math.mul(usize, expected_count - 1, stride) catch return null;
+    const last = std.math.add(usize, base, span) catch return null;
+    const end = std.math.add(usize, last, comps * 4) catch return null;
+    if (end > bin_data.len) return null;
 
     const out = try allocator.alloc([comps]f32, expected_count);
     errdefer allocator.free(out);
     var i: usize = 0;
     while (i < expected_count) : (i += 1) {
         const off = base + i * stride;
-        if (off + comps * 4 > bin_data.len) {
-            allocator.free(out);
-            return null;
-        }
         inline for (0..comps) |c| {
             out[i][c] = @bitCast(std.mem.readInt(u32, bin_data[off + c * 4 ..][0..4], .little));
         }
@@ -455,21 +530,26 @@ pub fn decode(bytes: []const u8, filename: []const u8, allocator: std.mem.Alloca
     const version = std.mem.readInt(u32, bytes[4..8], .little);
     if (version != 2) return .{ .err = "Versione glTF non supportata (solo v2)" };
 
-    // Chunk 0: JSON
-    const chunk0_len = std.mem.readInt(u32, bytes[12..16], .little);
+    // Chunk 0: JSON. Le lunghezze arrivano dal file (u32 ostili): tutta
+    // l'aritmetica degli offset si fa in usize con controlli espliciti, così un
+    // GLB corrotto produce un errore e mai un overflow/OOB.
+    const chunk0_len: usize = std.mem.readInt(u32, bytes[12..16], .little);
     const chunk0_type = std.mem.readInt(u32, bytes[16..20], .little);
     if (chunk0_type != 0x4E4F534A) return .{ .err = "Il primo chunk GLB deve essere JSON" };
-    if (20 + chunk0_len > bytes.len) return .{ .err = "JSON chunk fuori dai limiti del file" };
-    const json_str = bytes[20 .. 20 + chunk0_len];
+    const json_end = std.math.add(usize, 20, chunk0_len) catch return .{ .err = "JSON chunk fuori dai limiti del file" };
+    if (json_end > bytes.len) return .{ .err = "JSON chunk fuori dai limiti del file" };
+    const json_str = bytes[20..json_end];
 
     // Chunk 1: BIN
-    const chunk1_offset = 20 + chunk0_len;
-    if (chunk1_offset + 8 > bytes.len) return .{ .err = "Nessun chunk BIN trovato" };
-    const chunk1_len = std.mem.readInt(u32, bytes[chunk1_offset .. chunk1_offset + 4][0..4], .little);
-    const chunk1_type = std.mem.readInt(u32, bytes[chunk1_offset + 4 .. chunk1_offset + 8][0..4], .little);
+    const chunk1_offset = json_end;
+    const chunk1_hdr_end = std.math.add(usize, chunk1_offset, 8) catch return .{ .err = "Nessun chunk BIN trovato" };
+    if (chunk1_hdr_end > bytes.len) return .{ .err = "Nessun chunk BIN trovato" };
+    const chunk1_len: usize = std.mem.readInt(u32, bytes[chunk1_offset..][0..4], .little);
+    const chunk1_type = std.mem.readInt(u32, bytes[chunk1_offset + 4 ..][0..4], .little);
     if (chunk1_type != 0x004E4942) return .{ .err = "Il secondo chunk GLB deve essere BIN" };
-    if (chunk1_offset + 8 + chunk1_len > bytes.len) return .{ .err = "BIN chunk fuori dai limiti del file" };
-    const bin_data = bytes[chunk1_offset + 8 .. chunk1_offset + 8 + chunk1_len];
+    const bin_end = std.math.add(usize, chunk1_hdr_end, chunk1_len) catch return .{ .err = "BIN chunk fuori dai limiti del file" };
+    if (bin_end > bytes.len) return .{ .err = "BIN chunk fuori dai limiti del file" };
+    const bin_data = bytes[chunk1_hdr_end..bin_end];
 
     // Parse JSON
     var parsed = std.json.parseFromSlice(GltfStructure, allocator, json_str, .{ .ignore_unknown_fields = true }) catch |err| {
@@ -494,6 +574,9 @@ const Builder = struct {
     bin: []const u8,
     allocator: std.mem.Allocator,
     tex_cache: TexCache,
+    /// Copie (con b.allocator) memoizzate per immagine sorgente: i submesh che
+    /// condividono un atlas puntano allo stesso buffer (vedi takeCachedTex).
+    shared_tex: TexCache,
     vertices: std.ArrayList([3]f32),
     normals: std.ArrayList([3]f32),
     uvs: std.ArrayList([2]f32),
@@ -645,7 +728,8 @@ fn addFaces(b: *Builder, prim: GltfPrimitive, pos_count: usize, vertex_offset: u
         const bv_idx = acc.bufferView orelse return error.NoBufferViewForIndices;
         if (bv_idx >= bvs.len) return error.BufferViewOutOfBounds;
         const bv = bvs[bv_idx];
-        const ind_offset = (bv.byteOffset orelse 0) + (acc.byteOffset orelse 0);
+        // Somma controllata: gli offset arrivano dal JSON (usize ostili).
+        const ind_offset = std.math.add(usize, bv.byteOffset orelse 0, acc.byteOffset orelse 0) catch return error.OutOfBounds;
         var j: usize = 0;
         while (j + 2 < acc.count) : (j += 3) {
             const v1 = try readIndex(b.bin, ind_offset, j, acc.componentType);
@@ -692,6 +776,7 @@ fn decodeGltfScene(gltf: GltfStructure, bin_data: []const u8, filename: []const 
         .bin = bin_data,
         .allocator = allocator,
         .tex_cache = tex_cache,
+        .shared_tex = .empty,
         .vertices = .empty,
         .normals = .empty,
         .uvs = .empty,
@@ -703,16 +788,17 @@ fn decodeGltfScene(gltf: GltfStructure, bin_data: []const u8, filename: []const 
         .all_normals = true,
         .all_tangents = true,
     };
+    // La mappa di memoizzazione si libera sempre (i pixel appartengono ai
+    // submesh, qui si rilascia solo la struttura).
+    defer b.shared_tex.deinit(allocator);
     errdefer {
         b.vertices.deinit(allocator);
         b.normals.deinit(allocator);
         b.uvs.deinit(allocator);
         b.tangents.deinit(allocator);
         b.faces.deinit(allocator);
-        for (b.submeshes.items) |s| {
-            if (s.tex_pixels.len > 0) allocator.free(s.tex_pixels);
-            if (s.nrm_tex_pixels.len > 0) allocator.free(s.nrm_tex_pixels);
-        }
+        // Le texture possono essere condivise tra submesh: free dedup-aware.
+        decoder.freeSubmeshTextures(b.submeshes.items, allocator);
         b.submeshes.deinit(allocator);
     }
 
@@ -784,21 +870,26 @@ fn decodeGltfScene(gltf: GltfStructure, bin_data: []const u8, filename: []const 
 }
 
 fn readIndex(bin_data: []const u8, offset: usize, index: usize, component_type: usize) !usize {
+    // `index` deriva da acc.count (JSON ostile): aritmetica controllata.
     switch (component_type) {
         5121 => { // u8
-            const idx = offset + index;
+            const idx = std.math.add(usize, offset, index) catch return error.OutOfBounds;
             if (idx >= bin_data.len) return error.OutOfBounds;
             return bin_data[idx];
         },
         5123 => { // u16
-            const idx = offset + index * 2;
-            if (idx + 2 > bin_data.len) return error.OutOfBounds;
-            return std.mem.readInt(u16, bin_data[idx .. idx + 2][0..2], .little);
+            const rel = std.math.mul(usize, index, 2) catch return error.OutOfBounds;
+            const idx = std.math.add(usize, offset, rel) catch return error.OutOfBounds;
+            const end = std.math.add(usize, idx, 2) catch return error.OutOfBounds;
+            if (end > bin_data.len) return error.OutOfBounds;
+            return std.mem.readInt(u16, bin_data[idx..][0..2], .little);
         },
         5125 => { // u32
-            const idx = offset + index * 4;
-            if (idx + 4 > bin_data.len) return error.OutOfBounds;
-            return std.mem.readInt(u32, bin_data[idx .. idx + 4][0..4], .little);
+            const rel = std.math.mul(usize, index, 4) catch return error.OutOfBounds;
+            const idx = std.math.add(usize, offset, rel) catch return error.OutOfBounds;
+            const end = std.math.add(usize, idx, 4) catch return error.OutOfBounds;
+            if (end > bin_data.len) return error.OutOfBounds;
+            return std.mem.readInt(u32, bin_data[idx..][0..4], .little);
         },
         else => return error.UnsupportedIndexType,
     }
@@ -848,4 +939,10 @@ const extensions = "glb";
 
 export fn zuer_extensions() callconv(.c) decoder.SliceC {
     return decoder.SliceC.fromSlice(extensions);
+}
+
+/// Versione dell'ABI plugin con cui questo decoder è compilato: l'host la
+/// confronta con la propria `decoder.abi_version` e scarta i mismatch.
+export fn zuer_abi_version() callconv(.c) u32 {
+    return decoder.abi_version;
 }

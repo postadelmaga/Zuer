@@ -8,12 +8,14 @@
 //!
 //! Formato "RTX2": magic[4] | w u32 | h u32 | rgba (w*h*4 byte), little-endian.
 //! Ci si tiene solo il tier COARSE (256²): ~192KB/texture → disco minimo. Il tier
-//! full non è cachato (si ridecodifica in background nella 2ª fase), così la
-//! cartella resta piccola senza bisogno di eviction. Il bump RTX1→RTX2 invalida
-//! i vecchi file full-res (che venivano scritti a 2048²).
+//! full non è cachato (si ridecodifica in background nella 2ª fase). Il bump
+//! RTX1→RTX2 invalida i vecchi file full-res (che venivano scritti a 2048²).
+//! La directory ha comunque un cap LRU (vedi `evict_cap_bytes`): tanti modelli
+//! texture-heavy accumulano file all'infinito senza eviction.
 
 const std = @import("std");
 const builtin = @import("builtin");
+const evict = @import("cache_evict.zig");
 
 /// Solo Linux: usa syscall POSIX (open/read/write/rename/mkdir con flag O_* e
 /// mkdir a due argomenti) che non linkerebbero sul CRT Windows. Sugli altri OS la
@@ -35,7 +37,14 @@ const O_TRUNC: c_int = 0o1000;
 
 const magic = "RTX2";
 
+/// Cap LRU della directory `~/.cache/zuer/tex`: oltre questa soglia l'eviction
+/// (post-scrittura) cancella i file con mtime più vecchio.
+const evict_cap_bytes: u64 = 256 * 1024 * 1024; // 256 MiB
+
 var tmp_seq: std.atomic.Value(u64) = .init(0);
+
+/// Sweep dei tmp orfani fatto al più una volta per processo (alla prima scrittura).
+var tmp_sweep_done: std.atomic.Value(bool) = .init(false);
 
 fn rd32(b: []const u8, off: usize) u32 {
     return std.mem.readInt(u32, b[off..][0..4], .little);
@@ -103,6 +112,8 @@ pub fn read_cached(gpa: std.mem.Allocator, encoded: []const u8, out_w: *usize, o
         gpa.free(buf);
         return null;
     }
+    // Cache-hit: "touch" dell'mtime così l'eviction LRU non cancella le entry usate.
+    evict.touchFd(fd);
     out_w.* = w;
     out_h.* = h;
     return buf;
@@ -110,15 +121,18 @@ pub fn read_cached(gpa: std.mem.Allocator, encoded: []const u8, out_w: *usize, o
 
 /// Scrive l'RGBA decodificato in cache (write-to-temp + rename atomico). Best-effort:
 /// ogni errore è silenzioso (la cache è un'ottimizzazione, non deve mai far fallire
-/// il decode). Dopo la scrittura applica l'eviction se la dir supera il cap.
+/// il decode). Dopo ogni scrittura riuscita si applica il cap LRU della directory
+/// (e, una volta per processo, lo sweep dei tmp orfani).
 pub fn write_cached(gpa: std.mem.Allocator, encoded: []const u8, w: usize, h: usize, rgba: []const u8) void {
     if (!enabled) return;
     if (rgba.len != w * h * 4) return;
     const dir = cacheDir(gpa) orelse return;
     defer gpa.free(dir);
     const key = std.hash.Wyhash.hash(0x9e3779b97f4a7c15, encoded);
+    // Nome tmp univoco anche TRA processi (PID + seq): due istanze concorrenti
+    // non devono interleave-arsi sullo stesso file temporaneo.
     const seq = tmp_seq.fetchAdd(1, .monotonic);
-    const tmp = std.fmt.allocPrintSentinel(gpa, "{s}/{x}.rtex.tmp{d}", .{ dir, key, seq }, 0) catch return;
+    const tmp = std.fmt.allocPrintSentinel(gpa, "{s}/{x}.rtex.tmp{d}_{d}", .{ dir, key, std.os.linux.getpid(), seq }, 0) catch return;
     defer gpa.free(tmp);
     const path = std.fmt.allocPrintSentinel(gpa, "{s}/{x}.rtex", .{ dir, key }, 0) catch return;
     defer gpa.free(path);
@@ -135,5 +149,8 @@ pub fn write_cached(gpa: std.mem.Allocator, encoded: []const u8, w: usize, h: us
     }
     _ = close(fd);
     if (!ok) return;
-    _ = rename(tmp.ptr, path.ptr);
+    if (rename(tmp.ptr, path.ptr) != 0) return;
+    // Manutenzione post-scrittura: sweep una-tantum dei tmp orfani + cap LRU.
+    evict.sweepTmpOnce(&tmp_sweep_done, dir);
+    evict.evictLru(dir, evict_cap_bytes);
 }

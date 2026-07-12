@@ -12,18 +12,25 @@ const Decoded = decoder.Decoded;
 pub fn decode(bytes: []const u8, filename: []const u8, allocator: std.mem.Allocator) Decoded {
     defer allocator.free(bytes);
 
+    // Central directory parsata una volta sola: tutte le letture di entry
+    // successive sono lookup in memoria sulla stessa lista.
+    const entries = parseCentralDirectory(bytes, allocator) catch |err| {
+        return errMsg(allocator, "Archivio ZIP non valido: {s}", .{@errorName(err)});
+    };
+    defer allocator.free(entries);
+
     if (hasExtension(filename, ".xlsx") or hasExtension(filename, ".xlsm")) {
-        return decodeXlsx(bytes, allocator);
+        return decodeXlsx(bytes, entries, allocator);
     }
     if (hasExtension(filename, ".ods")) {
-        return decodeOds(bytes, allocator);
+        return decodeOds(bytes, entries, allocator);
     }
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     const w = &out.writer;
 
-    const result = extract(bytes, filename, allocator, w);
+    const result = extract(bytes, entries, filename, allocator, w);
     if (result) {
         const text = out.toOwnedSlice() catch {
             const msg = allocator.dupe(u8, "Memoria esaurita durante l'estrazione.") catch "";
@@ -41,9 +48,9 @@ pub fn decode(bytes: []const u8, filename: []const u8, allocator: std.mem.Alloca
     }
 }
 
-fn extract(bytes: []const u8, filename: []const u8, allocator: std.mem.Allocator, w: *std.Io.Writer) !void {
+fn extract(bytes: []const u8, entries: []const ZipEntry, filename: []const u8, allocator: std.mem.Allocator, w: *std.Io.Writer) !void {
     if (hasExtension(filename, ".docx")) {
-        const xml = try readZipEntry(bytes, "word/document.xml", allocator);
+        const xml = try readZipEntry(bytes, entries, "word/document.xml", allocator);
         defer allocator.free(xml);
         try xmlToText(xml, w);
     } else if (hasExtension(filename, ".pptx")) {
@@ -52,7 +59,7 @@ fn extract(bytes: []const u8, filename: []const u8, allocator: std.mem.Allocator
         while (slide <= 500) : (slide += 1) {
             var name_buf: [48]u8 = undefined;
             const entry_name = try std.fmt.bufPrint(&name_buf, "ppt/slides/slide{d}.xml", .{slide});
-            const xml = readZipEntry(bytes, entry_name, allocator) catch break;
+            const xml = readZipEntry(bytes, entries, entry_name, allocator) catch break;
             defer allocator.free(xml);
             try w.print("— Slide {d} —\n", .{slide});
             try xmlToText(xml, w);
@@ -61,7 +68,7 @@ fn extract(bytes: []const u8, filename: []const u8, allocator: std.mem.Allocator
         if (slide == 1) return error.NoSlidesFound;
     } else {
         // odt / odp
-        const xml = try readZipEntry(bytes, "content.xml", allocator);
+        const xml = try readZipEntry(bytes, entries, "content.xml", allocator);
         defer allocator.free(xml);
         try xmlToText(xml, w);
     }
@@ -90,9 +97,20 @@ fn readU32(bytes: []const u8, off: usize) u32 {
     return std.mem.readInt(u32, bytes[off..][0..4], .little);
 }
 
-/// Estrae e decomprime una singola entry dello ZIP cercandola per nome
-/// nella central directory. Supporta i metodi stored (0) e deflate (8).
-fn readZipEntry(bytes: []const u8, wanted: []const u8, allocator: std.mem.Allocator) ![]u8 {
+/// Entry della central directory: il nome punta dentro `bytes` (nessuna copia).
+const ZipEntry = struct {
+    name: []const u8,
+    method: u16,
+    comp_size: usize,
+    uncomp_size: usize,
+    local_off: usize,
+};
+
+/// Analizza la central directory UNA volta sola in una lista di entry. I fogli
+/// xlsx (fino a 256) e le slide pptx (fino a 500) si leggono poi con lookup in
+/// memoria: riscandire EOCD + intera CD per ogni entry era O(entry × CD) sul
+/// percorso di apertura. Il chiamante libera lo slice con `allocator.free`.
+fn parseCentralDirectory(bytes: []const u8, allocator: std.mem.Allocator) ![]ZipEntry {
     if (bytes.len < 22) return error.NotAZipFile;
 
     // End Of Central Directory: si cerca all'indietro (può seguirlo un commento)
@@ -112,35 +130,45 @@ fn readZipEntry(bytes: []const u8, wanted: []const u8, allocator: std.mem.Alloca
     const total_entries = readU16(bytes, eocd_off + 10);
     var cd_off: usize = readU32(bytes, eocd_off + 16);
 
+    var entries: std.ArrayList(ZipEntry) = .empty;
+    errdefer entries.deinit(allocator);
+
     var i: usize = 0;
     while (i < total_entries) : (i += 1) {
         if (cd_off + 46 > bytes.len or readU32(bytes, cd_off) != central_sig) return error.CorruptZip;
-        const method = readU16(bytes, cd_off + 10);
-        const comp_size: usize = readU32(bytes, cd_off + 20);
-        const uncomp_size: usize = readU32(bytes, cd_off + 24);
         const name_len: usize = readU16(bytes, cd_off + 28);
         const extra_len: usize = readU16(bytes, cd_off + 30);
         const comment_len: usize = readU16(bytes, cd_off + 32);
-        const local_off: usize = readU32(bytes, cd_off + 42);
         if (cd_off + 46 + name_len > bytes.len) return error.CorruptZip;
-        const name = bytes[cd_off + 46 .. cd_off + 46 + name_len];
-
-        if (std.mem.eql(u8, name, wanted)) {
-            if (local_off + 30 > bytes.len or readU32(bytes, local_off) != local_sig) return error.CorruptZip;
-            const l_name_len: usize = readU16(bytes, local_off + 26);
-            const l_extra_len: usize = readU16(bytes, local_off + 28);
-            const data_off = local_off + 30 + l_name_len + l_extra_len;
-            if (data_off + comp_size > bytes.len) return error.CorruptZip;
-            const comp = bytes[data_off .. data_off + comp_size];
-
-            switch (method) {
-                0 => return allocator.dupe(u8, comp),
-                8 => return inflateRaw(comp, uncomp_size, allocator),
-                else => return error.UnsupportedCompression,
-            }
-        }
-
+        try entries.append(allocator, .{
+            .name = bytes[cd_off + 46 .. cd_off + 46 + name_len],
+            .method = readU16(bytes, cd_off + 10),
+            .comp_size = readU32(bytes, cd_off + 20),
+            .uncomp_size = readU32(bytes, cd_off + 24),
+            .local_off = readU32(bytes, cd_off + 42),
+        });
         cd_off += 46 + name_len + extra_len + comment_len;
+    }
+    return entries.toOwnedSlice(allocator);
+}
+
+/// Estrae e decomprime l'entry `wanted` cercandola nella lista già parsata.
+/// Supporta i metodi stored (0) e deflate (8).
+fn readZipEntry(bytes: []const u8, entries: []const ZipEntry, wanted: []const u8, allocator: std.mem.Allocator) ![]u8 {
+    for (entries) |e| {
+        if (!std.mem.eql(u8, e.name, wanted)) continue;
+        if (e.local_off + 30 > bytes.len or readU32(bytes, e.local_off) != local_sig) return error.CorruptZip;
+        const l_name_len: usize = readU16(bytes, e.local_off + 26);
+        const l_extra_len: usize = readU16(bytes, e.local_off + 28);
+        const data_off = e.local_off + 30 + l_name_len + l_extra_len;
+        if (data_off + e.comp_size > bytes.len) return error.CorruptZip;
+        const comp = bytes[data_off .. data_off + e.comp_size];
+
+        switch (e.method) {
+            0 => return allocator.dupe(u8, comp),
+            8 => return inflateRaw(comp, e.uncomp_size, allocator),
+            else => return error.UnsupportedCompression,
+        }
     }
     return error.EntryNotFound;
 }
@@ -314,24 +342,29 @@ fn attrValue(tag: []const u8, comptime name: []const u8) ?[]const u8 {
 /// Colonna 0-based da un riferimento cella A1 ("BC12" → 54).
 fn colFromRef(ref: []const u8) ?usize {
     var col: usize = 0;
-    var any = false;
+    var letters: usize = 0;
     for (ref) |c| {
         if (c >= 'A' and c <= 'Z') {
+            // Excel arriva a XFD (3 lettere): oltre 4 il riferimento non è
+            // plausibile e col*26 finirebbe in overflow su input ostili.
+            letters += 1;
+            if (letters > 4) return null;
             col = col * 26 + (c - 'A' + 1);
-            any = true;
         } else break;
     }
-    if (!any or col == 0) return null;
+    if (letters == 0 or col == 0) return null;
     return col - 1;
 }
 
 const max_sheets = 256;
 
 /// xlsx/xlsm: tutti i fogli. Uno solo → tabella semplice (`.csv`); più fogli →
-/// `.workbook` con le linguette. Nomi da `xl/workbook.xml`, dati da
-/// `xl/worksheets/sheetN.xml`, testo condiviso da `xl/sharedStrings.xml`.
-fn decodeXlsx(bytes: []const u8, allocator: std.mem.Allocator) Decoded {
-    const shared_xml: ?[]u8 = readZipEntry(bytes, "xl/sharedStrings.xml", allocator) catch null;
+/// `.workbook` con le linguette. Ordine e nomi da `xl/workbook.xml`, entry dei
+/// fogli risolte via `r:id` → `xl/_rels/workbook.xml.rels` (la numerazione dei
+/// file sheetN.xml può essere sparsa dopo l'eliminazione di un foglio), testo
+/// condiviso da `xl/sharedStrings.xml`. Senza rels → enumerazione legacy.
+fn decodeXlsx(bytes: []const u8, entries: []const ZipEntry, allocator: std.mem.Allocator) Decoded {
+    const shared_xml: ?[]u8 = readZipEntry(bytes, entries, "xl/sharedStrings.xml", allocator) catch null;
     defer if (shared_xml) |sx| allocator.free(sx);
 
     var shared = std.ArrayList([]const u8).empty;
@@ -345,13 +378,17 @@ fn decodeXlsx(bytes: []const u8, allocator: std.mem.Allocator) Decoded {
         };
     }
 
-    // Nomi dei fogli (in ordine di workbook.xml); assenti → "Foglio N".
-    var names = std.ArrayList([]const u8).empty;
+    // Riferimenti dei fogli nell'ordine di workbook.xml: nome + entry ZIP
+    // risolta dalle relationship. Assenti → fallback legacy più sotto.
+    var refs = std.ArrayList(SheetRef).empty;
     defer {
-        for (names.items) |n| allocator.free(n);
-        names.deinit(allocator);
+        for (refs.items) |r| {
+            if (r.name) |n| allocator.free(n);
+            if (r.target) |t| allocator.free(t);
+        }
+        refs.deinit(allocator);
     }
-    readSheetNames(bytes, allocator, &names);
+    readSheetRefs(bytes, entries, allocator, &refs);
 
     var sheets = std.ArrayList(decoder.Sheet).empty;
     errdefer {
@@ -359,37 +396,28 @@ fn decodeXlsx(bytes: []const u8, allocator: std.mem.Allocator) Decoded {
         sheets.deinit(allocator);
     }
 
-    var idx: usize = 1;
-    while (idx <= max_sheets) : (idx += 1) {
-        var name_buf: [64]u8 = undefined;
-        const entry = std.fmt.bufPrint(&name_buf, "xl/worksheets/sheet{d}.xml", .{idx}) catch break;
-        const sheet_xml = readZipEntry(bytes, entry, allocator) catch break; // foglio mancante → fine
+    // Percorso standard OOXML: i fogli si leggono nell'ordine di workbook.xml
+    // seguendo il target delle relationship. Un'entry mancante o illeggibile
+    // salta solo quel foglio, non interrompe gli altri.
+    for (refs.items, 0..) |r, i| {
+        if (sheets.items.len >= max_sheets) break;
+        const target = r.target orelse continue;
+        const sheet_xml = readZipEntry(bytes, entries, target, allocator) catch continue;
         defer allocator.free(sheet_xml);
+        if (!appendParsedSheet(allocator, &sheets, sheet_xml, shared.items, r.name, i + 1)) break;
+    }
 
-        var d = parseSheetRows(sheet_xml, shared.items, allocator);
-        switch (d) {
-            .csv => |csvd| {
-                const nm = if (idx - 1 < names.items.len)
-                    (allocator.dupe(u8, names.items[idx - 1]) catch {
-                        var cc = csvd;
-                        cc.deinit(allocator);
-                        break;
-                    })
-                else
-                    (std.fmt.allocPrint(allocator, "Foglio {d}", .{idx}) catch {
-                        var cc = csvd;
-                        cc.deinit(allocator);
-                        break;
-                    });
-                sheets.append(allocator, .{ .name = nm, .data = csvd }) catch {
-                    allocator.free(nm);
-                    var cc = csvd;
-                    cc.deinit(allocator);
-                    break;
-                };
-            },
-            // Foglio vuoto o illeggibile: lo si salta senza abortire il workbook.
-            else => d.deinit(allocator),
+    // Fallback legacy: rels mancante/illeggibile o nessun foglio risolto →
+    // enumerazione xl/worksheets/sheetN.xml come prima, nomi per posizione.
+    if (sheets.items.len == 0) {
+        var idx: usize = 1;
+        while (idx <= max_sheets) : (idx += 1) {
+            var name_buf: [64]u8 = undefined;
+            const entry = std.fmt.bufPrint(&name_buf, "xl/worksheets/sheet{d}.xml", .{idx}) catch break;
+            const sheet_xml = readZipEntry(bytes, entries, entry, allocator) catch break; // foglio mancante → fine
+            defer allocator.free(sheet_xml);
+            const nm: ?[]const u8 = if (idx - 1 < refs.items.len) refs.items[idx - 1].name else null;
+            if (!appendParsedSheet(allocator, &sheets, sheet_xml, shared.items, nm, idx)) break;
         }
     }
 
@@ -410,26 +438,139 @@ fn decodeXlsx(bytes: []const u8, allocator: std.mem.Allocator) Decoded {
     return .{ .workbook = .{ .sheets = owned, .active = 0 } };
 }
 
-/// Legge i nomi dei fogli da `xl/workbook.xml` (elemento `<sheet name="…"/>`).
-/// Fallimento non fatale: i fogli senza nome ricadono su "Foglio N".
-fn readSheetNames(bytes: []const u8, allocator: std.mem.Allocator, out: *std.ArrayList([]const u8)) void {
-    const wb = readZipEntry(bytes, "xl/workbook.xml", allocator) catch return;
+/// Riferimento a un foglio, nell'ordine in cui compare in `xl/workbook.xml`.
+/// Entrambi i campi sono allocati e di proprietà del chiamante.
+const SheetRef = struct {
+    name: ?[]const u8, // null se il tag <sheet> non ha l'attributo name
+    target: ?[]const u8, // path completo dell'entry ZIP; null se r:id non risolto
+};
+
+/// Legge i fogli da `xl/workbook.xml` (elemento `<sheet name="…" r:id="…"/>`)
+/// e risolve ogni `r:id` nell'entry ZIP corrispondente tramite
+/// `xl/_rels/workbook.xml.rels`. Fallimento non fatale: senza rels i target
+/// restano null e il chiamante ricade sull'enumerazione legacy sheetN.xml.
+fn readSheetRefs(bytes: []const u8, entries: []const ZipEntry, allocator: std.mem.Allocator, out: *std.ArrayList(SheetRef)) void {
+    const wb = readZipEntry(bytes, entries, "xl/workbook.xml", allocator) catch return;
     defer allocator.free(wb);
+
+    const rels: ?[]u8 = readZipEntry(bytes, entries, "xl/_rels/workbook.xml.rels", allocator) catch null;
+    defer if (rels) |r| allocator.free(r);
 
     var pos: usize = 0;
     // findTag("sheet") non matcha `<sheets>` (il carattere dopo "sheet" è 's').
     while (findTag(wb, pos, "sheet")) |at| {
+        if (out.items.len >= max_sheets) break;
         const open_end = std.mem.indexOfScalarPos(u8, wb, at, '>') orelse break;
         const tag = wb[at..open_end];
-        if (attrValue(tag, "name")) |raw| {
-            const nm = xmlTextDupe(allocator, raw) catch break;
-            out.append(allocator, nm) catch {
-                allocator.free(nm);
-                break;
-            };
+
+        const name: ?[]const u8 = if (attrValue(tag, "name")) |raw|
+            (xmlTextDupe(allocator, raw) catch null)
+        else
+            null;
+
+        var target: ?[]const u8 = null;
+        if (rels) |rx| {
+            if (ridValue(tag)) |rid| target = resolveRelTarget(rx, rid, allocator);
         }
+
+        out.append(allocator, .{ .name = name, .target = target }) catch {
+            if (name) |n| allocator.free(n);
+            if (target) |t| allocator.free(t);
+            break;
+        };
         pos = open_end + 1;
     }
+}
+
+/// Valore dell'attributo `r:id` di un tag `<sheet>`. Il prefisso di namespace
+/// non è garantito essere "r": in mancanza si accetta qualunque attributo che
+/// termini in `:id` (parsing tollerante, coerente col resto del file).
+fn ridValue(tag: []const u8) ?[]const u8 {
+    if (attrValue(tag, "r:id")) |v| return v;
+    const needle = ":id=\"";
+    const at = std.mem.indexOf(u8, tag, needle) orelse return null;
+    const vstart = at + needle.len;
+    const vend = std.mem.indexOfScalarPos(u8, tag, vstart, '"') orelse return null;
+    return tag[vstart..vend];
+}
+
+/// Cerca in `rels_xml` la `<Relationship Id="rid" Target="…"/>` e converte il
+/// Target in path di entry ZIP. Restituisce una stringa allocata o null.
+fn resolveRelTarget(rels_xml: []const u8, rid: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
+    var pos: usize = 0;
+    // findTag("Relationship") non matcha il tag radice `<Relationships>`.
+    while (findTag(rels_xml, pos, "Relationship")) |at| {
+        const open_end = std.mem.indexOfScalarPos(u8, rels_xml, at, '>') orelse return null;
+        const tag = rels_xml[at..open_end];
+        pos = open_end + 1;
+        const id = attrValue(tag, "Id") orelse continue;
+        if (!std.mem.eql(u8, id, rid)) continue;
+        const target = attrValue(tag, "Target") orelse return null;
+        return zipPathFromTarget(target, allocator);
+    }
+    return null;
+}
+
+/// Converte il Target di una relationship in path di entry ZIP. Il Target è
+/// relativo a `xl/` ("worksheets/sheet3.xml") oppure assoluto ("/xl/…");
+/// `../` risale di una componente (oltre la prima uscirebbe dall'archivio →
+/// null, senza crash). Restituisce una stringa allocata o null.
+fn zipPathFromTarget(target: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
+    if (target.len == 0) return null;
+    if (target[0] == '/') {
+        if (target.len == 1) return null;
+        return allocator.dupe(u8, target[1..]) catch null;
+    }
+    var rest = target;
+    var ups: usize = 0;
+    while (std.mem.startsWith(u8, rest, "../")) {
+        rest = rest[3..];
+        ups += 1;
+    }
+    // La base "xl/" ha una sola componente: più di un "../" non è risolvibile.
+    if (rest.len == 0 or ups > 1) return null;
+    if (ups == 1) return allocator.dupe(u8, rest) catch null;
+    return std.fmt.allocPrint(allocator, "xl/{s}", .{rest}) catch null;
+}
+
+/// Analizza `sheet_xml` e, se contiene dati, lo accoda a `sheets` col nome
+/// `name_src` (duplicato) o "Foglio N" se assente. Un foglio vuoto o
+/// illeggibile si salta senza abortire il workbook. Restituisce false solo
+/// per esaurimento memoria (il chiamante interrompe il loop, come prima).
+fn appendParsedSheet(
+    allocator: std.mem.Allocator,
+    sheets: *std.ArrayList(decoder.Sheet),
+    sheet_xml: []const u8,
+    shared: []const []const u8,
+    name_src: ?[]const u8,
+    ordinal: usize,
+) bool {
+    var d = parseSheetRows(sheet_xml, shared, allocator);
+    switch (d) {
+        .csv => |csvd| {
+            const nm = if (name_src) |src|
+                (allocator.dupe(u8, src) catch {
+                    var cc = csvd;
+                    cc.deinit(allocator);
+                    return false;
+                })
+            else
+                (std.fmt.allocPrint(allocator, "Foglio {d}", .{ordinal}) catch {
+                    var cc = csvd;
+                    cc.deinit(allocator);
+                    return false;
+                });
+            sheets.append(allocator, .{ .name = nm, .data = csvd }) catch {
+                allocator.free(nm);
+                var cc = csvd;
+                cc.deinit(allocator);
+                return false;
+            };
+        },
+        // Foglio vuoto o illeggibile: lo si salta senza abortire il workbook.
+        else => d.deinit(allocator),
+    }
+    return true;
 }
 
 /// Analizza un singolo foglio (`xl/worksheets/sheetN.xml`) in `.csv` (prima riga
@@ -558,8 +699,8 @@ fn parseSharedStrings(xml: []const u8, allocator: std.mem.Allocator, out: *std.A
 }
 
 /// ods: prima <table:table> di content.xml.
-fn decodeOds(bytes: []const u8, allocator: std.mem.Allocator) Decoded {
-    const content = readZipEntry(bytes, "content.xml", allocator) catch |err| {
+fn decodeOds(bytes: []const u8, entries: []const ZipEntry, allocator: std.mem.Allocator) Decoded {
+    const content = readZipEntry(bytes, entries, "content.xml", allocator) catch |err| {
         return errMsg(allocator, "Impossibile leggere content.xml: {s}", .{@errorName(err)});
     };
     defer allocator.free(content);
@@ -716,4 +857,10 @@ const extensions = "docx,pptx,odt,odp,xlsx,xlsm,ods";
 
 export fn zuer_extensions() callconv(.c) decoder.SliceC {
     return decoder.SliceC.fromSlice(extensions);
+}
+
+/// Versione dell'ABI plugin con cui questo decoder è compilato: l'host la
+/// confronta con la propria `decoder.abi_version` e scarta i mismatch.
+export fn zuer_abi_version() callconv(.c) u32 {
+    return decoder.abi_version;
 }

@@ -17,6 +17,25 @@ extern fn stbi_image_free(retval_from_stbi_load: ?*anyopaque) void;
 extern fn stbi_failure_reason() ?[*:0]const u8;
 
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+extern fn realpath(path: [*:0]const u8, resolved: [*]u8) ?[*:0]u8;
+
+/// Canonicalizza `path` in un percorso ASSOLUTO con realpath(3) prima di
+/// passarlo come argv a un tool esterno: un path relativo che inizia con `-`
+/// verrebbe parsato come opzione, e ImageMagick interpreta prefissi coder
+/// (`msl:`, `caption:`, `pango:`…) DENTRO il filename — un path che inizia
+/// con `/` li neutralizza. Fallback: se realpath fallisce (file sparito nel
+/// frattempo), usa il path originale ma prefissato con `./` quando è relativo
+/// e inizia con `-`. Il chiamante libera con lo stesso allocator.
+fn absPath(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+    const pz = try gpa.dupeZ(u8, path);
+    defer gpa.free(pz);
+    var buf: [4096]u8 = undefined; // PATH_MAX
+    if (realpath(pz.ptr, &buf)) |res|
+        return gpa.dupe(u8, std.mem.span(res));
+    if (std.mem.startsWith(u8, path, "-"))
+        return std.fmt.allocPrint(gpa, "./{s}", .{path});
+    return gpa.dupe(u8, path);
+}
 
 pub fn decode(path: []const u8, file_bytes: []const u8, filename: []const u8, allocator: std.mem.Allocator) Decoded {
     // I subprocess (SVG/ImageMagick) usano decoder.runCapture (fork/exec diretti),
@@ -88,8 +107,12 @@ fn decodeWithRsvg(path: []const u8, filename: []const u8, max_dim: usize, alloca
     var dim_buf: [16]u8 = undefined;
     const dim_str = try std.fmt.bufPrint(&dim_buf, "{d}", .{svg_dim});
 
+    // Path assoluto: mai passare il path utente as-given a un subprocess.
+    const abs_path = try absPath(allocator, path);
+    defer allocator.free(abs_path);
+
     // Sfondo esplicito: stb scarta l'alpha e il trasparente diverrebbe nero.
-    var result = try decoder.runCapture(allocator, &.{ "rsvg-convert", "--width", dim_str, "--height", dim_str, "--keep-aspect-ratio", "--format", "png", "--background-color", "#101018", path });
+    var result = try decoder.runCapture(allocator, &.{ "rsvg-convert", "--width", dim_str, "--height", dim_str, "--keep-aspect-ratio", "--format", "png", "--background-color", "#101018", abs_path });
     defer result.deinit(allocator);
 
     if (result.exit_code != 0 or result.stdout.len == 0) return error.RsvgFailed;
@@ -164,8 +187,19 @@ fn resizeToFit(src: [*]const u8, src_w: usize, src_h: usize, filename: []const u
 }
 
 fn decodeWithImageMagick(path: []const u8, filename: []const u8, max_dim: usize, allocator: std.mem.Allocator) !ImageData {
+    // Path assoluto (neutralizza i prefissi coder di ImageMagick) + selettore
+    // `[0]` esplicito: ImageMagick interpreta un suffisso `[N]` anche su path
+    // assoluti, quindi lo fissiamo noi al primo frame. La semantica non cambia:
+    // il codice sotto usava già solo il primo frame (primi due token di
+    // identify, primi expected_bytes di convert) — con `[0]` identify non
+    // concatena più le misure dei frame successivi e convert decodifica meno.
+    const abs_path = try absPath(allocator, path);
+    defer allocator.free(abs_path);
+    const first_frame = try std.fmt.allocPrint(allocator, "{s}[0]", .{abs_path});
+    defer allocator.free(first_frame);
+
     // 1. identify to get original size
-    var size_result = try decoder.runCapture(allocator, &.{ "identify", "-format", "%w %h", path });
+    var size_result = try decoder.runCapture(allocator, &.{ "identify", "-format", "%w %h", first_frame });
     defer size_result.deinit(allocator);
     if (size_result.exit_code != 0) return error.IdentifyProcessFailed;
 
@@ -191,7 +225,7 @@ fn decodeWithImageMagick(path: []const u8, filename: []const u8, max_dim: usize,
     var resize_buf: [32]u8 = undefined;
     const resize_str = try std.fmt.bufPrint(&resize_buf, "{d}x{d}", .{ width, height });
 
-    var convert_result = try decoder.runCapture(allocator, &.{ "convert", path, "-depth", "8", "-resize", resize_str, "rgb:-" });
+    var convert_result = try decoder.runCapture(allocator, &.{ "convert", first_frame, "-depth", "8", "-resize", resize_str, "rgb:-" });
     defer convert_result.deinit(allocator);
     if (convert_result.exit_code != 0) return error.ConvertProcessFailed;
 
@@ -245,4 +279,10 @@ const extensions = "png,jpg,jpeg,gif,bmp,tga,psd,hdr,pic,pnm,pbm,pgm,ppm,svg,svg
 
 export fn zuer_extensions() callconv(.c) decoder.SliceC {
     return decoder.SliceC.fromSlice(extensions);
+}
+
+/// Versione dell'ABI plugin con cui questo decoder è compilato: l'host la
+/// confronta con la propria `decoder.abi_version` e scarta i mismatch.
+export fn zuer_abi_version() callconv(.c) u32 {
+    return decoder.abi_version;
 }

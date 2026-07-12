@@ -37,3 +37,9 @@ const extensions = "md,markdown";
 export fn zuer_extensions() callconv(.c) decoder.SliceC {
     return decoder.SliceC.fromSlice(extensions);
 }
+
+/// Versione dell'ABI plugin con cui questo decoder è compilato: l'host la
+/// confronta con la propria `decoder.abi_version` e scarta i mismatch.
+export fn zuer_abi_version() callconv(.c) u32 {
+    return decoder.abi_version;
+}

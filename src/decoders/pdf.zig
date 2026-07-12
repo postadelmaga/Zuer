@@ -10,6 +10,21 @@ const Decoded = decoder.Decoded;
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 extern fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
 extern fn rmdir(path: [*:0]const u8) c_int;
+extern fn realpath(path: [*:0]const u8, resolved: [*]u8) ?[*:0]u8;
+
+// Iterazione directory via libc (come le altre syscall del plugin): serve per
+// ripulire i file pagina residui prima di rmdir.
+const DIR = opaque {};
+const dirent = extern struct {
+    d_ino: u64,
+    d_off: u64,
+    d_reclen: c_ushort,
+    d_type: u8,
+    d_name: [256]u8,
+};
+extern fn opendir(name: [*:0]const u8) ?*DIR;
+extern fn readdir(dirp: *DIR) ?*dirent;
+extern fn closedir(dirp: *DIR) c_int;
 
 const page_gap = 8;
 const gap_color = [3]u8{ 0x30, 0x30, 0x38 };
@@ -61,9 +76,30 @@ pub fn decode(path: []const u8, io: std.Io, filename: []const u8, allocator: std
     };
 }
 
+/// Canonicalizza `path` in un percorso ASSOLUTO con realpath(3) prima di
+/// passarlo come argv a un tool esterno: un path relativo che inizia con `-`
+/// (es. `zuer ./-r.pdf`) verrebbe altrimenti parsato come opzione da
+/// pdfinfo/pdftoppm. Fallback: se realpath fallisce (file sparito nel
+/// frattempo), usa il path originale ma prefissato con `./` quando è relativo
+/// e inizia con `-`. Il chiamante libera con lo stesso allocator.
+fn absPath(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+    const pz = try gpa.dupeZ(u8, path);
+    defer gpa.free(pz);
+    var buf: [4096]u8 = undefined; // PATH_MAX
+    if (realpath(pz.ptr, &buf)) |res|
+        return gpa.dupe(u8, std.mem.span(res));
+    if (std.mem.startsWith(u8, path, "-"))
+        return std.fmt.allocPrint(gpa, "./{s}", .{path});
+    return gpa.dupe(u8, path);
+}
+
 fn decodeInner(clean_path: []const u8, filename: []const u8, dpi: []const u8, page_num: usize, allocator: std.mem.Allocator) !Decoded {
+    // Path assoluto per i subprocess: mai passare il path utente as-given.
+    const abs_path = try absPath(allocator, clean_path);
+    defer allocator.free(abs_path);
+
     // 1. Numero di pagine dal sommario di pdfinfo
-    var info = try decoder.runCapture(allocator, &.{ "pdfinfo", clean_path });
+    var info = try decoder.runCapture(allocator, &.{ "pdfinfo", abs_path });
     defer info.deinit(allocator);
     if (info.exit_code != 0) return error.PdfInfoFailed;
 
@@ -86,7 +122,7 @@ fn decodeInner(clean_path: []const u8, filename: []const u8, dpi: []const u8, pa
     var dir_template: [32]u8 = undefined;
     const tmpl = try std.fmt.bufPrintZ(&dir_template, "/tmp/zuer_pdf_XXXXXX", .{});
     if (mkdtemp(tmpl.ptr) == null) return error.TempDirFailed;
-    defer _ = rmdir(tmpl.ptr);
+    defer cleanupTmpDir(tmpl.ptr);
 
     var prefix_buf: [48]u8 = undefined;
     const prefix = try std.fmt.bufPrint(&prefix_buf, "{s}/page", .{tmpl});
@@ -94,7 +130,7 @@ fn decodeInner(clean_path: []const u8, filename: []const u8, dpi: []const u8, pa
     var page_buf: [16]u8 = undefined;
     const page_str = try std.fmt.bufPrint(&page_buf, "{d}", .{page});
 
-    var run_result = try decoder.runCapture(allocator, &.{ "pdftoppm", "-f", page_str, "-l", page_str, "-r", dpi, clean_path, prefix });
+    var run_result = try decoder.runCapture(allocator, &.{ "pdftoppm", "-f", page_str, "-l", page_str, "-r", dpi, abs_path, prefix });
     defer run_result.deinit(allocator);
     if (run_result.exit_code != 0) return error.PdfToPpmFailed;
 
@@ -107,6 +143,8 @@ fn decodeInner(clean_path: []const u8, filename: []const u8, dpi: []const u8, pa
     // Passiamo al chiamante l'ownership diretta dei pixel parsati, evitando duplicazioni.
     const pixels = ppm.pixels;
 
+    // La label testuale resta per la UI; il conteggio pagine viaggia anche nel
+    // campo strutturato `total_pages`, così l'host non deve parsare la stringa.
     const name = try std.fmt.allocPrint(allocator, "{s} (pagina {d} di {d})", .{ filename, page, total_pages });
 
     return .{ .image = .{
@@ -114,6 +152,7 @@ fn decodeInner(clean_path: []const u8, filename: []const u8, dpi: []const u8, pa
         .height = ppm.height,
         .pixels = pixels,
         .name = name,
+        .total_pages = std.math.cast(u32, total_pages) orelse std.math.maxInt(u32),
     } };
 }
 
@@ -142,6 +181,24 @@ fn readPageFile(prefix: []const u8, page: usize, allocator: std.mem.Allocator) ?
 }
 
 extern fn unlink(filename: [*:0]const u8) c_int;
+
+/// Rimuove (best-effort) la directory temporanea: prima cancella gli eventuali
+/// file `page-*` residui — pdftoppm può generarne più di uno e `rmdir` fallisce
+/// in silenzio su una directory non vuota, lasciando orfani in /tmp — poi rmdir.
+/// Ogni errore è ignorato: la pulizia non deve mai far fallire il decode.
+fn cleanupTmpDir(tmpl: [*:0]const u8) void {
+    if (opendir(tmpl)) |d| {
+        while (readdir(d)) |ent| {
+            const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&ent.d_name)), 0);
+            if (!std.mem.startsWith(u8, name, "page")) continue;
+            var buf: [320]u8 = undefined;
+            const full = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ std.mem.span(tmpl), name }) catch continue;
+            _ = unlink(full.ptr);
+        }
+        _ = closedir(d);
+    }
+    _ = rmdir(tmpl);
+}
 
 fn deleteFile(path: []const u8) void {
     var buf: [128]u8 = undefined;
@@ -222,4 +279,15 @@ const extensions = "pdf";
 
 export fn zuer_extensions() callconv(.c) decoder.SliceC {
     return decoder.SliceC.fromSlice(extensions);
+}
+
+/// pdftoppm rilegge il PDF dal path: l'host non deve leggere alcun byte.
+export fn zuer_content_prefix() callconv(.c) usize {
+    return 0;
+}
+
+/// Versione dell'ABI plugin con cui questo decoder è compilato: l'host la
+/// confronta con la propria `decoder.abi_version` e scarta i mismatch.
+export fn zuer_abi_version() callconv(.c) u32 {
+    return decoder.abi_version;
 }

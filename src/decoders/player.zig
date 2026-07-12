@@ -15,7 +15,16 @@ pub const c = @cImport({
     @cInclude("libavformat/avformat.h");
     @cInclude("libavcodec/avcodec.h");
     @cInclude("libavutil/imgutils.h");
+    // Decodifica hardware VAAPI: device context (hwcontext) e descrittori dei
+    // pixel format (per riconoscere i formati hw nel callback get_format).
+    @cInclude("libavutil/hwcontext.h");
+    @cInclude("libavutil/pixdesc.h");
     @cInclude("libswscale/swscale.h");
+    // Audio: resample → f32 interleaved e gestione dei channel layout (usati da
+    // src/audio_player.zig, che riusa questo @cImport per condividere i tipi).
+    @cInclude("libswresample/swresample.h");
+    @cInclude("libavutil/channel_layout.h");
+    @cInclude("libavutil/opt.h");
 });
 
 // Decoder VP9 su GPU compute (libcompute_vp9): Linux-only (la libreria non è portata su
@@ -28,7 +37,10 @@ const cvp9 = if (cvp9_enabled) @import("cvp9.zig") else struct {};
 pub const Frame = struct {
     width: usize,
     height: usize,
-    /// RGB24 impacchettato (3 byte/pixel, righe contigue senza padding).
+    /// Pixel impacchettati, righe contigue senza padding. Formato secondo il player:
+    /// RGB24 (3 B/px) per il poster one-shot, di proprietà del chiamante; RGBA (4 B/px)
+    /// per il player live, che PRESTA il proprio `scratch` (valido fino al prossimo
+    /// `nextFrame`/`deinit`: da consumare subito, non liberare).
     pixels: []u8,
     /// Timestamp di presentazione in secondi (0 se il container non lo fornisce).
     pts_s: f64 = 0,
@@ -58,6 +70,30 @@ fn fitDims(src_w: c_int, src_h: c_int, max_dim: usize) struct { w: c_int, h: c_i
     return .{ .w = w, .h = h };
 }
 
+/// Callback `get_format` per la decodifica VAAPI. È una funzione C senza stato
+/// catturabile, quindi la scelta è fissa: AV_PIX_FMT_VAAPI se il decoder lo
+/// propone, altrimenti il primo formato SOFTWARE della lista (fallback
+/// dinamico: alcuni stream cambiano parametri a metà e perdono l'hwaccel).
+fn pickVaapiFormat(ctx: [*c]c.AVCodecContext, fmts: [*c]const c.enum_AVPixelFormat) callconv(.c) c.enum_AVPixelFormat {
+    _ = ctx;
+    var i: usize = 0;
+    while (fmts[i] != c.AV_PIX_FMT_NONE) : (i += 1) {
+        if (fmts[i] == c.AV_PIX_FMT_VAAPI) return c.AV_PIX_FMT_VAAPI;
+    }
+    // Niente VAAPI nella lista: primo formato NON hardware (un formato hw di un
+    // altro tipo non sarebbe usabile senza il relativo device context).
+    i = 0;
+    while (fmts[i] != c.AV_PIX_FMT_NONE) : (i += 1) {
+        const desc = c.av_pix_fmt_desc_get(fmts[i]);
+        if (desc != null and (desc.*.flags & c.AV_PIX_FMT_FLAG_HWACCEL) == 0) return fmts[i];
+    }
+    return fmts[0];
+}
+
+/// Ultimo stato hwaccel loggato (null = mai): un log solo quando il percorso
+/// cambia, non a ogni open (i poster aprono un Player per ogni anteprima).
+var vaapi_last_logged: ?bool = null;
+
 pub const Player = struct {
     fmt_ctx: [*c]c.AVFormatContext,
     codec_ctx: [*c]c.AVCodecContext,
@@ -66,6 +102,11 @@ pub const Player = struct {
     video_stream: c_int,
     time_base: f64, // secondi per unità di PTS dello stream video
     duration_s: f64, // durata del container in secondi (0 se ignota)
+    // Alcuni container (tipici AVI) non danno PTS per-frame → best_effort_timestamp
+    // resta a 0/NOPTS su tutti i frame e il pacing si blocca. Fallback: PTS
+    // sintetizzato da un contatore di frame diviso il frame rate.
+    frame_rate: f64 = 25.0, // fps dello stream (per il PTS sintetico)
+    frame_index: i64 = 0, // frame decodificati (avanza; azzerato/rimappato al seek)
 
     // Contesto di scaling riusato tra i frame; ricreato se cambiano le dimensioni.
     sws: ?*c.struct_SwsContext = null,
@@ -81,8 +122,48 @@ pub const Player = struct {
     cvp9_ctx: if (cvp9_enabled) ?cvp9.Ctx else void = if (cvp9_enabled) null else {},
     is_vp9: bool = false,
 
+    // Decodifica hardware VAAPI: device context (ref del player, oltre a quella
+    // trattenuta dal codec context), frame CPU riusato per il download GPU→CPU
+    // dei frame AV_PIX_FMT_VAAPI e guardia per loggare una sola volta
+    // l'eventuale degrado a software durante la riproduzione.
+    hw_device_ctx: [*c]c.AVBufferRef = null,
+    sw_frame: [*c]c.AVFrame = null,
+    hw_active: bool = false,
+    hw_warned: bool = false,
+
+    // Formato di uscita e buffer di scaling. Il player live (`Player.open`) emette
+    // RGBA (il formato di presentazione) riusando `scratch`: niente malloc per-frame
+    // né passaggio scalare RGB→RGBA a valle. `nextFrame` restituisce allora un Frame
+    // che PRESTA `scratch`, valido fino alla chiamata successiva o a `deinit`. Il
+    // poster one-shot (`openEx(…, false)`/`firstVideoFrame`) resta invece su RGB24 di
+    // proprietà del chiamante (lo consuma `decoder.ImageData`, RGB 24-bit).
+    out_fmt: c_int = c.AV_PIX_FMT_RGB24,
+    out_bpp: usize = 3,
+    reuse: bool = false,
+    scratch: []u8 = &.{},
+    scratch_gpa: ?std.mem.Allocator = null,
+
     pub fn open(path: [*:0]const u8) Error!Player {
-        return openEx(path, true);
+        var p = try openEx(path, true);
+        // Player live: emette RGBA riusando il buffer di scaling.
+        p.out_fmt = c.AV_PIX_FMT_RGBA;
+        p.out_bpp = 4;
+        p.reuse = true;
+        return p;
+    }
+
+    /// Buffer di destinazione per `need` byte: con `reuse` cresce `scratch` solo se
+    /// necessario e ne PRESTA una fetta; altrimenti alloca di proprietà del chiamante.
+    fn outBuf(self: *Player, need: usize, allocator: std.mem.Allocator) Error![]u8 {
+        if (!self.reuse) return allocator.alloc(u8, need) catch return Error.OutOfMemory;
+        if (self.scratch.len < need) {
+            self.scratch = if (self.scratch.len == 0)
+                allocator.alloc(u8, need) catch return Error.OutOfMemory
+            else
+                allocator.realloc(self.scratch, need) catch return Error.OutOfMemory;
+            self.scratch_gpa = allocator;
+        }
+        return self.scratch[0..need];
     }
 
     /// `allow_cvp9` = consenti il decoder GPU per gli stream VP9. Il poster
@@ -99,13 +180,86 @@ pub const Player = struct {
         if (stream_idx < 0 or codec == null) return Error.NoVideoStream;
         const stream = fmt_ctx.*.streams[@intCast(stream_idx)];
 
-        const codec_ctx = c.avcodec_alloc_context3(codec) orelse return Error.AllocFailed;
+        var codec_ctx = c.avcodec_alloc_context3(codec) orelse return Error.AllocFailed;
         errdefer {
             var cc: [*c]c.AVCodecContext = codec_ctx;
             c.avcodec_free_context(&cc);
         }
         if (c.avcodec_parameters_to_context(codec_ctx, stream.*.codecpar) < 0) return Error.CodecOpenFailed;
-        if (c.avcodec_open2(codec_ctx, codec, null) < 0) return Error.CodecOpenFailed;
+
+        // Decodifica hardware VAAPI: prova il device di default (/dev/dri) e
+        // verifica che il decoder supporti il metodo hw_device_ctx con VAAPI.
+        // Qualsiasi mancanza → software puro, in silenzio (il log è più giù).
+        // Il pix_fmt hw per VAAPI è sempre AV_PIX_FMT_VAAPI: pickVaapiFormat lo
+        // usa come costante, senza bisogno di stato condiviso col callback.
+        var hw_device_ctx: [*c]c.AVBufferRef = null;
+        errdefer c.av_buffer_unref(&hw_device_ctx);
+        var use_hw = false;
+        if (c.av_hwdevice_ctx_create(&hw_device_ctx, c.AV_HWDEVICE_TYPE_VAAPI, null, null, 0) >= 0) {
+            var ci: c_int = 0;
+            while (c.avcodec_get_hw_config(codec, ci)) |cfg| : (ci += 1) {
+                if ((cfg.*.methods & c.AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) != 0 and
+                    cfg.*.device_type == c.AV_HWDEVICE_TYPE_VAAPI)
+                {
+                    use_hw = true;
+                    break;
+                }
+            }
+            if (use_hw) {
+                const dev_ref = c.av_buffer_ref(hw_device_ctx);
+                if (dev_ref != null) {
+                    codec_ctx.*.hw_device_ctx = dev_ref;
+                    codec_ctx.*.get_format = pickVaapiFormat;
+                } else use_hw = false;
+            }
+            if (!use_hw) c.av_buffer_unref(&hw_device_ctx);
+        }
+
+        if (use_hw) {
+            // Con VAAPI il frame-threading non serve (decodifica la GPU) e
+            // aggiunge solo latenza di pipeline: un thread solo, tipi azzerati.
+            codec_ctx.*.thread_count = 1;
+            codec_ctx.*.thread_type = 0;
+        } else {
+            // Decodifica multi-thread: `thread_count = 0` = auto (n. core logici), con
+            // threading sia a livello di frame che di slice. È la leva principale sulle
+            // performance: un H.264/HEVC HD su un solo core non regge 30/60 fps.
+            codec_ctx.*.thread_count = 0;
+            codec_ctx.*.thread_type = c.FF_THREAD_FRAME | c.FF_THREAD_SLICE;
+        }
+        if (c.avcodec_open2(codec_ctx, codec, null) < 0) {
+            if (!use_hw) return Error.CodecOpenFailed;
+            // Alcuni driver accettano il device ma rifiutano il profilo solo
+            // alla open: ritenta UNA volta in software puro, con un contesto
+            // nuovo (quello fallito può essere in uno stato indefinito).
+            use_hw = false;
+            c.av_buffer_unref(&hw_device_ctx);
+            var cc: [*c]c.AVCodecContext = codec_ctx;
+            c.avcodec_free_context(&cc);
+            codec_ctx = null; // l'errdefer non deve rivedere il puntatore morto
+            codec_ctx = c.avcodec_alloc_context3(codec) orelse return Error.AllocFailed;
+            if (c.avcodec_parameters_to_context(codec_ctx, stream.*.codecpar) < 0) return Error.CodecOpenFailed;
+            codec_ctx.*.thread_count = 0;
+            codec_ctx.*.thread_type = c.FF_THREAD_FRAME | c.FF_THREAD_SLICE;
+            if (c.avcodec_open2(codec_ctx, codec, null) < 0) return Error.CodecOpenFailed;
+        }
+
+        // Frame CPU per il download dei frame VAAPI (allocato una volta,
+        // unref-ato a ogni iterazione in frameFromCurrent).
+        var sw_frame: [*c]c.AVFrame = null;
+        errdefer c.av_frame_free(&sw_frame);
+        if (use_hw) sw_frame = c.av_frame_alloc() orelse return Error.AllocFailed;
+
+        // Log una tantum (solo al cambio di percorso) così l'utente può
+        // verificare se la decodifica hardware è attiva.
+        if (vaapi_last_logged != use_hw) {
+            vaapi_last_logged = use_hw;
+            if (use_hw) {
+                std.log.info("zuer video: decodifica VAAPI attiva (codec {s})", .{std.mem.span(codec.*.name)});
+            } else {
+                std.log.info("zuer video: decodifica software (codec {s})", .{std.mem.span(codec.*.name)});
+            }
+        }
 
         const frame = c.av_frame_alloc() orelse return Error.AllocFailed;
         errdefer {
@@ -148,6 +302,16 @@ pub const Player = struct {
             }
         }
 
+        // Frame rate per il PTS sintetico: avg_frame_rate, poi r_frame_rate, poi 25.
+        const afr = stream.*.avg_frame_rate;
+        const rfr = stream.*.r_frame_rate;
+        const frame_rate: f64 = if (afr.num > 0 and afr.den > 0)
+            @as(f64, @floatFromInt(afr.num)) / @as(f64, @floatFromInt(afr.den))
+        else if (rfr.num > 0 and rfr.den > 0)
+            @as(f64, @floatFromInt(rfr.num)) / @as(f64, @floatFromInt(rfr.den))
+        else
+            25.0;
+
         return .{
             .fmt_ctx = fmt_ctx,
             .codec_ctx = codec_ctx,
@@ -156,16 +320,26 @@ pub const Player = struct {
             .video_stream = stream_idx,
             .time_base = time_base,
             .duration_s = duration_s,
+            .frame_rate = frame_rate,
             .cvp9_ctx = cvp9_ctx,
             .is_vp9 = is_vp9,
+            .hw_device_ctx = hw_device_ctx,
+            .sw_frame = sw_frame,
+            .hw_active = use_hw,
         };
     }
 
     pub fn deinit(self: *Player) void {
+        if (self.scratch_gpa) |g| g.free(self.scratch);
         if (comptime cvp9_enabled) {
             if (self.cvp9_ctx) |cx| cx.destroy();
         }
         if (self.sws) |s| c.sws_freeContext(s);
+        // Risorse VAAPI: frame CPU di download e ref del device (il codec
+        // context libera la propria in avcodec_free_context).
+        var sf: [*c]c.AVFrame = self.sw_frame;
+        c.av_frame_free(&sf);
+        c.av_buffer_unref(&self.hw_device_ctx);
         var p: [*c]c.AVPacket = self.packet;
         c.av_packet_free(&p);
         var f: [*c]c.AVFrame = self.frame;
@@ -176,9 +350,16 @@ pub const Player = struct {
     }
 
     fn ptsSeconds(self: *Player) f64 {
+        const idx = self.frame_index;
+        self.frame_index += 1;
         const ts = self.frame.*.best_effort_timestamp;
-        if (ts == c.AV_NOPTS_VALUE) return 0;
-        return @as(f64, @floatFromInt(ts)) * self.time_base;
+        // PTS reale se disponibile e progressivo; altrimenti (AVI senza timestamp:
+        // ts=0/NOPTS su tutti i frame) sintetizzato da indice/fps così il pacing
+        // avanza invece di restare bloccato a 0.
+        if (ts != c.AV_NOPTS_VALUE and ts > 0 and self.time_base > 0) {
+            return @as(f64, @floatFromInt(ts)) * self.time_base;
+        }
+        return @as(f64, @floatFromInt(idx)) / self.frame_rate;
     }
 
     /// Secondi da un timestamp grezzo nella time_base dello stream (per i frame cvp9,
@@ -201,17 +382,83 @@ pub const Player = struct {
                 _ = c.avcodec_send_packet(self.codec_ctx, null);
                 const r = c.avcodec_receive_frame(self.codec_ctx, self.frame);
                 if (r < 0) return null;
-                return try self.scaleCurrent(max_dim, allocator);
+                // Se il download hw fallisse proprio all'ultimo frame (null),
+                // il file finisce qui comunque: nessun frame da recuperare.
+                return try self.frameFromCurrent(max_dim, allocator);
             }
             defer c.av_packet_unref(self.packet);
             if (self.packet.*.stream_index != self.video_stream) continue;
-            if (c.avcodec_send_packet(self.codec_ctx, self.packet) < 0) continue;
+            const sr = c.avcodec_send_packet(self.codec_ctx, self.packet);
+            if (sr == c.AVERROR(c.EAGAIN)) {
+                // Decoder pieno (frame-threading): l'API garantisce che c'è un frame
+                // in uscita. Drenalo e ri-sottometti lo STESSO packet — scartarlo
+                // (il vecchio `continue`) perdeva frame. Dopo il drenaggio il
+                // send è accettato; il packet viene poi unref-ato dal defer.
+                const rd = c.avcodec_receive_frame(self.codec_ctx, self.frame);
+                if (rd < 0) continue; // stato anomalo: rinuncia a questo packet
+                _ = c.avcodec_send_packet(self.codec_ctx, self.packet);
+                if (try self.frameFromCurrent(max_dim, allocator)) |fr| return fr;
+                continue; // download hw fallito: degradato, prosegui in software
+            }
+            if (sr < 0) continue; // errore vero: packet inservibile
             const r = c.avcodec_receive_frame(self.codec_ctx, self.frame);
             if (r == c.AVERROR(c.EAGAIN)) continue; // servono altri packet
             if (r == c.AVERROR_EOF) return null;
             if (r < 0) return Error.NoFrameDecoded;
-            return try self.scaleCurrent(max_dim, allocator);
+            if (try self.frameFromCurrent(max_dim, allocator)) |fr| return fr;
+            continue; // download hw fallito: degradato, prosegui in software
         }
+    }
+
+    /// Frame appena decodificato (`self.frame`) → Frame impacchettato. Se il
+    /// decoder ha prodotto un frame VAAPI lo scarica prima in `sw_frame`
+    /// (GPU→CPU, tipicamente NV12); se il download fallisce degrada l'intera
+    /// riproduzione a software e ritorna null: il chiamante prosegue col
+    /// prossimo packet, che verrà decodificato dal nuovo contesto software.
+    fn frameFromCurrent(self: *Player, max_dim: usize, allocator: std.mem.Allocator) Error!?Frame {
+        var src: [*c]c.AVFrame = self.frame;
+        if (self.frame.*.format == c.AV_PIX_FMT_VAAPI) {
+            var ok = self.sw_frame != null;
+            if (ok) {
+                c.av_frame_unref(self.sw_frame);
+                ok = c.av_hwframe_transfer_data(self.sw_frame, self.frame, 0) >= 0;
+            }
+            if (!ok) {
+                if (!self.hw_warned) {
+                    self.hw_warned = true;
+                    std.log.warn("zuer video: download frame VAAPI fallito, degrado a decodifica software", .{});
+                }
+                if (!self.reopenSoftware()) return Error.NoFrameDecoded;
+                return null;
+            }
+            // Timestamp del frame hw anche sul frame scaricato, per coerenza
+            // (ptsSeconds legge comunque self.frame, che li possiede).
+            self.sw_frame.*.pts = self.frame.*.pts;
+            self.sw_frame.*.best_effort_timestamp = self.frame.*.best_effort_timestamp;
+            src = self.sw_frame;
+        }
+        return try self.scaleCurrent(src, max_dim, allocator);
+    }
+
+    /// Riapre il codec context in software puro dopo un fallimento runtime del
+    /// percorso VAAPI. Il decode riparte pulito dal prossimo keyframe. Ritorna
+    /// false se la riapertura non riesce: il player non è più utilizzabile e il
+    /// chiamante deve propagare un errore (mai continuare con un ctx nullo).
+    fn reopenSoftware(self: *Player) bool {
+        self.hw_active = false;
+        c.av_buffer_unref(&self.hw_device_ctx);
+        const stream = self.fmt_ctx.*.streams[@intCast(self.video_stream)];
+        const codec = c.avcodec_find_decoder(stream.*.codecpar.*.codec_id);
+        if (codec == null) return false;
+        var cc: [*c]c.AVCodecContext = self.codec_ctx;
+        c.avcodec_free_context(&cc);
+        self.codec_ctx = null; // deinit non deve rivedere il puntatore morto
+        self.codec_ctx = c.avcodec_alloc_context3(codec) orelse return false;
+        if (c.avcodec_parameters_to_context(self.codec_ctx, stream.*.codecpar) < 0) return false;
+        self.codec_ctx.*.thread_count = 0;
+        self.codec_ctx.*.thread_type = c.FF_THREAD_FRAME | c.FF_THREAD_SLICE;
+        if (c.avcodec_open2(self.codec_ctx, codec, null) < 0) return false;
+        return true;
     }
 
     /// Percorso VP9 su GPU: sottomette i packet grezzi a cvp9 e raccoglie i frame
@@ -251,13 +498,12 @@ pub const Player = struct {
 
         const w: usize = @intCast(dims.w);
         const h: usize = @intCast(dims.h);
-        const pixels = try allocator.alloc(u8, w * h * 3);
-        errdefer allocator.free(pixels);
+        const pixels = try self.outBuf(w * h * self.out_bpp, allocator);
 
         var src_data = [_][*c]u8{ f.y, f.u, f.v, null };
         var src_linesize = [_]c_int{ @intCast(f.stride_y), @intCast(f.stride_uv), @intCast(f.stride_uv), 0 };
         var dst_data = [_][*c]u8{ pixels.ptr, null, null, null };
-        var dst_linesize = [_]c_int{ @intCast(w * 3), 0, 0, 0 };
+        var dst_linesize = [_]c_int{ @intCast(w * self.out_bpp), 0, 0, 0 };
         _ = c.sws_scale(self.sws, &src_data[0], &src_linesize[0], 0, src_h, &dst_data[0], &dst_linesize[0]);
 
         return .{ .width = w, .height = h, .pixels = pixels, .pts_s = self.rawPtsSeconds(f.pts) };
@@ -275,7 +521,7 @@ pub const Player = struct {
             c.sws_freeContext(s);
             self.sws = null;
         }
-        const sws = c.sws_getContext(src_w, src_h, src_fmt, dst_w, dst_h, c.AV_PIX_FMT_RGB24, c.SWS_BILINEAR, null, null, null) orelse return Error.ScaleInitFailed;
+        const sws = c.sws_getContext(src_w, src_h, src_fmt, dst_w, dst_h, self.out_fmt, c.SWS_FAST_BILINEAR, null, null, null) orelse return Error.ScaleInitFailed;
         self.sws = sws;
         self.sws_src_w = src_w;
         self.sws_src_h = src_h;
@@ -284,21 +530,22 @@ pub const Player = struct {
         self.sws_dst_h = dst_h;
     }
 
-    /// Converte `self.frame` in RGB24 impacchettato scalato a `max_dim`.
-    fn scaleCurrent(self: *Player, max_dim: usize, allocator: std.mem.Allocator) Error!Frame {
-        const src_w = self.frame.*.width;
-        const src_h = self.frame.*.height;
+    /// Converte `src` (self.frame, oppure sw_frame dopo il download VAAPI) in
+    /// pixel impacchettati scalati a `max_dim`. ensureSws è keyed anche sul
+    /// formato sorgente, quindi il passaggio dinamico YUV420P↔NV12 è coperto.
+    fn scaleCurrent(self: *Player, src: [*c]c.AVFrame, max_dim: usize, allocator: std.mem.Allocator) Error!Frame {
+        const src_w = src.*.width;
+        const src_h = src.*.height;
         const dims = fitDims(src_w, src_h, max_dim);
-        try self.ensureSws(src_w, src_h, self.frame.*.format, dims.w, dims.h);
+        try self.ensureSws(src_w, src_h, src.*.format, dims.w, dims.h);
 
         const w: usize = @intCast(dims.w);
         const h: usize = @intCast(dims.h);
-        const pixels = try allocator.alloc(u8, w * h * 3);
-        errdefer allocator.free(pixels);
+        const pixels = try self.outBuf(w * h * self.out_bpp, allocator);
 
         var dst_data = [_][*c]u8{ pixels.ptr, null, null, null };
-        var dst_linesize = [_]c_int{ @intCast(w * 3), 0, 0, 0 };
-        _ = c.sws_scale(self.sws, &self.frame.*.data[0], &self.frame.*.linesize[0], 0, src_h, &dst_data[0], &dst_linesize[0]);
+        var dst_linesize = [_]c_int{ @intCast(w * self.out_bpp), 0, 0, 0 };
+        _ = c.sws_scale(self.sws, &src.*.data[0], &src.*.linesize[0], 0, src_h, &dst_data[0], &dst_linesize[0]);
 
         return .{ .width = w, .height = h, .pixels = pixels, .pts_s = self.ptsSeconds() };
     }
@@ -306,11 +553,19 @@ pub const Player = struct {
     /// Riposiziona la riproduzione a `seconds` (approssimato al keyframe più
     /// vicino) e svuota i buffer del decoder.
     pub fn seek(self: *Player, seconds: f64) void {
-        const ts: i64 = if (self.time_base > 0)
-            @intFromFloat(seconds / self.time_base)
-        else
-            @intFromFloat(seconds * @as(f64, c.AV_TIME_BASE));
-        _ = c.av_seek_frame(self.fmt_ctx, self.video_stream, ts, c.AVSEEK_FLAG_BACKWARD);
+        if (self.time_base > 0) {
+            const ts: i64 = @intFromFloat(seconds / self.time_base);
+            _ = c.av_seek_frame(self.fmt_ctx, self.video_stream, ts, c.AVSEEK_FLAG_BACKWARD);
+        } else {
+            // Senza time_base il ts è in unità AV_TIME_BASE: va passato con stream
+            // index -1 (default), altrimenti verrebbe interpretato nella time_base
+            // dello stream video → seek a una posizione sbagliata.
+            const ts: i64 = @intFromFloat(seconds * @as(f64, c.AV_TIME_BASE));
+            _ = c.av_seek_frame(self.fmt_ctx, -1, ts, c.AVSEEK_FLAG_BACKWARD);
+        }
+        // Rimappa il contatore del PTS sintetico al punto di seek (per gli AVI
+        // senza timestamp, così il pacing riprende coerente dalla nuova posizione).
+        self.frame_index = @intFromFloat(@max(0, seconds) * self.frame_rate);
         if (comptime cvp9_enabled) {
             if (self.is_vp9) {
                 // cvp9 non ha una flush: ricrea il contesto per azzerare i frame di
