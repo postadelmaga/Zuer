@@ -82,6 +82,11 @@ pub const VideoState = struct {
     // oscilloscopio disegnato dai campioni live (`drawOscilloscope`). La stessa
     // macchina di controlli/seek/pausa del video vale identica.
     audio_only: bool = false,
+    // Testina di lettura dell'oscilloscopio (indice ASSOLUTO di campione, stesse
+    // unità di `AudioPlayer.scopeWritten`). Avanza al wall-clock (`dt·rate`) così il
+    // tracciato scorre in continuo tra un blocco audio e l'altro; si riaggancia se
+    // esce dai campioni validi (pausa, seek, underrun).
+    scope_head: f64 = 0,
 
     pub fn isActive(self: *const VideoState) bool {
         return self.player != null or self.audio_only;
@@ -105,6 +110,7 @@ pub const VideoState = struct {
         self.catchup_until = -1;
         self.audio_clk_prev = -1;
         self.audio_only = false;
+        self.scope_head = 0;
     }
 };
 
@@ -378,17 +384,23 @@ pub fn advanceVideo(sink: FrameSink, vs: *VideoState, dt: f32) bool {
 /// a parte con `drawOscilloscope`. Ritorna true in riproduzione (il tracciato si
 /// muove → il chiamante ripresenta) e false in pausa (frame congelato).
 pub fn advanceAudio(vs: *VideoState, dt: f32) bool {
-    _ = dt;
     if (comptime @import("build_options").video) {
         if (vs.seek_to >= 0) {
             if (vs.audio) |a| a.seek(vs.seek_to);
             vs.pos_s = vs.seek_to;
             vs.seek_to = -1;
+            vs.scope_head = 0; // fuori banda → il draw riaggancia al nuovo flusso
         } else if (vs.audio) |a| {
             a.setPlaying(vs.playing);
             // Il clock audio è la verità: in pausa è fermo, a fine brano l'auto-loop
             // del thread audio lo riporta a 0 e la barra riparte da capo.
-            if (vs.playing) vs.pos_s = a.clockSeconds();
+            if (vs.playing) {
+                vs.pos_s = a.clockSeconds();
+                // Testina al wall-clock: scorre di `dt·rate` campioni. In pausa NON
+                // avanza (frame congelato). Il clamp entro la banda valida del ring
+                // (e il riaggancio se ne esce) sta nel draw, che rilegge `scope_w`.
+                vs.scope_head += @as(f64, dt) * AudioPlayer.scope_rate;
+            }
         }
         if (vs.dur_s > 0 and vs.pos_s > vs.dur_s) vs.pos_s = vs.dur_s;
         return vs.playing;
@@ -450,7 +462,21 @@ pub fn drawOscilloscope(buf: []u8, W: u32, H: u32, vs: *VideoState) void {
     // colonne della finestra, con linea connessa tra colonne adiacenti.
     var samples: [2048]f32 = undefined;
     const n: usize = @min(samples.len, @max(@as(usize, 1), @as(usize, W)));
-    a.copyScope(samples[0..n]);
+
+    // Testina di lettura ancorata al wall-clock (avanzata in `advanceAudio`),
+    // riclampata sulla banda valida del ring RILEGGENDO `scope_w` ora: la finestra
+    // deve terminare in `[scope_w - (cap - n) , scope_w]` o leggerebbe campioni già
+    // sovrascritti. Fuori banda (pausa lunga, seek, underrun) → riaggancia ~64 ms
+    // dietro l'ultimo campione, con margine per scorrere senza gelare.
+    const cap = AudioPlayer.scope_capacity;
+    const w = a.scopeWritten();
+    const min_end: usize = if (w > cap - n) w - (cap - n) else 0;
+    var end: usize = if (vs.scope_head <= 0) 0 else @intFromFloat(vs.scope_head);
+    if (end > w or end < min_end) {
+        end = if (w > 3072) w - 3072 else w;
+        vs.scope_head = @floatFromInt(end);
+    }
+    a.copyScopeAt(samples[0..n], end);
 
     const amp: f32 = @as(f32, @floatFromInt(H)) * 0.44;
     const den: usize = @max(@as(usize, 1), @as(usize, W) - 1);

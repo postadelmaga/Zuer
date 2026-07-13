@@ -37,9 +37,11 @@ const OUT_CH: c_int = 2;
 // il "sottomesso" meno questa latenza stimata, così il video non anticipa.
 const LATENCY_S: f64 = 0.12;
 
-/// Campioni (mono) tenuti in coda per l'oscilloscopio del player audio (~85 ms a
-/// 48 kHz). Potenza di 2 → il modulo sul ring è un semplice AND.
-const scope_len: usize = 4096;
+/// Campioni (mono) tenuti in coda per l'oscilloscopio del player audio (~170 ms a
+/// 48 kHz). Potenza di 2 → il modulo sul ring è un semplice AND. Abbondante rispetto
+/// alla finestra mostrata (~43 ms) così la testina di lettura ancorata al wall-clock
+/// ha margine per scorrere senza uscire dai campioni validi.
+const scope_len: usize = 8192;
 
 pub const AudioPlayer = struct {
     fmt_ctx: [*c]c.AVFormatContext,
@@ -175,16 +177,27 @@ pub const AudioPlayer = struct {
         self.playing.store(on, .monotonic);
     }
 
-    /// Copia gli ultimi `dst.len` campioni mono (dal più vecchio al più recente)
-    /// nel buffer del visualizzatore. Prima che sia stato prodotto abbastanza, le
-    /// posizioni non ancora riempite restano a 0 (linea piatta).
-    pub fn copyScope(self: *const AudioPlayer, dst: []f32) void {
-        const w = self.scope_w.load(.monotonic);
+    /// Capacità del ring dell'oscilloscopio e cadenza di uscita: servono al
+    /// visualizzatore per ancorare la testina di lettura entro i campioni validi.
+    pub const scope_capacity: usize = scope_len;
+    pub const scope_rate: f64 = 48_000.0;
+
+    /// Totale campioni (mono) scritti finora nel ring: indice assoluto del prossimo.
+    pub fn scopeWritten(self: *const AudioPlayer) usize {
+        return self.scope_w.load(.monotonic);
+    }
+
+    /// Copia `dst.len` campioni mono che TERMINANO all'indice assoluto `end_abs`
+    /// (dal più vecchio al più recente). Le posizioni che precedono l'inizio del
+    /// prodotto restano a 0. Il chiamante deve tenere `end_abs` entro la finestra
+    /// valida del ring (`[scopeWritten - scope_capacity, scopeWritten]`); oltre, i
+    /// campioni sarebbero già sovrascritti.
+    pub fn copyScopeAt(self: *const AudioPlayer, dst: []f32, end_abs: usize) void {
         const n = dst.len;
         var i: usize = 0;
         while (i < n) : (i += 1) {
-            const back = n - i; // 1 = campione più recente
-            dst[i] = if (back > w) 0 else self.scope[(w - back) & (scope_len - 1)];
+            const back = n - i; // 1 = campione a `end_abs`
+            dst[i] = if (back > end_abs) 0 else self.scope[(end_abs - back) & (scope_len - 1)];
         }
     }
 
