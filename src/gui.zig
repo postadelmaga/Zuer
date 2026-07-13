@@ -530,17 +530,15 @@ fn renderWorker(
             // dorme oltre (fa resync senza burst) e fornisce solo il dt. Su
             // Win32/finestra occlusa waitFrame ritorna subito o a timeout e
             // resta il solo pacing software di prima.
-            if (do_present and busy and !audio_only) _ = win.waitFrame(20);
-            // In riproduzione: video a 120 Hz così il confine di ogni frame (30 fps →
-            // 33 ms) è rilevato entro ~8 ms → cadenza regolare; l'oscilloscopio audio
-            // basta a 60 Hz (il tracciato si aggiorna a blocchi di ~20 ms). A riposo
-            // (pausa, controlli fermi) 20 Hz.
-            frame_dt = @min(0.1, @as(f32, @floatCast(if (!busy)
-                pacer_20.tick()
-            else if (audio_only)
-                pacer_60.tick()
-            else
-                pacer_vid.tick())));
+            // Anche l'audio si aggancia al vsync via waitFrame: è LUI a dare la
+            // cadenza fluida (~refresh dello schermo), il pacer sotto fornisce solo
+            // il dt. Saltarlo (com'era) lasciava l'oscilloscopio al solo pacer
+            // software → present non sincronizzati col compositor e scatti percepiti.
+            if (do_present and busy) _ = win.waitFrame(20);
+            // In riproduzione: clock a 120 Hz così, dopo il waitFrame (vsync), il
+            // pacer NON dorme oltre e fornisce solo il dt. A riposo (pausa, controlli
+            // fermi) 20 Hz. Video e audio condividono lo stesso percorso.
+            frame_dt = @min(0.1, @as(f32, @floatCast(if (busy) pacer_vid.tick() else pacer_20.tick())));
             continue;
         }
 
