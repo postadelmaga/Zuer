@@ -34,8 +34,9 @@ fn sleepMs(ms: u32) void {
 const OUT_RATE: c_int = 48_000;
 const OUT_CH: c_int = 2;
 // Il device bufferizza ~qualche decina di ms davanti al "consumato"; il clock è
-// il "sottomesso" meno questa latenza stimata, così il video non anticipa.
-const LATENCY_S: f64 = 0.12;
+// il "sottomesso" meno questa latenza stimata, così il video non anticipa. Allineato
+// al ring PipeWire di zicro (4 quanti da 256 @48k ≈ 21 ms + latenza grafo ≈ 26 ms).
+const LATENCY_S: f64 = 0.03;
 
 /// Campioni (mono) tenuti in coda per l'oscilloscopio del player audio (~170 ms a
 /// 48 kHz). Potenza di 2 → il modulo sul ring è un semplice AND. Abbondante rispetto
