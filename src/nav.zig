@@ -253,6 +253,11 @@ pub fn applyDecoded(state: *GuiAppState, new_decoded: decoder_mod.Decoded, stage
     state.shared.is_text = (state.shared.decoded != .mesh and state.shared.decoded != .image);
     state.shared.is_table = state.shared.decoded == .csv or state.shared.decoded == .workbook;
 
+    // Listato di un archivio (tabella + path base senza `#voce`): parte con la
+    // prima riga selezionata, così ↑/↓/Invio navigano subito. Altrimenti niente
+    // selezione riga (-1).
+    state.shared.table_sel_row = if (state.shared.is_table and gui_state_mod.isArchiveListing(path_copy)) 0 else -1;
+
     // Il prefetch prepara lo staging solo per le mesh: se per qualsiasi motivo
     // arriva uno stage per un non-mesh, liberalo qui (solo il ramo mesh lo usa).
     if (!state.shared.is_mesh) {
@@ -382,8 +387,17 @@ fn isMidiPath(path: []const u8) bool {
 
 pub fn startVideo(state: *GuiAppState, path: []const u8) bool {
     const first = videomod.setupVideo(&state.video, path, state.gpa) catch |e| {
-        std.debug.print("Video non apribile ({s})\n", .{@errorName(e)});
-        return false;
+        // Nessuno stream video (mp3, wav, flac…): apri come audio-only →
+        // oscilloscopio stile Winamp, riusando la stessa finestra/controlli.
+        const af = videomod.setupAudio(&state.video, path, state.gpa) catch |e2| {
+            std.debug.print("Media non apribile (video: {s}, audio: {s})\n", .{ @errorName(e), @errorName(e2) });
+            return false;
+        };
+        state.gpa.free(state.shared.static_rgba);
+        state.shared.static_rgba = af.rgba;
+        state.shared.static_w = af.w;
+        state.shared.static_h = af.h;
+        return true;
     };
     state.gpa.free(state.shared.static_rgba);
     state.shared.static_rgba = first.rgba;

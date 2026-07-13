@@ -6,34 +6,57 @@ const Decoded = decoder.Decoded;
 /// l'apertura di archivi con centinaia di migliaia di voci.
 const max_entries: usize = 10_000;
 
-pub fn decode(bytes: []const u8, allocator: std.mem.Allocator) Decoded {
-    defer allocator.free(bytes);
-    return decodeZip(bytes, allocator) catch |err| {
+/// La central directory è proporzionale al NUMERO di voci, non ai dati compressi.
+/// 256 MiB coprono qualche milione di entry: oltre, si legge solo questo prefisso
+/// della CD (il conteggio totale resta esatto, dall'EOCD). Così un archivio da
+/// molti GB si apre leggendo solo la coda + la CD, mai i dati.
+const max_cd_bytes: u64 = 256 * 1024 * 1024;
+
+/// Decodifica lavorando dal PATH (mai caricando l'intero file): individua la
+/// central directory con il seeking dello stdlib e ne legge solo i byte.
+pub fn decode(path: []const u8, io: std.Io, allocator: std.mem.Allocator) Decoded {
+    var clean_path = path;
+    if (std.mem.indexOfScalar(u8, path, '#')) |h| clean_path = path[0..h];
+    return decodeZip(clean_path, io, allocator) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "Errore lettura archivio ZIP: {s}", .{@errorName(err)}) catch "Errore archivio";
         return .{ .err = msg };
     };
 }
 
-/// Legge la central directory ZIP direttamente dal buffer in memoria e produce
-/// una tabella (stesso render dei CSV): nome, dimensione, compressa, metodo.
-fn decodeZip(bytes: []const u8, allocator: std.mem.Allocator) !Decoded {
-    // End of central directory: si cerca la signature dal fondo. Non si usa
-    // std.zip.EndRecord.findBuffer perché in questa stdlib non compila
-    // (ritorna error.EndOfStream fuori dal proprio error set).
-    const end_pos = std.mem.lastIndexOf(u8, bytes, &std.zip.end_record_sig) orelse return error.ZipNoEndRecord;
-    if (end_pos + 22 > bytes.len) return error.ZipTruncated;
+fn decodeZip(path: []const u8, io: std.Io, allocator: std.mem.Allocator) !Decoded {
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
 
-    var entry_count: u64 = std.mem.readInt(u16, bytes[end_pos + 10 ..][0..2], .little);
-    var cd_offset: u64 = std.mem.readInt(u32, bytes[end_pos + 16 ..][0..4], .little);
+    var rbuf: [8192]u8 = undefined;
+    var reader = file.reader(io, &rbuf);
 
-    if (entry_count == std.math.maxInt(u16) or cd_offset == std.math.maxInt(u32)) {
-        // ZIP64: l'end record classico satura i campi, i valori reali sono nell'EndRecord64.
-        const pos64 = std.mem.lastIndexOf(u8, bytes, &std.zip.end_record64_sig) orelse return error.Zip64RecordMissing;
-        if (pos64 + 56 > bytes.len) return error.ZipTruncated;
-        entry_count = std.mem.readInt(u64, bytes[pos64 + 32 ..][0..8], .little);
-        cd_offset = std.mem.readInt(u64, bytes[pos64 + 48 ..][0..8], .little);
-    }
+    // Individua la central directory (EOCD classico o ZIP64) col seeking dello
+    // stdlib — nessun caricamento del file. Servono solo posizione, dimensione e
+    // conteggio; l'iterazione vera e propria la fa il parser lenient sotto, che
+    // gestisce anche entry cifrate/insolite senza abortire tutto il listato.
+    const iter = try std.zip.Iterator.init(&reader);
+    const entry_count: u64 = iter.cd_record_count;
+    const cd_offset: u64 = iter.cd_zip_offset;
+    const cd_total: u64 = iter.cd_size;
 
+    // Legge SOLO la central directory (con tetto): proporzionale alle voci.
+    const cd_read: usize = @intCast(@min(cd_total, max_cd_bytes));
+    const cd = try allocator.alloc(u8, cd_read);
+    defer allocator.free(cd);
+    try reader.seekTo(cd_offset);
+    reader.interface.readSliceAll(cd) catch |err| switch (err) {
+        // Coda troncata rispetto a quanto dichiarato dall'EOCD: si parsa quel che c'è.
+        error.EndOfStream => {},
+        else => return error.ZipReadFailed,
+    };
+
+    return listFromCd(cd, entry_count, allocator);
+}
+
+/// Parsa la central directory (buffer che inizia esattamente a `cd_offset`) e
+/// produce la tabella. `entry_count` è il totale reale dall'EOCD: se il buffer è
+/// troncato dal tetto `max_cd_bytes` si mostra comunque il conteggio corretto.
+fn listFromCd(cd: []const u8, entry_count: u64, allocator: std.mem.Allocator) !Decoded {
     var rows = std.ArrayList([][]const u8).empty;
     errdefer {
         for (rows.items) |row| freeRow(allocator, row);
@@ -43,27 +66,27 @@ fn decodeZip(bytes: []const u8, allocator: std.mem.Allocator) !Decoded {
     var total_size: u64 = 0;
     var total_comp: u64 = 0;
     var listed: usize = 0;
-    var pos = std.math.cast(usize, cd_offset) orelse return error.ZipTruncated;
+    var pos: usize = 0;
 
     var i: u64 = 0;
     while (i < entry_count) : (i += 1) {
-        if (pos + 46 > bytes.len) break;
-        if (!std.mem.eql(u8, bytes[pos..][0..4], &std.zip.central_file_header_sig)) break;
+        if (pos + 46 > cd.len) break;
+        if (!std.mem.eql(u8, cd[pos..][0..4], &std.zip.central_file_header_sig)) break;
 
-        const method = std.mem.readInt(u16, bytes[pos + 10 ..][0..2], .little);
-        var comp_size: u64 = std.mem.readInt(u32, bytes[pos + 20 ..][0..4], .little);
-        var unc_size: u64 = std.mem.readInt(u32, bytes[pos + 24 ..][0..4], .little);
-        const name_len = std.mem.readInt(u16, bytes[pos + 28 ..][0..2], .little);
-        const extra_len = std.mem.readInt(u16, bytes[pos + 30 ..][0..2], .little);
-        const comment_len = std.mem.readInt(u16, bytes[pos + 32 ..][0..2], .little);
+        const method = std.mem.readInt(u16, cd[pos + 10 ..][0..2], .little);
+        var comp_size: u64 = std.mem.readInt(u32, cd[pos + 20 ..][0..4], .little);
+        var unc_size: u64 = std.mem.readInt(u32, cd[pos + 24 ..][0..4], .little);
+        const name_len = std.mem.readInt(u16, cd[pos + 28 ..][0..2], .little);
+        const extra_len = std.mem.readInt(u16, cd[pos + 30 ..][0..2], .little);
+        const comment_len = std.mem.readInt(u16, cd[pos + 32 ..][0..2], .little);
 
         const entry_end = pos + 46 + @as(usize, name_len) + extra_len + comment_len;
-        if (entry_end > bytes.len) break;
-        const name = bytes[pos + 46 ..][0..name_len];
+        if (entry_end > cd.len) break;
+        const name = cd[pos + 46 ..][0..name_len];
 
         // Dimensioni saturate a 0xFFFFFFFF: i valori reali sono nell'extra field ZIP64 (id 0x0001).
         if (unc_size == std.math.maxInt(u32) or comp_size == std.math.maxInt(u32)) {
-            var extra = bytes[pos + 46 + name_len ..][0..extra_len];
+            var extra = cd[pos + 46 + name_len ..][0..extra_len];
             while (extra.len >= 4) {
                 const id = std.mem.readInt(u16, extra[0..2], .little);
                 const sz = std.mem.readInt(u16, extra[2..4], .little);
@@ -95,17 +118,18 @@ fn decodeZip(bytes: []const u8, allocator: std.mem.Allocator) !Decoded {
         pos = entry_end;
     }
 
-    if (i < entry_count and listed < max_entries) return error.ZipCentralDirectoryCorrupt;
-
-    if (i > listed) {
-        const note = try std.fmt.allocPrint(allocator, "… altre {d} voci", .{i - listed});
+    // Voci non mostrate = totale reale (EOCD) meno quelle elencate. Conta sia le
+    // saltate per il tetto `max_entries`, sia quelle oltre il prefisso di CD letto
+    // (`i` si ferma al buffer): `i - listed` da solo le ometterebbe.
+    if (entry_count > listed) {
+        const note = try std.fmt.allocPrint(allocator, "… altre {d} voci", .{entry_count - listed});
         errdefer allocator.free(note);
         const row = try makeRawRow(allocator, note, "", "", "");
         try rows.append(allocator, row);
     }
 
     {
-        const label = try std.fmt.allocPrint(allocator, "TOTALE ({d} voci)", .{i});
+        const label = try std.fmt.allocPrint(allocator, "TOTALE ({d} voci)", .{entry_count});
         errdefer allocator.free(label);
         const size_str = try formatSize(allocator, total_size);
         errdefer allocator.free(size_str);
@@ -196,11 +220,13 @@ export fn zuer_decode(
     io_ptr: *const anyopaque,
     allocator_ptr: *const anyopaque,
 ) callconv(.c) decoder.DecodedC {
-    _ = path;
-    _ = io_ptr;
+    const io = @as(*const std.Io, @ptrCast(@alignCast(io_ptr))).*;
     const allocator = @as(*const std.mem.Allocator, @ptrCast(@alignCast(allocator_ptr))).*;
+    // Path-based (`zuer_content_prefix = 0`): l'host non ha caricato il file, ma
+    // per contratto il plugin libera comunque `content` (qui vuoto).
+    allocator.free(content.toSlice());
 
-    const decoded = decode(content.toSlice(), allocator);
+    const decoded = decode(path.toSlice(), io, allocator);
     return decoded.toDecodedC(allocator) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "error";
         return .{
@@ -214,6 +240,13 @@ const extensions = "zip,jar,apk,cbz,epub,xpi,whl";
 
 export fn zuer_extensions() callconv(.c) decoder.SliceC {
     return decoder.SliceC.fromSlice(extensions);
+}
+
+/// L'archivio si legge dal path via seeking (coda EOCD + sola central directory):
+/// l'host non deve caricare in RAM alcun byte del contenuto. Così anche archivi
+/// da molti GB si aprono istantaneamente.
+export fn zuer_content_prefix() callconv(.c) usize {
+    return 0;
 }
 
 /// Versione dell'ABI plugin con cui questo decoder è compilato: l'host la

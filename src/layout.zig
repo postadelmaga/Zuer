@@ -33,6 +33,12 @@ pub fn winKindFromExt(path: []const u8) WinKind {
     inline for (.{ "mp4", "mkv", "webm", "mov", "avi", "m4v", "wmv", "flv", "mpg", "mpeg", "ts" }) |e| {
         if (extLowerEql(ext, e)) return .video;
     }
+    // Audio comune: stesso percorso del player nativo (`.video`), ma senza stream
+    // video `setupVideo` fallisce e `startVideo` ripiega su `setupAudio` →
+    // oscilloscopio. mid/midi restano al loro synth dedicato, fuori da qui.
+    inline for (.{ "mp3", "wav", "flac", "ogg", "oga", "opus", "m4a", "aac", "wma", "aiff", "aif" }) |e| {
+        if (extLowerEql(ext, e)) return .video;
+    }
     inline for (.{ "csv", "tsv", "xlsx", "xls", "ods", "zip", "jar", "apk", "cbz", "epub", "xpi", "whl" }) |e| {
         if (extLowerEql(ext, e)) return .table;
     }

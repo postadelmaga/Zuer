@@ -42,6 +42,7 @@ const KEY_F: u32 = 33;
 const KEY_SPACE: u32 = 57;
 const KEY_0: u32 = 11;
 const KEY_Q: u32 = 16;
+const KEY_ENTER: u32 = 28;
 
 // Stato per il rilevamento del doppio-click sinistro (solo thread finestra).
 var last_click_ms: i64 = -1000;
@@ -159,6 +160,133 @@ pub fn clampImagePan(pan_x: *f32, pan_y: *f32, zoom: f32, W: u32, H: u32, sw: u3
 /// Scroll verticale fluido (rotella/tasti): accumula `delta` px nel buffer di
 /// smoothing low-pass della primitiva, che il worker applica in `tick` (stesso feel
 /// egui della rotella). Il clamp ai limiti del contenuto avviene nel `tick`.
+/// Una cella-nome è una voce apribile se non è una cartella (`/` finale) né una
+/// delle righe speciali di riepilogo generate dai decoder archivio.
+fn isOpenableEntryName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (name[name.len - 1] == '/') return false; // cartella
+    if (std.mem.startsWith(u8, name, "TOTALE")) return false;
+    if (std.mem.startsWith(u8, name, "…")) return false; // "… altre N voci" / "… elenco troncato"
+    return true;
+}
+
+/// Tasti per la navigazione dentro un archivio. Nel listato (path base, tabella):
+/// ↑/↓ spostano `table_sel_row` (saltando le righe di riepilogo) e Invio apre
+/// `archivio#voce`. Dentro una voce (`archivio#voce`): Esc torna al listato.
+/// Porta la riga selezionata `sel` dentro la viewport agendo sull'offset verticale
+/// della primitiva scroll condivisa (stessa che il worker `tick`-a). Da chiamare con
+/// `shared.mutex` già acquisito. No-op se la riga è già visibile: non "ruba" lo
+/// scroll all'utente quando la selezione si muove entro lo schermo.
+fn ensureRowVisible(app_state: *GuiAppState, win: *zrame.Window, sel: i32) void {
+    const m = app_state.shared.text_metrics;
+    if (m.line_h <= 0) return;
+    const line_h: f32 = @floatFromInt(m.line_h);
+    const pad_y: f32 = @floatFromInt(m.pad_y);
+    const vp_h: f32 = @floatFromInt(win.contentPx().h);
+    // Banda header pinnata (riga 0), identica a quella di gui.zig/compose.
+    const header_h = pad_y + line_h;
+    const row_top = pad_y + @as(f32, @floatFromInt(1 + sel)) * line_h; // riga dati
+    const row_bot = row_top + line_h;
+
+    var off = app_state.shared.sc.offset[1];
+    if (row_top - off < header_h) {
+        off = row_top - header_h; // riga sopra il bordo (sotto l'header) → scorri su
+    } else if (row_bot - off > vp_h) {
+        off = row_bot - vp_h; // riga sotto il bordo inferiore → scorri giù
+    } else return; // già visibile
+
+    const content_h: f32 = @floatFromInt(app_state.shared.static_h);
+    const max_off = @max(0.0, content_h - vp_h);
+    off = std.math.clamp(off, 0.0, max_off);
+    app_state.shared.sc.offset[1] = off;
+    app_state.shared.sc.vel[1] = 0; // taglia l'inerzia: salto netto alla riga
+}
+
+/// Ritorna true se il tasto è stato consumato.
+fn handleArchiveKey(app_state: *GuiAppState, win: *zrame.Window, key: u32) bool {
+    app_state.shared.mutex.lockUncancelable(app_state.io);
+    const path = app_state.shared.current_file_path;
+
+    // Esc dentro una voce → ricarica l'archivio base (strip del frammento).
+    if (key == KEY_ESC and gui_state_mod.isInsideArchive(path)) {
+        const hash = std.mem.indexOfScalar(u8, path, '#') orelse {
+            app_state.shared.mutex.unlock(app_state.io);
+            return false;
+        };
+        const base = app_state.gpa.dupe(u8, path[0..hash]) catch {
+            app_state.shared.mutex.unlock(app_state.io);
+            return false;
+        };
+        app_state.shared.mutex.unlock(app_state.io);
+        defer app_state.gpa.free(base);
+        nav.postLoad(app_state, base);
+        return true;
+    }
+
+    // Da qui in poi serve il listato di un archivio.
+    if (!gui_state_mod.isArchiveListing(path) or app_state.shared.decoded != .csv) {
+        app_state.shared.mutex.unlock(app_state.io);
+        return false;
+    }
+    const rows = app_state.shared.decoded.csv.rows;
+
+    // Ultimo indice apribile: esclude le righe di riepilogo in coda.
+    var last_openable: i32 = -1;
+    var i: usize = rows.len;
+    while (i > 0) {
+        i -= 1;
+        if (rows[i].len > 0 and isOpenableEntryName(rows[i][0])) {
+            last_openable = @intCast(i);
+            break;
+        }
+    }
+
+    if (key == KEY_UP or key == KEY_DOWN) {
+        // Nessuna voce apribile (es. archivio vuoto: solo la riga TOTALE): niente
+        // selezione da spostare.
+        if (last_openable < 0) {
+            app_state.shared.mutex.unlock(app_state.io);
+            return true;
+        }
+        var sel = app_state.shared.table_sel_row;
+        if (sel < 0) sel = 0;
+        sel += if (key == KEY_DOWN) @as(i32, 1) else -1;
+        if (sel < 0) sel = 0;
+        if (sel > last_openable) sel = last_openable;
+        app_state.shared.table_sel_row = sel;
+        ensureRowVisible(app_state, win, sel); // segui la selezione con lo scroll
+        app_state.shared.file_changed = true; // la selezione è un overlay: ridisegna
+        app_state.shared.mutex.unlock(app_state.io);
+        return true;
+    }
+
+    if (key == KEY_ENTER) {
+        const sel = app_state.shared.table_sel_row;
+        if (sel < 0 or sel >= @as(i32, @intCast(rows.len)) or rows[@intCast(sel)].len == 0) {
+            app_state.shared.mutex.unlock(app_state.io);
+            return true;
+        }
+        const name = rows[@intCast(sel)][0];
+        if (!isOpenableEntryName(name)) {
+            app_state.shared.mutex.unlock(app_state.io);
+            return true;
+        }
+        // `path` è il listato (nessun `#`): la voce è `path#nome`. allocPrint copia
+        // i byte, quindi è sicuro rilasciare il lock subito dopo.
+        const new_path = std.fmt.allocPrint(app_state.gpa, "{s}#{s}", .{ path, name }) catch {
+            app_state.shared.mutex.unlock(app_state.io);
+            return true;
+        };
+        app_state.shared.mutex.unlock(app_state.io);
+        defer app_state.gpa.free(new_path);
+        nav.postLoad(app_state, new_path);
+        return true;
+    }
+
+    app_state.shared.mutex.unlock(app_state.io);
+    return false;
+}
+
 fn scrollText(app_state: *GuiAppState, delta: f32) void {
     app_state.shared.mutex.lockUncancelable(app_state.io);
     defer app_state.shared.mutex.unlock(app_state.io);
@@ -347,6 +475,10 @@ pub fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) 
             }
             return;
         }
+        // Navigazione archivio: nel listato ↑/↓ spostano la riga e Invio apre la
+        // voce; dentro una voce Esc torna al listato. Ha priorità sul resto (il
+        // ramo is_text sotto scorrerebbe la tabella invece di selezionare).
+        if (handleArchiveKey(app_state, win, key)) return;
         if (key == KEY_ESC or key == KEY_Q) {
             win.close();
         } else if (key == KEY_0) {

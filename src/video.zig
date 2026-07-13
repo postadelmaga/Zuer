@@ -78,9 +78,13 @@ pub const VideoState = struct {
     // sta davvero drenando (device muto → clock fermo → NON congelare il video).
     audio: ?*AudioPlayer = null,
     audio_clk_prev: f64 = -1,
+    // Modalità audio-only (mp3, wav, flac…): nessun `player` video, il frame è un
+    // oscilloscopio disegnato dai campioni live (`drawOscilloscope`). La stessa
+    // macchina di controlli/seek/pausa del video vale identica.
+    audio_only: bool = false,
 
     pub fn isActive(self: *const VideoState) bool {
-        return self.player != null;
+        return self.player != null or self.audio_only;
     }
 
     /// Chiude il container libav (e ferma l'audio). Idempotente: azzera anche
@@ -100,6 +104,7 @@ pub const VideoState = struct {
         self.scrubbing = false;
         self.catchup_until = -1;
         self.audio_clk_prev = -1;
+        self.audio_only = false;
     }
 };
 
@@ -155,6 +160,38 @@ pub fn setupVideo(vs: *VideoState, path: []const u8, gpa: std.mem.Allocator) !Vi
     // Avvia l'audio (handle libav separato + thread). null se il file è muto.
     vs.audio = AudioPlayer.start(path_z.ptr, gpa);
     return .{ .rgba = rgba, .w = w, .h = h };
+}
+
+/// Apre SOLO l'audio di un file (mp3, wav, flac, ogg…) e mette `vs` in modalità
+/// visualizzatore: nessun player video, l'oscilloscopio viene disegnato dai
+/// campioni live in `advanceAudio`+`drawOscilloscope`. Ritorna un canvas iniziale
+/// (→ `static_rgba`) così la finestra nasce già dimensionata come un video. Usato
+/// da `nav.startVideo` come fallback quando `setupVideo` non trova stream video.
+pub fn setupAudio(vs: *VideoState, path: []const u8, gpa: std.mem.Allocator) !VideoFirst {
+    if (comptime @import("build_options").video) {
+        var clean: []const u8 = path;
+        if (std.mem.indexOfScalar(u8, path, '#')) |h| clean = path[0..h];
+        const path_z = try gpa.dupeZ(u8, clean);
+        defer gpa.free(path_z);
+
+        const a = AudioPlayer.start(path_z.ptr, gpa) orelse return error.NoAudio;
+        errdefer a.stopAndDestroy();
+
+        const w: u32 = 960;
+        const h: u32 = 540;
+        const rgba = try gpa.alloc(u8, @as(usize, w) * h * 4);
+        drawOscBackground(rgba, w, h);
+
+        vs.audio = a;
+        vs.audio_only = true;
+        vs.player = null;
+        vs.dur_s = a.duration_s;
+        vs.pos_s = 0;
+        vs.shown_pts = 0;
+        vs.playing = true;
+        return .{ .rgba = rgba, .w = w, .h = h };
+    }
+    return error.NoAudio;
 }
 
 /// Copia il frame corrente (RGBA, prestato dal player) in `sink.rgba`, riallocando
@@ -301,7 +338,12 @@ pub fn advanceVideo(sink: FrameSink, vs: *VideoState, dt: f32) bool {
     // frame/iterazione il video sta comunque al passo, ma senza scatti.
     // Con catch-up ancora attivo (budget esaurito) questo loop NON deve girare:
     // presenterebbe un frame intermedio, l'esatto difetto che stiamo evitando.
-    while (vs.catchup_until < 0 and vs.shown_pts < vs.pos_s and guard < 1) : (guard += 1) {
+    // In PAUSA non si avanza: `pos_s` (barra) è congelato ma se la decodifica era
+    // in ritardo sul wall-clock `shown_pts` gli è rimasto indietro — senza questo
+    // gate il loop continuerebbe a decodificare un frame per giro per raggiungere
+    // `pos_s`, e l'immagine "continuerebbe a girare" a barra ferma (il seek/scrub
+    // resta comunque coperto dal ramo catch-up qui sopra, che non guarda `playing`).
+    while (vs.playing and vs.catchup_until < 0 and vs.shown_pts < vs.pos_s and guard < 1) : (guard += 1) {
         // Unwrap guardato come per ogni altro accesso a `vs.player` nella funzione.
         const p = if (vs.player) |*pl| pl else break;
         // Errore di decode (packet corrotto a metà file) ≠ EOF: logga e salta il
@@ -329,6 +371,108 @@ pub fn advanceVideo(sink: FrameSink, vs: *VideoState, dt: f32) bool {
         }
     }
     return decoded_any;
+}
+
+/// Modalità audio-only: aggiorna la temporizzazione (posizione, seek, play/pausa)
+/// dal clock audio. Non decodifica nulla — il "frame" è l'oscilloscopio, disegnato
+/// a parte con `drawOscilloscope`. Ritorna true in riproduzione (il tracciato si
+/// muove → il chiamante ripresenta) e false in pausa (frame congelato).
+pub fn advanceAudio(vs: *VideoState, dt: f32) bool {
+    _ = dt;
+    if (comptime @import("build_options").video) {
+        if (vs.seek_to >= 0) {
+            if (vs.audio) |a| a.seek(vs.seek_to);
+            vs.pos_s = vs.seek_to;
+            vs.seek_to = -1;
+        } else if (vs.audio) |a| {
+            a.setPlaying(vs.playing);
+            // Il clock audio è la verità: in pausa è fermo, a fine brano l'auto-loop
+            // del thread audio lo riporta a 0 e la barra riparte da capo.
+            if (vs.playing) vs.pos_s = a.clockSeconds();
+        }
+        if (vs.dur_s > 0 and vs.pos_s > vs.dur_s) vs.pos_s = vs.dur_s;
+        return vs.playing;
+    }
+    return false;
+}
+
+// ── Oscilloscopio stile Winamp ──────────────────────────────────────────────
+const osc_bg = [3]u8{ 8, 10, 14 }; // fondo quasi nero
+
+/// Riempie il buffer col fondo scuro dell'oscilloscopio (RGBA opaco).
+fn drawOscBackground(buf: []u8, W: u32, H: u32) void {
+    const px = @as(usize, W) * H;
+    var i: usize = 0;
+    while (i < px) : (i += 1) {
+        buf[i * 4 + 0] = osc_bg[0];
+        buf[i * 4 + 1] = osc_bg[1];
+        buf[i * 4 + 2] = osc_bg[2];
+        buf[i * 4 + 3] = 255;
+    }
+}
+
+/// Colore del tracciato per magnitudine 0..1: verde al centro → giallo → rosso ai
+/// picchi (gradiente stile analizzatore Winamp).
+fn oscColor(mag: f32) [3]u8 {
+    const m = std.math.clamp(mag, 0.0, 1.0);
+    if (m < 0.5) {
+        const t = m / 0.5; // verde → giallo
+        return .{ @intFromFloat(60.0 + 195.0 * t), 255, @intFromFloat(120.0 * (1.0 - t)) };
+    }
+    const t = (m - 0.5) / 0.5; // giallo → rosso
+    return .{ 255, @intFromFloat(255.0 * (1.0 - 0.75 * t)), 0 };
+}
+
+/// Disegna l'oscilloscopio Winamp: fondo scuro, linea centrale fioca e il
+/// tracciato dei campioni live (colonna verticale connessa, colore per ampiezza).
+pub fn drawOscilloscope(buf: []u8, W: u32, H: u32, vs: *VideoState) void {
+    drawOscBackground(buf, W, H);
+    if (W == 0 or H == 0) return;
+    if (comptime !@import("build_options").video) return;
+    const a = vs.audio orelse return;
+
+    const Hi: i32 = @intCast(H);
+    const cyf: f32 = @as(f32, @floatFromInt(H)) * 0.5;
+    const cy: i32 = @intFromFloat(cyf);
+
+    // Linea centrale di riferimento (fioca).
+    {
+        var x: u32 = 0;
+        while (x < W) : (x += 1) {
+            const idx = (@as(usize, @intCast(cy)) * W + x) * 4;
+            buf[idx + 0] = 24;
+            buf[idx + 1] = 40;
+            buf[idx + 2] = 30;
+        }
+    }
+
+    // ~2048 campioni (~43 ms) danno un tracciato stabile ma vivo. Mappati sulle
+    // colonne della finestra, con linea connessa tra colonne adiacenti.
+    var samples: [2048]f32 = undefined;
+    const n: usize = @min(samples.len, @max(@as(usize, 1), @as(usize, W)));
+    a.copyScope(samples[0..n]);
+
+    const amp: f32 = @as(f32, @floatFromInt(H)) * 0.44;
+    const den: usize = @max(@as(usize, 1), @as(usize, W) - 1);
+    var prev_y: i32 = cy;
+    var x: u32 = 0;
+    while (x < W) : (x += 1) {
+        const si = (@as(usize, x) * (n - 1)) / den;
+        const s = std.math.clamp(samples[@min(si, n - 1)], -1.0, 1.0);
+        const y: i32 = @intFromFloat(cyf - s * amp);
+        const col = oscColor(@abs(s));
+        const y0 = @max(@as(i32, 0), @min(prev_y, y));
+        const y1 = @min(Hi - 1, @max(prev_y, y));
+        var yy = y0;
+        while (yy <= y1) : (yy += 1) {
+            const idx = (@as(usize, @intCast(yy)) * W + x) * 4;
+            buf[idx + 0] = col[0];
+            buf[idx + 1] = col[1];
+            buf[idx + 2] = col[2];
+            buf[idx + 3] = 255;
+        }
+        prev_y = y;
+    }
 }
 
 /// Alpha-blend src-over di un colore sul pixel RGBA in `buf[idx..]`.

@@ -185,6 +185,31 @@ pub fn drawTextSelection(buf: []u8, W: u32, H: u32, src_w: u32, src_h: u32, scro
     }
 }
 
+const row_hl_color = [3]u8{ 70, 110, 190 };
+const row_hl_alpha: u8 = 80;
+
+/// Evidenzia a tutta larghezza la riga selezionata di una tabella-archivio.
+/// Stessa geometria di `drawTextSelection`: la riga dati `sel_row` è la linea
+/// `1 + sel_row` (la linea 0 è l'header). Non dipinge sotto la banda header
+/// pinnata (`header_band`). Overlay economico: nessuna ri-rasterizzazione.
+pub fn drawTableRowHighlight(buf: []u8, W: u32, H: u32, src_w: u32, src_h: u32, scroll_y: f32, scroll_x: f32, m: text_render.Metrics, sel_row: i32, header_band: u32) void {
+    if (m.line_h <= 0 or sel_row < 0) return;
+    const geom = textBlitGeom(W, H, src_w, src_h, scroll_y, scroll_x);
+    const Hi: i32 = @intCast(H);
+    const line_idx: i32 = 1 + sel_row; // riga 0 = header
+    const y0 = m.pad_y + line_idx * m.line_h - @as(i32, @intCast(geom.off_y));
+    const top: i32 = @max(y0, @as(i32, @intCast(header_band)));
+    const ya: u32 = @intCast(std.math.clamp(top, 0, Hi));
+    const yb: u32 = @intCast(std.math.clamp(y0 + m.line_h, 0, Hi));
+    var py = ya;
+    while (py < yb) : (py += 1) {
+        var px: u32 = 0;
+        while (px < W) : (px += 1) {
+            blendPixel(buf, (py * W + px) * 4, row_hl_color[0], row_hl_color[1], row_hl_color[2], row_hl_alpha);
+        }
+    }
+}
+
 /// Compositing di un'immagine (o frame mesh/video) in aspect-fit a tutto schermo con
 /// zoom e pan, campionamento nearest a virgola fissa. `is_text` tratta il colore di
 /// fondo del testo (8,8,16) come trasparente.

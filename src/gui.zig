@@ -458,7 +458,17 @@ fn renderWorker(
                     continue;
                 };
             }
-            const new_frame = videomod.advanceVideo(.{
+            // Audio-only (mp3, wav…): nessun frame video da decodificare, il
+            // "frame" è l'oscilloscopio disegnato più sotto direttamente nel buffer
+            // finestra. `static_w/h` seguono la finestra così il fit-rect è pieno e
+            // l'hit-test dei controlli (che usa le stesse dimensioni) resta corretto.
+            const audio_only = vs.audio_only;
+            const new_frame = if (audio_only) blk: {
+                const nf = videomod.advanceAudio(vs, frame_dt);
+                state.shared.static_w = cur_w;
+                state.shared.static_h = cur_h;
+                break :blk nf;
+            } else videomod.advanceVideo(.{
                 .gpa = state.gpa,
                 .rgba = &state.shared.static_rgba,
                 .w = &state.shared.static_w,
@@ -483,9 +493,18 @@ fn renderWorker(
                 // gli angoli col solito content_radius — stesso frame di ogni altro tipo
                 // di file (nessun percorso speciale per il video).
                 const fr = videomod.videoFitRect(cur_w, cur_h, state.shared.static_w, state.shared.static_h);
-                const px = @as(usize, fr.w) * fr.h * 4;
-                @memset(composited_rgba.*[0..px], 0);
-                compose.composeFrame(composited_rgba.*, fr.w, fr.h, state.shared.static_rgba, state.shared.static_w, state.shared.static_h, false, 1.0, 0.0, 0.0);
+                if (audio_only) {
+                    // Oscilloscopio disegnato a piena finestra (fr = cur_w×cur_h):
+                    // niente static_rgba/composeFrame, si dipinge diretto nel buffer.
+                    videomod.drawOscilloscope(composited_rgba.*, fr.w, fr.h, vs);
+                } else {
+                    // Buffer STRETTO in aspect-fit: zrame lo centra nel vetro e ne arrotonda
+                    // gli angoli col solito content_radius — stesso frame di ogni altro tipo
+                    // di file (nessun percorso speciale per il video).
+                    const px = @as(usize, fr.w) * fr.h * 4;
+                    @memset(composited_rgba.*[0..px], 0);
+                    compose.composeFrame(composited_rgba.*, fr.w, fr.h, state.shared.static_rgba, state.shared.static_w, state.shared.static_h, false, 1.0, 0.0, 0.0);
+                }
                 const raster: ?*glyph.Raster = if (name_raster) |*r| r else null;
                 videomod.drawVideoControls(composited_rgba.*, fr.w, fr.h, vs, raster);
                 if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, fr.w, fr.h, r, std.fs.path.basename(state.shared.current_file_path));
@@ -511,11 +530,17 @@ fn renderWorker(
             // dorme oltre (fa resync senza burst) e fornisce solo il dt. Su
             // Win32/finestra occlusa waitFrame ritorna subito o a timeout e
             // resta il solo pacing software di prima.
-            if (do_present and busy) _ = win.waitFrame(20);
-            // In riproduzione: campiona il clock a 120 Hz così il confine di ogni
-            // frame (30 fps → 33 ms) viene rilevato entro ~8 ms → cadenza più
-            // regolare (meno scatti). A riposo (in pausa, controlli fermi) 20 Hz.
-            frame_dt = @min(0.1, @as(f32, @floatCast(if (busy) pacer_vid.tick() else pacer_20.tick())));
+            if (do_present and busy and !audio_only) _ = win.waitFrame(20);
+            // In riproduzione: video a 120 Hz così il confine di ogni frame (30 fps →
+            // 33 ms) è rilevato entro ~8 ms → cadenza regolare; l'oscilloscopio audio
+            // basta a 60 Hz (il tracciato si aggiorna a blocchi di ~20 ms). A riposo
+            // (pausa, controlli fermi) 20 Hz.
+            frame_dt = @min(0.1, @as(f32, @floatCast(if (!busy)
+                pacer_20.tick()
+            else if (audio_only)
+                pacer_60.tick()
+            else
+                pacer_vid.tick())));
             continue;
         }
 
@@ -653,6 +678,11 @@ fn renderWorker(
                     };
                 } else {
                     compose.composeTextFrame(composited_rgba.*, cur_w, cur_h, state.shared.static_rgba, state.shared.static_w, state.shared.static_h, state.shared.scroll_y, state.shared.scroll_x, header_band);
+                }
+                // Listato archivio: evidenzia la riga selezionata (overlay, nessuna
+                // ri-rasterizzazione della tabella bitmap).
+                if (state.shared.is_table and state.shared.table_sel_row >= 0) {
+                    compose.drawTableRowHighlight(composited_rgba.*, cur_w, cur_h, state.shared.static_w, state.shared.static_h, state.shared.scroll_y, state.shared.scroll_x, state.shared.text_metrics, state.shared.table_sel_row, header_band);
                 }
                 if (state.shared.sel_active) {
                     compose.drawTextSelection(composited_rgba.*, cur_w, cur_h, state.shared.static_w, state.shared.static_h, state.shared.scroll_y, state.shared.scroll_x, state.shared.text_metrics, state.shared.text_lines.items, state.shared.sel_a, state.shared.sel_b);

@@ -1242,10 +1242,265 @@ pub fn decodeCoarse(path: []const u8, io: std.Io, allocator: std.mem.Allocator) 
     return decodeImpl(path, io, allocator, true);
 }
 
+/// Estensioni degli archivi "navigabili" dentro (anteprima delle voci). Deve
+/// restare allineata alle estensioni dichiarate da archive.zig e tar.zig.
+pub fn isArchiveExt(ext: []const u8) bool {
+    const list = [_][]const u8{ "zip", "jar", "apk", "cbz", "epub", "xpi", "whl", "tar", "tgz", "tar.gz" };
+    for (list) |e| {
+        if (asciiEqualIgnoreCase(ext, e)) return true;
+    }
+    return false;
+}
+
+fn isTarExt(ext: []const u8) bool {
+    return asciiEqualIgnoreCase(ext, "tar") or
+        asciiEqualIgnoreCase(ext, "tgz") or
+        asciiEqualIgnoreCase(ext, "tar.gz");
+}
+
+/// Nome voce sicuro = relativo e senza componenti `..` (anti path-traversal /
+/// zip-slip quando lo si materializza su disco).
+fn isSafeEntryName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (name[0] == '/' or name[0] == '\\') return false;
+    var it = std.mem.splitAny(u8, name, "/\\");
+    while (it.next()) |comp| {
+        if (std.mem.eql(u8, comp, "..")) return false;
+    }
+    return true;
+}
+
+/// Apre un file DENTRO un archivio (`archivio.zip#voce`): estrae la voce in
+/// `~/.cache/zuer/extract/<hash>/<voce>` in streaming (memoria costante, cap =
+/// `max_size` sulla dimensione decompressa) e la ridecodifica col decoder giusto
+/// per la sua estensione, riusando l'intera pipeline. Riaperture della stessa
+/// voce riusano il file già estratto (chiave = path archivio + mtime).
+fn decodeArchiveEntry(base_path: []const u8, entry: []const u8, io: std.Io, allocator: std.mem.Allocator, max_size: usize) ?Decoded {
+    const extracted = extractArchiveEntry(base_path, entry, io, allocator, max_size) catch |err| {
+        const msg = std.fmt.allocPrint(allocator, "Impossibile aprire '{s}' dentro l'archivio: {s}", .{ entry, @errorName(err) }) catch "";
+        return .{ .err = msg };
+    };
+    defer allocator.free(extracted);
+    // Ridecodifica il file materializzato: senza frammento → dispatch normale per
+    // estensione, nessuna ricorsione nel ramo archivio.
+    return decodeImpl(extracted, io, allocator, false);
+}
+
+/// Materializza la voce dell'archivio su disco e ne ritorna il path assoluto
+/// (posseduto dal chiamante). Riusa il file se già estratto per questa versione.
+fn extractArchiveEntry(base_path: []const u8, entry: []const u8, io: std.Io, allocator: std.mem.Allocator, max_size: usize) ![]u8 {
+    if (!isSafeEntryName(entry)) return error.UnsafeEntryName;
+
+    const home_c = getenv("HOME") orelse return error.NoHomeDir;
+    const home = std.mem.span(home_c);
+
+    // Chiave cache = hash(path archivio + mtime): un archivio modificato cambia
+    // chiave → riestrazione automatica.
+    const bstat = try std.Io.Dir.cwd().statFile(io, base_path, .{});
+    var hasher = std.hash.Wyhash.init(0x2571ee7c0de);
+    hasher.update(base_path);
+    hasher.update(std.mem.asBytes(&bstat.mtime.nanoseconds));
+    const key = hasher.final();
+
+    const rel_dir = try std.fmt.allocPrint(allocator, ".cache/zuer/extract/{x}", .{key});
+    defer allocator.free(rel_dir);
+    const rel_out = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ rel_dir, entry });
+    defer allocator.free(rel_out);
+    const out_abs = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, rel_out });
+    errdefer allocator.free(out_abs);
+
+    var home_dir = try std.Io.Dir.openDirAbsolute(io, home, .{});
+    defer home_dir.close(io);
+
+    // Già estratta (stessa versione dell'archivio)? Riusa senza rileggere.
+    if (home_dir.statFile(io, rel_out, .{})) |_| return out_abs else |_| {}
+
+    var dest = try home_dir.createDirPathOpen(io, rel_dir, .{});
+    defer dest.close(io);
+
+    // Estrazione ATOMICA: scrivi su `<voce>.part` e rinomina solo a estrazione
+    // completa. La statFile di riuso sopra cerca `entry` (mai `.part`), quindi un
+    // file parziale lasciato da un crash duro (SIGKILL, kernel panic) non viene mai
+    // riusato come cache valida: alla riapertura manca `entry` → riestrazione.
+    const tmp_name = try std.fmt.allocPrint(allocator, "{s}.part", .{entry});
+    defer allocator.free(tmp_name);
+
+    const ext = getExtension(base_path);
+    (if (isTarExt(ext))
+        extractTarEntry(base_path, entry, tmp_name, io, dest, max_size)
+    else
+        extractZipEntry(base_path, entry, tmp_name, io, dest, allocator, max_size)) catch |err| {
+        // Estrazione fallita a metà (disco pieno, archivio corrotto…): rimuovi il
+        // parziale così non resta a sporcare la cache.
+        dest.deleteFile(io, tmp_name) catch {};
+        return err;
+    };
+    dest.rename(tmp_name, dest, entry, io) catch |err| {
+        dest.deleteFile(io, tmp_name) catch {};
+        return err;
+    };
+
+    return out_abs;
+}
+
+fn extractZipEntry(base_path: []const u8, entry: []const u8, out_name: []const u8, io: std.Io, dest: std.Io.Dir, allocator: std.mem.Allocator, max_size: usize) !void {
+    var file = try std.Io.Dir.cwd().openFile(io, base_path, .{});
+    defer file.close(io);
+    var rbuf: [8192]u8 = undefined;
+    var reader = file.reader(io, &rbuf);
+
+    // Localizza la central directory col seeking (EOCD/ZIP64) SENZA iterare le
+    // voci: `Iterator.next()` abortirebbe su una entry cifrata/multi-disk anche se
+    // non è quella cercata. Poi scan lenient della CD, coerente col listato — usa
+    // il nome della CENTRAL directory, così il file estratto combacia con `out_abs`.
+    const iter = try std.zip.Iterator.init(&reader);
+    const cd_read: usize = @intCast(@min(iter.cd_size, @as(u64, 256 * 1024 * 1024)));
+    const cd = try allocator.alloc(u8, cd_read);
+    defer allocator.free(cd);
+    try reader.seekTo(iter.cd_zip_offset);
+    reader.interface.readSliceAll(cd) catch |err| switch (err) {
+        error.EndOfStream => {},
+        else => return error.ZipReadFailed,
+    };
+
+    const max32 = std.math.maxInt(u32);
+    var pos: usize = 0;
+    while (pos + 46 <= cd.len) {
+        if (!std.mem.eql(u8, cd[pos..][0..4], &std.zip.central_file_header_sig)) break;
+        const method = std.mem.readInt(u16, cd[pos + 10 ..][0..2], .little);
+        var comp_size: u64 = std.mem.readInt(u32, cd[pos + 20 ..][0..4], .little);
+        var unc_size: u64 = std.mem.readInt(u32, cd[pos + 24 ..][0..4], .little);
+        const name_len = std.mem.readInt(u16, cd[pos + 28 ..][0..2], .little);
+        const extra_len = std.mem.readInt(u16, cd[pos + 30 ..][0..2], .little);
+        const comment_len = std.mem.readInt(u16, cd[pos + 32 ..][0..2], .little);
+        var local_off: u64 = std.mem.readInt(u32, cd[pos + 42 ..][0..4], .little);
+
+        const entry_end = pos + 46 + @as(usize, name_len) + extra_len + comment_len;
+        if (entry_end > cd.len) break;
+        const name = cd[pos + 46 ..][0..name_len];
+
+        // ZIP64: campi saturati → valori reali nell'extra 0x0001, nell'ordine
+        // uncompressed, compressed, local_header_offset (solo quelli saturati).
+        if (unc_size == max32 or comp_size == max32 or local_off == max32) {
+            var extra = cd[pos + 46 + name_len ..][0..extra_len];
+            while (extra.len >= 4) {
+                const id = std.mem.readInt(u16, extra[0..2], .little);
+                const sz = std.mem.readInt(u16, extra[2..4], .little);
+                if (4 + @as(usize, sz) > extra.len) break;
+                if (id == 0x0001) {
+                    var f = extra[4 .. 4 + sz];
+                    if (unc_size == max32 and f.len >= 8) {
+                        unc_size = std.mem.readInt(u64, f[0..8], .little);
+                        f = f[8..];
+                    }
+                    if (comp_size == max32 and f.len >= 8) {
+                        comp_size = std.mem.readInt(u64, f[0..8], .little);
+                        f = f[8..];
+                    }
+                    if (local_off == max32 and f.len >= 8) {
+                        local_off = std.mem.readInt(u64, f[0..8], .little);
+                    }
+                    break;
+                }
+                extra = extra[4 + sz ..];
+            }
+        }
+
+        if (std.mem.eql(u8, name, entry)) {
+            if (unc_size > max_size) return error.EntryTooLarge;
+            return extractZipData(&reader, dest, io, out_name, method, unc_size, local_off);
+        }
+        pos = entry_end;
+    }
+    return error.EntryNotFound;
+}
+
+/// Decomprime una singola entry ZIP (store/deflate) dallo stream posizionato,
+/// leggendo il local header per l'offset dei dati e scrivendo `entry` sotto `dest`.
+fn extractZipData(reader: *std.Io.File.Reader, dest: std.Io.Dir, io: std.Io, out_name: []const u8, method: u16, unc_size: u64, local_off: u64) !void {
+    try reader.seekTo(local_off);
+    var lfh: [30]u8 = undefined;
+    try reader.interface.readSliceAll(&lfh);
+    if (!std.mem.eql(u8, lfh[0..4], &std.zip.local_file_header_sig)) return error.ZipBadFileOffset;
+    const l_name = std.mem.readInt(u16, lfh[26..][0..2], .little);
+    const l_extra = std.mem.readInt(u16, lfh[28..][0..2], .little);
+    const data_off = local_off + 30 + @as(u64, l_name) + @as(u64, l_extra);
+
+    var out = try createDestFile(dest, io, out_name);
+    defer out.close(io);
+    var obuf: [8192]u8 = undefined;
+    var fw = out.writer(io, &obuf);
+
+    try reader.seekTo(data_off);
+    switch (method) {
+        0 => try reader.interface.streamExact64(&fw.interface, unc_size),
+        8 => {
+            var window: [std.compress.flate.max_window_len]u8 = undefined;
+            var dc = std.compress.flate.Decompress.init(&reader.interface, .raw, &window);
+            try dc.reader.streamExact64(&fw.interface, unc_size);
+        },
+        else => return error.UnsupportedCompressionMethod,
+    }
+    try fw.end();
+}
+
+fn extractTarEntry(base_path: []const u8, entry: []const u8, out_name: []const u8, io: std.Io, dest: std.Io.Dir, max_size: usize) !void {
+    var file = try std.Io.Dir.cwd().openFile(io, base_path, .{});
+    defer file.close(io);
+    var rbuf: [8192]u8 = undefined;
+    var reader = file.reader(io, &rbuf);
+
+    var magic: [2]u8 = .{ 0, 0 };
+    _ = try file.readPositionalAll(io, &magic, 0);
+    const is_gzip = magic[0] == 0x1f and magic[1] == 0x8b;
+
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var dec: std.compress.flate.Decompress = undefined;
+    var src: *std.Io.Reader = &reader.interface;
+    if (is_gzip) {
+        dec = std.compress.flate.Decompress.init(&reader.interface, .gzip, &window);
+        src = &dec.reader;
+    }
+
+    var name_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var it = std.tar.Iterator.init(src, .{
+        .file_name_buffer = &name_buf,
+        .link_name_buffer = &link_buf,
+    });
+    while (try it.next()) |f| {
+        if (f.kind != .file) continue;
+        if (!std.mem.eql(u8, f.name, entry)) continue;
+        if (f.size > max_size) return error.EntryTooLarge;
+
+        var out_file = try createDestFile(dest, io, out_name);
+        defer out_file.close(io);
+        var obuf: [8192]u8 = undefined;
+        var fw = out_file.writer(io, &obuf);
+        try it.streamRemaining(f, &fw.interface);
+        try fw.end();
+        return;
+    }
+    return error.EntryNotFound;
+}
+
+/// Crea (con eventuali sottocartelle) e apre in scrittura il file di output per
+/// una voce, sotto `dest`.
+fn createDestFile(dest: std.Io.Dir, io: std.Io, name: []const u8) !std.Io.File {
+    if (std.fs.path.dirname(name)) |dn| {
+        var parent = try dest.createDirPathOpen(io, dn, .{});
+        defer parent.close(io);
+        return parent.createFile(io, std.fs.path.basename(name), .{});
+    }
+    return dest.createFile(io, name, .{});
+}
+
 fn decodeImpl(path: []const u8, io: std.Io, allocator: std.mem.Allocator, coarse: bool) ?Decoded {
     var clean_path = path;
+    var fragment: ?[]const u8 = null;
     if (std.mem.indexOfScalar(u8, path, '#')) |hash_idx| {
         clean_path = path[0..hash_idx];
+        if (hash_idx + 1 < path.len) fragment = path[hash_idx + 1 ..];
     }
 
     // Limite di dimensione proporzionale alla memoria disponibile; ZUER_MAX_MB lo
@@ -1258,14 +1513,27 @@ fn decodeImpl(path: []const u8, io: std.Io, allocator: std.mem.Allocator, coarse
         } else |_| {}
     }
 
+    // Anteprima di un file DENTRO un archivio: `archivio.zip#voce`. Gate sull'ext
+    // dell'archivio così lo `#N` dei PDF e lo `#foglio` degli XLSX restano ai loro
+    // plugin. La voce viene estratta in cache (streaming) e ridecodificata dal
+    // decoder giusto per la sua estensione → immagini/testo/pdf/… interni si aprono
+    // col loro viewer nativo. In fase coarse si salta: l'host farà il full decode.
+    if (!coarse) {
+        if (fragment) |entry| {
+            if (entry.len > 0 and isArchiveExt(getExtension(clean_path)))
+                return decodeArchiveEntry(clean_path, entry, io, allocator, max_size);
+        }
+    }
+
     const stat = std.Io.Dir.cwd().statFile(io, clean_path, .{}) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "Impossibile ottenere informazioni sul file: {s} ({s})", .{ clean_path, @errorName(err) }) catch "";
         return .{ .err = msg };
     };
-    if (stat.size > max_size) {
-        const msg = std.fmt.allocPrint(allocator, "File troppo grande: {d} MB (limite {d} MB, ~metà della memoria disponibile).\nIl caricamento rischierebbe di esaurire la memoria.", .{ stat.size / (1024 * 1024), max_size / (1024 * 1024) }) catch "";
-        return .{ .err = msg };
-    }
+    // Il limite di dimensione NON viene applicato qui su `stat.size`: un plugin
+    // path-based (`zuer_content_prefix = 0`, es. archivi grandi) non carica il
+    // file in RAM e deve poter aprire anche archivi da molti GB. Il tetto viene
+    // verificato più sotto su `to_read` — i byte che si allocheranno davvero —
+    // così i plugin whole-file restano protetti mentre quelli streaming no.
 
     const mtime_ns: i128 = stat.mtime.nanoseconds;
 
@@ -1356,8 +1624,17 @@ fn decodeImpl(path: []const u8, io: std.Io, allocator: std.mem.Allocator, coarse
     // plugin lavora dal path (pdf), N = bastano i primi N byte (media: header
     // sniffing — un video multi-GB non va caricato in RAM per il poster).
     // Default (nessun export): file intero, comportamento storico.
-    const file_size: usize = @intCast(stat.size); // ≤ max_size, già verificato
+    const file_size: usize = @intCast(stat.size);
     const to_read = @min(content_prefix, file_size);
+    // Il limite si applica QUI, su ciò che verrà davvero allocato (`to_read`), non
+    // sulla dimensione del file su disco: un plugin path-based (`content_prefix=0`,
+    // `to_read=0`, es. archivi) apre qualsiasi dimensione senza rischio di OOM,
+    // mentre i plugin whole-file (`content_prefix=maxInt`, `to_read=file_size`)
+    // restano protetti esattamente come prima.
+    if (to_read > max_size) {
+        const msg = std.fmt.allocPrint(allocator, "File troppo grande: {d} MB (limite {d} MB, ~metà della memoria disponibile).\nIl caricamento rischierebbe di esaurire la memoria.", .{ to_read / (1024 * 1024), max_size / (1024 * 1024) }) catch "";
+        return .{ .err = msg };
+    }
     const content: []u8 = if (to_read == 0) &.{} else if (to_read < file_size) blk: {
         // Prefisso parziale: si legge esattamente to_read byte dall'inizio.
         const buf = allocator.alloc(u8, to_read) catch return .{ .err = "Out of memory" };
@@ -1413,8 +1690,12 @@ fn asciiEqualIgnoreCase(a: []const u8, b: []const u8) bool {
     return true;
 }
 
-fn getExtension(path: []const u8) []const u8 {
+pub fn getExtension(path: []const u8) []const u8 {
     const filename = std.fs.path.basename(path);
+    // Doppio suffisso `.tar.gz`: l'estensione utile è "tar.gz", non "gz" (un `.gz`
+    // semplice resta invece "gz", non dirottato sul decoder tar).
+    if (filename.len >= 7 and asciiEqualIgnoreCase(filename[filename.len - 7 ..], ".tar.gz"))
+        return "tar.gz";
     if (std.mem.lastIndexOfScalar(u8, filename, '.')) |dot_index| {
         return filename[dot_index + 1 ..];
     }

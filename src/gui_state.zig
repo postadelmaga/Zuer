@@ -122,6 +122,12 @@ pub const GuiAppState = struct {
         sel_selecting: bool = false,
         sel_a: [2]i32 = .{ 0, 0 },
         sel_b: [2]i32 = .{ 0, 0 },
+
+        // Riga selezionata nel listato di un archivio (>= 0 solo quando si mostra
+        // la tabella di un archivio): ↑/↓ la spostano, Invio apre la voce. -1 = la
+        // selezione non è attiva (contenuto non-archivio). Impostata in
+        // `applyDecoded`, letta dall'input e dall'overlay di compose.
+        table_sel_row: i32 = -1,
     };
 
     /// Thread di caricamento asincrono per la navigazione a cache-miss: decodifica
@@ -321,6 +327,25 @@ pub fn isPdfPath(path: []const u8) bool {
         clean_path = path[0..hash_idx];
     }
     return std.mem.endsWith(u8, clean_path, ".pdf") or std.mem.endsWith(u8, clean_path, ".PDF");
+}
+
+/// Vero se il path (ignorando l'eventuale frammento `#voce`) è un archivio
+/// navigabile (zip/tar/…).
+pub fn isArchivePath(path: []const u8) bool {
+    var clean = path;
+    if (std.mem.indexOfScalar(u8, path, '#')) |h| clean = path[0..h];
+    return decoder_mod.isArchiveExt(decoder_mod.getExtension(clean));
+}
+
+/// Vero quando è mostrato il LISTATO di un archivio (nessuna voce selezionata nel
+/// path): abilita selezione di riga + Invio per aprire la voce.
+pub fn isArchiveListing(path: []const u8) bool {
+    return std.mem.indexOfScalar(u8, path, '#') == null and isArchivePath(path);
+}
+
+/// Vero quando si è DENTRO un archivio (`archivio#voce`): Esc torna al listato.
+pub fn isInsideArchive(path: []const u8) bool {
+    return std.mem.indexOfScalar(u8, path, '#') != null and isArchivePath(path);
 }
 
 /// Zoom "contain": scala il frame così che stia interamente nella finestra

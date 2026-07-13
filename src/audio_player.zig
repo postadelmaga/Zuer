@@ -37,6 +37,10 @@ const OUT_CH: c_int = 2;
 // il "sottomesso" meno questa latenza stimata, così il video non anticipa.
 const LATENCY_S: f64 = 0.12;
 
+/// Campioni (mono) tenuti in coda per l'oscilloscopio del player audio (~85 ms a
+/// 48 kHz). Potenza di 2 → il modulo sul ring è un semplice AND.
+const scope_len: usize = 4096;
+
 pub const AudioPlayer = struct {
     fmt_ctx: [*c]c.AVFormatContext,
     codec_ctx: [*c]c.AVCodecContext,
@@ -60,6 +64,17 @@ pub const AudioPlayer = struct {
     // campioni vecchi col clock che dice la posizione nuova → offset A/V sistematico.
     // Toccata solo dal thread audio (la richiesta passa dall'atomico `seek_ms`).
     skip_until_s: f64 = -1,
+
+    // Durata totale del brano in secondi (0 se il container non la fornisce): usata
+    // dal player audio-only per la timeline dei controlli.
+    duration_s: f64 = 0,
+
+    // Tap per il visualizzatore (oscilloscopio): ring degli ultimi campioni MONO
+    // prodotti. Il thread audio scrive, il thread finestra legge con `copyScope`.
+    // Nessun lock: un campione strappato è invisibile in un visualizzatore; solo
+    // l'indice di scrittura `scope_w` usa un atomico per un avanzamento coerente.
+    scope: [scope_len]f32 = [_]f32{0} ** scope_len,
+    scope_w: std.atomic.Value(usize) = .init(0),
 
     /// Apre l'audio del file e avvia il thread. `null` (senza errore) se il file
     /// non ha stream audio o il device non si apre → il video va muto.
@@ -120,6 +135,15 @@ pub const AudioPlayer = struct {
         const tb = stream.*.time_base;
         const time_base: f64 = if (tb.den != 0) @as(f64, @floatFromInt(tb.num)) / @as(f64, @floatFromInt(tb.den)) else 0;
 
+        // Durata: preferisci quella del container (AV_TIME_BASE = 1e6), poi lo stream
+        // (nel suo time_base). 0 se ignota → timeline senza durata (solo posizione).
+        var duration_s: f64 = 0;
+        if (fmt_ctx.*.duration > 0) {
+            duration_s = @as(f64, @floatFromInt(fmt_ctx.*.duration)) / 1_000_000.0;
+        } else if (stream.*.duration > 0 and time_base > 0) {
+            duration_s = @as(f64, @floatFromInt(stream.*.duration)) * time_base;
+        }
+
         const self = try gpa.create(AudioPlayer);
         errdefer gpa.destroy(self); // spawn fallito → gli errdefer sopra liberano libav+dev
         self.* = .{
@@ -133,6 +157,7 @@ pub const AudioPlayer = struct {
             .in_rate = codec_ctx.*.sample_rate,
             .dev = dev,
             .gpa = gpa,
+            .duration_s = duration_s,
         };
         self.thread = try std.Thread.spawn(.{}, threadMain, .{self});
         return self;
@@ -148,6 +173,19 @@ pub const AudioPlayer = struct {
 
     pub fn setPlaying(self: *AudioPlayer, on: bool) void {
         self.playing.store(on, .monotonic);
+    }
+
+    /// Copia gli ultimi `dst.len` campioni mono (dal più vecchio al più recente)
+    /// nel buffer del visualizzatore. Prima che sia stato prodotto abbastanza, le
+    /// posizioni non ancora riempite restano a 0 (linea piatta).
+    pub fn copyScope(self: *const AudioPlayer, dst: []f32) void {
+        const w = self.scope_w.load(.monotonic);
+        const n = dst.len;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const back = n - i; // 1 = campione più recente
+            dst[i] = if (back > w) 0 else self.scope[(w - back) & (scope_len - 1)];
+        }
     }
 
     pub fn seek(self: *AudioPlayer, seconds: f64) void {
@@ -219,6 +257,20 @@ pub const AudioPlayer = struct {
             }
             const n = self.convert(&out) catch continue;
             if (n == 0) continue;
+            // Tap oscilloscopio: downmix mono di questo blocco nel ring PRIMA del
+            // play bloccante, così il visualizzatore vede i campioni appena decodificati.
+            {
+                var w = self.scope_w.load(.monotonic);
+                var si: usize = 0;
+                while (si < n) : (si += 1) {
+                    const l = out.items[si * @as(usize, OUT_CH)];
+                    const r = out.items[si * @as(usize, OUT_CH) + 1];
+                    self.scope[w & (scope_len - 1)] = (l + r) * 0.5;
+                    w += 1;
+                }
+                self.scope_w.store(w, .monotonic);
+            }
+
             var block = AudioBlock.init(self.gpa, @intCast(OUT_RATE), @intCast(OUT_CH), out.items[0 .. n * @as(usize, OUT_CH)]) catch continue;
             defer block.deinit();
             self.dev.play(&block); // bloccante → pacing real-time (backpressure)

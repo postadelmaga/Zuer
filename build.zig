@@ -294,7 +294,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // Compile decoders as shared library plugins
-    inline for (.{ "text", "csv", "markdown", "mesh", "image", "glb", "archive", "media", "pdf", "office" }) |name| {
+    inline for (.{ "text", "csv", "markdown", "mesh", "image", "glb", "archive", "tar", "media", "pdf", "office" }) |name| {
         const lib = b.addLibrary(.{
             .name = "decoder_" ++ name,
             .linkage = .dynamic,
@@ -321,7 +321,7 @@ pub fn build(b: *std.Build) void {
         // The media decoder needs FFmpeg (+ compute_vp9); pdf/office shell out to external
         // tools and use POSIX temp dirs (mkdtemp). Both groups are Linux-only for now — on
         // a CPU-only target they're simply not installed, so their libav/POSIX deps never
-        // reach the link. The core plugins (text/csv/markdown/mesh/image/glb/archive) build
+        // reach the link. The core plugins (text/csv/markdown/mesh/image/glb/archive/tar) build
         // everywhere.
         const needs_ffmpeg = comptime std.mem.eql(u8, name, "media");
         const needs_tools = comptime (std.mem.eql(u8, name, "pdf") or std.mem.eql(u8, name, "office"));

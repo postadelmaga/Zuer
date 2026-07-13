@@ -55,7 +55,23 @@ pub fn main(init: std.process.Init) !void {
     switch (shared.result) {
         .image => |img| try w.print("OK IMAGE {d}x{d}\n", .{ img.width, img.height }),
         .text => |txt| try w.print("OK TEXT ({d} byte)\n", .{txt.len}),
-        .csv => try w.print("OK CSV\n", .{}),
+        .csv => |tbl| {
+            try w.print("OK CSV ({d} righe)\n", .{tbl.rows.len});
+            for (tbl.headers, 0..) |h, i| {
+                if (i > 0) try w.print(" | ", .{});
+                try w.print("{s}", .{h});
+            }
+            try w.print("\n", .{});
+            const show = @min(tbl.rows.len, 40);
+            for (tbl.rows[0..show]) |row| {
+                for (row, 0..) |cell, i| {
+                    if (i > 0) try w.print(" | ", .{});
+                    try w.print("{s}", .{cell});
+                }
+                try w.print("\n", .{});
+            }
+            if (tbl.rows.len > show) try w.print("... (+{d} righe)\n", .{tbl.rows.len - show});
+        },
         .workbook => |wb| try w.print("OK WORKBOOK ({d} fogli)\n", .{wb.sheets.len}),
         .markdown => try w.print("OK MARKDOWN\n", .{}),
         .mesh => try w.print("OK MESH\n", .{}),
