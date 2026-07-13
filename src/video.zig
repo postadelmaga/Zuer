@@ -464,16 +464,19 @@ pub fn drawOscilloscope(buf: []u8, W: u32, H: u32, vs: *VideoState) void {
     const n: usize = @min(samples.len, @max(@as(usize, 1), @as(usize, W)));
 
     // Testina di lettura ancorata al wall-clock (avanzata in `advanceAudio`),
-    // riclampata sulla banda valida del ring RILEGGENDO `scope_w` ora: la finestra
-    // deve terminare in `[scope_w - (cap - n) , scope_w]` o leggerebbe campioni già
-    // sovrascritti. Fuori banda (pausa lunga, seek, underrun) → riaggancia ~64 ms
-    // dietro l'ultimo campione, con margine per scorrere senza gelare.
+    // riclampata sulla banda valida del ring RILEGGENDO `scope_w` ora. Latenza
+    // MINIMA: nessun buffer artificiale dietro la punta — quando la testina
+    // raggiunge l'ultimo campione (`> scope_w`, tra un blocco e l'altro) si aggancia
+    // lì (`= scope_w`) e riparte appena arriva un blocco nuovo. Così il bordo destro
+    // del tracciato è sempre il campione più recente disponibile: media ~mezzo
+    // blocco di ritardo. Se resta troppo indietro (pausa lunga/seek/underrun) →
+    // riaggancio secco alla punta.
     const cap = AudioPlayer.scope_capacity;
     const w = a.scopeWritten();
     const min_end: usize = if (w > cap - n) w - (cap - n) else 0;
     var end: usize = if (vs.scope_head <= 0) 0 else @intFromFloat(vs.scope_head);
     if (end > w or end < min_end) {
-        end = if (w > 3072) w - 3072 else w;
+        end = w; // aggancio alla punta (nessun lag artificiale)
         vs.scope_head = @floatFromInt(end);
     }
     a.copyScopeAt(samples[0..n], end);
