@@ -408,19 +408,40 @@ pub fn advanceAudio(vs: *VideoState, dt: f32) bool {
     return false;
 }
 
-// ── Oscilloscopio stile Winamp ──────────────────────────────────────────────
-const osc_bg = [3]u8{ 8, 10, 14 }; // fondo quasi nero
+// ── Oscilloscopio stile Winamp (neon glow) ──────────────────────────────────
+const osc_bg_edge = [3]u8{ 3, 5, 9 }; // ai bordi: quasi nero
+const osc_bg_center = [3]u8{ 10, 16, 26 }; // al centro: un filo di blu notte
 
-/// Riempie il buffer col fondo scuro dell'oscilloscopio (RGBA opaco).
+/// Fondo a gradiente verticale (scuro ai bordi, un po' più chiaro al centro) per
+/// dare profondità al vetro. RGBA opaco.
 fn drawOscBackground(buf: []u8, W: u32, H: u32) void {
-    const px = @as(usize, W) * H;
-    var i: usize = 0;
-    while (i < px) : (i += 1) {
-        buf[i * 4 + 0] = osc_bg[0];
-        buf[i * 4 + 1] = osc_bg[1];
-        buf[i * 4 + 2] = osc_bg[2];
-        buf[i * 4 + 3] = 255;
+    if (H == 0) return;
+    const half: f32 = @as(f32, @floatFromInt(H)) * 0.5;
+    var y: u32 = 0;
+    while (y < H) : (y += 1) {
+        const dy = @abs(@as(f32, @floatFromInt(y)) - half) / @max(1.0, half); // 0 centro → 1 bordo
+        const t = (1.0 - dy) * (1.0 - dy); // luce concentrata al centro
+        const r: u8 = @intFromFloat(@as(f32, @floatFromInt(osc_bg_edge[0])) + (@as(f32, @floatFromInt(osc_bg_center[0])) - @as(f32, @floatFromInt(osc_bg_edge[0]))) * t);
+        const g: u8 = @intFromFloat(@as(f32, @floatFromInt(osc_bg_edge[1])) + (@as(f32, @floatFromInt(osc_bg_center[1])) - @as(f32, @floatFromInt(osc_bg_edge[1]))) * t);
+        const b: u8 = @intFromFloat(@as(f32, @floatFromInt(osc_bg_edge[2])) + (@as(f32, @floatFromInt(osc_bg_center[2])) - @as(f32, @floatFromInt(osc_bg_edge[2]))) * t);
+        const row = @as(usize, y) * W;
+        var x: u32 = 0;
+        while (x < W) : (x += 1) {
+            const idx = (row + x) * 4;
+            buf[idx + 0] = r;
+            buf[idx + 1] = g;
+            buf[idx + 2] = b;
+            buf[idx + 3] = 255;
+        }
     }
+}
+
+/// Somma additiva (con clamp a 255) di un colore f32 sul pixel RGBA: è ciò che dà
+/// il "bloom" neon quando linea e glow si sovrappongono su fondo scuro.
+fn addPix(buf: []u8, idx: usize, r: f32, g: f32, b: f32) void {
+    buf[idx + 0] = @intFromFloat(@min(255.0, @as(f32, @floatFromInt(buf[idx + 0])) + r));
+    buf[idx + 1] = @intFromFloat(@min(255.0, @as(f32, @floatFromInt(buf[idx + 1])) + g));
+    buf[idx + 2] = @intFromFloat(@min(255.0, @as(f32, @floatFromInt(buf[idx + 2])) + b));
 }
 
 /// Colore del tracciato per magnitudine 0..1: verde al centro → giallo → rosso ai
@@ -447,14 +468,17 @@ pub fn drawOscilloscope(buf: []u8, W: u32, H: u32, vs: *VideoState) void {
     const cyf: f32 = @as(f32, @floatFromInt(H)) * 0.5;
     const cy: i32 = @intFromFloat(cyf);
 
-    // Linea centrale di riferimento (fioca).
+    // Linea centrale di riferimento: glow orizzontale fioco (additivo).
     {
-        var x: u32 = 0;
-        while (x < W) : (x += 1) {
-            const idx = (@as(usize, @intCast(cy)) * W + x) * 4;
-            buf[idx + 0] = 24;
-            buf[idx + 1] = 40;
-            buf[idx + 2] = 30;
+        const band: i32 = @max(@as(i32, 1), @divTrunc(Hi, 260));
+        var dyi: i32 = -band;
+        while (dyi <= band) : (dyi += 1) {
+            const yy = cy + dyi;
+            if (yy < 0 or yy >= Hi) continue;
+            const f = 1.0 - @abs(@as(f32, @floatFromInt(dyi))) / @as(f32, @floatFromInt(band + 1));
+            const row = @as(usize, @intCast(yy)) * W;
+            var x: u32 = 0;
+            while (x < W) : (x += 1) addPix(buf, (row + x) * 4, 4.0 * f, 20.0 * f, 12.0 * f);
         }
     }
 
@@ -483,6 +507,10 @@ pub fn drawOscilloscope(buf: []u8, W: u32, H: u32, vs: *VideoState) void {
 
     const amp: f32 = @as(f32, @floatFromInt(H)) * 0.44;
     const den: usize = @max(@as(usize, 1), @as(usize, W) - 1);
+    // Raggio del glow: scala con l'altezza (~3-9 px) per un neon coerente a ogni
+    // dimensione di finestra. `invR` normalizza il falloff.
+    const R: i32 = @max(@as(i32, 5), @divTrunc(Hi, 90));
+    const invR: f32 = 1.0 / @as(f32, @floatFromInt(R + 1));
     var prev_y: i32 = cy;
     var x: u32 = 0;
     while (x < W) : (x += 1) {
@@ -490,15 +518,27 @@ pub fn drawOscilloscope(buf: []u8, W: u32, H: u32, vs: *VideoState) void {
         const s = std.math.clamp(samples[@min(si, n - 1)], -1.0, 1.0);
         const y: i32 = @intFromFloat(cyf - s * amp);
         const col = oscColor(@abs(s));
-        const y0 = @max(@as(i32, 0), @min(prev_y, y));
-        const y1 = @min(Hi - 1, @max(prev_y, y));
-        var yy = y0;
-        while (yy <= y1) : (yy += 1) {
+        const cr: f32 = @floatFromInt(col[0]);
+        const cg: f32 = @floatFromInt(col[1]);
+        const cb: f32 = @floatFromInt(col[2]);
+        // Segmento connesso tra colonne: core pieno tra prev_y..y, glow additivo ±R.
+        const ylo = @min(prev_y, y);
+        const yhi = @max(prev_y, y);
+        var yy = @max(@as(i32, 0), ylo - R);
+        const yy_end = @min(Hi - 1, yhi + R);
+        while (yy <= yy_end) : (yy += 1) {
             const idx = (@as(usize, @intCast(yy)) * W + x) * 4;
-            buf[idx + 0] = col[0];
-            buf[idx + 1] = col[1];
-            buf[idx + 2] = col[2];
-            buf[idx + 3] = 255;
+            if (yy >= ylo and yy <= yhi) {
+                // Core: tiene la tinta neon (0.8·colore) + spinta bianca contenuta.
+                addPix(buf, idx, cr * 0.8 + 95.0, cg * 0.8 + 95.0, cb * 0.8 + 95.0);
+            } else {
+                const d: f32 = @floatFromInt(if (yy < ylo) ylo - yy else yy - yhi);
+                const f = 1.0 - d * invR; // 0..1
+                if (f > 0) {
+                    const g2 = f * f * 1.35; // falloff morbido, alone con più corpo
+                    addPix(buf, idx, cr * g2, cg * g2, cb * g2);
+                }
+            }
         }
         prev_y = y;
     }
