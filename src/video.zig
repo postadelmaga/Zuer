@@ -168,6 +168,58 @@ pub fn setupVideo(vs: *VideoState, path: []const u8, gpa: std.mem.Allocator) !Vi
     return .{ .rgba = rgba, .w = w, .h = h };
 }
 
+/// Player + primo frame per la RIACCENSIONE del solo video (toggle 'v'): apre il
+/// container su `path` (file o URL) e decodifica il poster; l'audio in corso non
+/// viene toccato. Il chiamante installa `player` in `VideoState` sotto `mutex`.
+pub const VideoOnly = struct { player: player_mod.Player, rgba: []u8, w: u32, h: u32 };
+
+pub fn openVideoOnly(path: []const u8, gpa: std.mem.Allocator) !VideoOnly {
+    if (comptime @import("build_options").video) {
+        const path_z = try gpa.dupeZ(u8, path);
+        defer gpa.free(path_z);
+        var p = try player_mod.Player.open(path_z.ptr);
+        errdefer p.deinit();
+        const frame = (try p.nextFrame(video_max_dim, gpa)) orelse return error.NoFrameDecoded;
+        const w: u32 = @intCast(frame.width);
+        const h: u32 = @intCast(frame.height);
+        const rgba = try gpa.alloc(u8, @as(usize, w) * h * 4);
+        @memcpy(rgba, frame.pixels[0 .. @as(usize, w) * h * 4]);
+        return .{ .player = p, .rgba = rgba, .w = w, .h = h };
+    }
+    return error.NoVideo;
+}
+
+/// Come `setupVideo`, ma per uno stream remoto con URL video e URL audio
+/// SEPARATI (yt-dlp risolve i formati DASH di YouTube su due URL distinti; con
+/// un formato muxed i due URL coincidono). Nessuno stripping di frammenti `#`:
+/// gli URL vanno passati a libav così come sono. Usato dalla ricerca YouTube
+/// (`yt_search.openWorker`) su uno stato LOCALE, fuori dai lock.
+pub fn setupStream(vs: *VideoState, video_url: []const u8, audio_url: []const u8, gpa: std.mem.Allocator) !VideoFirst {
+    if (comptime !@import("build_options").video) return error.NoVideo;
+    const vurl_z = try gpa.dupeZ(u8, video_url);
+    defer gpa.free(vurl_z);
+    const aurl_z = try gpa.dupeZ(u8, audio_url);
+    defer gpa.free(aurl_z);
+
+    var p = try player_mod.Player.open(vurl_z.ptr);
+    errdefer p.deinit();
+    const frame = (try p.nextFrame(video_max_dim, gpa)) orelse return error.NoFrameDecoded;
+
+    const w: u32 = @intCast(frame.width);
+    const h: u32 = @intCast(frame.height);
+    const rgba = try gpa.alloc(u8, @as(usize, w) * h * 4);
+    @memcpy(rgba, frame.pixels[0 .. @as(usize, w) * h * 4]);
+
+    vs.dur_s = p.duration_s;
+    vs.pos_s = frame.pts_s;
+    vs.shown_pts = frame.pts_s;
+    vs.playing = true;
+    vs.player = p;
+    // Audio dal SUO URL (stream DASH separato). null se non si apre: video muto.
+    vs.audio = AudioPlayer.start(aurl_z.ptr, gpa);
+    return .{ .rgba = rgba, .w = w, .h = h };
+}
+
 /// Apre SOLO l'audio di un file (mp3, wav, flac, ogg…) e mette `vs` in modalità
 /// visualizzatore: nessun player video, l'oscilloscopio viene disegnato dai
 /// campioni live in `advanceAudio`+`drawOscilloscope`. Ritorna un canvas iniziale

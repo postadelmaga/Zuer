@@ -16,6 +16,8 @@ const text_render = @import("text_render.zig");
 // Player video nativo (libav): puntato da `GuiAppState.video`.
 const videomod = @import("video.zig");
 const midi_player = @import("midi_player.zig");
+// Ricerca YouTube (overlay tasto `y`): stato dentro `Shared`, logica nel modulo.
+const yt_search = @import("yt_search.zig");
 const compose = @import("compose.zig");
 const TabBarState = compose.TabBarState;
 const zrame = @import("zrame");
@@ -128,6 +130,18 @@ pub const GuiAppState = struct {
         // selezione non è attiva (contenuto non-archivio). Impostata in
         // `applyDecoded`, letta dall'input e dall'overlay di compose.
         table_sel_row: i32 = -1,
+
+        // Overlay di ricerca YouTube (tasto `y`): query, risultati e flag dei
+        // worker yt-dlp. Come tutto in `Shared`, ogni accesso sotto `mutex`.
+        yt: yt_search.YtState = .{},
+
+        // Sorgenti A/V del player corrente (percorso locale o URL yt), possedute:
+        // servono al toggle 'v' (video ↔ solo audio) per riaprire il container
+        // video. `av_has_video` = la sorgente HA uno stream video (per gli mp3 il
+        // toggle non ha senso).
+        av_src_video: ?[]u8 = null,
+        av_src_audio: ?[]u8 = null,
+        av_has_video: bool = false,
     };
 
     /// Thread di caricamento asincrono per la navigazione a cache-miss: decodifica
@@ -282,6 +296,22 @@ pub const GuiAppState = struct {
         return voxel.voxelize(self.gpa, m, dim);
     }
 };
+
+/// Registra le sorgenti A/V correnti del player in `Shared` (copiate, possedute):
+/// il toggle 'v' (video ↔ solo audio) le usa per riaprire il container video.
+/// Da chiamare con `shared.mutex` acquisito.
+pub fn setAvSrc(state: *GuiAppState, v: []const u8, a: []const u8, src_has_video: bool) void {
+    const nv = state.gpa.dupe(u8, v) catch return;
+    const na = state.gpa.dupe(u8, a) catch {
+        state.gpa.free(nv);
+        return;
+    };
+    if (state.shared.av_src_video) |o| state.gpa.free(o);
+    if (state.shared.av_src_audio) |o| state.gpa.free(o);
+    state.shared.av_src_video = nv;
+    state.shared.av_src_audio = na;
+    state.shared.av_has_video = src_has_video;
+}
 
 /// Riporta la scrollbar all'origine azzerando offset, kinetica e coda di smoothing.
 /// Il chiamante deve già detenere il `mutex`. Usato ai cambi di foglio/file.

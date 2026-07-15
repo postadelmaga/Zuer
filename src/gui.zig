@@ -31,6 +31,8 @@ const rgbToRgba = gui_state_mod.rgbToRgba;
 const nav = @import("nav.zig");
 // Callback input zrame (tastiera/rotella/mouse) + comandi di vista.
 const input = @import("input.zig");
+// Ricerca YouTube (overlay tasto `y`): stato in Shared, ricerca/streaming yt-dlp.
+const yt_search = @import("yt_search.zig");
 const build_options = @import("build_options");
 /// Vulkan mesh/text renderer available (Linux + Windows). Comptime so the GPU code links
 /// only when enabled. Distinct from `has_video`: on Windows Vulkan is on but video is off.
@@ -379,6 +381,12 @@ fn renderWorker(
     var name_raster: ?glyph.Raster = glyph.Raster.init(state.gpa, 13.0) catch null;
     defer if (name_raster) |*r| r.deinit();
 
+    // Autorepeat del Backspace nell'overlay YouTube (zrame non sintetizza il
+    // key-repeat di Wayland): dopo il ritardo iniziale, una cancellazione ogni
+    // 50 ms finché il tasto resta giù (bs_held, azzerato al rilascio).
+    var bs_delay: f32 = 0;
+    var bs_rep: f32 = 0;
+
     // La primitiva scrollbar `state.shared.sc` è condivisa coi callback input: qui la si usa
     // solo entro il lock del mutex (già preso attorno alla sezione compose).
     // Secondi trascorsi dall'ultimo frame presentato (dal Pacer a fine loop); guida
@@ -403,6 +411,18 @@ fn renderWorker(
         }
 
         state.shared.mutex.lockUncancelable(state.io);
+
+        // Autorepeat Backspace dell'overlay (vale per ogni ramo: testo, video…).
+        if (state.shared.yt.active and state.shared.yt.bs_held) {
+            bs_delay += frame_dt;
+            if (bs_delay >= 0.35) {
+                bs_rep += frame_dt;
+                while (bs_rep >= 0.05) : (bs_rep -= 0.05) yt_search.backspaceOnce(state);
+            }
+        } else {
+            bs_delay = 0;
+            bs_rep = 0;
+        }
 
         // Traccia da quanto dura il caricamento per la soglia anti-flash.
         const now_loading = state.shared.loading;
@@ -483,9 +503,16 @@ fn renderWorker(
             // Presenta solo se è cambiato qualcosa: nuovo frame, resize, oppure
             // l'alpha dei controlli si sta muovendo. In pausa a controlli fermi
             // non ricomponiamo (niente 60 Hz sprecati sullo stesso fotogramma).
+            // L'overlay YouTube conta come cambiamento: digitazione/selezione
+            // arrivano via `file_changed` (consumato qui: il ramo normale non
+            // gira finché il video è attivo), lo spinner anima da sé.
             const size_ch = (cur_w != vid_pw or cur_h != vid_ph);
             const ctrl_ch = @abs(vs.controls - vid_prev_ctrl) > 0.002;
-            const do_present = new_frame or size_ch or ctrl_ch or vs.scrubbing;
+            const yt_active = state.shared.yt.active;
+            const yt_anim = yt_active and (state.shared.yt.searching or state.shared.yt.opening);
+            const yt_ch = state.shared.file_changed;
+            state.shared.file_changed = false;
+            const do_present = new_frame or size_ch or ctrl_ch or vs.scrubbing or yt_ch or yt_anim;
             var pres_w: u32 = 0;
             var pres_h: u32 = 0;
             if (do_present) {
@@ -508,6 +535,10 @@ fn renderWorker(
                 const raster: ?*glyph.Raster = if (name_raster) |*r| r else null;
                 videomod.drawVideoControls(composited_rgba.*, fr.w, fr.h, vs, raster);
                 if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, fr.w, fr.h, r, std.fs.path.basename(state.shared.current_file_path));
+                if (yt_active) {
+                    if (name_raster) |*r| yt_search.drawOverlay(composited_rgba.*, fr.w, fr.h, state, r, @as(f32, @floatFromInt(spin_frame)) / 60.0);
+                    spin_frame +%= 1;
+                }
                 vid_pw = cur_w;
                 vid_ph = cur_h;
                 vid_prev_ctrl = vs.controls;
@@ -517,7 +548,7 @@ fn renderWorker(
             // Stato del pacer campionato ANCORA sotto lock (il worker lo rilegge
             // dopo l'unlock); il catch-up post-seek conta come "busy" così il
             // recupero prosegue a 120 Hz anche in pausa.
-            const busy = vs.playing or vs.scrubbing or ctrl_ch or vs.catchup_until >= 0;
+            const busy = vs.playing or vs.scrubbing or ctrl_ch or vs.catchup_until >= 0 or yt_anim;
             state.shared.mutex.unlock(state.io);
             // Present FUORI dal lock: `presentRgba` copia subito il buffer (di cui
             // il worker è unico proprietario) nel mailbox di zrame → i callback
@@ -559,6 +590,8 @@ fn renderWorker(
         // Un cambio contenuto arma qualche present di rinforzo (vedi present_pulse).
         if (state.shared.file_changed) present_pulse = 4;
         if (present_pulse > 0) need_render = true;
+        // Spinner dell'overlay YouTube: anima finché ricerca/apertura sono in corso.
+        if (state.shared.yt.active and (state.shared.yt.searching or state.shared.yt.opening)) need_render = true;
         var text_animating = false;
 
         // Modalità follow (-f): sonda la crescita del file (~2 volte/s) e accoda i
@@ -710,6 +743,11 @@ fn renderWorker(
             // ramo mesh il frame viene composto DOPO l'unlock: label e flag lì.
             if (mesh_push == null and mesh_voxel_push == null) {
                 if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, cur_w, cur_h, r, std.fs.path.basename(state.shared.current_file_path));
+                // Overlay di ricerca YouTube, sopra tutto (siamo ancora sotto lock).
+                if (state.shared.yt.active) {
+                    if (name_raster) |*r| yt_search.drawOverlay(composited_rgba.*, cur_w, cur_h, state, r, @as(f32, @floatFromInt(spin_frame)) / 60.0);
+                    spin_frame +%= 1;
+                }
                 did_compose = true;
             }
         }
@@ -744,6 +782,14 @@ fn renderWorker(
                 // render, quindi comporre fuori dal lock è sicuro.
                 compose.composeFrame(composited_rgba.*, cur_w, cur_h, mr, cur_w, cur_h, false, 1.0, 0.0, 0.0);
                 if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, cur_w, cur_h, r, mesh_name_buf[0..mesh_name_len]);
+                // Overlay YouTube anche sulle mesh: qui il frame è composto fuori
+                // dal lock, quindi lo stato dell'overlay va riletto sotto mutex.
+                state.shared.mutex.lockUncancelable(state.io);
+                if (state.shared.yt.active) {
+                    if (name_raster) |*r| yt_search.drawOverlay(composited_rgba.*, cur_w, cur_h, state, r, @as(f32, @floatFromInt(spin_frame)) / 60.0);
+                    spin_frame +%= 1;
+                }
+                state.shared.mutex.unlock(state.io);
                 did_compose = true;
             } else {
                 // Riarma il redraw così il prossimo giro riprova il render.
@@ -897,6 +943,9 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(gui_state.shared.static_rgba);
     defer gui_state_mod.freeTextDoc(&gui_state);
     defer if (has_video) gui_state.video.deinit();
+    defer yt_search.deinit(&gui_state);
+    defer if (gui_state.shared.av_src_video) |s| gpa.free(s);
+    defer if (gui_state.shared.av_src_audio) |s| gpa.free(s);
 
     defer {
         gpa.free(gui_state.shared.current_file_path);
@@ -993,6 +1042,7 @@ pub fn main(init: std.process.Init) !void {
         .width = win_size.w,
         .height = win_size.h,
         .on_key = input.keyCallback,
+        .on_text = input.textCallback,
         .on_scroll = input.scrollCallback,
         .on_mouse = input.mouseCallback,
         .user = &gui_state,

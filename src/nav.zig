@@ -393,17 +393,94 @@ pub fn startVideo(state: *GuiAppState, path: []const u8) bool {
             std.debug.print("Media non apribile (video: {s}, audio: {s})\n", .{ @errorName(e), @errorName(e2) });
             return false;
         };
+        gui_state_mod.setAvSrc(state, path, path, false);
         state.gpa.free(state.shared.static_rgba);
         state.shared.static_rgba = af.rgba;
         state.shared.static_w = af.w;
         state.shared.static_h = af.h;
         return true;
     };
+    gui_state_mod.setAvSrc(state, path, path, true);
     state.gpa.free(state.shared.static_rgba);
     state.shared.static_rgba = first.rgba;
     state.shared.static_w = first.w;
     state.shared.static_h = first.h;
     return true;
+}
+
+/// Toggle 'v' durante la riproduzione: spegne il video (resta l'audio → il
+/// worker passa all'oscilloscopio, come per gli mp3) o lo riaccende riaprendo
+/// il container della sorgente corrente su un thread (rete/disco lenti) e
+/// riagganciandosi alla posizione dell'audio.
+pub fn toggleVideoTrack(state: *GuiAppState) void {
+    if (comptime !has_video) return;
+    state.shared.mutex.lockUncancelable(state.io);
+    const vs = &state.video;
+    if (!vs.isActive() or !state.shared.av_has_video) {
+        state.shared.mutex.unlock(state.io);
+        return;
+    }
+    if (!vs.audio_only) {
+        // Video → solo audio: chiudi il container video, l'audio continua.
+        if (vs.player) |*p| p.deinit();
+        vs.player = null;
+        vs.audio_only = true;
+        vs.catchup_until = -1;
+        state.shared.file_changed = true;
+        state.shared.mutex.unlock(state.io);
+        return;
+    }
+    const src_ref = state.shared.av_src_video orelse {
+        state.shared.mutex.unlock(state.io);
+        return;
+    };
+    const src = state.gpa.dupe(u8, src_ref) catch {
+        state.shared.mutex.unlock(state.io);
+        return;
+    };
+    const pos = vs.pos_s;
+    state.shared.mutex.unlock(state.io);
+    const t = std.Thread.spawn(.{}, videoReopenWorker, .{ state, src, pos }) catch {
+        state.gpa.free(src);
+        return;
+    };
+    t.detach();
+}
+
+/// Thread di riaccensione del video (toggle 'v'): apre il container fuori dal
+/// lock, poi installa player e poster sotto `mutex` se lo stato è ancora
+/// audio-only. `seek_to` riallinea video e audio alla posizione corrente.
+fn videoReopenWorker(state: *GuiAppState, src: []u8, pos: f64) void {
+    defer state.gpa.free(src);
+    if (comptime !has_video) return;
+    var vo = videomod.openVideoOnly(src, state.gpa) catch |e| {
+        std.debug.print("[video] riaccensione video fallita: {s}\n", .{@errorName(e)});
+        return;
+    };
+
+    state.shared.mutex.lockUncancelable(state.io);
+    defer state.shared.mutex.unlock(state.io);
+    const vs = &state.video;
+    // Nel frattempo l'utente può aver navigato altrove (anche verso un ALTRO
+    // audio-only) o ri-toggleato: installa solo se siamo ancora in audio-only
+    // senza container video e la sorgente corrente è la stessa di partenza.
+    const same_src = if (state.shared.av_src_video) |cur| std.mem.eql(u8, cur, src) else false;
+    if (!vs.audio_only or vs.player != null or !same_src) {
+        vo.player.deinit();
+        state.gpa.free(vo.rgba);
+        return;
+    }
+    vs.player = vo.player;
+    vs.audio_only = false;
+    vs.scope_head = 0;
+    // Riaggancio alla posizione VERA: il clock audio ha continuato ad avanzare
+    // durante l'apertura del container; `pos` è solo il fallback senza audio.
+    vs.seek_to = if (vs.audio) |a| a.clockSeconds() else @max(pos, 0);
+    state.gpa.free(state.shared.static_rgba);
+    state.shared.static_rgba = vo.rgba;
+    state.shared.static_w = vo.w;
+    state.shared.static_h = vo.h;
+    state.shared.file_changed = true;
 }
 
 pub fn initFileList(state: *GuiAppState) !void {

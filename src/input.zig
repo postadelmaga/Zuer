@@ -11,6 +11,7 @@ const clipboard = @import("clipboard.zig");
 // Player video nativo: hit-test dei controlli overlay e seek da tastiera/mouse.
 const videomod = @import("video.zig");
 const nav = @import("nav.zig");
+const yt_search = @import("yt_search.zig");
 const gui_state_mod = @import("gui_state.zig");
 const GuiAppState = gui_state_mod.GuiAppState;
 const resetScroll = gui_state_mod.resetScroll;
@@ -43,6 +44,9 @@ const KEY_SPACE: u32 = 57;
 const KEY_0: u32 = 11;
 const KEY_Q: u32 = 16;
 const KEY_ENTER: u32 = 28;
+const KEY_Y: u32 = 21;
+const KEY_BACKSPACE: u32 = 14;
+const KEY_A: u32 = 30;
 
 // Stato per il rilevamento del doppio-click sinistro (solo thread finestra).
 var last_click_ms: i64 = -1000;
@@ -405,6 +409,113 @@ fn toggleVoxel(app_state: *GuiAppState) void {
     app_state.shared.file_changed = true; // forza un re-render
 }
 
+/// Tasti dell'overlay di ricerca YouTube. Ritorna true se l'evento è consumato:
+/// col pannello aperto TUTTA la tastiera è sua (Esc chiude, ↑/↓ selezionano,
+/// Invio cerca/apre, Backspace cancella; i caratteri arrivano da `textCallback`).
+/// A pannello chiuso, `y` lo apre.
+fn handleYtKey(app_state: *GuiAppState, key: u32) bool {
+    app_state.shared.mutex.lockUncancelable(app_state.io);
+    defer app_state.shared.mutex.unlock(app_state.io);
+    const yt = &app_state.shared.yt;
+    if (!yt.active) {
+        if (key == KEY_Y and !app_state.ctrl_down) {
+            yt.active = true;
+            // Il 'y' di apertura genera anche un evento testo (on_text è
+            // additivo a on_key): non deve finire nella query.
+            yt.swallow_text = true;
+            yt.sel_all = false;
+            yt.bs_held = false;
+            yt.sb_drag = false;
+            app_state.shared.file_changed = true;
+            return true;
+        }
+        return false;
+    }
+    // Scorciatoie col Ctrl: seleziona tutto / copia / incolla nella textbox.
+    if (app_state.ctrl_down) {
+        switch (key) {
+            KEY_A => {
+                if (yt.query.items.len > 0) {
+                    yt.sel_all = true;
+                    app_state.shared.file_changed = true;
+                }
+            },
+            KEY_C => yt_search.copyQuery(app_state),
+            KEY_V => yt_search.startPaste(app_state),
+            else => {},
+        }
+        return true;
+    }
+    switch (key) {
+        KEY_ESC => {
+            yt.active = false;
+            yt.bs_held = false;
+            yt.sb_drag = false;
+            app_state.shared.file_changed = true;
+        },
+        KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT => {
+            // Navigazione a griglia: ←/→ di una card, ↑/↓ di una riga. Lo
+            // scroll insegue la selezione (solo per la tastiera: follow_sel).
+            const n: i32 = @intCast(yt.results.len);
+            if (n > 0) {
+                const step: i32 = switch (key) {
+                    KEY_LEFT => -1,
+                    KEY_RIGHT => 1,
+                    KEY_UP => -yt_search.grid_cols,
+                    else => yt_search.grid_cols,
+                };
+                yt.sel = std.math.clamp(yt.sel + step, 0, n - 1);
+                yt.follow_sel = true;
+                app_state.shared.file_changed = true;
+            }
+        },
+        KEY_PGUP, KEY_PGDOWN => {
+            const n: i32 = @intCast(yt.results.len);
+            if (n > 0) {
+                const step: i32 = 3 * yt_search.grid_cols;
+                yt.sel = std.math.clamp(yt.sel + (if (key == KEY_PGDOWN) step else -step), 0, n - 1);
+                yt.follow_sel = true;
+                app_state.shared.file_changed = true;
+            }
+        },
+        KEY_ENTER => {
+            if (yt.results.len > 0 and yt.sel >= 0) {
+                yt_search.openSelected(app_state);
+            } else {
+                yt_search.startSearch(app_state);
+            }
+        },
+        KEY_BACKSPACE => {
+            // Prima cancellazione subito; l'autorepeat (tasto tenuto giù) lo
+            // genera il render worker finché `bs_held` è vero (zrame non
+            // sintetizza il key-repeat di Wayland).
+            yt_search.backspaceOnce(app_state);
+            yt.bs_held = true;
+        },
+        else => {},
+    }
+    return true;
+}
+
+/// Callback `on_text` di zrame (traduzione xkbcommon layout-correct, additiva a
+/// `on_key`): digitazione nel campo query dell'overlay YouTube.
+pub fn textCallback(win: *zrame.Window, bytes: [4]u8, len: u8, user: ?*anyopaque) void {
+    _ = win;
+    const app_state: *GuiAppState = @ptrCast(@alignCast(user orelse return));
+    if (len == 0 or len > 4) return;
+    app_state.shared.mutex.lockUncancelable(app_state.io);
+    defer app_state.shared.mutex.unlock(app_state.io);
+    const yt = &app_state.shared.yt;
+    if (yt.swallow_text) {
+        yt.swallow_text = false;
+        return;
+    }
+    if (!yt.active or app_state.ctrl_down) return;
+    // Inserimento (con eventuale rimpiazzo della selezione Ctrl+A); invalida i
+    // risultati mostrati, che non corrispondono più alla query.
+    yt_search.insertText(app_state, bytes[0..len]);
+}
+
 pub fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) void {
     const app_state: *GuiAppState = @ptrCast(@alignCast(user orelse return));
     const pressed = (state == 1);
@@ -415,7 +526,16 @@ pub fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) 
         app_state.ctrl_down = pressed;
         return;
     }
+    // Rilascio del Backspace: ferma l'autorepeat dell'overlay (vedi bs_held).
+    if (!pressed and key == KEY_BACKSPACE) {
+        app_state.shared.mutex.lockUncancelable(app_state.io);
+        app_state.shared.yt.bs_held = false;
+        app_state.shared.mutex.unlock(app_state.io);
+    }
     if (pressed) {
+        // Overlay ricerca YouTube: ha priorità su tutto (col pannello aperto la
+        // tastiera è sua; da chiuso `y` lo apre).
+        if (handleYtKey(app_state, key)) return;
         // Snapshot sotto lock: `current_file_path` è liberato/riassegnato e i
         // flag di tipo (is_text/is_mesh) riscritti da `applyDecoded` (thread
         // loader) sotto `mutex` — mai leggerli a nudo.
@@ -442,6 +562,10 @@ pub fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) 
                 vid.seek_to = t;
                 vid.idle_s = 0;
                 app_state.shared.mutex.unlock(app_state.io);
+                return;
+            } else if (key == KEY_V) {
+                // Toggle video ↔ solo audio (oscilloscopio): l'audio non si ferma.
+                nav.toggleVideoTrack(app_state);
                 return;
             }
         }
@@ -523,6 +647,8 @@ pub fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) 
 
 pub fn scrollCallback(win: *zrame.Window, axis: u32, value: i32, user: ?*anyopaque) void {
     const app_state: *GuiAppState = @ptrCast(@alignCast(user orelse return));
+    // Overlay YouTube aperto: la rotella sfoglia la griglia dei risultati.
+    if (yt_search.handleWheel(app_state, win, axis, value)) return;
     // Snapshot sotto lock (stesso pattern di `is_pdf` nel key handler):
     // `is_text` è riscritto da `applyDecoded` sui thread loader.
     app_state.shared.mutex.lockUncancelable(app_state.io);
@@ -563,6 +689,10 @@ pub fn scrollCallback(win: *zrame.Window, axis: u32, value: i32, user: ?*anyopaq
 /// Così un click sulla scrollbar afferra il thumb invece di spostare la finestra.
 pub fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopaque) bool {
     const app_state: *GuiAppState = @ptrCast(@alignCast(user orelse return false));
+    // Overlay di ricerca YouTube aperto: il mouse è suo (hover seleziona la
+    // card, click apre, click fuori dal pannello chiude). `handleMouse` ritorna
+    // false solo a overlay chiuso o sul leave → si prosegue col flusso normale.
+    if (yt_search.handleMouse(app_state, win, event)) return true;
     // Gli eventi puntatore arrivano da zrame già in coordinate del frame presentato
     // (vedi `zrame.MouseEvent`): lo stesso spazio in cui zuer disegna, quindi tutti gli
     // hit-test qui sotto (scrollbar, selezione testo, tab bar, controlli video) usano
