@@ -22,7 +22,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const zicro = @import("zicro");
 const DeviceOut = zicro.audio_device.DeviceOut;
-const AudioBlock = zicro.audio.AudioBlock;
 
 const c = @cImport({
     @cInclude("tsf.h");
@@ -48,8 +47,9 @@ const OUT_CH: u16 = 2;
 /// atterrare i messaggi MIDI vicino al loro tempo, abbastanza grandi da non
 /// stressare il device.
 const BLOCK_FRAMES: usize = 1024;
-// Il device bufferizza qualche decina di ms davanti al "consumato": il clock è
-// il tempo sottomesso meno questa latenza stimata (stessa stima del player audio).
+// Il device bufferizza davanti al "consumato": il clock è il tempo sottomesso meno
+// la latenza. Quando il backend la riporta (PipeWire) si usa quella viva; questa
+// costante è solo il FALLBACK per i backend muti (ALSA/waveOut).
 const LATENCY_S: f64 = 0.12;
 
 /// `tml_message` ridichiarata in Zig: la struct C usa union/struct anonime che
@@ -258,11 +258,16 @@ pub const MidiPlayer = struct {
             }
             c.tsf_render_float(self.synth, &buf, @intCast(BLOCK_FRAMES), 0);
 
-            var block = AudioBlock.init(self.gpa, OUT_RATE, OUT_CH, &buf) catch continue;
-            defer block.deinit();
-            self.dev.play(&block); // bloccante → pacing real-time (backpressure)
+            // Sottomissione diretta dal buffer di render: bloccante → pacing
+            // real-time (backpressure), senza alloc+copy di un blocco per giro.
+            self.dev.playRaw(&buf);
 
-            const played_ms: i64 = @intFromFloat(@max(0.0, self.song_ms - LATENCY_S * 1000.0));
+            // Latenza reale dal backend quando la riporta (PipeWire), stima altrimenti.
+            const lat_ms: f64 = if (self.dev.latencyFrames()) |lf|
+                @as(f64, @floatFromInt(lf)) * 1000.0 / @as(f64, @floatFromInt(OUT_RATE))
+            else
+                LATENCY_S * 1000.0;
+            const played_ms: i64 = @intFromFloat(@max(0.0, self.song_ms - lat_ms));
             self.clock_ms.store(@min(played_ms, @as(i64, @intCast(self.duration_ms))), .monotonic);
         }
     }

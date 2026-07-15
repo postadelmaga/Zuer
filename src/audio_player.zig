@@ -17,7 +17,6 @@ const player = @import("decoders/player.zig");
 const c = player.c;
 const zicro = @import("zicro");
 const DeviceOut = zicro.audio_device.DeviceOut;
-const AudioBlock = zicro.audio.AudioBlock;
 
 extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
 
@@ -33,9 +32,10 @@ fn sleepMs(ms: u32) void {
 
 const OUT_RATE: c_int = 48_000;
 const OUT_CH: c_int = 2;
-// Il device bufferizza ~qualche decina di ms davanti al "consumato"; il clock è
-// il "sottomesso" meno questa latenza stimata, così il video non anticipa. Allineato
-// al ring PipeWire di zicro (4 quanti da 256 @48k ≈ 21 ms + latenza grafo ≈ 26 ms).
+// Il device bufferizza davanti al "consumato"; il clock è il "sottomesso" meno la
+// latenza. Quando il backend la riporta (PipeWire: occupazione ring + un quanto,
+// via `dev.latencyFrames`) si usa quella, viva e già allineata al fill adattivo.
+// Questa costante è solo il FALLBACK per i backend muti (ALSA/waveOut).
 const LATENCY_S: f64 = 0.03;
 
 /// Campioni (mono) tenuti in coda per l'oscilloscopio del player audio (~170 ms a
@@ -285,12 +285,18 @@ pub const AudioPlayer = struct {
                 self.scope_w.store(w, .monotonic);
             }
 
-            var block = AudioBlock.init(self.gpa, @intCast(OUT_RATE), @intCast(OUT_CH), out.items[0 .. n * @as(usize, OUT_CH)]) catch continue;
-            defer block.deinit();
-            self.dev.play(&block); // bloccante → pacing real-time (backpressure)
+            // Sottomissione diretta dal buffer di conversione: bloccante → pacing
+            // real-time (backpressure), senza alloc+copy di un blocco per giro.
+            self.dev.playRaw(out.items[0 .. n * @as(usize, OUT_CH)]);
 
             submitted += @intCast(n);
-            const played_ms = @divTrunc(submitted * 1000, OUT_RATE) - @as(i64, @intFromFloat(LATENCY_S * 1000.0));
+            // Latenza reale dal backend quando disponibile (letta DOPO il play,
+            // quindi già comprensiva del blocco appena accodato), stima altrimenti.
+            const lat_frames: i64 = if (self.dev.latencyFrames()) |lf|
+                @intCast(lf)
+            else
+                @intFromFloat(LATENCY_S * @as(f64, @floatFromInt(OUT_RATE)));
+            const played_ms = @divTrunc((submitted - lat_frames) * 1000, OUT_RATE);
             self.clock_ms.store(@max(0, played_ms), .monotonic);
         }
     }

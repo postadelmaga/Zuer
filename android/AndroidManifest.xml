@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Manifest dell'APK di Zuer (M1). Nessun codice Java/Kotlin: l'activity è la
+     NativeActivity del framework, che carica `libzuer.so` (android.app.lib_name =
+     "zuer") e ne chiama ANativeActivity_onCreate → native_app_glue → android_main.
+     Da qui `hasCode="false"`: nel pacchetto non c'è alcun classes.dex.
+
+     M2 aggiungerà i permessi e gli intent-filter per aprire file/cartelle (SAF);
+     M1 è solo l'icona nel launcher. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="dev.zuer.viewer"
+    android:versionCode="1"
+    android:versionName="0.1.0">
+
+    <!-- Zuer è un file manager: deve poter LEGGERE file che non ha creato lui. Da
+         Android 11 questo non basta più chiederlo col dialogo runtime (lo storage
+         "scoped" copre solo i media): serve MANAGE_EXTERNAL_STORAGE, che si concede
+         dalla schermata di sistema aperta da android_jni.requestAllFilesAccess.
+         READ_EXTERNAL_STORAGE resta per i dispositivi fino ad Android 10. -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+
+    <application
+        android:label="Zuer"
+        android:icon="@mipmap/ic_launcher"
+        android:hasCode="false"
+        android:requestLegacyExternalStorage="true"
+        android:allowBackup="true">
+
+        <activity
+            android:name="android.app.NativeActivity"
+            android:label="Zuer"
+            android:exported="true"
+            android:screenOrientation="fullUser"
+            android:theme="@style/Zuer.Fullscreen"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|density">
+
+            <!-- Il nome della libreria nativa SENZA "lib"/".so": il framework la
+                 risolve come lib<name>.so dentro lib/<abi>/ dell'APK. -->
+            <meta-data android:name="android.app.lib_name" android:value="zuer" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

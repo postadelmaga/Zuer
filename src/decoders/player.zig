@@ -179,6 +179,14 @@ pub const Player = struct {
         const stream_idx = c.av_find_best_stream(fmt_ctx, c.AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0);
         if (stream_idx < 0 or codec == null) return Error.NoVideoStream;
         const stream = fmt_ctx.*.streams[@intCast(stream_idx)];
+        // Copertina embedded (mp3/flac con APIC): è uno stream "video" di un solo
+        // frame marcato attached_pic. Per il player LIVE non è un video: aprirlo
+        // qui manderebbe l'audio nel player video, dove ogni nextFrame demuxa
+        // l'intero file cercando un secondo frame che non esiste e il loop a EOF
+        // fa ripartire la riproduzione da capo all'infinito. Il poster one-shot
+        // (allow_cvp9=false) invece la usa eccome: è la cover art dell'anteprima.
+        if (allow_cvp9 and (stream.*.disposition & c.AV_DISPOSITION_ATTACHED_PIC) != 0)
+            return Error.NoVideoStream;
 
         var codec_ctx = c.avcodec_alloc_context3(codec) orelse return Error.AllocFailed;
         errdefer {

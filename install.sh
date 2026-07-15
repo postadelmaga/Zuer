@@ -99,6 +99,46 @@ xdg-mime default zuer-gui.desktop image/png image/jpeg image/gif image/bmp image
 echo "Updating desktop database..."
 update-desktop-database "$APP_DIR"
 
+# Desktop entry "sfoglia" per la scorciatoia globale: apre la home in zuer
+# (con le frecce si naviga tutta la cartella → file manager visuale).
+cat <<EOF > "$APP_DIR/zuer-browse.desktop"
+[Desktop Entry]
+Type=Application
+Name=Zuer (Sfoglia)
+Comment=Apre la home in Zuer e naviga i file con le frecce
+Exec=$INSTALL_DIR/zuer-gui $HOME
+Icon=utilities-terminal
+Terminal=false
+Categories=Graphics;Viewer;
+EOF
+
+# KDE: voce "Apri con Zuer" nel menu contestuale di Dolphin (service menu)…
+SVCMENU_DIR="$HOME/.local/share/kio/servicemenus"
+mkdir -p "$SVCMENU_DIR"
+cat <<EOF > "$SVCMENU_DIR/zuer.desktop"
+[Desktop Entry]
+Type=Service
+ServiceTypes=KonqPopupMenu/Plugin
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+MimeType=all/allfiles;inode/directory;
+Actions=openWithZuer;
+X-KDE-Priority=TopLevel
+
+[Desktop Action openWithZuer]
+Name=Apri con Zuer
+Icon=viewimage
+Exec=$INSTALL_DIR/zuer-gui %f
+EOF
+chmod +x "$SVCMENU_DIR/zuer.desktop" # Dolphin recente esige il bit eseguibile
+
+# …e scorciatoia globale Meta+Z → Zuer (Sfoglia). Solo la registrazione nel
+# config: kwin/kglobalaccel la carica al volo o al prossimo login. NON Ctrl+Z
+# (è l'Annulla di sistema); Meta+Z è libera.
+if command -v kwriteconfig6 &> /dev/null; then
+  echo "Registering global shortcut Meta+Z (KDE)..."
+  kwriteconfig6 --file kglobalshortcutsrc --group services --group zuer-browse.desktop --key _launch "Meta+Z"
+fi
+
 # Rebuild KDE sycoca cache if applicable
 if command -v kbuildsycoca6 &> /dev/null; then
   echo "Rebuilding KDE sycoca cache..."

@@ -913,7 +913,7 @@ fn decodeExport(
     };
 }
 
-export fn zuer_decode(
+fn zuer_decode(
     path: decoder.SliceC,
     content: decoder.SliceC,
     io_ptr: *const anyopaque,
@@ -925,7 +925,7 @@ export fn zuer_decode(
 
 // Prima fase progressiva: texture al tier coarse (256², da cache se presente →
 // resa istantanea). L'host la usa opzionalmente prima di `zuer_decode` (full).
-export fn zuer_decode_coarse(
+fn zuer_decode_coarse(
     path: decoder.SliceC,
     content: decoder.SliceC,
     io_ptr: *const anyopaque,
@@ -937,12 +937,24 @@ export fn zuer_decode_coarse(
 
 const extensions = "glb";
 
-export fn zuer_extensions() callconv(.c) decoder.SliceC {
+fn zuer_extensions() callconv(.c) decoder.SliceC {
     return decoder.SliceC.fromSlice(extensions);
 }
 
 /// Versione dell'ABI plugin con cui questo decoder è compilato: l'host la
 /// confronta con la propria `decoder.abi_version` e scarta i mismatch.
-export fn zuer_abi_version() callconv(.c) u32 {
+fn zuer_abi_version() callconv(.c) u32 {
     return decoder.abi_version;
+}
+
+// Gli export dell'ABI plugin esistono solo dove i decoder SONO plugin (vedi
+// decoder.plugin_abi): su Android sono linkati dentro l'unica libreria dell'APK e i loro
+// nomi colliderebbero.
+comptime {
+    if (decoder.plugin_abi) {
+        @export(&zuer_decode, .{ .name = "zuer_decode", .linkage = .strong });
+        @export(&zuer_decode_coarse, .{ .name = "zuer_decode_coarse", .linkage = .strong });
+        @export(&zuer_extensions, .{ .name = "zuer_extensions", .linkage = .strong });
+        @export(&zuer_abi_version, .{ .name = "zuer_abi_version", .linkage = .strong });
+    }
 }

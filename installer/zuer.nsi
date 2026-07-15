@@ -104,6 +104,11 @@ Section "Install"
   ; Collegamenti nel menu Start.
   CreateDirectory "$SMPROGRAMS\${APP}"
   CreateShortcut  "$SMPROGRAMS\${APP}\${APP}.lnk" "$INSTDIR\${APP_EXE}"
+  ; "Sfoglia": apre la home in Zuer (con le frecce si naviga la cartella), con
+  ; hotkey GLOBALE Ctrl+Alt+Z via .lnk (Windows attiva le hotkey dei collegamenti
+  ; solo in Start Menu/Desktop; Win+Z non è assegnabile a un .lnk e Ctrl+Z è
+  ; l'Annulla di sistema — Ctrl+Alt+Z è la scelta sicura).
+  CreateShortcut  "$SMPROGRAMS\${APP}\${APP} (Sfoglia).lnk" "$INSTDIR\${APP_EXE}" '"$PROFILE"' "" 0 SW_SHOWNORMAL "CTRL|ALT|Z" "Sfoglia la home con ${APP}"
   CreateShortcut  "$SMPROGRAMS\${APP}\Disinstalla ${APP}.lnk" "$INSTDIR\uninstall.exe"
 
   ; Uninstaller + voce in "App e funzionalità" (App installate).
@@ -143,6 +148,7 @@ Section "Uninstall"
   RMDir  "$INSTDIR"
 
   Delete "$SMPROGRAMS\${APP}\${APP}.lnk"
+  Delete "$SMPROGRAMS\${APP}\${APP} (Sfoglia).lnk"
   Delete "$SMPROGRAMS\${APP}\Disinstalla ${APP}.lnk"
   RMDir  "$SMPROGRAMS\${APP}"
 

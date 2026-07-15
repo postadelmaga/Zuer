@@ -391,6 +391,105 @@ pub fn build(b: *std.Build) void {
         const fail = b.addFail("player-test richiede libav: ricompila senza -Dffmpeg=false");
         b.step("player-test", "Itera i frame video di un file (libav)").dependOn(&fail.step);
     }
+
+    // `zig build android` — la libreria nativa dell'APK: `libzuer.so` per
+    // aarch64-linux-android, caricata da NativeActivity (M1). Contiene il backend
+    // finestra NDK di zicro (modulo `zicro_android`: canvas+text+window, senza lo
+    // stack Wayland/ALSA che su Android non esiste), il nostro `android_main` e la
+    // native_app_glue del NDK, che è ciò che espone `ANativeActivity_onCreate` —
+    // il simbolo che il framework cerca nel .so. Impacchettato da
+    // scripts/build-android-apk.sh; senza NDK lo step fallisce con un messaggio chiaro.
+    {
+        const android_step = b.step("android", "Compila libzuer.so per Android (aarch64)");
+        const ndk = b.option([]const u8, "ndk", "Percorso dell'Android NDK (default: $ANDROID_NDK_HOME)") orelse
+            b.graph.environ_map.get("ANDROID_NDK_HOME") orelse "";
+        // API 24 (Android 7): la più bassa con tutte le AMotionEvent/ANativeWindow usate.
+        const android_target = b.resolveTargetQuery(.{
+            .cpu_arch = .aarch64,
+            .os_tag = .linux,
+            .abi = .android,
+            .android_api_level = 24,
+        });
+        if (ndk.len == 0) {
+            android_step.dependOn(&b.addFail("Android NDK non trovato: passa -Dndk=<path> o esporta ANDROID_NDK_HOME").step);
+        } else {
+            const glue_dir = b.pathJoin(&.{ ndk, "sources", "android", "native_app_glue" });
+            const sysroot = b.pathJoin(&.{ ndk, "toolchains", "llvm", "prebuilt", "linux-x86_64", "sysroot" });
+            const sysroot_inc = b.pathJoin(&.{ sysroot, "usr", "include" });
+            const sysroot_lib = b.pathJoin(&.{ sysroot, "usr", "lib", "aarch64-linux-android", "24" });
+            const lib = b.addLibrary(.{
+                .name = "zuer",
+                .linkage = .dynamic,
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/android_main.zig"),
+                    .target = android_target,
+                    // ReleaseFast, non ReleaseSmall: l'interfaccia mobile è rasterizzata
+                    // dalla CPU (canvas zicro), e -Os su un rasterizzatore costa più in
+                    // frame che non guadagni in KB — l'APK cresce di poco, l'interfaccia
+                    // diventa un'altra cosa.
+                    .optimize = .ReleaseFast,
+                    .link_libc = true,
+                }),
+            });
+            // Zig non porta con sé una bionic: la libc di Android è quella del NDK, indicata
+            // con un file libc (header + crt/lib dell'API level scelto). È il modo previsto
+            // da Zig per una libc esterna — senza, `zig build-lib` rifiuta il target con
+            // "unable to provide libc for target …-android".
+            const libc_conf = b.addWriteFiles().add("android-libc.conf", b.fmt(
+                \\include_dir={s}
+                \\sys_include_dir={s}
+                \\crt_dir={s}
+                \\msvc_lib_dir=
+                \\kernel32_lib_dir=
+                \\gcc_dir=
+                \\
+            , .{ sysroot_inc, sysroot_inc, sysroot_lib }));
+            lib.setLibCFile(libc_conf);
+            // Header per-architettura del NDK (asm/*.h, tirati dentro da linux/types.h e
+            // poll.h): stanno in una dir a parte che il file libc non copre. Serve a ENTRAMBI
+            // i moduli con sorgenti C — il nostro (native_app_glue) e quello di zicro (stb).
+            const arch_inc: std.Build.LazyPath = .{ .cwd_relative = b.pathJoin(&.{ sysroot_inc, "aarch64-linux-android" }) };
+
+            // I decoder in Zig puro (testo, CSV, markdown, ZIP, TAR, mesh, GLB, immagini)
+            // sono gli stessi del desktop, ma qui LINKATI DENTRO la .so invece che caricati
+            // come plugin: un APK carica solo la propria libreria, non c'è nessuna dlopen da
+            // fare. Restano fuori solo media (ffmpeg), pdf e office, che dipendono da
+            // librerie/eseguibili esterni che su Android non esistono.
+            const decoder_android = b.createModule(.{
+                .root_source_file = b.path("src/decoder.zig"),
+                .target = android_target,
+                .optimize = .ReleaseFast,
+            });
+            lib.root_module.addImport("decoder", decoder_android);
+
+            const zicro_android = dep_zicro.module("zicro_android");
+            zicro_android.addIncludePath(arch_inc);
+            lib.root_module.addImport("zicro", zicro_android);
+            lib.root_module.addIncludePath(arch_inc);
+            lib.root_module.addIncludePath(.{ .cwd_relative = glue_dir });
+            lib.root_module.addCSourceFile(.{
+                .file = .{ .cwd_relative = b.pathJoin(&.{ glue_dir, "android_native_app_glue.c" }) },
+                .flags = &.{ "-O2", "-fno-sanitize=undefined" },
+            });
+            // stb_image: le anteprime e il viewer immagini dell'explorer mobile. Sul
+            // desktop sta nel plugin decoder_image (dlopen); qui è linkato dentro la .so —
+            // un APK carica solo la propria libreria, niente plugin da cercare.
+            lib.root_module.addIncludePath(b.path("vendor/stb"));
+            lib.root_module.addCSourceFile(.{
+                .file = b.path("vendor/stb/stb_image_impl.c"),
+                .flags = &.{ "-O2", "-fno-sanitize=undefined" },
+            });
+            lib.root_module.addLibraryPath(.{ .cwd_relative = sysroot_lib });
+            lib.root_module.linkSystemLibrary("android", .{}); // ANativeWindow, AInputEvent…
+            lib.root_module.linkSystemLibrary("log", .{}); // __android_log_* (usato dalla glue)
+            // libjnigraphics: legge i pixel di un android.graphics.Bitmap direttamente da
+            // nativo — è così che le anteprime prodotte dal framework (fotogramma video,
+            // pagina PDF, HEIC) arrivano sul nostro canvas senza passare da un array Java.
+            lib.root_module.linkSystemLibrary("jnigraphics", .{});
+            const install = b.addInstallArtifact(lib, .{ .dest_dir = .{ .override = .{ .custom = "android/lib/arm64-v8a" } } });
+            android_step.dependOn(&install.step);
+        }
+    }
 }
 
 /// Compila TinySoundFont + TinyMidiLoader (vendor/tsf) nel modulo e ne espone

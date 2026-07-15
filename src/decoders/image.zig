@@ -17,20 +17,37 @@ extern fn stbi_image_free(retval_from_stbi_load: ?*anyopaque) void;
 extern fn stbi_failure_reason() ?[*:0]const u8;
 
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
-extern fn realpath(path: [*:0]const u8, resolved: [*]u8) ?[*:0]u8;
 
-/// Canonicalizza `path` in un percorso ASSOLUTO con realpath(3) prima di
+// Canonicalizzazione per-OS: realpath(3) su POSIX, _fullpath (CRT) su Windows.
+// Switch comptime come per `sub` in decoder.zig: solo il ramo selezionato viene
+// analizzato, quindi l'extern dell'altro OS non arriva mai al link.
+const canon = switch (@import("builtin").os.tag) {
+    .windows => struct {
+        extern fn _fullpath(resolved: [*]u8, path: [*:0]const u8, max_len: usize) ?[*:0]u8;
+        fn resolve(pz: [*:0]const u8, buf: []u8) ?[*:0]u8 {
+            return _fullpath(buf.ptr, pz, buf.len);
+        }
+    },
+    else => struct {
+        extern fn realpath(path: [*:0]const u8, resolved: [*]u8) ?[*:0]u8;
+        fn resolve(pz: [*:0]const u8, buf: []u8) ?[*:0]u8 {
+            return realpath(pz, buf.ptr);
+        }
+    },
+};
+
+/// Canonicalizza `path` in un percorso ASSOLUTO (realpath/_fullpath) prima di
 /// passarlo come argv a un tool esterno: un path relativo che inizia con `-`
 /// verrebbe parsato come opzione, e ImageMagick interpreta prefissi coder
 /// (`msl:`, `caption:`, `pango:`…) DENTRO il filename — un path che inizia
-/// con `/` li neutralizza. Fallback: se realpath fallisce (file sparito nel
-/// frattempo), usa il path originale ma prefissato con `./` quando è relativo
-/// e inizia con `-`. Il chiamante libera con lo stesso allocator.
+/// con `/` li neutralizza. Fallback: se la canonicalizzazione fallisce (file
+/// sparito nel frattempo), usa il path originale ma prefissato con `./` quando
+/// è relativo e inizia con `-`. Il chiamante libera con lo stesso allocator.
 fn absPath(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
     const pz = try gpa.dupeZ(u8, path);
     defer gpa.free(pz);
     var buf: [4096]u8 = undefined; // PATH_MAX
-    if (realpath(pz.ptr, &buf)) |res|
+    if (canon.resolve(pz.ptr, &buf)) |res|
         return gpa.dupe(u8, std.mem.span(res));
     if (std.mem.startsWith(u8, path, "-"))
         return std.fmt.allocPrint(gpa, "./{s}", .{path});
@@ -247,7 +264,7 @@ fn decodeWithImageMagick(path: []const u8, filename: []const u8, max_dim: usize,
     };
 }
 
-export fn zuer_decode(
+fn zuer_decode(
     path: decoder.SliceC,
     content: decoder.SliceC,
     io_ptr: *const anyopaque,
@@ -277,12 +294,23 @@ export fn zuer_decode(
 // ImageMagick già presente in decode().
 const extensions = "png,jpg,jpeg,gif,bmp,tga,psd,hdr,pic,pnm,pbm,pgm,ppm,svg,svgz,webp,tif,tiff,ico,avif";
 
-export fn zuer_extensions() callconv(.c) decoder.SliceC {
+fn zuer_extensions() callconv(.c) decoder.SliceC {
     return decoder.SliceC.fromSlice(extensions);
 }
 
 /// Versione dell'ABI plugin con cui questo decoder è compilato: l'host la
 /// confronta con la propria `decoder.abi_version` e scarta i mismatch.
-export fn zuer_abi_version() callconv(.c) u32 {
+fn zuer_abi_version() callconv(.c) u32 {
     return decoder.abi_version;
+}
+
+// Gli export dell'ABI plugin esistono solo dove i decoder SONO plugin (vedi
+// decoder.plugin_abi): su Android sono linkati dentro l'unica libreria dell'APK e i loro
+// nomi colliderebbero.
+comptime {
+    if (decoder.plugin_abi) {
+        @export(&zuer_decode, .{ .name = "zuer_decode", .linkage = .strong });
+        @export(&zuer_extensions, .{ .name = "zuer_extensions", .linkage = .strong });
+        @export(&zuer_abi_version, .{ .name = "zuer_abi_version", .linkage = .strong });
+    }
 }

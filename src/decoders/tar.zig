@@ -176,7 +176,7 @@ fn formatSize(allocator: std.mem.Allocator, n: u64) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{d:.1} {s}", .{ v, units[u] });
 }
 
-export fn zuer_decode(
+fn zuer_decode(
     path: decoder.SliceC,
     content: decoder.SliceC,
     io_ptr: *const anyopaque,
@@ -200,15 +200,27 @@ export fn zuer_decode(
 
 const extensions = "tar,tgz,tar.gz";
 
-export fn zuer_extensions() callconv(.c) decoder.SliceC {
+fn zuer_extensions() callconv(.c) decoder.SliceC {
     return decoder.SliceC.fromSlice(extensions);
 }
 
 /// Come archive.zig: si legge dal path in streaming, nessun byte caricato dall'host.
-export fn zuer_content_prefix() callconv(.c) usize {
+fn zuer_content_prefix() callconv(.c) usize {
     return 0;
 }
 
-export fn zuer_abi_version() callconv(.c) u32 {
+fn zuer_abi_version() callconv(.c) u32 {
     return decoder.abi_version;
+}
+
+// Gli export dell'ABI plugin esistono solo dove i decoder SONO plugin (vedi
+// decoder.plugin_abi): su Android sono linkati dentro l'unica libreria dell'APK e i loro
+// nomi colliderebbero.
+comptime {
+    if (decoder.plugin_abi) {
+        @export(&zuer_decode, .{ .name = "zuer_decode", .linkage = .strong });
+        @export(&zuer_extensions, .{ .name = "zuer_extensions", .linkage = .strong });
+        @export(&zuer_content_prefix, .{ .name = "zuer_content_prefix", .linkage = .strong });
+        @export(&zuer_abi_version, .{ .name = "zuer_abi_version", .linkage = .strong });
+    }
 }

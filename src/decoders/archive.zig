@@ -214,7 +214,7 @@ fn formatSize(allocator: std.mem.Allocator, n: u64) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{d:.1} {s}", .{ v, units[u] });
 }
 
-export fn zuer_decode(
+fn zuer_decode(
     path: decoder.SliceC,
     content: decoder.SliceC,
     io_ptr: *const anyopaque,
@@ -238,19 +238,31 @@ export fn zuer_decode(
 
 const extensions = "zip,jar,apk,cbz,epub,xpi,whl";
 
-export fn zuer_extensions() callconv(.c) decoder.SliceC {
+fn zuer_extensions() callconv(.c) decoder.SliceC {
     return decoder.SliceC.fromSlice(extensions);
 }
 
 /// L'archivio si legge dal path via seeking (coda EOCD + sola central directory):
 /// l'host non deve caricare in RAM alcun byte del contenuto. Così anche archivi
 /// da molti GB si aprono istantaneamente.
-export fn zuer_content_prefix() callconv(.c) usize {
+fn zuer_content_prefix() callconv(.c) usize {
     return 0;
 }
 
 /// Versione dell'ABI plugin con cui questo decoder è compilato: l'host la
 /// confronta con la propria `decoder.abi_version` e scarta i mismatch.
-export fn zuer_abi_version() callconv(.c) u32 {
+fn zuer_abi_version() callconv(.c) u32 {
     return decoder.abi_version;
+}
+
+// Gli export dell'ABI plugin esistono solo dove i decoder SONO plugin (vedi
+// decoder.plugin_abi): su Android sono linkati dentro l'unica libreria dell'APK e i loro
+// nomi colliderebbero.
+comptime {
+    if (decoder.plugin_abi) {
+        @export(&zuer_decode, .{ .name = "zuer_decode", .linkage = .strong });
+        @export(&zuer_extensions, .{ .name = "zuer_extensions", .linkage = .strong });
+        @export(&zuer_content_prefix, .{ .name = "zuer_content_prefix", .linkage = .strong });
+        @export(&zuer_abi_version, .{ .name = "zuer_abi_version", .linkage = .strong });
+    }
 }

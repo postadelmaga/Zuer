@@ -26,11 +26,13 @@ pub fn main(init: std.process.Init) !void {
     var count: usize = 0;
     var last_pts: f64 = 0;
     var first_dims: [2]usize = .{ 0, 0 };
+    // NB: col player live `frame.pixels` è PRESTATO (scratch interno del player,
+    // liberato da `p.deinit`): liberarlo qui manderebbe la sws_scale del frame
+    // successivo a scrivere su memoria morta (segfault in libswscale).
     while (try p.nextFrame(320, gpa)) |frame| {
         if (count == 0) first_dims = .{ frame.width, frame.height };
         count += 1;
         last_pts = frame.pts_s;
-        gpa.free(frame.pixels);
     }
     std.debug.print("frame decodificati: {d}, dimensioni: {d}x{d}, PTS finale: {d:.3}s\n", .{ count, first_dims[0], first_dims[1], last_pts });
 }

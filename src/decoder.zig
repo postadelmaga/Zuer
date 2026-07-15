@@ -550,6 +550,12 @@ pub const DecodedC = extern struct {
 /// v2: aggiunto `total_pages: u32` in coda a `ImageDataC`.
 pub const abi_version: u32 = 2;
 
+/// True quando i decoder sono compilati come **plugin** caricabili con `dlopen` — il caso
+/// del desktop. Su Android no: l'APK porta una libreria sola e i decoder ci finiscono
+/// dentro linkati, dove gli export dell'ABI plugin (`zuer_decode`, `zuer_extensions`…)
+/// colliderebbero l'uno con l'altro, uno per decoder, senza che nessuno li chiami.
+pub const plugin_abi = builtin.abi != .android;
+
 /// Ogni plugin esporta `zuer_abi_version` (ritorna l'`abi_version` con cui è
 /// stato compilato); l'host la verifica al caricamento e scarta i mismatch.
 pub const AbiVersionFn = *const fn () callconv(.c) u32;
