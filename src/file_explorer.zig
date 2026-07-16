@@ -166,12 +166,11 @@ fn enterDir(state: *GuiAppState, dir_path: []const u8) bool {
                 truncated = true;
                 break;
             }
+            // NIENTE statFile qui: siamo sul thread finestra e su Windows ogni
+            // stat apre un handle (500 voci = secondi, peggio sotto Wine). Le
+            // dimensioni le riempie il thumb worker (fillSizes) in background.
             const name = state.gpa.dupe(u8, entry.name) catch break;
-            var size: u64 = 0;
-            if (!is_dir) {
-                if (dir.statFile(state.io, entry.name, .{})) |st| size = st.size else |_| {}
-            }
-            list.append(state.gpa, .{ .name = name, .is_dir = is_dir, .size = size }) catch {
+            list.append(state.gpa, .{ .name = name, .is_dir = is_dir }) catch {
                 state.gpa.free(name);
                 break;
             };
@@ -650,10 +649,60 @@ fn makeThumb(gpa: std.mem.Allocator, pixels: []const u8, sw: usize, sh: usize) ?
     return .{ .rgba = rgba, .w = @intCast(dw), .h = @intCast(dh) };
 }
 
+/// Fase dimensioni del thumb worker: le `statFile` avvengono qui, fuori dal
+/// thread finestra, e i risultati sono installati per indice sotto lock (le
+/// voci non cambiano entro la stessa generazione). Va eseguita PRIMA delle
+/// miniature: il guard `size > max_thumb_bytes` legge questi valori.
+fn fillSizes(state: *GuiAppState, gen: u32) void {
+    const Pending = struct { idx: usize, name: []u8 };
+    var dir_copy: []u8 = &.{};
+    var names: std.ArrayList(Pending) = .empty;
+    defer {
+        for (names.items) |n| state.gpa.free(n.name);
+        names.deinit(state.gpa);
+        state.gpa.free(dir_copy);
+    }
+    {
+        // Snapshot di cartella e nomi file sotto lock (poche KB, niente I/O).
+        state.shared.mutex.lockUncancelable(state.io);
+        defer state.shared.mutex.unlock(state.io);
+        const fx = &state.shared.fx;
+        if (gen != fx.gen) return;
+        dir_copy = state.gpa.dupe(u8, fx.dir) catch return;
+        for (fx.entries, 0..) |e, i| {
+            if (e.is_dir) continue;
+            const nm = state.gpa.dupe(u8, e.name) catch return;
+            names.append(state.gpa, .{ .idx = i, .name = nm }) catch {
+                state.gpa.free(nm);
+                return;
+            };
+        }
+    }
+    if (names.items.len == 0) return;
+
+    var dir = std.Io.Dir.cwd().openDir(state.io, dir_copy, .{}) catch return;
+    defer dir.close(state.io);
+    const sizes = state.gpa.alloc(u64, names.items.len) catch return;
+    defer state.gpa.free(sizes);
+    for (names.items, sizes) |n, *sz| {
+        sz.* = if (dir.statFile(state.io, n.name, .{})) |st| st.size else |_| 0;
+    }
+
+    state.shared.mutex.lockUncancelable(state.io);
+    defer state.shared.mutex.unlock(state.io);
+    const fx = &state.shared.fx;
+    if (gen != fx.gen) return;
+    for (names.items, sizes) |n, sz| {
+        if (n.idx < fx.entries.len) fx.entries[n.idx].size = sz;
+    }
+    state.shared.file_changed = true;
+}
+
 /// Thread miniature: decodifica in sequenza i file "thumbabili" della
 /// generazione `gen` coi normali plugin decoder e installa il risultato
 /// downscalato. Ogni installazione ricontrolla la generazione sotto lock.
 fn thumbWorker(state: *GuiAppState, gen: u32) void {
+    fillSizes(state, gen);
     var i: usize = 0;
     var attempts: usize = 0;
     while (attempts < max_thumb_files) : (i += 1) {
