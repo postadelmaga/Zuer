@@ -33,6 +33,7 @@ const nav = @import("nav.zig");
 const input = @import("input.zig");
 // Ricerca YouTube (overlay tasto `y`): stato in Shared, ricerca/streaming yt-dlp.
 const yt_search = @import("yt_search.zig");
+const file_explorer = @import("file_explorer.zig");
 const build_options = @import("build_options");
 /// Vulkan mesh/text renderer available (Linux + Windows). Comptime so the GPU code links
 /// only when enabled. Distinct from `has_video`: on Windows Vulkan is on but video is off.
@@ -535,6 +536,9 @@ fn renderWorker(
                 const raster: ?*glyph.Raster = if (name_raster) |*r| r else null;
                 videomod.drawVideoControls(composited_rgba.*, fr.w, fr.h, vs, raster);
                 if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, fr.w, fr.h, r, std.fs.path.basename(state.shared.current_file_path));
+                if (state.shared.fx.active) {
+                    if (name_raster) |*r| file_explorer.drawOverlay(composited_rgba.*, fr.w, fr.h, state, r);
+                }
                 if (yt_active) {
                     if (name_raster) |*r| yt_search.drawOverlay(composited_rgba.*, fr.w, fr.h, state, r, @as(f32, @floatFromInt(spin_frame)) / 60.0);
                     spin_frame +%= 1;
@@ -743,6 +747,10 @@ fn renderWorker(
             // ramo mesh il frame viene composto DOPO l'unlock: label e flag lì.
             if (mesh_push == null and mesh_voxel_push == null) {
                 if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, cur_w, cur_h, r, std.fs.path.basename(state.shared.current_file_path));
+                // Esploratore file sotto l'eventuale overlay YouTube (siamo sotto lock).
+                if (state.shared.fx.active) {
+                    if (name_raster) |*r| file_explorer.drawOverlay(composited_rgba.*, cur_w, cur_h, state, r);
+                }
                 // Overlay di ricerca YouTube, sopra tutto (siamo ancora sotto lock).
                 if (state.shared.yt.active) {
                     if (name_raster) |*r| yt_search.drawOverlay(composited_rgba.*, cur_w, cur_h, state, r, @as(f32, @floatFromInt(spin_frame)) / 60.0);
@@ -782,9 +790,12 @@ fn renderWorker(
                 // render, quindi comporre fuori dal lock è sicuro.
                 compose.composeFrame(composited_rgba.*, cur_w, cur_h, mr, cur_w, cur_h, false, 1.0, 0.0, 0.0);
                 if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, cur_w, cur_h, r, mesh_name_buf[0..mesh_name_len]);
-                // Overlay YouTube anche sulle mesh: qui il frame è composto fuori
-                // dal lock, quindi lo stato dell'overlay va riletto sotto mutex.
+                // Overlay (esploratore file + YouTube) anche sulle mesh: qui il frame
+                // è composto fuori dal lock, quindi lo stato va riletto sotto mutex.
                 state.shared.mutex.lockUncancelable(state.io);
+                if (state.shared.fx.active) {
+                    if (name_raster) |*r| file_explorer.drawOverlay(composited_rgba.*, cur_w, cur_h, state, r);
+                }
                 if (state.shared.yt.active) {
                     if (name_raster) |*r| yt_search.drawOverlay(composited_rgba.*, cur_w, cur_h, state, r, @as(f32, @floatFromInt(spin_frame)) / 60.0);
                     spin_frame +%= 1;
@@ -877,7 +888,11 @@ pub fn main(init: std.process.Init) !void {
             arg_path_opt = a;
         }
     }
-    const arg_path = arg_path_opt orelse {
+    // Senza argomenti (es. scorciatoia di sistema o lancio dal menu: KDE non
+    // espande %f) si sfoglia la home invece di uscire subito. Su Windows la
+    // HOME non esiste: il collegamento del menu Start lancia senza argomenti.
+    const arg_path = arg_path_opt orelse home: {
+        if (getenv("HOME") orelse getenv("USERPROFILE")) |h| break :home std.mem.span(h);
         std.debug.print("Uso: zuer-gui [-f] <file|cartella>\n", .{});
         std.process.exit(1);
     };
@@ -944,6 +959,7 @@ pub fn main(init: std.process.Init) !void {
     defer gui_state_mod.freeTextDoc(&gui_state);
     defer if (has_video) gui_state.video.deinit();
     defer yt_search.deinit(&gui_state);
+    defer file_explorer.deinit(&gui_state);
     defer if (gui_state.shared.av_src_video) |s| gpa.free(s);
     defer if (gui_state.shared.av_src_audio) |s| gpa.free(s);
 

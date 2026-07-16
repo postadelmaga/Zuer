@@ -18,6 +18,8 @@ const videomod = @import("video.zig");
 const midi_player = @import("midi_player.zig");
 // Ricerca YouTube (overlay tasto `y`): stato dentro `Shared`, logica nel modulo.
 const yt_search = @import("yt_search.zig");
+// Esploratore file (overlay tasto `f`): stesso schema dell'overlay YouTube.
+const file_explorer = @import("file_explorer.zig");
 const compose = @import("compose.zig");
 const TabBarState = compose.TabBarState;
 const zrame = @import("zrame");
@@ -134,6 +136,10 @@ pub const GuiAppState = struct {
         // Overlay di ricerca YouTube (tasto `y`): query, risultati e flag dei
         // worker yt-dlp. Come tutto in `Shared`, ogni accesso sotto `mutex`.
         yt: yt_search.YtState = .{},
+
+        // Esploratore file (tasto `f`): cartella corrente, voci e miniature.
+        // Come tutto in `Shared`, ogni accesso sotto `mutex`.
+        fx: file_explorer.FxState = .{},
 
         // Sorgenti A/V del player corrente (percorso locale o URL yt), possedute:
         // servono al toggle 'v' (video ↔ solo audio) per riaprire il container

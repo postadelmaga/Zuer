@@ -58,21 +58,28 @@ pub fn requestPrefetch(state: *GuiAppState, a: ?[]const u8, b: ?[]const u8) void
 
 /// Programma il prefetch dei file immediatamente prima/dopo quello corrente
 /// nella lista della cartella. No-op per liste ≤1 o indice ignoto.
+/// Lo snapshot dei percorsi avviene sotto `shared.mutex`: l'esploratore file
+/// (tasto `f`) può ricostruire `file_list` dal thread finestra mentre un thread
+/// loader arriva qui dopo l'apply. Nessun chiamante detiene già quel lock.
 pub fn schedulePrefetchAround(state: *GuiAppState) void {
-    const idx = state.current_file_index orelse return;
-    const n = state.file_list.items.len;
-    if (n <= 1) return;
-    const dir_path = std.fs.path.dirname(state.shared.current_file_path);
-    const prev_i = if (idx == 0) n - 1 else idx - 1;
-    const next_i = (idx + 1) % n;
     var buf: [2]?[]u8 = .{ null, null };
-    for (&buf, [2]usize{ prev_i, next_i }) |*out, i| {
-        if (i == idx) continue; // liste di 2: prev==next==state va evitato
-        const filename = state.file_list.items[i];
-        out.* = if (dir_path) |dp|
-            std.fs.path.join(state.gpa, &.{ dp, filename }) catch null
-        else
-            state.gpa.dupe(u8, filename) catch null;
+    {
+        state.shared.mutex.lockUncancelable(state.io);
+        defer state.shared.mutex.unlock(state.io);
+        const idx = state.current_file_index orelse return;
+        const n = state.file_list.items.len;
+        if (n <= 1) return;
+        const dir_path = std.fs.path.dirname(state.shared.current_file_path);
+        const prev_i = if (idx == 0) n - 1 else idx - 1;
+        const next_i = (idx + 1) % n;
+        for (&buf, [2]usize{ prev_i, next_i }) |*out, i| {
+            if (i == idx) continue; // liste di 2: prev==next==state va evitato
+            const filename = state.file_list.items[i];
+            out.* = if (dir_path) |dp|
+                std.fs.path.join(state.gpa, &.{ dp, filename }) catch null
+            else
+                state.gpa.dupe(u8, filename) catch null;
+        }
     }
     defer for (buf) |p| if (p) |x| state.gpa.free(x);
     requestPrefetch(state, buf[0], buf[1]);

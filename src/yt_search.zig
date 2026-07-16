@@ -764,7 +764,8 @@ const text_dim = [3]u8{ 150, 158, 175 };
 const text_err = [3]u8{ 240, 120, 110 };
 
 /// Testo monospazio troncato a `max_w` px; ritorna la larghezza usata.
-fn drawText(buf: []u8, W: u32, H: u32, raster: *glyph.Raster, x: i32, baseline: i32, text: []const u8, rgb: [3]u8, max_w: i32) i32 {
+/// Pubblica: riusata dall'esploratore file (stesso stile di overlay).
+pub fn drawText(buf: []u8, W: u32, H: u32, raster: *glyph.Raster, x: i32, baseline: i32, text: []const u8, rgb: [3]u8, max_w: i32) i32 {
     const wi: i32 = @intCast(W);
     const hi: i32 = @intCast(H);
     const cell = raster.advance;
@@ -811,7 +812,8 @@ fn blendPx(buf: []u8, idx: usize, rgb: [3]u8, a: u8) void {
 
 /// Blit della miniatura scalata (nearest) nel rettangolo destinazione, con clip
 /// ai bordi del frame. Sorgente e destinazione sono RGBA opache: copia di parole.
-fn blitThumb(buf: []u8, W: u32, H: u32, dx: i32, dy: i32, dw: i32, dh: i32, src: []const u8, sw: u32, sh: u32) void {
+/// Pubblica: riusata dall'esploratore file.
+pub fn blitThumb(buf: []u8, W: u32, H: u32, dx: i32, dy: i32, dw: i32, dh: i32, src: []const u8, sw: u32, sh: u32) void {
     if (dw <= 0 or dh <= 0 or sw == 0 or sh == 0) return;
     const wi: i32 = @intCast(W);
     const hi: i32 = @intCast(H);

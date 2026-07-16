@@ -12,6 +12,7 @@ const clipboard = @import("clipboard.zig");
 const videomod = @import("video.zig");
 const nav = @import("nav.zig");
 const yt_search = @import("yt_search.zig");
+const file_explorer = @import("file_explorer.zig");
 const gui_state_mod = @import("gui_state.zig");
 const GuiAppState = gui_state_mod.GuiAppState;
 const resetScroll = gui_state_mod.resetScroll;
@@ -40,6 +41,7 @@ const KEY_5: u32 = 6;
 const KEY_C: u32 = 46;
 const KEY_V: u32 = 47;
 const KEY_F: u32 = 33;
+const KEY_F11: u32 = 87;
 const KEY_SPACE: u32 = 57;
 const KEY_0: u32 = 11;
 const KEY_Q: u32 = 16;
@@ -536,6 +538,9 @@ pub fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) 
         // Overlay ricerca YouTube: ha priorità su tutto (col pannello aperto la
         // tastiera è sua; da chiuso `y` lo apre).
         if (handleYtKey(app_state, key)) return;
+        // Esploratore file: da chiuso `e` lo apre, da aperto la tastiera è sua
+        // (Esc/e chiudono, frecce/Invio navigano, Backspace sale di cartella).
+        if (file_explorer.handleKey(app_state, key)) return;
         // Snapshot sotto lock: `current_file_path` è liberato/riassegnato e i
         // flag di tipo (is_text/is_mesh) riscritti da `applyDecoded` (thread
         // loader) sotto `mutex` — mai leggerli a nudo.
@@ -627,7 +632,7 @@ pub fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) 
         } else if (key == KEY_MINUS) {
             const cpx = win.contentPx();
             applyZoomAt(app_state, 1.0 / 1.1, @as(f32, @floatFromInt(cpx.w)) / 2.0, @as(f32, @floatFromInt(cpx.h)) / 2.0, cpx.w, cpx.h);
-        } else if (key == KEY_F) {
+        } else if (key == KEY_F or key == KEY_F11) {
             win.toggleFullscreen();
         } else if (key == KEY_V and is_mesh) {
             toggleVoxel(app_state);
@@ -649,6 +654,8 @@ pub fn scrollCallback(win: *zrame.Window, axis: u32, value: i32, user: ?*anyopaq
     const app_state: *GuiAppState = @ptrCast(@alignCast(user orelse return));
     // Overlay YouTube aperto: la rotella sfoglia la griglia dei risultati.
     if (yt_search.handleWheel(app_state, win, axis, value)) return;
+    // Esploratore file aperto: la rotella sfoglia la griglia delle voci.
+    if (file_explorer.handleWheel(app_state, win, axis, value)) return;
     // Snapshot sotto lock (stesso pattern di `is_pdf` nel key handler):
     // `is_text` è riscritto da `applyDecoded` sui thread loader.
     app_state.shared.mutex.lockUncancelable(app_state.io);
@@ -693,6 +700,9 @@ pub fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopa
     // card, click apre, click fuori dal pannello chiude). `handleMouse` ritorna
     // false solo a overlay chiuso o sul leave → si prosegue col flusso normale.
     if (yt_search.handleMouse(app_state, win, event)) return true;
+    // Esploratore file aperto: hover seleziona; su una cartella click sinistro
+    // entra e destro avvia l'anteprima; su un file qualsiasi tasto la apre.
+    if (file_explorer.handleMouse(app_state, win, event)) return true;
     // Gli eventi puntatore arrivano da zrame già in coordinate del frame presentato
     // (vedi `zrame.MouseEvent`): lo stesso spazio in cui zuer disegna, quindi tutti gli
     // hit-test qui sotto (scrollbar, selezione testo, tab bar, controlli video) usano

@@ -129,7 +129,9 @@ fn decodeWithRsvg(path: []const u8, filename: []const u8, max_dim: usize, alloca
     defer allocator.free(abs_path);
 
     // Sfondo esplicito: stb scarta l'alpha e il trasparente diverrebbe nero.
-    var result = try decoder.runCapture(allocator, &.{ "rsvg-convert", "--width", dim_str, "--height", dim_str, "--keep-aspect-ratio", "--format", "png", "--background-color", "#101018", abs_path });
+    // Bianco, come i viewer di documenti: gli SVG sono quasi sempre disegnati
+    // per sfondi chiari (tratti scuri) e su nero sparirebbero.
+    var result = try decoder.runCapture(allocator, &.{ "rsvg-convert", "--width", dim_str, "--height", dim_str, "--keep-aspect-ratio", "--format", "png", "--background-color", "#ffffff", abs_path });
     defer result.deinit(allocator);
 
     if (result.exit_code != 0 or result.stdout.len == 0) return error.RsvgFailed;
@@ -242,7 +244,9 @@ fn decodeWithImageMagick(path: []const u8, filename: []const u8, max_dim: usize,
     var resize_buf: [32]u8 = undefined;
     const resize_str = try std.fmt.bufPrint(&resize_buf, "{d}x{d}", .{ width, height });
 
-    var convert_result = try decoder.runCapture(allocator, &.{ "convert", first_frame, "-depth", "8", "-resize", resize_str, "rgb:-" });
+    // `rgb:-` scarta l'alpha: senza flatten esplicito il trasparente diventa
+    // nero. Stesso sfondo bianco del percorso rsvg.
+    var convert_result = try decoder.runCapture(allocator, &.{ "convert", first_frame, "-background", "white", "-alpha", "remove", "-depth", "8", "-resize", resize_str, "rgb:-" });
     defer convert_result.deinit(allocator);
     if (convert_result.exit_code != 0) return error.ConvertProcessFailed;
 
