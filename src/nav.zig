@@ -241,7 +241,7 @@ pub fn applyDecoded(state: *GuiAppState, new_decoded: decoder_mod.Decoded, stage
             // dentro `render()` fuori dal lock condiviso — il rilascio va sotto
             // il suo lock dedicato (vedi `renderer_mutex` in GuiAppState).
             state.renderer_mutex.lockUncancelable(state.io);
-            state.renderer.releaseMesh();
+            if (state.renderer_ready) state.renderer.releaseMesh();
             state.renderer_mutex.unlock(state.io);
         }
         s.buffer.deinit(state.gpa);
@@ -292,6 +292,7 @@ pub fn applyDecoded(state: *GuiAppState, new_decoded: decoder_mod.Decoded, stage
         if (native) {
             state.renderer_mutex.lockUncancelable(state.io);
             defer state.renderer_mutex.unlock(state.io);
+            if (!gui_state_mod.ensureRendererLocked(state)) return error.RendererInit;
             try state.renderer.setMesh(stage.buffer.ptr, stage.vertex_bytes, @intCast(stage.index_bytes / @sizeOf(u32)));
             try state.renderer.setMeshMaterials(&m);
             // Geometria e texture sono ora su GPU (vertex buffer + pool VT) e

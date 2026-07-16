@@ -161,6 +161,10 @@ fn rasterizeTextGpu(state: *GuiAppState, name: []const u8, opts: text_render.Ren
     // Renderer sotto il suo lock dedicato (ordine: shared.mutex → renderer_mutex;
     // qui shared.mutex è già tenuto dal chiamante).
     state.renderer_mutex.lockUncancelable(state.io);
+    if (!gui_state_mod.ensureRendererLocked(state)) {
+        state.renderer_mutex.unlock(state.io);
+        return;
+    }
     const rgba_src = state.renderer.renderText(
         std.mem.sliceAsBytes(mesh.vertices),
         @intCast(mesh.vertices.len),
@@ -693,7 +697,7 @@ fn renderWorker(
                 // l'unlock, serializzato con setMesh/setVoxels da `renderer_mutex`.
                 // `hasVoxels` è coerente: `setVoxels` avviene sotto `shared.mutex`
                 // (toggleVoxel), che qui stiamo tenendo.
-                if (state.shared.voxel_mode and state.renderer.hasVoxels()) {
+                if (state.shared.voxel_mode and state.renderer_ready and state.renderer.hasVoxels()) {
                     // Modalità voxel (tasto V): ray-march della griglia invece
                     // della mesh triangolata.
                     mesh_voxel_push = gpu.buildVoxelPush(state.shared.mesh_center, state.shared.mesh_max_size / state.shared.zoom, state.shared.yaw, state.shared.pitch, cur_w, cur_h, state.shared.voxel_bbox_min, state.shared.voxel_bbox_size, state.shared.voxel_dim);
@@ -779,6 +783,9 @@ fn renderWorker(
         if (native and (mesh_push != null or mesh_voxel_push != null)) {
             state.renderer_mutex.lockUncancelable(state.io);
             const mesh_rgba: ?[]const u8 = blk: {
+                // Difensivo: con push non-null il setMesh ha già inizializzato
+                // il renderer; se l'init era fallita, salta il frame GPU.
+                if (!state.renderer_ready) break :blk null;
                 if (mesh_voxel_push) |*vpc| {
                     break :blk state.renderer.renderVoxel(cur_w, cur_h, vpc) catch |e| {
                         // Errore Vulkan transitorio: non uccidere il worker (finestra
@@ -965,11 +972,10 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(gui_state.shared.tab_bar.rgba);
     defer if (gui_state.shared.stage_opt) |*s| s.buffer.deinit(gpa);
 
-    // Renderer Vulkan Offscreen (nessuna estensione swapchain WSI richiesta). Solo con
-    // rendering nativo: su build CPU-only resta `undefined` e non viene mai usato (tutti
-    // i suoi call site sono esclusi a comptime da `native`).
-    if (native) gui_state.renderer = try gpu.Renderer.init(gpa, .{});
-    defer if (native) gui_state.renderer.deinit();
+    // Renderer Vulkan Offscreen (nessuna estensione swapchain WSI richiesta): init
+    // LAZY alla prima mesh/voxel/testo-GPU (`ensureRendererLocked`) — instance,
+    // device e pipeline non pesano più sull'avvio di testo/immagini CPU.
+    defer if (native and gui_state.renderer_ready) gui_state.renderer.deinit();
 
     defer gpa.free(gui_state.shared.static_rgba);
     defer gui_state_mod.freeTextDoc(&gui_state);

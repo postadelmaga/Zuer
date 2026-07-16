@@ -202,6 +202,11 @@ pub const GuiAppState = struct {
     // renderer_mutex (applyDecoded, toggleVoxel, rasterizeTextGpu); nessuno
     // prende shared.mutex tenendo renderer_mutex.
     renderer: gpu.Renderer = undefined,
+    /// Il renderer è inizializzato LAZY (`ensureRendererLocked`): l'init Vulkan
+    /// (instance+device+pipeline mesh) costa e per testo/immagini CPU non serve.
+    renderer_ready: bool = false,
+    /// Init già tentata e fallita: non riprovare (e non ri-loggare) a ogni frame.
+    renderer_failed: bool = false,
     renderer_mutex: std.Io.Mutex = .init,
     // Player video nativo (posseduto; player null = nessun video). Lo stato
     // interno del player è condiviso col worker sotto `shared.mutex`
@@ -321,6 +326,22 @@ pub fn setAvSrc(state: *GuiAppState, v: []const u8, a: []const u8, src_has_video
 
 /// Riporta la scrollbar all'origine azzerando offset, kinetica e coda di smoothing.
 /// Il chiamante deve già detenere il `mutex`. Usato ai cambi di foglio/file.
+/// Inizializza il renderer Vulkan alla prima necessità (mesh/voxel/testo GPU).
+/// Da chiamare con `renderer_mutex` GIÀ acquisito. false = init impossibile
+/// (loggato una volta): il chiamante salta il lavoro GPU.
+pub fn ensureRendererLocked(state: *GuiAppState) bool {
+    if (comptime !@import("build_options").gpu) return false;
+    if (state.renderer_ready) return true;
+    if (state.renderer_failed) return false;
+    state.renderer = gpu.Renderer.init(state.gpa, .{}) catch |e| {
+        state.renderer_failed = true;
+        std.debug.print("zuer: init renderer Vulkan fallita: {s} (mesh/3D non disponibili)\n", .{@errorName(e)});
+        return false;
+    };
+    state.renderer_ready = true;
+    return true;
+}
+
 pub fn resetScroll(sc: *zscroll.Scroll) void {
     sc.offset = .{ 0, 0 };
     sc.vel = .{ 0, 0 };

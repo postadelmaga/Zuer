@@ -393,6 +393,7 @@ fn toggleVoxel(app_state: *GuiAppState) void {
             // Il renderer è serializzato dal suo lock dedicato (non più da `mutex`).
             app_state.renderer_mutex.lockUncancelable(app_state.io);
             defer app_state.renderer_mutex.unlock(app_state.io);
+            if (!gui_state_mod.ensureRendererLocked(app_state)) return;
             app_state.renderer.setVoxels(grid.dim, grid.data) catch |e| {
                 std.debug.print("[voxel] setVoxels: {s}\n", .{@errorName(e)});
                 return;
@@ -405,7 +406,7 @@ fn toggleVoxel(app_state: *GuiAppState) void {
     // Il path mesh `render()` è pipelined (fence ping-pong), il voxel è slot 0
     // sincrono: risincronizza il double-buffer a ogni cambio di modalità.
     app_state.renderer_mutex.lockUncancelable(app_state.io);
-    app_state.renderer.resetFrameSync();
+    if (app_state.renderer_ready) app_state.renderer.resetFrameSync();
     app_state.renderer_mutex.unlock(app_state.io);
     app_state.shared.voxel_mode = !app_state.shared.voxel_mode;
     app_state.shared.file_changed = true; // forza un re-render
