@@ -34,6 +34,148 @@ pub const c = @cImport({
 const cvp9_enabled = builtin.os.tag == .linux and @import("build_options").gpu;
 const cvp9 = if (cvp9_enabled) @import("cvp9.zig") else struct {};
 
+// ── libav a runtime ──────────────────────────────────────────────────────────
+// Le firme vengono dagli header (@TypeOf sui simboli del cImport), quindi
+// restano allineate da sole. Su Linux i campi puntano agli extern del link
+// diretto (LinkAv); su Windows l'exe NON linka le import lib: le DLL si
+// caricano al primo video (`ensureAv`) e l'app parte anche senza FFmpeg —
+// i file multimediali danno errore, tutto il resto funziona.
+
+const bo = @import("build_options");
+const av_dynamic = @hasDecl(bo, "av_runtime") and bo.av_runtime;
+
+/// Tabella delle funzioni libav usate qui e in src/audio_player.zig.
+pub const AvApi = struct {
+    av_buffer_ref: *const @TypeOf(c.av_buffer_ref),
+    av_buffer_unref: *const @TypeOf(c.av_buffer_unref),
+    av_channel_layout_check: *const @TypeOf(c.av_channel_layout_check),
+    av_channel_layout_copy: *const @TypeOf(c.av_channel_layout_copy),
+    av_channel_layout_default: *const @TypeOf(c.av_channel_layout_default),
+    av_channel_layout_uninit: *const @TypeOf(c.av_channel_layout_uninit),
+    avcodec_alloc_context3: *const @TypeOf(c.avcodec_alloc_context3),
+    avcodec_find_decoder: *const @TypeOf(c.avcodec_find_decoder),
+    avcodec_flush_buffers: *const @TypeOf(c.avcodec_flush_buffers),
+    avcodec_free_context: *const @TypeOf(c.avcodec_free_context),
+    avcodec_get_hw_config: *const @TypeOf(c.avcodec_get_hw_config),
+    avcodec_open2: *const @TypeOf(c.avcodec_open2),
+    avcodec_parameters_to_context: *const @TypeOf(c.avcodec_parameters_to_context),
+    avcodec_receive_frame: *const @TypeOf(c.avcodec_receive_frame),
+    avcodec_send_packet: *const @TypeOf(c.avcodec_send_packet),
+    av_find_best_stream: *const @TypeOf(c.av_find_best_stream),
+    avformat_close_input: *const @TypeOf(c.avformat_close_input),
+    avformat_find_stream_info: *const @TypeOf(c.avformat_find_stream_info),
+    avformat_open_input: *const @TypeOf(c.avformat_open_input),
+    av_frame_alloc: *const @TypeOf(c.av_frame_alloc),
+    av_frame_free: *const @TypeOf(c.av_frame_free),
+    av_frame_unref: *const @TypeOf(c.av_frame_unref),
+    av_hwdevice_ctx_create: *const @TypeOf(c.av_hwdevice_ctx_create),
+    av_hwframe_transfer_data: *const @TypeOf(c.av_hwframe_transfer_data),
+    av_packet_alloc: *const @TypeOf(c.av_packet_alloc),
+    av_packet_free: *const @TypeOf(c.av_packet_free),
+    av_packet_unref: *const @TypeOf(c.av_packet_unref),
+    av_pix_fmt_desc_get: *const @TypeOf(c.av_pix_fmt_desc_get),
+    av_read_frame: *const @TypeOf(c.av_read_frame),
+    av_seek_frame: *const @TypeOf(c.av_seek_frame),
+    swr_alloc_set_opts2: *const @TypeOf(c.swr_alloc_set_opts2),
+    swr_convert: *const @TypeOf(c.swr_convert),
+    swr_free: *const @TypeOf(c.swr_free),
+    swr_init: *const @TypeOf(c.swr_init),
+    sws_freeContext: *const @TypeOf(c.sws_freeContext),
+    sws_getContext: *const @TypeOf(c.sws_getContext),
+    sws_scale: *const @TypeOf(c.sws_scale),
+};
+
+const av_static: AvApi = if (av_dynamic) undefined else blk: {
+    var t: AvApi = undefined;
+    for (@typeInfo(AvApi).@"struct".fields) |f| {
+        @field(t, f.name) = &@field(c, f.name);
+    }
+    break :blk t;
+};
+
+var av_win_table: AvApi = undefined;
+var av_state: enum { unloaded, ok, failed } = if (av_dynamic) .unloaded else .ok;
+var av_mutex: std.atomic.Mutex = .unlocked;
+
+/// Le funzioni libav, pronte all'uso DOPO un `ensureAv()` riuscito.
+pub const av: *const AvApi = if (av_dynamic) &av_win_table else &av_static;
+
+/// Nomi DLL versionati derivati dagli header vendorati (es. "avcodec-63.dll").
+fn dllName(comptime base: []const u8, comptime major: u32) [:0]const u8 {
+    return std.fmt.comptimePrint("{s}-{d}.dll", .{ base, major });
+}
+
+/// In ordine di dipendenza (avutil prima di tutti). File-scope: il nome deve
+/// essere comptime-known per la conversione UTF-16 nell'inline for.
+const av_dll_names = [_][:0]const u8{
+    dllName("avutil", c.LIBAVUTIL_VERSION_MAJOR),
+    dllName("swresample", c.LIBSWRESAMPLE_VERSION_MAJOR),
+    dllName("swscale", c.LIBSWSCALE_VERSION_MAJOR),
+    dllName("avcodec", c.LIBAVCODEC_VERSION_MAJOR),
+    dllName("avformat", c.LIBAVFORMAT_VERSION_MAJOR),
+};
+
+/// true se libav è utilizzabile. Su Windows carica le 5 DLL al primo uso
+/// (accanto all'exe o nel search path standard) e risolve la tabella; un
+/// fallimento è ricordato e i media restituiscono errore senza riprovare.
+pub fn ensureAv() bool {
+    // Ramo comptime: nei build a link diretto (Linux, plugin media, player_dbg)
+    // ensureAvRuntime non viene mai analizzata (né il suo import di dynlib).
+    if (comptime !av_dynamic) return true;
+    return ensureAvRuntime();
+}
+
+fn ensureAvRuntime() bool {
+    // Externs locali (niente import di dynlib.zig: nel plugin media quel file
+    // appartiene al modulo `decoder` e l'import da qui dividerebbe i moduli).
+    const win = struct {
+        extern "kernel32" fn LoadLibraryW(name: [*:0]const u16) callconv(.winapi) ?*anyopaque;
+        extern "kernel32" fn FreeLibrary(mod: *anyopaque) callconv(.winapi) i32;
+        extern "kernel32" fn GetProcAddress(mod: *anyopaque, name: [*:0]const u8) callconv(.winapi) ?*anyopaque;
+    };
+
+    while (!av_mutex.tryLock()) {
+        std.Thread.yield() catch {};
+    }
+    defer av_mutex.unlock();
+    switch (av_state) {
+        .ok => return true,
+        .failed => return false,
+        .unloaded => {},
+    }
+    av_state = .failed;
+
+    var libs: [av_dll_names.len]*anyopaque = undefined;
+    var opened: usize = 0;
+    inline for (av_dll_names, 0..) |n, i| {
+        const wide = comptime std.unicode.utf8ToUtf16LeStringLiteral(n);
+        libs[i] = win.LoadLibraryW(wide) orelse {
+            std.debug.print("zuer: libav non disponibile ({s} mancante): niente audio/video\n", .{n});
+            for (libs[0..opened]) |l| _ = win.FreeLibrary(l);
+            return false;
+        };
+        opened += 1;
+    }
+    // Le DLL restano caricate per la vita del processo (mai chiuse): i puntatori
+    // della tabella vivono dentro di loro.
+    inline for (@typeInfo(AvApi).@"struct".fields) |f| {
+        var found = false;
+        for (libs) |l| {
+            if (win.GetProcAddress(l, f.name)) |p| {
+                @field(av_win_table, f.name) = @ptrCast(@alignCast(p));
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            std.debug.print("zuer: simbolo libav mancante: {s}\n", .{f.name});
+            return false;
+        }
+    }
+    av_state = .ok;
+    return true;
+}
+
 pub const Frame = struct {
     width: usize,
     height: usize,
@@ -84,7 +226,7 @@ fn pickVaapiFormat(ctx: [*c]c.AVCodecContext, fmts: [*c]const c.enum_AVPixelForm
     // altro tipo non sarebbe usabile senza il relativo device context).
     i = 0;
     while (fmts[i] != c.AV_PIX_FMT_NONE) : (i += 1) {
-        const desc = c.av_pix_fmt_desc_get(fmts[i]);
+        const desc = av.av_pix_fmt_desc_get(fmts[i]);
         if (desc != null and (desc.*.flags & c.AV_PIX_FMT_FLAG_HWACCEL) == 0) return fmts[i];
     }
     return fmts[0];
@@ -169,14 +311,15 @@ pub const Player = struct {
     /// `allow_cvp9` = consenti il decoder GPU per gli stream VP9. Il poster
     /// (`firstVideoFrame`) passa false: un solo frame non giustifica un contesto GPU.
     pub fn openEx(path: [*:0]const u8, allow_cvp9: bool) Error!Player {
+        if (!ensureAv()) return Error.OpenFailed; // Windows: DLL FFmpeg assenti
         var fmt_ctx: [*c]c.AVFormatContext = null;
-        if (c.avformat_open_input(&fmt_ctx, path, null, null) != 0) return Error.OpenFailed;
-        errdefer c.avformat_close_input(&fmt_ctx);
+        if (av.avformat_open_input(&fmt_ctx, path, null, null) != 0) return Error.OpenFailed;
+        errdefer av.avformat_close_input(&fmt_ctx);
 
-        if (c.avformat_find_stream_info(fmt_ctx, null) < 0) return Error.NoStreamInfo;
+        if (av.avformat_find_stream_info(fmt_ctx, null) < 0) return Error.NoStreamInfo;
 
         var codec: [*c]const c.AVCodec = null;
-        const stream_idx = c.av_find_best_stream(fmt_ctx, c.AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0);
+        const stream_idx = av.av_find_best_stream(fmt_ctx, c.AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0);
         if (stream_idx < 0 or codec == null) return Error.NoVideoStream;
         const stream = fmt_ctx.*.streams[@intCast(stream_idx)];
         // Copertina embedded (mp3/flac con APIC): è uno stream "video" di un solo
@@ -188,12 +331,12 @@ pub const Player = struct {
         if (allow_cvp9 and (stream.*.disposition & c.AV_DISPOSITION_ATTACHED_PIC) != 0)
             return Error.NoVideoStream;
 
-        var codec_ctx = c.avcodec_alloc_context3(codec) orelse return Error.AllocFailed;
+        var codec_ctx = av.avcodec_alloc_context3(codec) orelse return Error.AllocFailed;
         errdefer {
             var cc: [*c]c.AVCodecContext = codec_ctx;
-            c.avcodec_free_context(&cc);
+            av.avcodec_free_context(&cc);
         }
-        if (c.avcodec_parameters_to_context(codec_ctx, stream.*.codecpar) < 0) return Error.CodecOpenFailed;
+        if (av.avcodec_parameters_to_context(codec_ctx, stream.*.codecpar) < 0) return Error.CodecOpenFailed;
 
         // Decodifica hardware VAAPI: prova il device di default (/dev/dri) e
         // verifica che il decoder supporti il metodo hw_device_ctx con VAAPI.
@@ -201,11 +344,11 @@ pub const Player = struct {
         // Il pix_fmt hw per VAAPI è sempre AV_PIX_FMT_VAAPI: pickVaapiFormat lo
         // usa come costante, senza bisogno di stato condiviso col callback.
         var hw_device_ctx: [*c]c.AVBufferRef = null;
-        errdefer c.av_buffer_unref(&hw_device_ctx);
+        errdefer av.av_buffer_unref(&hw_device_ctx);
         var use_hw = false;
-        if (c.av_hwdevice_ctx_create(&hw_device_ctx, c.AV_HWDEVICE_TYPE_VAAPI, null, null, 0) >= 0) {
+        if (av.av_hwdevice_ctx_create(&hw_device_ctx, c.AV_HWDEVICE_TYPE_VAAPI, null, null, 0) >= 0) {
             var ci: c_int = 0;
-            while (c.avcodec_get_hw_config(codec, ci)) |cfg| : (ci += 1) {
+            while (av.avcodec_get_hw_config(codec, ci)) |cfg| : (ci += 1) {
                 if ((cfg.*.methods & c.AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) != 0 and
                     cfg.*.device_type == c.AV_HWDEVICE_TYPE_VAAPI)
                 {
@@ -214,13 +357,13 @@ pub const Player = struct {
                 }
             }
             if (use_hw) {
-                const dev_ref = c.av_buffer_ref(hw_device_ctx);
+                const dev_ref = av.av_buffer_ref(hw_device_ctx);
                 if (dev_ref != null) {
                     codec_ctx.*.hw_device_ctx = dev_ref;
                     codec_ctx.*.get_format = pickVaapiFormat;
                 } else use_hw = false;
             }
-            if (!use_hw) c.av_buffer_unref(&hw_device_ctx);
+            if (!use_hw) av.av_buffer_unref(&hw_device_ctx);
         }
 
         if (use_hw) {
@@ -235,28 +378,28 @@ pub const Player = struct {
             codec_ctx.*.thread_count = 0;
             codec_ctx.*.thread_type = c.FF_THREAD_FRAME | c.FF_THREAD_SLICE;
         }
-        if (c.avcodec_open2(codec_ctx, codec, null) < 0) {
+        if (av.avcodec_open2(codec_ctx, codec, null) < 0) {
             if (!use_hw) return Error.CodecOpenFailed;
             // Alcuni driver accettano il device ma rifiutano il profilo solo
             // alla open: ritenta UNA volta in software puro, con un contesto
             // nuovo (quello fallito può essere in uno stato indefinito).
             use_hw = false;
-            c.av_buffer_unref(&hw_device_ctx);
+            av.av_buffer_unref(&hw_device_ctx);
             var cc: [*c]c.AVCodecContext = codec_ctx;
-            c.avcodec_free_context(&cc);
+            av.avcodec_free_context(&cc);
             codec_ctx = null; // l'errdefer non deve rivedere il puntatore morto
-            codec_ctx = c.avcodec_alloc_context3(codec) orelse return Error.AllocFailed;
-            if (c.avcodec_parameters_to_context(codec_ctx, stream.*.codecpar) < 0) return Error.CodecOpenFailed;
+            codec_ctx = av.avcodec_alloc_context3(codec) orelse return Error.AllocFailed;
+            if (av.avcodec_parameters_to_context(codec_ctx, stream.*.codecpar) < 0) return Error.CodecOpenFailed;
             codec_ctx.*.thread_count = 0;
             codec_ctx.*.thread_type = c.FF_THREAD_FRAME | c.FF_THREAD_SLICE;
-            if (c.avcodec_open2(codec_ctx, codec, null) < 0) return Error.CodecOpenFailed;
+            if (av.avcodec_open2(codec_ctx, codec, null) < 0) return Error.CodecOpenFailed;
         }
 
         // Frame CPU per il download dei frame VAAPI (allocato una volta,
         // unref-ato a ogni iterazione in frameFromCurrent).
         var sw_frame: [*c]c.AVFrame = null;
-        errdefer c.av_frame_free(&sw_frame);
-        if (use_hw) sw_frame = c.av_frame_alloc() orelse return Error.AllocFailed;
+        errdefer av.av_frame_free(&sw_frame);
+        if (use_hw) sw_frame = av.av_frame_alloc() orelse return Error.AllocFailed;
 
         // Log una tantum (solo al cambio di percorso) così l'utente può
         // verificare se la decodifica hardware è attiva.
@@ -269,15 +412,15 @@ pub const Player = struct {
             }
         }
 
-        const frame = c.av_frame_alloc() orelse return Error.AllocFailed;
+        const frame = av.av_frame_alloc() orelse return Error.AllocFailed;
         errdefer {
             var f: [*c]c.AVFrame = frame;
-            c.av_frame_free(&f);
+            av.av_frame_free(&f);
         }
-        const packet = c.av_packet_alloc() orelse return Error.AllocFailed;
+        const packet = av.av_packet_alloc() orelse return Error.AllocFailed;
         errdefer {
             var p: [*c]c.AVPacket = packet;
-            c.av_packet_free(&p);
+            av.av_packet_free(&p);
         }
 
         const tb = stream.*.time_base;
@@ -342,19 +485,19 @@ pub const Player = struct {
         if (comptime cvp9_enabled) {
             if (self.cvp9_ctx) |cx| cx.destroy();
         }
-        if (self.sws) |s| c.sws_freeContext(s);
+        if (self.sws) |s| av.sws_freeContext(s);
         // Risorse VAAPI: frame CPU di download e ref del device (il codec
         // context libera la propria in avcodec_free_context).
         var sf: [*c]c.AVFrame = self.sw_frame;
-        c.av_frame_free(&sf);
-        c.av_buffer_unref(&self.hw_device_ctx);
+        av.av_frame_free(&sf);
+        av.av_buffer_unref(&self.hw_device_ctx);
         var p: [*c]c.AVPacket = self.packet;
-        c.av_packet_free(&p);
+        av.av_packet_free(&p);
         var f: [*c]c.AVFrame = self.frame;
-        c.av_frame_free(&f);
+        av.av_frame_free(&f);
         var cc: [*c]c.AVCodecContext = self.codec_ctx;
-        c.avcodec_free_context(&cc);
-        c.avformat_close_input(&self.fmt_ctx);
+        av.avcodec_free_context(&cc);
+        av.avformat_close_input(&self.fmt_ctx);
     }
 
     fn ptsSeconds(self: *Player) f64 {
@@ -384,32 +527,32 @@ pub const Player = struct {
             if (self.is_vp9) return self.nextFrameCvp9(max_dim, allocator);
         }
         while (true) {
-            const rr = c.av_read_frame(self.fmt_ctx, self.packet);
+            const rr = av.av_read_frame(self.fmt_ctx, self.packet);
             if (rr < 0) {
                 // Fine file: svuota il decoder con un packet nullo.
-                _ = c.avcodec_send_packet(self.codec_ctx, null);
-                const r = c.avcodec_receive_frame(self.codec_ctx, self.frame);
+                _ = av.avcodec_send_packet(self.codec_ctx, null);
+                const r = av.avcodec_receive_frame(self.codec_ctx, self.frame);
                 if (r < 0) return null;
                 // Se il download hw fallisse proprio all'ultimo frame (null),
                 // il file finisce qui comunque: nessun frame da recuperare.
                 return try self.frameFromCurrent(max_dim, allocator);
             }
-            defer c.av_packet_unref(self.packet);
+            defer av.av_packet_unref(self.packet);
             if (self.packet.*.stream_index != self.video_stream) continue;
-            const sr = c.avcodec_send_packet(self.codec_ctx, self.packet);
+            const sr = av.avcodec_send_packet(self.codec_ctx, self.packet);
             if (sr == c.AVERROR(c.EAGAIN)) {
                 // Decoder pieno (frame-threading): l'API garantisce che c'è un frame
                 // in uscita. Drenalo e ri-sottometti lo STESSO packet — scartarlo
                 // (il vecchio `continue`) perdeva frame. Dopo il drenaggio il
                 // send è accettato; il packet viene poi unref-ato dal defer.
-                const rd = c.avcodec_receive_frame(self.codec_ctx, self.frame);
+                const rd = av.avcodec_receive_frame(self.codec_ctx, self.frame);
                 if (rd < 0) continue; // stato anomalo: rinuncia a questo packet
-                _ = c.avcodec_send_packet(self.codec_ctx, self.packet);
+                _ = av.avcodec_send_packet(self.codec_ctx, self.packet);
                 if (try self.frameFromCurrent(max_dim, allocator)) |fr| return fr;
                 continue; // download hw fallito: degradato, prosegui in software
             }
             if (sr < 0) continue; // errore vero: packet inservibile
-            const r = c.avcodec_receive_frame(self.codec_ctx, self.frame);
+            const r = av.avcodec_receive_frame(self.codec_ctx, self.frame);
             if (r == c.AVERROR(c.EAGAIN)) continue; // servono altri packet
             if (r == c.AVERROR_EOF) return null;
             if (r < 0) return Error.NoFrameDecoded;
@@ -428,8 +571,8 @@ pub const Player = struct {
         if (self.frame.*.format == c.AV_PIX_FMT_VAAPI) {
             var ok = self.sw_frame != null;
             if (ok) {
-                c.av_frame_unref(self.sw_frame);
-                ok = c.av_hwframe_transfer_data(self.sw_frame, self.frame, 0) >= 0;
+                av.av_frame_unref(self.sw_frame);
+                ok = av.av_hwframe_transfer_data(self.sw_frame, self.frame, 0) >= 0;
             }
             if (!ok) {
                 if (!self.hw_warned) {
@@ -454,18 +597,18 @@ pub const Player = struct {
     /// chiamante deve propagare un errore (mai continuare con un ctx nullo).
     fn reopenSoftware(self: *Player) bool {
         self.hw_active = false;
-        c.av_buffer_unref(&self.hw_device_ctx);
+        av.av_buffer_unref(&self.hw_device_ctx);
         const stream = self.fmt_ctx.*.streams[@intCast(self.video_stream)];
-        const codec = c.avcodec_find_decoder(stream.*.codecpar.*.codec_id);
+        const codec = av.avcodec_find_decoder(stream.*.codecpar.*.codec_id);
         if (codec == null) return false;
         var cc: [*c]c.AVCodecContext = self.codec_ctx;
-        c.avcodec_free_context(&cc);
+        av.avcodec_free_context(&cc);
         self.codec_ctx = null; // deinit non deve rivedere il puntatore morto
-        self.codec_ctx = c.avcodec_alloc_context3(codec) orelse return false;
-        if (c.avcodec_parameters_to_context(self.codec_ctx, stream.*.codecpar) < 0) return false;
+        self.codec_ctx = av.avcodec_alloc_context3(codec) orelse return false;
+        if (av.avcodec_parameters_to_context(self.codec_ctx, stream.*.codecpar) < 0) return false;
         self.codec_ctx.*.thread_count = 0;
         self.codec_ctx.*.thread_type = c.FF_THREAD_FRAME | c.FF_THREAD_SLICE;
-        if (c.avcodec_open2(self.codec_ctx, codec, null) < 0) return false;
+        if (av.avcodec_open2(self.codec_ctx, codec, null) < 0) return false;
         return true;
     }
 
@@ -477,7 +620,7 @@ pub const Player = struct {
         while (true) {
             // Un frame potrebbe essere già pronto dalla pipeline.
             if (self.cvp9_ctx.?.getFrame(&f) == .ok) return try self.scaleI420(f, max_dim, allocator);
-            const rr = c.av_read_frame(self.fmt_ctx, self.packet);
+            const rr = av.av_read_frame(self.fmt_ctx, self.packet);
             if (rr < 0) {
                 // Fine file: drena i frame ancora in volo (pipeline poco profonda),
                 // con un tetto di tentativi così un frame bloccato non appende il worker.
@@ -491,7 +634,7 @@ pub const Player = struct {
                 }
                 return null;
             }
-            defer c.av_packet_unref(self.packet);
+            defer av.av_packet_unref(self.packet);
             if (self.packet.*.stream_index != self.video_stream) continue;
             self.cvp9_ctx.?.decode(self.packet.*.data, @intCast(self.packet.*.size), self.packet.*.pts);
         }
@@ -512,7 +655,7 @@ pub const Player = struct {
         var src_linesize = [_]c_int{ @intCast(f.stride_y), @intCast(f.stride_uv), @intCast(f.stride_uv), 0 };
         var dst_data = [_][*c]u8{ pixels.ptr, null, null, null };
         var dst_linesize = [_]c_int{ @intCast(w * self.out_bpp), 0, 0, 0 };
-        _ = c.sws_scale(self.sws, &src_data[0], &src_linesize[0], 0, src_h, &dst_data[0], &dst_linesize[0]);
+        _ = av.sws_scale(self.sws, &src_data[0], &src_linesize[0], 0, src_h, &dst_data[0], &dst_linesize[0]);
 
         return .{ .width = w, .height = h, .pixels = pixels, .pts_s = self.rawPtsSeconds(f.pts) };
     }
@@ -526,10 +669,10 @@ pub const Player = struct {
             return;
         }
         if (self.sws) |s| {
-            c.sws_freeContext(s);
+            av.sws_freeContext(s);
             self.sws = null;
         }
-        const sws = c.sws_getContext(src_w, src_h, src_fmt, dst_w, dst_h, self.out_fmt, c.SWS_FAST_BILINEAR, null, null, null) orelse return Error.ScaleInitFailed;
+        const sws = av.sws_getContext(src_w, src_h, src_fmt, dst_w, dst_h, self.out_fmt, c.SWS_FAST_BILINEAR, null, null, null) orelse return Error.ScaleInitFailed;
         self.sws = sws;
         self.sws_src_w = src_w;
         self.sws_src_h = src_h;
@@ -553,7 +696,7 @@ pub const Player = struct {
 
         var dst_data = [_][*c]u8{ pixels.ptr, null, null, null };
         var dst_linesize = [_]c_int{ @intCast(w * self.out_bpp), 0, 0, 0 };
-        _ = c.sws_scale(self.sws, &src.*.data[0], &src.*.linesize[0], 0, src_h, &dst_data[0], &dst_linesize[0]);
+        _ = av.sws_scale(self.sws, &src.*.data[0], &src.*.linesize[0], 0, src_h, &dst_data[0], &dst_linesize[0]);
 
         return .{ .width = w, .height = h, .pixels = pixels, .pts_s = self.ptsSeconds() };
     }
@@ -563,13 +706,13 @@ pub const Player = struct {
     pub fn seek(self: *Player, seconds: f64) void {
         if (self.time_base > 0) {
             const ts: i64 = @intFromFloat(seconds / self.time_base);
-            _ = c.av_seek_frame(self.fmt_ctx, self.video_stream, ts, c.AVSEEK_FLAG_BACKWARD);
+            _ = av.av_seek_frame(self.fmt_ctx, self.video_stream, ts, c.AVSEEK_FLAG_BACKWARD);
         } else {
             // Senza time_base il ts è in unità AV_TIME_BASE: va passato con stream
             // index -1 (default), altrimenti verrebbe interpretato nella time_base
             // dello stream video → seek a una posizione sbagliata.
             const ts: i64 = @intFromFloat(seconds * @as(f64, c.AV_TIME_BASE));
-            _ = c.av_seek_frame(self.fmt_ctx, -1, ts, c.AVSEEK_FLAG_BACKWARD);
+            _ = av.av_seek_frame(self.fmt_ctx, -1, ts, c.AVSEEK_FLAG_BACKWARD);
         }
         // Rimappa il contatore del PTS sintetico al punto di seek (per gli AVI
         // senza timestamp, così il pacing riprende coerente dalla nuova posizione).
@@ -583,12 +726,12 @@ pub const Player = struct {
                 self.cvp9_ctx = cvp9.Ctx.create();
                 if (self.cvp9_ctx == null) {
                     self.is_vp9 = false;
-                    c.avcodec_flush_buffers(self.codec_ctx);
+                    av.avcodec_flush_buffers(self.codec_ctx);
                 }
                 return;
             }
         }
-        c.avcodec_flush_buffers(self.codec_ctx);
+        av.avcodec_flush_buffers(self.codec_ctx);
     }
 };
 

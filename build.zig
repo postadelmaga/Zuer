@@ -19,6 +19,16 @@ pub fn build(b: *std.Build) void {
     // gui.zig/player.zig read `gpu` as "Vulkan renderer available"; `video` as "libav available".
     build_opts.addOption(bool, "gpu", vulkan_enabled);
     build_opts.addOption(bool, "video", ffmpeg_enabled);
+    // Solo per zuer-gui: su Windows i simboli libav si risolvono a runtime
+    // (LoadLibrary al primo video) invece che dalla import table.
+    build_opts.addOption(bool, "av_runtime", os_tag == .windows);
+
+    // Variante per i consumer che linkano libav DIRETTAMENTE (plugin media,
+    // tool player_dbg): per loro gli extern del cImport restano il percorso.
+    const build_opts_linked = b.addOptions();
+    build_opts_linked.addOption(bool, "gpu", vulkan_enabled);
+    build_opts_linked.addOption(bool, "video", ffmpeg_enabled);
+    build_opts_linked.addOption(bool, "av_runtime", false);
 
     // Link the Vulkan loader into a module: system loader on Linux, the vendored
     // vulkan-1 import lib on Windows (vk.zig's `extern "vulkan"` emits `-lvulkan`).
@@ -32,10 +42,13 @@ pub fn build(b: *std.Build) void {
     // Link libav (native video). Linux uses the system FFmpeg (pkg-config names have the
     // `lib` prefix); Windows uses the vendored headers + import libs under vendor/ffmpeg
     // (unversioned names → the versioned runtime DLLs fetched by scripts/fetch-ffmpeg-dlls.sh).
+    // Su Windows zuer-gui NON linka le import lib: player.zig risolve i simboli a
+    // RUNTIME (LoadLibrary al primo video) così l'exe parte anche senza le DLL —
+    // usare `headersOnly` lì. I plugin (decoder_media) continuano a linkare.
     const LinkAv = struct {
         fn link(bld: *std.Build, m: *std.Build.Module, tgt: std.Build.ResolvedTarget) void {
             if (tgt.result.os.tag == .windows) {
-                m.addIncludePath(bld.path("vendor/ffmpeg/include"));
+                headersOnly(bld, m, tgt);
                 m.addLibraryPath(bld.path("vendor/ffmpeg/lib"));
                 m.linkSystemLibrary("avformat", .{});
                 m.linkSystemLibrary("avcodec", .{});
@@ -48,6 +61,13 @@ pub fn build(b: *std.Build) void {
                 m.linkSystemLibrary("libavutil", .{});
                 m.linkSystemLibrary("libswscale", .{});
                 m.linkSystemLibrary("libswresample", .{});
+            }
+        }
+
+        /// Solo gli header vendorati (per il @cImport), niente import lib.
+        fn headersOnly(bld: *std.Build, m: *std.Build.Module, tgt: std.Build.ResolvedTarget) void {
+            if (tgt.result.os.tag == .windows) {
+                m.addIncludePath(bld.path("vendor/ffmpeg/include"));
             }
         }
     };
@@ -199,9 +219,13 @@ pub fn build(b: *std.Build) void {
     if (vulkan_enabled) LinkVk.link(b, gui_exe.root_module, target);
     if (ffmpeg_enabled) {
         // Player video nativo: il worker decodifica i frame in tempo reale con libav
-        // (src/decoders/player.zig, importato da gui.zig), quindi il gui_exe linka
-        // ffmpeg direttamente (finora era solo nel decoder .so per il poster).
-        LinkAv.link(b, gui_exe.root_module, target);
+        // (src/decoders/player.zig, importato da gui.zig). Su Linux il gui_exe linka
+        // ffmpeg direttamente; su Windows SOLO gli header — i simboli si risolvono a
+        // runtime (LoadLibrary al primo video) e l'exe parte anche senza le DLL.
+        if (os_tag == .windows)
+            LinkAv.headersOnly(b, gui_exe.root_module, target)
+        else
+            LinkAv.link(b, gui_exe.root_module, target);
         // Decoder VP9 su GPU compute (Vulkan): Linux-only (compute_vp9 non è portato su
         // Windows). Altrove player.zig ripiega sul decoder VP9 di libav (gate cvp9 in player).
         if (os_tag == .linux) gui_exe.root_module.linkSystemLibrary("compute_vp9", .{});
@@ -336,7 +360,7 @@ pub fn build(b: *std.Build) void {
                 LinkAv.link(b, lib.root_module, target);
                 // media importa player.zig (poster): serve build_options per il
                 // gate cvp9 e il link della lib (il poster resta però su libav).
-                lib.root_module.addOptions("build_options", build_opts);
+                lib.root_module.addOptions("build_options", build_opts_linked);
                 if (os_tag == .linux) lib.root_module.linkSystemLibrary("compute_vp9", .{});
                 // TinyMidiLoader (vendor/tsf): la scheda MIDI mostra la durata
                 // reale parsando il file con tml (vedi parseMidi in media.zig).
@@ -388,7 +412,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         LinkAv.link(b, player_dbg.root_module, target);
-        player_dbg.root_module.addOptions("build_options", build_opts);
+        player_dbg.root_module.addOptions("build_options", build_opts_linked);
         if (os_tag == .linux) player_dbg.root_module.linkSystemLibrary("compute_vp9", .{});
         const player_run = b.addRunArtifact(player_dbg);
         if (b.args) |args| player_run.addArgs(args);

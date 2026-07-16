@@ -15,6 +15,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const player = @import("decoders/player.zig");
 const c = player.c;
+const av = player.av;
 const zicro = @import("zicro");
 const DeviceOut = zicro.audio_device.DeviceOut;
 
@@ -82,6 +83,7 @@ pub const AudioPlayer = struct {
     /// Apre l'audio del file e avvia il thread. `null` (senza errore) se il file
     /// non ha stream audio o il device non si apre → il video va muto.
     pub fn start(path_z: [*:0]const u8, gpa: std.mem.Allocator) ?*AudioPlayer {
+        if (!player.ensureAv()) return null; // Windows: DLL FFmpeg assenti
         return startInner(path_z, gpa) catch null;
     }
 
@@ -91,46 +93,46 @@ pub const AudioPlayer = struct {
     /// `return null` li salterebbe, leakando risorse per ogni video muto aperto.
     fn startInner(path_z: [*:0]const u8, gpa: std.mem.Allocator) anyerror!*AudioPlayer {
         var fmt_ctx: [*c]c.AVFormatContext = null;
-        if (c.avformat_open_input(&fmt_ctx, path_z, null, null) != 0) return error.OpenFailed;
-        errdefer c.avformat_close_input(&fmt_ctx);
-        if (c.avformat_find_stream_info(fmt_ctx, null) < 0) return error.NoStreamInfo;
+        if (av.avformat_open_input(&fmt_ctx, path_z, null, null) != 0) return error.OpenFailed;
+        errdefer av.avformat_close_input(&fmt_ctx);
+        if (av.avformat_find_stream_info(fmt_ctx, null) < 0) return error.NoStreamInfo;
 
         var codec: [*c]const c.AVCodec = null;
-        const idx = c.av_find_best_stream(fmt_ctx, c.AVMEDIA_TYPE_AUDIO, -1, -1, &codec, 0);
+        const idx = av.av_find_best_stream(fmt_ctx, c.AVMEDIA_TYPE_AUDIO, -1, -1, &codec, 0);
         if (idx < 0 or codec == null) return error.NoAudio; // nessun audio: video muto
         const stream = fmt_ctx.*.streams[@intCast(idx)];
 
-        const codec_ctx = c.avcodec_alloc_context3(codec) orelse return error.AllocFailed;
+        const codec_ctx = av.avcodec_alloc_context3(codec) orelse return error.AllocFailed;
         var cc_free = codec_ctx;
-        errdefer c.avcodec_free_context(&cc_free);
-        if (c.avcodec_parameters_to_context(codec_ctx, stream.*.codecpar) < 0) return error.CodecParamsFailed;
-        if (c.avcodec_open2(codec_ctx, codec, null) < 0) return error.CodecOpenFailed;
+        errdefer av.avcodec_free_context(&cc_free);
+        if (av.avcodec_parameters_to_context(codec_ctx, stream.*.codecpar) < 0) return error.CodecParamsFailed;
+        if (av.avcodec_open2(codec_ctx, codec, null) < 0) return error.CodecOpenFailed;
 
         // swresample → f32 interleaved 48k stereo. Il layout di ingresso è quello
         // REALE del codec quando è valido (5.1(side) ≠ 5.1: il default sbaglierebbe
         // il mapping dei canali); il default per numero di canali è solo fallback.
         var in_layout: c.AVChannelLayout = undefined;
-        if (c.av_channel_layout_check(&codec_ctx.*.ch_layout) != 0) {
-            if (c.av_channel_layout_copy(&in_layout, &codec_ctx.*.ch_layout) < 0) return error.ChannelLayoutFailed;
+        if (av.av_channel_layout_check(&codec_ctx.*.ch_layout) != 0) {
+            if (av.av_channel_layout_copy(&in_layout, &codec_ctx.*.ch_layout) < 0) return error.ChannelLayoutFailed;
         } else {
             const in_ch: c_int = if (codec_ctx.*.ch_layout.nb_channels > 0) codec_ctx.*.ch_layout.nb_channels else 2;
-            c.av_channel_layout_default(&in_layout, in_ch);
+            av.av_channel_layout_default(&in_layout, in_ch);
         }
         // La copia può allocare (layout custom); swr ne fa una propria copia.
-        defer c.av_channel_layout_uninit(&in_layout);
+        defer av.av_channel_layout_uninit(&in_layout);
         var out_layout: c.AVChannelLayout = undefined;
-        c.av_channel_layout_default(&out_layout, OUT_CH);
+        av.av_channel_layout_default(&out_layout, OUT_CH);
         var swr: ?*c.SwrContext = null;
-        errdefer c.swr_free(&swr); // no-op se null; copre anche swr_init fallita
-        if (c.swr_alloc_set_opts2(&swr, &out_layout, c.AV_SAMPLE_FMT_FLT, OUT_RATE, &in_layout, codec_ctx.*.sample_fmt, codec_ctx.*.sample_rate, 0, null) < 0) return error.SwrSetupFailed;
-        if (swr == null or c.swr_init(swr) < 0) return error.SwrInitFailed;
+        errdefer av.swr_free(&swr); // no-op se null; copre anche swr_init fallita
+        if (av.swr_alloc_set_opts2(&swr, &out_layout, c.AV_SAMPLE_FMT_FLT, OUT_RATE, &in_layout, codec_ctx.*.sample_fmt, codec_ctx.*.sample_rate, 0, null) < 0) return error.SwrSetupFailed;
+        if (swr == null or av.swr_init(swr) < 0) return error.SwrInitFailed;
 
-        const frame = c.av_frame_alloc() orelse return error.AllocFailed;
+        const frame = av.av_frame_alloc() orelse return error.AllocFailed;
         var f_free = frame;
-        errdefer c.av_frame_free(&f_free);
-        const packet = c.av_packet_alloc() orelse return error.AllocFailed;
+        errdefer av.av_frame_free(&f_free);
+        const packet = av.av_packet_alloc() orelse return error.AllocFailed;
         var p_free = packet;
-        errdefer c.av_packet_free(&p_free);
+        errdefer av.av_packet_free(&p_free);
 
         var dev = try DeviceOut.open(@intCast(OUT_RATE), @intCast(OUT_CH));
         errdefer dev.close();
@@ -218,11 +220,11 @@ pub const AudioPlayer = struct {
 
     fn teardown(self: *AudioPlayer) void {
         self.dev.close();
-        c.swr_free(&self.swr);
-        c.av_packet_free(&self.packet);
-        c.av_frame_free(&self.frame);
-        c.avcodec_free_context(&self.codec_ctx);
-        c.avformat_close_input(&self.fmt_ctx);
+        av.swr_free(&self.swr);
+        av.av_packet_free(&self.packet);
+        av.av_frame_free(&self.frame);
+        av.avcodec_free_context(&self.codec_ctx);
+        av.avformat_close_input(&self.fmt_ctx);
     }
 
     fn threadMain(self: *AudioPlayer) void {
@@ -235,8 +237,8 @@ pub const AudioPlayer = struct {
             const sk = self.seek_ms.swap(-1, .monotonic);
             if (sk >= 0) {
                 const ts: i64 = if (self.time_base > 0) @intFromFloat((@as(f64, @floatFromInt(sk)) / 1000.0) / self.time_base) else 0;
-                _ = c.av_seek_frame(self.fmt_ctx, self.stream_idx, ts, c.AVSEEK_FLAG_BACKWARD);
-                c.avcodec_flush_buffers(self.codec_ctx);
+                _ = av.av_seek_frame(self.fmt_ctx, self.stream_idx, ts, c.AVSEEK_FLAG_BACKWARD);
+                av.avcodec_flush_buffers(self.codec_ctx);
                 // `submitted` qui è provvisorio: si riallinea sul pts reale del primo
                 // frame valido (>= soglia) più sotto, scartando i frame pre-seek.
                 self.skip_until_s = @as(f64, @floatFromInt(sk)) / 1000.0;
@@ -253,8 +255,8 @@ pub const AudioPlayer = struct {
                 continue;
             };
             if (!got) {
-                _ = c.av_seek_frame(self.fmt_ctx, self.stream_idx, 0, c.AVSEEK_FLAG_BACKWARD);
-                c.avcodec_flush_buffers(self.codec_ctx);
+                _ = av.av_seek_frame(self.fmt_ctx, self.stream_idx, 0, c.AVSEEK_FLAG_BACKWARD);
+                av.avcodec_flush_buffers(self.codec_ctx);
                 submitted = 0;
                 self.skip_until_s = -1;
                 continue;
@@ -312,19 +314,19 @@ pub const AudioPlayer = struct {
     /// Decodifica il prossimo frame audio in `self.frame`. `false` a fine file.
     fn decodeOne(self: *AudioPlayer) !bool {
         while (true) {
-            const r = c.avcodec_receive_frame(self.codec_ctx, self.frame);
+            const r = av.avcodec_receive_frame(self.codec_ctx, self.frame);
             if (r == 0) return true;
             if (r != c.AVERROR(c.EAGAIN) and r != c.AVERROR_EOF) return error.Decode;
             // Serve un altro packet.
-            const rr = c.av_read_frame(self.fmt_ctx, self.packet);
+            const rr = av.av_read_frame(self.fmt_ctx, self.packet);
             if (rr < 0) {
-                _ = c.avcodec_send_packet(self.codec_ctx, null); // flush
-                const r2 = c.avcodec_receive_frame(self.codec_ctx, self.frame);
+                _ = av.avcodec_send_packet(self.codec_ctx, null); // flush
+                const r2 = av.avcodec_receive_frame(self.codec_ctx, self.frame);
                 return r2 == 0;
             }
-            defer c.av_packet_unref(self.packet);
+            defer av.av_packet_unref(self.packet);
             if (self.packet.*.stream_index != self.stream_idx) continue;
-            _ = c.avcodec_send_packet(self.codec_ctx, self.packet);
+            _ = av.avcodec_send_packet(self.codec_ctx, self.packet);
         }
     }
 
@@ -333,7 +335,7 @@ pub const AudioPlayer = struct {
         const max_out: usize = @intCast(@divTrunc(@as(i64, self.frame.*.nb_samples) * OUT_RATE, @max(self.in_rate, 1)) + 256);
         try out.resize(self.gpa, max_out * @as(usize, OUT_CH));
         var out_ptr: [*c]u8 = @ptrCast(out.items.ptr);
-        const n = c.swr_convert(self.swr, &out_ptr, @intCast(max_out), @ptrCast(self.frame.*.extended_data), self.frame.*.nb_samples);
+        const n = av.swr_convert(self.swr, &out_ptr, @intCast(max_out), @ptrCast(self.frame.*.extended_data), self.frame.*.nb_samples);
         if (n < 0) return error.Resample;
         return @intCast(n);
     }

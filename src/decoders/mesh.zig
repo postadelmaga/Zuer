@@ -247,7 +247,7 @@ fn zuer_decode(
     };
 }
 
-const extensions = "obj,stl";
+pub const extensions = "obj,stl";
 
 fn zuer_extensions() callconv(.c) decoder.SliceC {
     return decoder.SliceC.fromSlice(extensions);

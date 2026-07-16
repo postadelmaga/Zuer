@@ -853,7 +853,7 @@ export fn zuer_decode(
     };
 }
 
-const extensions = "docx,pptx,odt,odp,xlsx,xlsm,ods";
+pub const extensions = "docx,pptx,odt,odp,xlsx,xlsm,ods";
 
 export fn zuer_extensions() callconv(.c) decoder.SliceC {
     return decoder.SliceC.fromSlice(extensions);

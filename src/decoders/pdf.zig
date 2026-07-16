@@ -275,7 +275,7 @@ export fn zuer_decode(
     };
 }
 
-const extensions = "pdf";
+pub const extensions = "pdf";
 
 export fn zuer_extensions() callconv(.c) decoder.SliceC {
     return decoder.SliceC.fromSlice(extensions);

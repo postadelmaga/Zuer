@@ -198,7 +198,7 @@ fn zuer_decode(
     };
 }
 
-const extensions = "tar,tgz,tar.gz";
+pub const extensions = "tar,tgz,tar.gz";
 
 fn zuer_extensions() callconv(.c) decoder.SliceC {
     return decoder.SliceC.fromSlice(extensions);

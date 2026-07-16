@@ -135,7 +135,7 @@ fn zuer_decode(
     };
 }
 
-const extensions = "csv,tsv";
+pub const extensions = "csv,tsv";
 
 fn zuer_extensions() callconv(.c) decoder.SliceC {
     return decoder.SliceC.fromSlice(extensions);

@@ -594,7 +594,7 @@ const LoadedPlugin = struct {
 };
 
 var plugin_registry: std.ArrayList(LoadedPlugin) = .empty;
-var plugin_registry_scanned = false;
+var third_party_scanned = false;
 var plugin_cache_mutex: std.atomic.Mutex = .unlocked;
 
 /// Chiude i plugin caricati e libera il registro. Da chiamare a fine processo,
@@ -613,7 +613,7 @@ pub fn closePluginCache(allocator: std.mem.Allocator) void {
     }
     plugin_registry.deinit(allocator);
     plugin_registry = .empty;
-    plugin_registry_scanned = false;
+    third_party_scanned = false;
 }
 
 // A dynamic library's on-disk name is target-specific: `libdecoder_x.so` on Linux,
@@ -626,10 +626,56 @@ const plugin_suffix = switch (builtin.os.tag) {
     else => ".so",
 };
 
+/// Manifest estensione→plugin per il caricamento LAZY del singolo plugin:
+/// evita il dlopen di TUTTI i .so/.dll (≈140 MB) solo per leggerne
+/// `zuer_extensions` alla prima decodifica. DUPLICA le liste `pub const
+/// extensions` dei decoder — importarle direttamente è impossibile: il blocco
+/// comptime di ogni decoder @export-a i simboli ABI e colliderebbero nell'host.
+/// La fonte di verità resta `zuer_extensions` del plugin: al load l'host
+/// ri-verifica, e un manifest stantio degrada nello scan completo di sempre,
+/// mai in un decode sbagliato. Plugin di terze parti: coperti dal fallback.
+const ManifestEntry = struct { name: []const u8, exts: []const u8 };
+const plugin_manifest = [_]ManifestEntry{
+    .{ .name = "text", .exts = "txt,text,log,nfo,rst,adoc,asciidoc,org,tex,bib,srt,vtt,diff,patch," ++
+        "json,jsonl,ndjson,yaml,yml,toml,ini,cfg,conf,properties,env,plist,editorconfig,gitignore,gitattributes,lock," ++
+        "xml,html,htm,xhtml,css,scss,sass,less," ++
+        "sh,bash,zsh,fish,ps1,bat,cmd,mk,make,cmake,gradle,dockerfile," ++
+        "rs,py,pyi,js,mjs,cjs,jsx,ts,tsx,c,h,cc,cpp,cxx,hpp,hh,cs,java,kt,kts,go,rb,php,swift,scala,lua,pl,pm,r,sql,dart,ex,exs,erl,hrl,hs,clj,cljs,vim,asm,s,zig,jl,nim,proto,graphql,gql" },
+    .{ .name = "image", .exts = "png,jpg,jpeg,gif,bmp,tga,psd,hdr,pic,pnm,pbm,pgm,ppm,svg,svgz,webp,tif,tiff,ico,avif" },
+    .{ .name = "media", .exts = "mp3,wav,flac,ogg,oga,ogv,opus,m4a,mp4,m4v,mov,mkv,webm,avi,mid,midi" },
+    .{ .name = "csv", .exts = "csv,tsv" },
+    .{ .name = "markdown", .exts = "md,markdown" },
+    .{ .name = "archive", .exts = "zip,jar,apk,cbz,epub,xpi,whl" },
+    .{ .name = "tar", .exts = "tar,tgz,tar.gz" },
+    .{ .name = "glb", .exts = "glb" },
+    .{ .name = "mesh", .exts = "obj,stl" },
+    .{ .name = "office", .exts = "docx,pptx,odt,odp,xlsx,xlsm,ods" },
+    .{ .name = "pdf", .exts = "pdf" },
+};
+
+fn manifestPluginForExt(ext: []const u8) ?[]const u8 {
+    for (&plugin_manifest) |*m| {
+        var tokens = std.mem.tokenizeScalar(u8, m.exts, ',');
+        while (tokens.next()) |tok| {
+            if (asciiEqualIgnoreCase(ext, tok)) return m.name;
+        }
+    }
+    return null;
+}
+
+fn manifestHasName(name: []const u8) bool {
+    for (&plugin_manifest) |*m| {
+        if (std.mem.eql(u8, m.name, name)) return true;
+    }
+    return false;
+}
+
 /// Scansiona una directory alla ricerca di plugin `libdecoder_*.so` e li
 /// registra interrogando `zuer_extensions`. Un plugin già registrato con lo
 /// stesso nome (da una directory precedente nell'ordine di ricerca) vince.
-fn scanPluginDir(dir_path: []const u8, io: std.Io, allocator: std.mem.Allocator) void {
+/// Con `skip_manifested` apre SOLO i plugin fuori manifest (terze parti):
+/// il resto è raggiungibile in modo mirato senza pagarne il dlopen.
+fn scanPluginDir(dir_path: []const u8, io: std.Io, allocator: std.mem.Allocator, skip_manifested: bool) void {
     var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return;
     defer dir.close(io);
 
@@ -641,95 +687,147 @@ fn scanPluginDir(dir_path: []const u8, io: std.Io, allocator: std.mem.Allocator)
 
         const type_name = entry.name[plugin_prefix.len .. entry.name.len - plugin_suffix.len];
         if (type_name.len == 0) continue;
-        if (findPluginByName(type_name) != null) continue;
-
-        const full_path = std.fs.path.join(allocator, &.{ dir_path, entry.name }) catch continue;
-        defer allocator.free(full_path);
-
-        var lib = dynlib.Lib.open(full_path) catch continue;
-        // Verifica dell'ABI: un plugin senza `zuer_abi_version` o compilato
-        // contro un'altra versione del contratto C va scartato subito (il
-        // layout di `DecodedC` potrebbe non combaciare → corruzione di memoria).
-        const abi_ok = if (lib.lookup(AbiVersionFn, "zuer_abi_version")) |abi_fn| blk: {
-            const v = abi_fn();
-            if (v != abi_version)
-                std.debug.print("zuer: plugin {s} ignorato: ABI v{d} != v{d}\n", .{ entry.name, v, abi_version });
-            break :blk v == abi_version;
-        } else blk: {
-            std.debug.print("zuer: plugin {s} ignorato: manca zuer_abi_version (atteso ABI v{d})\n", .{ entry.name, abi_version });
-            break :blk false;
-        };
-        if (!abi_ok) {
-            lib.close();
-            continue;
-        }
-        const decode_fn = lib.lookup(DecodeFn, "zuer_decode") orelse {
-            lib.close();
-            continue;
-        };
-        const decode_coarse_fn = lib.lookup(DecodeFn, "zuer_decode_coarse");
-        const content_prefix: usize = if (lib.lookup(ContentPrefixFn, "zuer_content_prefix")) |f| f() else std.math.maxInt(usize);
-
-        // `zuer_extensions` è opzionale: un plugin senza estensioni dichiarate
-        // resta raggiungibile solo come fallback per nome (es. "text").
-        var exts: std.ArrayList([]const u8) = .empty;
-        if (lib.lookup(ExtensionsFn, "zuer_extensions")) |ext_fn| {
-            var tokens = std.mem.tokenizeScalar(u8, ext_fn().toSlice(), ',');
-            while (tokens.next()) |tok| {
-                const trimmed = std.mem.trim(u8, tok, " \t\r\n");
-                if (trimmed.len == 0) continue;
-                const lower = allocator.dupe(u8, trimmed) catch continue;
-                for (lower) |*ch| ch.* = std.ascii.toLower(ch.*);
-                exts.append(allocator, lower) catch allocator.free(lower);
-            }
-        }
-
-        var registered = false;
-        defer if (!registered) {
-            for (exts.items) |e| allocator.free(e);
-            exts.deinit(allocator);
-            lib.close();
-        };
-
-        const type_name_dup = allocator.dupe(u8, type_name) catch continue;
-        const exts_owned = exts.toOwnedSlice(allocator) catch {
-            allocator.free(type_name_dup);
-            continue;
-        };
-        plugin_registry.append(allocator, .{
-            .type_name = type_name_dup,
-            .extensions = exts_owned,
-            .lib = lib,
-            .decode_fn = decode_fn,
-            .decode_coarse_fn = decode_coarse_fn,
-            .content_prefix = content_prefix,
-        }) catch {
-            allocator.free(type_name_dup);
-            for (exts_owned) |e| allocator.free(e);
-            allocator.free(exts_owned);
-            continue;
-        };
-        registered = true;
+        if (skip_manifested and manifestHasName(type_name)) continue;
+        registerPluginFile(dir_path, entry.name, type_name, io, allocator);
     }
 }
 
-/// Costruisce il registro dei plugin (una sola volta) scandendo, nell'ordine,
-/// `<exe_dir>/decoders`, `<exe_dir>`, `zig-out/lib` e `decoders`.
-/// Deve essere chiamata con `plugin_cache_mutex` già acquisito.
-fn ensureRegistryLocked(io: std.Io, allocator: std.mem.Allocator) void {
-    if (plugin_registry_scanned) return;
-    plugin_registry_scanned = true;
+/// Apre e registra il singolo file plugin `file_name` (in `dir_path`) come
+/// `type_name`, con verifica ABI e lettura di `zuer_extensions`. No-op se un
+/// plugin con quel nome è già registrato o il file non è caricabile.
+fn registerPluginFile(dir_path: []const u8, file_name: []const u8, type_name: []const u8, io: std.Io, allocator: std.mem.Allocator) void {
+    _ = io;
+    if (findPluginByName(type_name) != null) return;
+
+    const full_path = std.fs.path.join(allocator, &.{ dir_path, file_name }) catch return;
+    defer allocator.free(full_path);
+
+    var lib = dynlib.Lib.open(full_path) catch return;
+    // Verifica dell'ABI: un plugin senza `zuer_abi_version` o compilato
+    // contro un'altra versione del contratto C va scartato subito (il
+    // layout di `DecodedC` potrebbe non combaciare → corruzione di memoria).
+    const abi_ok = if (lib.lookup(AbiVersionFn, "zuer_abi_version")) |abi_fn| blk: {
+        const v = abi_fn();
+        if (v != abi_version)
+            std.debug.print("zuer: plugin {s} ignorato: ABI v{d} != v{d}\n", .{ file_name, v, abi_version });
+        break :blk v == abi_version;
+    } else blk: {
+        std.debug.print("zuer: plugin {s} ignorato: manca zuer_abi_version (atteso ABI v{d})\n", .{ file_name, abi_version });
+        break :blk false;
+    };
+    if (!abi_ok) {
+        lib.close();
+        return;
+    }
+    const decode_fn = lib.lookup(DecodeFn, "zuer_decode") orelse {
+        lib.close();
+        return;
+    };
+    const decode_coarse_fn = lib.lookup(DecodeFn, "zuer_decode_coarse");
+    const content_prefix: usize = if (lib.lookup(ContentPrefixFn, "zuer_content_prefix")) |f| f() else std.math.maxInt(usize);
+
+    // `zuer_extensions` è opzionale: un plugin senza estensioni dichiarate
+    // resta raggiungibile solo come fallback per nome (es. "text").
+    var exts: std.ArrayList([]const u8) = .empty;
+    if (lib.lookup(ExtensionsFn, "zuer_extensions")) |ext_fn| {
+        var tokens = std.mem.tokenizeScalar(u8, ext_fn().toSlice(), ',');
+        while (tokens.next()) |tok| {
+            const trimmed = std.mem.trim(u8, tok, " \t\r\n");
+            if (trimmed.len == 0) continue;
+            const lower = allocator.dupe(u8, trimmed) catch continue;
+            for (lower) |*ch| ch.* = std.ascii.toLower(ch.*);
+            exts.append(allocator, lower) catch allocator.free(lower);
+        }
+    }
+
+    var registered = false;
+    defer if (!registered) {
+        for (exts.items) |e| allocator.free(e);
+        exts.deinit(allocator);
+        lib.close();
+    };
+
+    const type_name_dup = allocator.dupe(u8, type_name) catch return;
+    const exts_owned = exts.toOwnedSlice(allocator) catch {
+        allocator.free(type_name_dup);
+        return;
+    };
+    plugin_registry.append(allocator, .{
+        .type_name = type_name_dup,
+        .extensions = exts_owned,
+        .lib = lib,
+        .decode_fn = decode_fn,
+        .decode_coarse_fn = decode_coarse_fn,
+        .content_prefix = content_prefix,
+    }) catch {
+        allocator.free(type_name_dup);
+        for (exts_owned) |e| allocator.free(e);
+        allocator.free(exts_owned);
+        return;
+    };
+    registered = true;
+}
+
+/// Registra (una sola volta) i plugin di TERZE PARTI — quelli fuori manifest —
+/// scandendo, nell'ordine, `<exe_dir>/decoders`, `<exe_dir>`, `zig-out/lib` e
+/// `decoders`. È un readdir + dlopen dei soli file sconosciuti: nel caso comune
+/// (nessun plugin extra) non apre nulla. Con `plugin_cache_mutex` acquisito.
+fn ensureThirdPartyLocked(io: std.Io, allocator: std.mem.Allocator) void {
+    if (third_party_scanned) return;
+    third_party_scanned = true;
 
     if (std.process.executableDirPathAlloc(io, allocator)) |exe_dir| {
         defer allocator.free(exe_dir);
         if (std.fs.path.join(allocator, &.{ exe_dir, "decoders" })) |p| {
             defer allocator.free(p);
-            scanPluginDir(p, io, allocator);
+            scanPluginDir(p, io, allocator, true);
         } else |_| {}
-        scanPluginDir(exe_dir, io, allocator);
+        scanPluginDir(exe_dir, io, allocator, true);
     } else |_| {}
-    scanPluginDir("zig-out/lib", io, allocator);
-    scanPluginDir("decoders", io, allocator);
+    scanPluginDir("zig-out/lib", io, allocator, true);
+    scanPluginDir("decoders", io, allocator, true);
+}
+
+/// Carica il SOLO plugin `name` cercandolo nelle stesse directory (e ordine)
+/// dello scan completo. No-op se già registrato o introvabile. Con
+/// `plugin_cache_mutex` acquisito.
+fn loadPluginByNameLocked(name: []const u8, io: std.Io, allocator: std.mem.Allocator) void {
+    if (findPluginByName(name) != null) return;
+    var fname_buf: [160]u8 = undefined;
+    const fname = std.fmt.bufPrint(&fname_buf, "{s}{s}{s}", .{ plugin_prefix, name, plugin_suffix }) catch return;
+
+    if (std.process.executableDirPathAlloc(io, allocator)) |exe_dir| {
+        defer allocator.free(exe_dir);
+        if (std.fs.path.join(allocator, &.{ exe_dir, "decoders" })) |p| {
+            defer allocator.free(p);
+            registerPluginFile(p, fname, name, io, allocator);
+        } else |_| {}
+        if (findPluginByName(name) != null) return;
+        registerPluginFile(exe_dir, fname, name, io, allocator);
+        if (findPluginByName(name) != null) return;
+    } else |_| {}
+    registerPluginFile("zig-out/lib", fname, name, io, allocator);
+    if (findPluginByName(name) != null) return;
+    registerPluginFile("decoders", fname, name, io, allocator);
+}
+
+/// Risoluzione LAZY per estensione: carica solo il plugin che (da manifest)
+/// dichiara `ext`; senza estensione bastano i fallback immagine/testo. Per
+/// estensioni fuori manifest — o manifest stantio rispetto al plugin reale —
+/// si tenta il registro dei plugin di terze parti (readdir, dlopen dei soli
+/// file sconosciuti). Con `plugin_cache_mutex` acquisito.
+fn ensureForExtLocked(ext: []const u8, io: std.Io, allocator: std.mem.Allocator) void {
+    if (ext.len == 0) {
+        loadPluginByNameLocked("image", io, allocator);
+        loadPluginByNameLocked("text", io, allocator);
+        return;
+    }
+    if (findPluginByExtension(ext) != null) return;
+    if (manifestPluginForExt(ext)) |name| {
+        loadPluginByNameLocked(name, io, allocator);
+        if (findPluginByExtension(ext) != null) return;
+    }
+    ensureThirdPartyLocked(io, allocator);
 }
 
 fn findPluginByName(type_name: []const u8) ?*const LoadedPlugin {
@@ -1572,12 +1670,16 @@ fn decodeImpl(path: []const u8, io: std.Io, allocator: std.mem.Allocator, coarse
             std.Thread.yield() catch {};
         }
         defer plugin_cache_mutex.unlock();
-        ensureRegistryLocked(io, allocator);
+        ensureForExtLocked(ext, io, allocator);
         if (findPluginByExtension(ext)) |p| {
             ext_found = true;
             ext_fn = if (coarse) p.decode_coarse_fn else p.decode_fn;
             ext_prefix = p.content_prefix;
         } else {
+            // Estensione sconosciuta anche dopo la risoluzione: servono solo i
+            // fallback (probe immagine per byte magici, poi testo).
+            loadPluginByNameLocked("image", io, allocator);
+            loadPluginByNameLocked("text", io, allocator);
             if (findPluginByName("image")) |p| {
                 image_found = true;
                 image_fn = if (coarse) p.decode_coarse_fn else p.decode_fn;

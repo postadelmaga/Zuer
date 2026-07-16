@@ -935,7 +935,7 @@ fn zuer_decode_coarse(
     return decodeExport(path, content, allocator_ptr, true);
 }
 
-const extensions = "glb";
+pub const extensions = "glb";
 
 fn zuer_extensions() callconv(.c) decoder.SliceC {
     return decoder.SliceC.fromSlice(extensions);

@@ -55,14 +55,22 @@ fn absPath(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
 }
 
 pub fn decode(path: []const u8, file_bytes: []const u8, filename: []const u8, allocator: std.mem.Allocator) Decoded {
-    // I subprocess (SVG/ImageMagick) usano decoder.runCapture (fork/exec diretti),
-    // quindi qui non serve l'io dell'host.
     var max_dim: usize = 160;
     if (getenv("ZUER_GUI")) |val| {
         if (std.mem.eql(u8, std.mem.span(val), "1")) {
             max_dim = 4096; // Risoluzione di alta qualità per la GUI
         }
     }
+    return decodeWithMax(path, file_bytes, filename, allocator, max_dim);
+}
+
+/// Tetto del tier coarse (miniature explorer): i pixel restituiti restano
+/// piccoli anche se stb decodifica comunque a piena risoluzione in C.
+pub const coarse_max_dim: usize = 512;
+
+pub fn decodeWithMax(path: []const u8, file_bytes: []const u8, filename: []const u8, allocator: std.mem.Allocator, max_dim: usize) Decoded {
+    // I subprocess (SVG/ImageMagick) usano decoder.runCapture (fork/exec diretti),
+    // quindi qui non serve l'io dell'host.
 
     // SVG: prima librsvg (rendering di qualità, gestisce anche .svgz),
     // poi il fallback ImageMagick come per gli altri formati non-stb.
@@ -268,18 +276,15 @@ fn decodeWithImageMagick(path: []const u8, filename: []const u8, max_dim: usize,
     };
 }
 
-fn zuer_decode(
-    path: decoder.SliceC,
-    content: decoder.SliceC,
-    io_ptr: *const anyopaque,
-    allocator_ptr: *const anyopaque,
-) callconv(.c) decoder.DecodedC {
-    _ = io_ptr; // i subprocess usano fork/exec diretti, non l'io dell'host
+fn decodeExport(path: decoder.SliceC, content: decoder.SliceC, allocator_ptr: *const anyopaque, coarse: bool) decoder.DecodedC {
     const allocator = @as(*const std.mem.Allocator, @ptrCast(@alignCast(allocator_ptr))).*;
     const path_slice = path.toSlice();
     const content_slice = content.toSlice();
     const filename = std.fs.path.basename(path_slice);
-    const decoded = decode(path_slice, content_slice, filename, allocator);
+    const decoded = if (coarse)
+        decodeWithMax(path_slice, content_slice, filename, allocator, coarse_max_dim)
+    else
+        decode(path_slice, content_slice, filename, allocator);
     // decode() non conserva i byte del file (stb copia i pixel nel buffer
     // ridimensionato, ImageMagick rilegge dal path): vanno liberati qui o
     // trapelano a ogni immagine.
@@ -293,10 +298,32 @@ fn zuer_decode(
     };
 }
 
+fn zuer_decode(
+    path: decoder.SliceC,
+    content: decoder.SliceC,
+    io_ptr: *const anyopaque,
+    allocator_ptr: *const anyopaque,
+) callconv(.c) decoder.DecodedC {
+    _ = io_ptr; // i subprocess usano fork/exec diretti, non l'io dell'host
+    return decodeExport(path, content, allocator_ptr, false);
+}
+
+/// Tier coarse: stessa pipeline ma pixel entro `coarse_max_dim` — per le
+/// miniature (explorer) che a piena risoluzione peserebbero ~64 MB l'una.
+fn zuer_decode_coarse(
+    path: decoder.SliceC,
+    content: decoder.SliceC,
+    io_ptr: *const anyopaque,
+    allocator_ptr: *const anyopaque,
+) callconv(.c) decoder.DecodedC {
+    _ = io_ptr;
+    return decodeExport(path, content, allocator_ptr, true);
+}
+
 // stb_image copre nativamente PNG/JPEG/GIF/BMP/TGA/PSD/HDR/PIC/PNM; i formati
 // vettoriali o non coperti (SVG, WebP, TIFF, ICO, AVIF) passano dal fallback
 // ImageMagick già presente in decode().
-const extensions = "png,jpg,jpeg,gif,bmp,tga,psd,hdr,pic,pnm,pbm,pgm,ppm,svg,svgz,webp,tif,tiff,ico,avif";
+pub const extensions = "png,jpg,jpeg,gif,bmp,tga,psd,hdr,pic,pnm,pbm,pgm,ppm,svg,svgz,webp,tif,tiff,ico,avif";
 
 fn zuer_extensions() callconv(.c) decoder.SliceC {
     return decoder.SliceC.fromSlice(extensions);
@@ -314,6 +341,7 @@ fn zuer_abi_version() callconv(.c) u32 {
 comptime {
     if (decoder.plugin_abi) {
         @export(&zuer_decode, .{ .name = "zuer_decode", .linkage = .strong });
+        @export(&zuer_decode_coarse, .{ .name = "zuer_decode_coarse", .linkage = .strong });
         @export(&zuer_extensions, .{ .name = "zuer_extensions", .linkage = .strong });
         @export(&zuer_abi_version, .{ .name = "zuer_abi_version", .linkage = .strong });
     }

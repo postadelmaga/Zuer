@@ -43,7 +43,7 @@ fn zuer_decode(
 
 // Estensioni testuali note (parità con viewer); il plugin "text" resta comunque
 // il fallback dell'host per qualsiasi estensione non reclamata da altri plugin.
-const extensions = "txt,text,log,nfo,rst,adoc,asciidoc,org,tex,bib,srt,vtt,diff,patch," ++
+pub const extensions = "txt,text,log,nfo,rst,adoc,asciidoc,org,tex,bib,srt,vtt,diff,patch," ++
     "json,jsonl,ndjson,yaml,yml,toml,ini,cfg,conf,properties,env,plist,editorconfig,gitignore,gitattributes,lock," ++
     "xml,html,htm,xhtml,css,scss,sass,less," ++
     "sh,bash,zsh,fish,ps1,bat,cmd,mk,make,cmake,gradle,dockerfile," ++

@@ -733,7 +733,10 @@ fn thumbWorker(state: *GuiAppState, gen: u32) void {
         defer state.gpa.free(name);
         attempts += 1;
 
-        var d = decoder_mod.decode(full, state.io, state.gpa);
+        // Tier coarse quando il plugin lo offre (immagini: pixel ≤512² invece
+        // di 4096², ~64 MB risparmiati a decode); altrimenti il decode pieno.
+        var d = decoder_mod.decodeCoarse(full, state.io, state.gpa) orelse
+            decoder_mod.decode(full, state.io, state.gpa);
         defer d.deinit(state.gpa);
         if (d != .image) continue;
         const th = makeThumb(state.gpa, d.image.pixels, d.image.width, d.image.height) orelse continue;

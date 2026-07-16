@@ -236,7 +236,7 @@ fn zuer_decode(
     };
 }
 
-const extensions = "zip,jar,apk,cbz,epub,xpi,whl";
+pub const extensions = "zip,jar,apk,cbz,epub,xpi,whl";
 
 fn zuer_extensions() callconv(.c) decoder.SliceC {
     return decoder.SliceC.fromSlice(extensions);
