@@ -34,7 +34,18 @@ const input = @import("input.zig");
 // Ricerca YouTube (overlay tasto `y`): stato in Shared, ricerca/streaming yt-dlp.
 const yt_search = @import("yt_search.zig");
 const file_explorer = @import("file_explorer.zig");
+const crash_log = @import("crash_log.zig");
+const crash_report = @import("crash_report.zig");
 const build_options = @import("build_options");
+
+/// Su Windows l'exe è subsystem GUI: un panic non ha stderr e l'app sparisce
+/// muta. Prima del panic di default, lascia una riga in crash.log.
+pub const panic = std.debug.FullPanic(panicWithLog);
+
+fn panicWithLog(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    crash_log.writeCrash(msg, first_trace_addr orelse @returnAddress());
+    std.debug.defaultPanic(msg, first_trace_addr);
+}
 /// Vulkan mesh/text renderer available (Linux + Windows). Comptime so the GPU code links
 /// only when enabled. Distinct from `has_video`: on Windows Vulkan is on but video is off.
 const native = build_options.gpu;
@@ -873,6 +884,11 @@ pub fn main(init: std.process.Init) !void {
     const io = threaded.io();
 
     defer decoder_mod.closePluginCache(gpa);
+
+    // Se l'avvio precedente è finito in panic, propone l'issue GitHub
+    // precompilata aprendo il browser (vedi crash_report.zig). Su thread:
+    // legge il crash log e fa l'handoff al browser, mai bloccare l'avvio.
+    if (std.Thread.spawn(.{}, crash_report.maybeReport, .{ io, gpa })) |t| t.detach() else |_| {}
 
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
     defer args.deinit();
