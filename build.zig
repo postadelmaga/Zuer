@@ -211,7 +211,13 @@ pub fn build(b: *std.Build) void {
         gui_exe.root_module.linkSystemLibrary("asound", .{}); // backend audio zicro (ALSA)
     }
     // Backend audio zicro su Windows (waveOut/winmm).
-    if (target.result.os.tag == .windows) gui_exe.root_module.linkSystemLibrary("winmm", .{});
+    if (target.result.os.tag == .windows) {
+        gui_exe.root_module.linkSystemLibrary("winmm", .{});
+        // App GUI: senza questo l'exe è "console" e ogni avvio da Explorer/menu
+        // Start apre anche un terminale. Gli errori su stdout spariscono, ma
+        // sono già invisibili in quel contesto.
+        gui_exe.subsystem = .Windows;
+    }
     // Player MIDI nativo (src/midi_player.zig): synth TinySoundFont + parser
     // TinyMidiLoader, vendorizzati in vendor/tsf.
     addTsf(b, gui_exe.root_module);

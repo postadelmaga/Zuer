@@ -19,8 +19,8 @@ const zicro = @import("zicro");
 const paint = zicro.paint;
 const build_options = @import("build_options");
 const has_video = build_options.video;
-
-extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+const builtin = @import("builtin");
+const vtcache = @import("vtcache.zig");
 
 /// Un risultato di ricerca (stringhe e miniatura possedute, vedi `freeResults`).
 pub const Result = struct {
@@ -168,22 +168,28 @@ fn copyWorker(state: *GuiAppState, txt: []u8) void {
     state.gpa.free(txt);
 }
 
-/// Ctrl+V: incolla dagli appunti (wl-paste su thread; su altri OS è un no-op
-/// silenzioso). Con `shared.mutex` acquisito.
+/// Ctrl+V: incolla dagli appunti (wl-paste o clipboard Win32, su thread).
+/// Con `shared.mutex` acquisito.
 pub fn startPaste(state: *GuiAppState) void {
     const t = std.Thread.spawn(.{}, pasteWorker, .{state}) catch return;
     t.detach();
 }
 
 fn pasteWorker(state: *GuiAppState) void {
-    var res = decoder_mod.runCaptureTimeout(state.gpa, &.{ "wl-paste", "-n" }, 2_000) catch return;
-    defer res.deinit(state.gpa);
-    if (res.exit_code != 0 or res.stdout.len == 0) return;
+    const raw: []u8 = if (comptime builtin.os.tag == .windows)
+        clipboard.pasteAlloc(state.gpa) orelse return
+    else raw: {
+        var res = decoder_mod.runCaptureTimeout(state.gpa, &.{ "wl-paste", "-n" }, 2_000) catch return;
+        defer res.deinit(state.gpa);
+        if (res.exit_code != 0 or res.stdout.len == 0) return;
+        break :raw state.gpa.dupe(u8, res.stdout) catch return;
+    };
+    defer state.gpa.free(raw);
     // Una query è una riga sola: newline/tab diventano spazi, il resto dei
     // caratteri di controllo sparisce.
     var clean: std.ArrayList(u8) = .empty;
     defer clean.deinit(state.gpa);
-    for (res.stdout) |ch| {
+    for (raw) |ch| {
         if (ch == '\n' or ch == '\r' or ch == '\t') {
             clean.append(state.gpa, ' ') catch return;
         } else if (ch >= 0x20) { // include i byte di continuazione UTF-8 (>= 0x80)
@@ -321,10 +327,9 @@ fn finishSearchErr(state: *GuiAppState, gen: u32, msg: []const u8) void {
 
 // ── Miniature ────────────────────────────────────────────────────────────────
 
-/// Directory cache delle miniature (`~/.cache/zuer/ytthumb`), creata al volo.
+/// Directory cache delle miniature (`…/zuer/ytthumb`), creata al volo.
 fn thumbCacheDir(gpa: std.mem.Allocator) ?[]u8 {
-    const home = getenv("HOME") orelse return null;
-    return std.fmt.allocPrint(gpa, "{s}/.cache/zuer/ytthumb", .{std.mem.span(home)}) catch null;
+    return vtcache.appCacheDir(gpa, "ytthumb");
 }
 
 /// Thread miniature: per ogni risultato della generazione `gen` scarica la
@@ -332,12 +337,10 @@ fn thumbCacheDir(gpa: std.mem.Allocator) ?[]u8 {
 /// plugin immagini e la installa nel risultato. Ogni installazione ricontrolla
 /// la generazione sotto lock: se l'utente ha già cambiato query non tocca nulla.
 fn thumbWorker(state: *GuiAppState, gen: u32) void {
+    // `appCacheDir` crea già la catena di directory (niente subprocess: su
+    // Windows `mkdir` non esiste come eseguibile).
     const dir = thumbCacheDir(state.gpa) orelse return;
     defer state.gpa.free(dir);
-    {
-        var mk = decoder_mod.runCaptureTimeout(state.gpa, &.{ "mkdir", "-p", dir }, 5_000) catch return;
-        mk.deinit(state.gpa);
-    }
 
     var i: usize = 0;
     while (true) : (i += 1) {

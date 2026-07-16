@@ -14,12 +14,20 @@ pub fn copy(text: []const u8) void {
     impl.copy(text);
 }
 
+/// Read text (UTF-8, caller frees) from the system clipboard. Windows only:
+/// on other OSes returns null and callers keep their own path (the GUI reads
+/// the Wayland selection via `wl-paste`, which needs subprocess plumbing).
+pub fn pasteAlloc(gpa: std.mem.Allocator) ?[]u8 {
+    return impl.pasteAlloc(gpa);
+}
+
 const impl = switch (builtin.os.tag) {
     .windows => struct {
         const HANDLE = ?*anyopaque;
         extern "user32" fn OpenClipboard(hWndNewOwner: HANDLE) callconv(.winapi) i32;
         extern "user32" fn EmptyClipboard() callconv(.winapi) i32;
         extern "user32" fn SetClipboardData(uFormat: u32, hMem: HANDLE) callconv(.winapi) HANDLE;
+        extern "user32" fn GetClipboardData(uFormat: u32) callconv(.winapi) HANDLE;
         extern "user32" fn CloseClipboard() callconv(.winapi) i32;
         extern "kernel32" fn GlobalAlloc(uFlags: u32, dwBytes: usize) callconv(.winapi) HANDLE;
         extern "kernel32" fn GlobalLock(hMem: HANDLE) callconv(.winapi) ?*anyopaque;
@@ -51,6 +59,16 @@ const impl = switch (builtin.os.tag) {
             defer _ = CloseClipboard();
             _ = EmptyClipboard();
             if (SetClipboardData(CF_UNICODETEXT, h) == null) _ = GlobalFree(h);
+        }
+
+        fn pasteAlloc(gpa: std.mem.Allocator) ?[]u8 {
+            if (OpenClipboard(null) == 0) return null;
+            defer _ = CloseClipboard();
+            const h = GetClipboardData(CF_UNICODETEXT) orelse return null;
+            const p = GlobalLock(h) orelse return null;
+            defer _ = GlobalUnlock(h);
+            const w: [*:0]const u16 = @ptrCast(@alignCast(p));
+            return std.unicode.utf16LeToUtf8Alloc(gpa, std.mem.span(w)) catch null;
         }
     },
     else => struct {
@@ -116,6 +134,10 @@ const impl = switch (builtin.os.tag) {
             _ = close(wfd); // EOF: wl-copy takes the selection and goes to background
             var status: c_int = 0;
             _ = waitpid(pid, &status, 0);
+        }
+
+        fn pasteAlloc(_: std.mem.Allocator) ?[]u8 {
+            return null; // i chiamanti Wayland passano da `wl-paste` (subprocess)
         }
     },
 };

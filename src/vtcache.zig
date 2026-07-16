@@ -265,16 +265,23 @@ pub const VtcMap = struct {
     }
 };
 
-/// Directory cache per-OS (`…/zuer/vt`), creando la catena di directory.
-/// null se la variabile d'ambiente di base non è definita.
-fn cacheDir(gpa: std.mem.Allocator) !?[]u8 {
-    // `%LOCALAPPDATA%\zuer\vt` su Windows, `$HOME/.cache/zuer/vt` altrove.
+/// Directory cache per-OS (`…/zuer/<sub>`), creando la catena di directory.
+/// `%LOCALAPPDATA%\zuer\<sub>` su Windows, `$HOME/.cache/zuer/<sub>` altrove.
+/// null se la variabile d'ambiente di base non è definita (o OOM).
+pub fn appCacheDir(gpa: std.mem.Allocator, sub: []const u8) ?[]u8 {
     const base = getEnvAlloc(gpa, if (is_win) "LOCALAPPDATA" else "HOME") orelse return null;
     defer gpa.free(base);
-    const sub = if (is_win) "zuer\\vt" else ".cache/zuer/vt";
-    const dir = try std.fmt.allocPrint(gpa, "{s}{c}{s}", .{ base, std.fs.path.sep, sub });
+    const root = if (is_win) "zuer" else ".cache/zuer";
+    const dir = std.fmt.allocPrint(gpa, "{s}{c}{s}{c}{s}", .{
+        base, std.fs.path.sep, root, std.fs.path.sep, sub,
+    }) catch return null;
     makeDirs(dir);
     return dir;
+}
+
+/// Directory cache delle texture (`…/zuer/vt`), creando la catena di directory.
+fn cacheDir(gpa: std.mem.Allocator) !?[]u8 {
+    return appCacheDir(gpa, "vt");
 }
 
 /// Apre e valida un file VTC per `(w,h)`; tiene l'handle aperto per le letture a
