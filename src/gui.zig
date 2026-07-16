@@ -64,13 +64,16 @@ const text_zoom_max: f32 = 6.0;
 /// Rasterizza il contenuto testuale corrente alla larghezza richiesta e al
 /// corpo scalato dallo zoom, sostituendo il buffer statico RGBA.
 /// Da chiamare con `state.shared.mutex` già acquisito.
+/// (Ri)impagina/rasterizza il contenuto testuale. Chiamata e ritorno con
+/// `shared.mutex` ACQUISITO, ma internamente lo RILASCIA per la fase pesante
+/// (protocollo pin di `decoded`, vedi commento nel corpo): al rientro il
+/// chiamante deve trattare lo stato condiviso come potenzialmente cambiato.
 fn rasterizeText(state: *GuiAppState, width: u32, text_zoom: f32) void {
     const pointsize: usize = @intFromFloat(@round(14.0 * text_zoom));
     const opts = text_render.RenderOpts{ .width = @max(width, 64), .pointsize = @max(pointsize, 6) };
-    const name = std.fs.path.basename(state.shared.current_file_path);
 
     if (native and state.text_gpu) {
-        rasterizeTextGpu(state, name, opts);
+        rasterizeTextGpu(state, std.fs.path.basename(state.shared.current_file_path), opts);
         return;
     }
 
@@ -81,72 +84,108 @@ fn rasterizeText(state: *GuiAppState, width: u32, text_zoom: f32) void {
     state.shared.sel_active = false;
     state.shared.sel_selecting = false;
 
+    // Layout/raster (centinaia di ms sui documenti grandi) FUORI dal lock:
+    // si PINNA `decoded` — `applyDecoded`, se swappa nel frattempo, parcheggia
+    // il vecchio valore in `decoded_retired` invece di liberarlo — e si lavora
+    // su uno snapshot shallow (layoutDoc/renderDoc prendono `*const`; i payload
+    // puntati restano vivi per contratto del pin). I risultati si installano al
+    // rientro nel lock SOLO se `load_seq` non è cambiato: altrimenti descrivono
+    // il contenuto vecchio e si buttano (il worker rifà il raster al giro dopo).
+    // Il nome file va copiato: il path può essere liberato durante la finestra.
+    var name_buf: [512]u8 = undefined;
+    const base = std.fs.path.basename(state.shared.current_file_path);
+    const nlen = @min(base.len, name_buf.len);
+    @memcpy(name_buf[0..nlen], base[0..nlen]);
+    const name = name_buf[0..nlen];
+
+    const seq0 = state.shared.load_seq;
+    const dec = state.shared.decoded; // snapshot shallow: i payload sono pinnati
+    state.shared.decoded_pinned = true;
+    state.shared.mutex.unlock(state.io);
+
+    var lines: std.ArrayList([]const u8) = .empty;
+    var metrics: text_render.Metrics = .{ .advance = 1, .line_h = 1, .pad_x = 20, .pad_y = 14 };
+    var new_doc: ?text_render.DocLayout = null;
+    var new_rgba: []u8 = &.{};
+    var new_w: u32 = 0;
+    var new_h: u32 = 0;
+    var ok = true;
+
     // Testo/codice/markdown: layout ritenuto, niente bitmap del documento — la
     // pittura avviene per viewport a ogni compose. static_w/h restano le
     // dimensioni LOGICHE (scrollbar/selezione), static_rgba resta vuoto.
-    const is_grid_doc = switch (state.shared.decoded) {
+    const is_grid_doc = switch (dec) {
         .csv, .workbook => false,
         else => true,
     };
     if (is_grid_doc) {
-        const doc = text_render.layoutDoc(state.gpa, &state.shared.decoded, name, opts, &state.shared.text_lines, &state.shared.text_metrics) catch |err| {
+        if (text_render.layoutDoc(state.gpa, &dec, name, opts, &lines, &metrics)) |doc| {
+            new_doc = doc;
+        } else |err| {
             std.debug.print("Impossibile impaginare il testo: {s}\n", .{@errorName(err)});
-            return;
-        };
-        state.gpa.free(state.shared.static_rgba);
-        state.shared.static_rgba = &.{};
-        state.shared.static_w = @intCast(doc.width);
-        state.shared.static_h = @intCast(doc.height);
-        state.shared.text_doc = doc;
-        rasterizeTabBar(state, width);
+            ok = false;
+        }
+    } else {
+        if (text_render.renderDoc(state.gpa, &dec, name, opts, &lines, &metrics)) |img_val| {
+            var img = img_val;
+            defer img.deinit(state.gpa);
+            new_w = @intCast(img.width);
+            new_h = @intCast(img.height);
+            new_rgba = rgbToRgba(state.gpa, img.pixels, new_w, new_h) catch blk: {
+                ok = false;
+                break :blk &.{};
+            };
+        } else |err| {
+            std.debug.print("Impossibile rasterizzare il testo: {s}\n", .{@errorName(err)});
+            ok = false;
+        }
+    }
+    // Barra delle linguette dei workbook: anch'essa fuori lock, sullo snapshot.
+    var tb_local: compose.TabBarState = .{};
+    if (ok and dec == .workbook) {
+        const wb = &dec.workbook;
+        if (text_render.renderTabBar(state.gpa, wb.sheets, wb.active, @max(width, 64), &tb_local.bounds)) |img_val| {
+            var img = img_val;
+            defer img.deinit(state.gpa);
+            tb_local.w = @intCast(img.width);
+            tb_local.h = @intCast(img.height);
+            tb_local.rgba = rgbToRgba(state.gpa, img.pixels, tb_local.w, tb_local.h) catch &.{};
+            tb_local.count = if (tb_local.rgba.len > 0) @min(wb.sheets.len, max_tabs) else 0;
+        } else |_| {}
+    }
+
+    state.shared.mutex.lockUncancelable(state.io);
+    state.shared.decoded_pinned = false;
+    if (state.shared.decoded_retired) |*old| {
+        old.deinit(state.gpa);
+        state.shared.decoded_retired = null;
+    }
+    if (state.shared.load_seq != seq0 or !ok) {
+        // Contenuto cambiato durante il raster (o errore): risultati da buttare.
+        for (lines.items) |l| state.gpa.free(l);
+        lines.deinit(state.gpa);
+        if (new_doc) |*d| d.deinit();
+        if (new_rgba.len > 0) state.gpa.free(new_rgba);
+        if (tb_local.rgba.len > 0) state.gpa.free(tb_local.rgba);
         return;
     }
 
-    var img = text_render.renderDoc(state.gpa, &state.shared.decoded, name, opts, &state.shared.text_lines, &state.shared.text_metrics) catch |err| {
-        std.debug.print("Impossibile rasterizzare il testo: {s}\n", .{@errorName(err)});
-        return;
-    };
-    defer img.deinit(state.gpa);
-
-    const w: u32 = @intCast(img.width);
-    const h: u32 = @intCast(img.height);
-    const rgba = rgbToRgba(state.gpa, img.pixels, w, h) catch return;
-
+    state.shared.text_lines.deinit(state.gpa);
+    state.shared.text_lines = lines;
+    state.shared.text_metrics = metrics;
     state.gpa.free(state.shared.static_rgba);
-    state.shared.static_rgba = rgba;
-    state.shared.static_w = w;
-    state.shared.static_h = h;
-
-    rasterizeTabBar(state, width);
-}
-
-/// (Ri)genera la barra delle linguette per un workbook, alla larghezza corrente.
-/// Non-workbook → azzera la barra (nessuna linguetta). Immagine RGB → RGBA opaca.
-/// Da chiamare con `state.shared.mutex` acquisito (come `rasterizeText`).
-fn rasterizeTabBar(state: *GuiAppState, width: u32) void {
-    const tb = &state.shared.tab_bar;
-    if (state.shared.decoded != .workbook) {
-        tb.count = 0;
-        return;
+    if (is_grid_doc) {
+        state.shared.static_rgba = &.{};
+        state.shared.static_w = @intCast(new_doc.?.width);
+        state.shared.static_h = @intCast(new_doc.?.height);
+        state.shared.text_doc = new_doc;
+    } else {
+        state.shared.static_rgba = new_rgba;
+        state.shared.static_w = new_w;
+        state.shared.static_h = new_h;
     }
-    const wb = &state.shared.decoded.workbook;
-    var img = text_render.renderTabBar(state.gpa, wb.sheets, wb.active, @max(width, 64), &tb.bounds) catch {
-        tb.count = 0;
-        return;
-    };
-    defer img.deinit(state.gpa);
-
-    const tw: u32 = @intCast(img.width);
-    const th: u32 = @intCast(img.height);
-    const rgba = rgbToRgba(state.gpa, img.pixels, tw, th) catch {
-        tb.count = 0;
-        return;
-    };
-    state.gpa.free(tb.rgba);
-    tb.rgba = rgba;
-    tb.w = tw;
-    tb.h = th;
-    tb.count = @min(wb.sheets.len, max_tabs);
+    state.gpa.free(state.shared.tab_bar.rgba);
+    state.shared.tab_bar = tb_local;
 }
 
 /// Percorso GPU (Soluzione B): costruisce i quad glifo + atlante e li renderizza
@@ -629,21 +668,19 @@ fn renderWorker(
             // (Ri)compone il testo quando cambiano larghezza finestra, zoom o
             // file: un solo tentativo per cambio di parametri (evita di ripetere
             // il layout a 20 Hz se qualcosa fallisce in modo persistente).
-            // TODO(lock-scope): il raster (centinaia di ms sui documenti grandi)
-            // gira ancora sotto `state.shared.mutex` perché legge `state.shared.decoded` per
-            // TUTTA la durata, e `applyDecoded` (thread loader) può liberarlo in
-            // qualunque momento: portarlo fuori richiede una copia profonda del
-            // documento o un protocollo di ownership dedicato, non basta uno
-            // snapshot di puntatori. Per ora fuori dal lock è uscito il present.
+            // Il layout/raster pesante avviene FUORI dal lock (rasterizeText
+            // rilascia e riacquisisce `shared.mutex` col pin di `decoded`):
+            // `last_seq` va catturato PRIMA — se il contenuto cambia durante la
+            // finestra senza lock, il mismatch con load_seq rifà il raster.
             // Il raster ora avviene in pixel FISICI (cur_w = contentPx): il corpo va
             // moltiplicato per la scala della superficie o il testo rimpicciolirebbe
             // sugli output HiDPI (stessa dimensione visiva di prima, ma nitida).
             const tz = std.math.clamp(state.shared.zoom, text_zoom_min, text_zoom_max) * win.scaleFactor();
             if (last_text_w != cur_w or last_text_zoom != tz or last_seq != state.shared.load_seq) {
+                last_seq = state.shared.load_seq;
                 rasterizeText(state, cur_w, tz);
                 last_text_w = cur_w;
                 last_text_zoom = tz;
-                last_seq = state.shared.load_seq;
                 need_render = true;
             }
             // La scrollbar flottante egui possiede l'offset di scroll: la geometria
@@ -969,6 +1006,7 @@ pub fn main(init: std.process.Init) !void {
     // Contenuto decodificato: parte come testo vuoto (placeholder, deinit no-op)
     // e viene sostituito da `applyDecoded` — sul thread di decodifica o qui sotto.
     defer gui_state.shared.decoded.deinit(gpa);
+    defer if (gui_state.shared.decoded_retired) |*o| o.deinit(gpa);
     defer gpa.free(gui_state.shared.tab_bar.rgba);
     defer if (gui_state.shared.stage_opt) |*s| s.buffer.deinit(gpa);
 

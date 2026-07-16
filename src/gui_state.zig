@@ -58,6 +58,13 @@ pub const GuiAppState = struct {
 
         // Variabili Zicro/Loader
         decoded: decoder_mod.Decoded = .{ .text = "" },
+        // Pin del decode per il raster fuori-lock (vedi rasterizeText in gui.zig):
+        // il render worker pinna `decoded` e rilascia il lock per layout/raster;
+        // `applyDecoded`, se swappa nel frattempo, NON libera il vecchio valore ma
+        // lo parcheggia in `decoded_retired` — lo libera il worker al de-pin.
+        // Un solo worker → al più un pin (e un retired) alla volta.
+        decoded_pinned: bool = false,
+        decoded_retired: ?decoder_mod.Decoded = null,
         stage_opt: ?loader_mod.GpuStage = null,
 
         // Variabili di stato rendering

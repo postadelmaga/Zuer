@@ -233,8 +233,16 @@ pub fn applyDecoded(state: *GuiAppState, new_decoded: decoder_mod.Decoded, stage
     // 2. Libera le vecchie risorse decodificate. La geometria Vulkan è
     // importata zero-copy dal memfd dello stage: va rilasciata PRIMA del
     // munmap del buffer (vedi `releaseMesh` in gpu_renderer), altrimenti la
-    // GPU legge memoria unmappata.
-    state.shared.decoded.deinit(state.gpa);
+    // GPU legge memoria unmappata. ECCEZIONE: se il render worker sta
+    // rasterizzando FUORI lock su questo valore (pin), il valore va
+    // parcheggiato in `decoded_retired` — lo libererà il worker al de-pin.
+    // Con retired già occupato il valore uscente NON è quello pinnato
+    // (secondo swap nella stessa finestra): si libera subito.
+    if (state.shared.decoded_pinned and state.shared.decoded_retired == null) {
+        state.shared.decoded_retired = state.shared.decoded;
+    } else {
+        state.shared.decoded.deinit(state.gpa);
+    }
     if (state.shared.stage_opt) |*s| {
         if (native) {
             // Il renderer non è più serializzato da `mutex`: il worker può stare
