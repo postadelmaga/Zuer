@@ -289,6 +289,10 @@ pub fn composeFrame(
     // ReleaseFast — determinante per reggere i 30/60 fps del video senza scatti.
     @setRuntimeSafety(false);
 
+    // Color-key del percorso testo (rgb 8,8,16 → alpha 0), come word LE:
+    // low-24 = r | g<<8 | b<<16.
+    const key_low24: u32 = 8 | (8 << 8) | (16 << 16);
+
     var py = start_y;
     while (py < end_y) : (py += 1) {
         const idx_row = py * W * 4;
@@ -310,27 +314,37 @@ pub fn composeFrame(
         const start_rx = @as(u64, @intCast(@as(i32, @intCast(start_x)) - fit_x));
         var rx_fp = start_rx * inv_w;
 
-        var px = start_x;
-        while (px < end_x) : (px += 1) {
-            const idx = idx_row + px * 4;
-            const sx = @min(@as(u32, @intCast(rx_fp >> 32)), src_w - 1);
-            rx_fp += inv_w;
-
-            const s_idx = (s_row_offset + sx) * 4;
-
-            const sr = src_rgba[s_idx + 0];
-            const sg = src_rgba[s_idx + 1];
-            const sb = src_rgba[s_idx + 2];
-            var sa = src_rgba[s_idx + 3];
-
-            if (is_text and sr == 8 and sg == 8 and sb == 16) {
-                sa = 0;
+        // Ricampionamento a WORD u32 (un load/store per pixel, non 4 byte) col
+        // branch color-key issato FUORI dal loop; scala orizzontale 1:1 → la
+        // riga sorgente è contigua e diventa un solo memcpy (è il caso mesh:
+        // il frame GPU ha già le dimensioni della finestra).
+        const row_px = end_x - start_x;
+        const dst_bytes = composited_rgba[idx_row + start_x * 4 ..][0 .. row_px * 4];
+        if (!is_text and inv_w == (@as(u64, 1) << 32)) {
+            const sx0 = @min(@as(u32, @intCast(rx_fp >> 32)), src_w - 1);
+            if (sx0 + row_px <= src_w) {
+                const s_off = (@as(usize, s_row_offset) + sx0) * 4;
+                @memcpy(dst_bytes, src_rgba[s_off..][0 .. row_px * 4]);
+                continue;
             }
-
-            composited_rgba[idx + 0] = sr;
-            composited_rgba[idx + 1] = sg;
-            composited_rgba[idx + 2] = sb;
-            composited_rgba[idx + 3] = sa;
+        }
+        if (is_text) {
+            var i: usize = 0;
+            while (i < row_px) : (i += 1) {
+                const sx = @min(@as(u32, @intCast(rx_fp >> 32)), src_w - 1);
+                rx_fp += inv_w;
+                var w32 = std.mem.readInt(u32, src_rgba[(@as(usize, s_row_offset) + sx) * 4 ..][0..4], .little);
+                if (w32 & 0x00FF_FFFF == key_low24) w32 &= 0x00FF_FFFF; // alpha 0, rgb intatti
+                std.mem.writeInt(u32, dst_bytes[i * 4 ..][0..4], w32, .little);
+            }
+        } else {
+            var i: usize = 0;
+            while (i < row_px) : (i += 1) {
+                const sx = @min(@as(u32, @intCast(rx_fp >> 32)), src_w - 1);
+                rx_fp += inv_w;
+                const w32 = std.mem.readInt(u32, src_rgba[(@as(usize, s_row_offset) + sx) * 4 ..][0..4], .little);
+                std.mem.writeInt(u32, dst_bytes[i * 4 ..][0..4], w32, .little);
+            }
         }
     }
 }
