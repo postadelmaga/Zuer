@@ -22,7 +22,23 @@ SRC="$WORK/src"
 PREFIX="$WORK/install"
 CROSS="x86_64-w64-mingw32-"
 
-command -v "${CROSS}gcc" >/dev/null || { echo "✗ manca ${CROSS}gcc (mingw-w64)"; exit 1; }
+# Short-circuit: se le 5 DLL trimmed sono già in cache (build precedente),
+# riusale — così rigenerare l'installer non richiede il toolchain mingw.
+have_cached=1
+for name in avutil avcodec avformat swscale swresample; do
+  compgen -G "$PREFIX/bin/${name}-*.dll" >/dev/null || { have_cached=0; break; }
+done
+if [[ "$have_cached" == 1 ]]; then
+  mkdir -p "$DEST"; total=0
+  echo "→ FFmpeg trimmed già in cache ($PREFIX/bin): riuso (niente ricompilazione)"
+  for dll in "$PREFIX"/bin/{avutil,avcodec,avformat,swscale,swresample}-*.dll; do
+    cp -f "$dll" "$DEST/"; total=$((total+$(stat -c%s "$dll")))
+  done
+  awk -v t="$total" -v d="$DEST" 'BEGIN{printf "✓ FFmpeg trimmed (cache): %.1f MB totali in %s\n", t/1048576, d}'
+  exit 0
+fi
+
+command -v "${CROSS}gcc" >/dev/null || { echo "✗ manca ${CROSS}gcc (mingw-w64) e nessuna build in cache"; exit 1; }
 
 # nasm → ottimizzazioni SIMD x86 (decode più veloce, DLL un filo più grandi).
 # Assente → C puro (--disable-x86asm): funziona ovunque, solo più lento.
