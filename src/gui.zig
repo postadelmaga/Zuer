@@ -1169,12 +1169,6 @@ pub fn main(init: std.process.Init) !void {
     // il contenuto, per non decodificare in parallelo al decode iniziale.)
     if (!gui_state.shared.loading) nav.schedulePrefetchAround(&gui_state);
 
-    // TEMPORANEO: stress test dell'esploratore (ZUER_FX_TEST=1), da rimuovere.
-    if (getenv("ZUER_FX_TEST") != null) {
-        const st = try std.Thread.spawn(.{}, file_explorer.stressTest, .{&gui_state});
-        st.detach();
-    }
-
     win.run() catch {};
     // Esc/chiusura: esci SUBITO. NON aspettare il join dei thread di decode: possono
     // essere dentro una decodifica non interrompibile in un plugin .so, e attenderli
