@@ -19,9 +19,13 @@ const android = zicro.android;
 const jni = @import("android_jni.zig");
 const ui = @import("android_ui.zig");
 
-/// Codice del tasto "indietro" di Android (AKEYCODE_BACK), l'unico tasto hardware che
-/// conta su un telefono: risale di un livello, e alla radice lascia uscire l'app.
-const KEYCODE_BACK: u32 = 4;
+/// Codice del tasto "indietro" di Android, l'unico tasto hardware che conta su un
+/// telefono: risale di un livello, e alla radice lascia uscire l'app.
+///
+/// Valore evdev (Esc = 1), non il raw AKEYCODE_BACK (4): il backend Android di zicro
+/// ora traduce ogni tasto in evdev prima di consegnarlo a `on_key`, per coerenza con
+/// gli altri backend (Wayland/Win32/macOS). Vedi zicro issue #19.
+const KEYCODE_BACK: u32 = 1;
 
 extern fn __android_log_print(prio: c_int, tag: [*:0]const u8, fmt: [*:0]const u8, ...) c_int;
 /// Traccia dell'avvio: su Android un blocco all'avvio non lascia altro che uno schermo nero
