@@ -21,7 +21,7 @@ const pad_y: i32 = 6;
 // vetro della finestra, vedi composeFrame) — sotto vetro il valore non si vede.
 const bg = Rgb.fromHex("#080810"); // key di trasparenza del compositore (8,8,16)
 const fg = Rgb.fromHex("#cdcdcd"); // corpo del testo (viewer: ~gray 205)
-const c_line_no = Rgb.fromHex("#606060"); // numeri di riga (viewer: gray 96)
+const c_line_no = Rgb.fromHex("#7c829c"); // numeri di riga (editor IDE: muted slate blue-gray)
 const c_keyword = Rgb.fromHex("#96aaeb"); // keyword (viewer: rgb 150,170,235)
 const c_string = Rgb.fromHex("#9ebc96"); // stringhe (viewer: rgb 158,188,150)
 const c_comment = Rgb.fromHex("#707070"); // commenti (viewer: gray 112)
@@ -118,7 +118,7 @@ pub fn render(gpa: std.mem.Allocator, io: std.Io, decoded: *const decoder_mod.De
     defer raster.deinit();
 
     var rows: std.ArrayList(Row) = .empty;
-    try buildRows(arena, &rows, &raster, decoded, name, opts);
+    _ = try buildRows(arena, &rows, &raster, decoded, name, opts);
 
     return paint(gpa, &raster, rows.items, name, opts, bg);
 }
@@ -130,6 +130,7 @@ pub const Metrics = struct {
     line_h: i32,
     pad_x: i32,
     pad_y: i32,
+    gutter_cols: i32 = 0,
 };
 
 /// Come `render`, ma raccoglie anche il testo semplice di ogni riga visiva
@@ -164,7 +165,7 @@ pub fn renderDoc(gpa: std.mem.Allocator, decoded: *const decoder_mod.Decoded, na
         // Un solo Raster (parse TTF) condiviso tra metriche e pittura della tabella.
         var sans = try glyph.Raster.initFamily(gpa, tableTextPx(opts.pointsize), .sans);
         defer sans.deinit();
-        out_metrics.* = .{ .advance = 8, .line_h = sans.lineHeight() + row_extra, .pad_x = pad_x, .pad_y = pad_y };
+        out_metrics.* = .{ .advance = 8, .line_h = sans.lineHeight() + row_extra, .pad_x = pad_x, .pad_y = pad_y, .gutter_cols = 0 };
         return paintTable(gpa, &sans, c, opts);
     }
 
@@ -176,15 +177,16 @@ pub fn renderDoc(gpa: std.mem.Allocator, decoded: *const decoder_mod.Decoded, na
     defer raster.deinit();
 
     var rows: std.ArrayList(Row) = .empty;
-    try buildRows(arena, &rows, &raster, decoded, name, opts);
+    const gutter_cols = try buildRows(arena, &rows, &raster, decoded, name, opts);
 
     for (rows.items) |row| {
         var line: std.ArrayList(u8) = .empty;
         errdefer line.deinit(gpa);
-        for (row) |run| try line.appendSlice(gpa, run.text);
+        const start_idx: usize = if (gutter_cols > 0 and row.len > 0) 1 else 0;
+        for (row[start_idx..]) |run| try line.appendSlice(gpa, run.text);
         try out_lines.append(gpa, try line.toOwnedSlice(gpa));
     }
-    out_metrics.* = .{ .advance = raster.advance, .line_h = raster.lineHeight(), .pad_x = pad_x, .pad_y = pad_y };
+    out_metrics.* = .{ .advance = raster.advance, .line_h = raster.lineHeight(), .pad_x = pad_x, .pad_y = pad_y, .gutter_cols = @intCast(gutter_cols) };
 
     return paint(gpa, &raster, rows.items, name, opts, bg);
 }
@@ -204,6 +206,7 @@ pub const DocLayout = struct {
     /// bitmap completa — scrollbar, selezione e hit-test ragionano su queste.
     width: usize,
     height: usize,
+    gutter_cols: usize = 0,
 
     pub fn deinit(self: *DocLayout) void {
         self.raster.deinit();
@@ -224,15 +227,16 @@ pub fn layoutDoc(gpa: std.mem.Allocator, decoded: *const decoder_mod.Decoded, na
     errdefer raster.deinit();
 
     var rows: std.ArrayList(Row) = .empty;
-    try buildRows(arena, &rows, &raster, decoded, name, opts);
+    const gutter_cols = try buildRows(arena, &rows, &raster, decoded, name, opts);
 
     for (rows.items) |row| {
         var line: std.ArrayList(u8) = .empty;
         errdefer line.deinit(gpa);
-        for (row) |run| try line.appendSlice(gpa, run.text);
+        const start_idx: usize = if (gutter_cols > 0 and row.len > 0) 1 else 0;
+        for (row[start_idx..]) |run| try line.appendSlice(gpa, run.text);
         try out_lines.append(gpa, try line.toOwnedSlice(gpa));
     }
-    out_metrics.* = .{ .advance = raster.advance, .line_h = raster.lineHeight(), .pad_x = pad_x, .pad_y = pad_y };
+    out_metrics.* = .{ .advance = raster.advance, .line_h = raster.lineHeight(), .pad_x = pad_x, .pad_y = pad_y, .gutter_cols = @intCast(gutter_cols) };
 
     const width: usize = @max(opts.width, 2 * @as(usize, @intCast(pad_x)) + 1);
     const n_rows: usize = @max(rows.items.len, 1);
@@ -243,6 +247,7 @@ pub fn layoutDoc(gpa: std.mem.Allocator, decoded: *const decoder_mod.Decoded, na
         .raster = raster,
         .width = width,
         .height = height,
+        .gutter_cols = gutter_cols,
     };
 }
 
@@ -268,6 +273,34 @@ pub fn paintDocViewport(dl: *DocLayout, buf: []u8, W: u32, H: u32, off_y: u32, x
     const Wi: i32 = @intCast(W);
     const Hi: i32 = @intCast(H);
     const dx: i32 = @as(i32, @intCast(x_dst)) - @as(i32, @intCast(x_src));
+
+    // Pannello di sfondo e linea divisoria per i numeri di riga (gutter stile editor IDE)
+    if (dl.gutter_cols > 0) {
+        const gutter_px: i32 = pad_x + @as(i32, @intCast(dl.gutter_cols)) * advance - @divTrunc(advance, 2);
+        const gx_end = std.math.clamp(gutter_px + dx, 0, Wi);
+        if (gx_end > 0) {
+            const g_bg = Rgb.fromHex("#12131a"); // sfondo scuro neutro del gutter
+            const border_col = Rgb.fromHex("#262836"); // separatore verticale sottile
+            var py: i32 = 0;
+            while (py < Hi) : (py += 1) {
+                var px: i32 = 0;
+                while (px < gx_end - 1) : (px += 1) {
+                    const idx: usize = @intCast((@as(usize, @intCast(py)) * @as(usize, @intCast(W)) + @as(usize, @intCast(px))) * 4);
+                    buf[idx] = g_bg.r;
+                    buf[idx + 1] = g_bg.g;
+                    buf[idx + 2] = g_bg.b;
+                    buf[idx + 3] = 255;
+                }
+                if (gx_end - 1 >= 0 and gx_end - 1 < Wi) {
+                    const idx: usize = @intCast((@as(usize, @intCast(py)) * @as(usize, @intCast(W)) + @as(usize, @intCast(gx_end - 1))) * 4);
+                    buf[idx] = border_col.r;
+                    buf[idx + 1] = border_col.g;
+                    buf[idx + 2] = border_col.b;
+                    buf[idx + 3] = 255;
+                }
+            }
+        }
+    }
 
     // Prima riga che interseca il viewport (le righe partono a pad_y + r*line_h).
     const first: usize = if (off_y_i > pad_y) @intCast(@divTrunc(off_y_i - pad_y, line_h)) else 0;
@@ -322,21 +355,24 @@ fn drawCodepointRgba(raster: *glyph.Raster, buf: []u8, buf_w: i32, buf_h: i32, p
 
 /// Costruisce le righe visive (run posizionati) del contenuto decodificato.
 /// Condiviso dal percorso CPU (composizione diretta) e da quello GPU (quad).
-fn buildRows(arena: std.mem.Allocator, rows: *std.ArrayList(Row), raster: *glyph.Raster, decoded: *const decoder_mod.Decoded, name: []const u8, opts: RenderOpts) !void {
+fn buildRows(arena: std.mem.Allocator, rows: *std.ArrayList(Row), raster: *glyph.Raster, decoded: *const decoder_mod.Decoded, name: []const u8, opts: RenderOpts) !usize {
     switch (decoded.*) {
         .text => |t| {
             const rich = t.len <= max_rich_bytes and isCodeLike(name);
             const lang: ?Lang = if (rich) langFor(extOf(name)) else null;
-            try layoutCode(arena, rows, raster, t, opts, rich, lang);
+            return try layoutCode(arena, rows, raster, t, opts, rich, lang);
         },
         .csv => |c| {
             try layoutTable(arena, rows, c);
+            return 0;
         },
         .workbook => |w| {
             try layoutTable(arena, rows, w.activeCsv());
+            return 0;
         },
         .markdown => |m| {
             try layoutMarkdown(arena, rows, raster, m.content, opts);
+            return 0;
         },
         else => return error.UnsupportedContent,
     }
@@ -389,7 +425,7 @@ pub fn buildTextMesh(gpa: std.mem.Allocator, decoded: *const decoder_mod.Decoded
     defer raster.deinit();
 
     var rows: std.ArrayList(Row) = .empty;
-    try buildRows(arena, &rows, &raster, decoded, name, opts);
+    _ = try buildRows(arena, &rows, &raster, decoded, name, opts);
 
     // Assicura che tutti i glifi usati siano in cache prima di impacchettarli.
     for (rows.items) |row| {
@@ -795,7 +831,7 @@ fn totalColumns(raster: *const glyph.Raster, opts: RenderOpts) usize {
 /// aggiunge i numeri di riga (allineati a destra, senza righello — come viewer);
 /// con `lang` non nullo evidenzia keyword/stringhe/commenti. Il testo va a capo
 /// per colonne, con rientro allineato al gutter sulle continuazioni.
-fn layoutCode(arena: std.mem.Allocator, rows: *std.ArrayList(Row), raster: *glyph.Raster, text: []const u8, opts: RenderOpts, gutter: bool, lang: ?Lang) !void {
+fn layoutCode(arena: std.mem.Allocator, rows: *std.ArrayList(Row), raster: *glyph.Raster, text: []const u8, opts: RenderOpts, gutter: bool, lang: ?Lang) !usize {
     const total_cols = totalColumns(raster, opts);
 
     var total_lines: usize = 1;
@@ -844,6 +880,7 @@ fn layoutCode(arena: std.mem.Allocator, rows: *std.ArrayList(Row), raster: *glyp
             if (start >= line.len) break;
         }
     }
+    return gutter_cols;
 }
 
 /// Numero di riga allineato a destra su `digits` cifre, seguito da uno spazio.

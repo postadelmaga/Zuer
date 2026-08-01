@@ -435,6 +435,9 @@ fn renderWorker(
     // Creato una volta e riusato; null se l'init fallisce (label semplicemente omessa).
     var name_raster: ?glyph.Raster = glyph.Raster.init(state.gpa, 13.0) catch null;
     defer if (name_raster) |*r| r.deinit();
+    // Raster dedicato ai sottotitoli (corpo più grande della label nome file).
+    var sub_raster: ?glyph.Raster = if (has_video) glyph.Raster.init(state.gpa, 17.0) catch null else null;
+    defer if (sub_raster) |*r| r.deinit();
 
     // Autorepeat del Backspace nell'overlay YouTube (zrame non sintetizza il
     // key-repeat di Wayland): dopo il ritardo iniziale, una cancellazione ogni
@@ -588,6 +591,13 @@ fn renderWorker(
                     compose.composeFrame(composited_rgba.*, fr.w, fr.h, state.shared.static_rgba, state.shared.static_w, state.shared.static_h, false, 1.0, 0.0, 0.0);
                 }
                 const raster: ?*glyph.Raster = if (name_raster) |*r| r else null;
+                // Sottotitoli YouTube (toggle `c`): cue corrente sopra i controlli,
+                // sotto ogni overlay. Stato letto sotto lock (siamo dentro `mutex`).
+                if (!audio_only and state.shared.yt.subs_on) {
+                    if (yt_search.currentSubText(state, vs.pos_s)) |sub_txt| {
+                        if (sub_raster) |*r| videomod.drawSubtitle(composited_rgba.*, fr.w, fr.h, r, sub_txt);
+                    }
+                }
                 videomod.drawVideoControls(composited_rgba.*, fr.w, fr.h, vs, raster);
                 if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, fr.w, fr.h, r, std.fs.path.basename(state.shared.current_file_path));
                 if (state.shared.fx.active) {
@@ -948,23 +958,33 @@ pub fn main(init: std.process.Init) !void {
             arg_path_opt = a;
         }
     }
-    // Senza argomenti (es. scorciatoia di sistema o lancio dal menu: KDE non
-    // espande %f) si sfoglia la home invece di uscire subito. Su Windows la
-    // HOME non esiste: il collegamento del menu Start lancia senza argomenti.
+    // Senza argomenti (scorciatoia di sistema, lancio dal menu: KDE non espande
+    // %f): coi build video si parte "da zero" — finestra vuota sul vetro con
+    // l'overlay di ricerca YouTube già aperto. Senza player video resta il
+    // fallback storico: sfoglia la home (su Windows USERPROFILE).
+    const yt_start = has_video and arg_path_opt == null;
     const arg_path = arg_path_opt orelse home: {
+        if (yt_start) break :home "";
         if (getenv("HOME") orelse getenv("USERPROFILE")) |h| break :home std.mem.span(h);
         std.debug.print("Uso: zuer-gui [-f] <file|cartella>\n", .{});
         std.process.exit(1);
     };
+    // Link YouTube come argomento: niente risoluzione file — si apre
+    // direttamente lo stream nel player nativo (yt-dlp risolve titolo e URL su
+    // un thread mentre il worker mostra lo spinner, vedi openById più sotto).
+    const yt_id: ?[]const u8 = if (has_video and !yt_start) yt_search.videoIdFromUrl(arg_path) else null;
     // Se l'argomento è una cartella, apri il primo file: la navigazione con le
     // frecce (e il prefetch) permette di sfogliare tutti i file della cartella.
-    const file_path = (nav.resolveInitialFile(io, gpa, arg_path) catch |e| {
-        std.debug.print("Impossibile accedere a '{s}': {s}\n", .{ arg_path, @errorName(e) });
-        std.process.exit(1);
-    }) orelse {
-        std.debug.print("La cartella '{s}' non contiene file da mostrare.\n", .{arg_path});
-        std.process.exit(1);
-    };
+    const file_path = if (yt_start or yt_id != null)
+        try gpa.dupe(u8, arg_path)
+    else
+        (nav.resolveInitialFile(io, gpa, arg_path) catch |e| {
+            std.debug.print("Impossibile accedere a '{s}': {s}\n", .{ arg_path, @errorName(e) });
+            std.process.exit(1);
+        }) orelse {
+            std.debug.print("La cartella '{s}' non contiene file da mostrare.\n", .{arg_path});
+            std.process.exit(1);
+        };
     defer gpa.free(file_path);
 
     // Decodifica differita: la finestra deve apparire SUBITO. I file grandi (o i
@@ -980,7 +1000,9 @@ pub fn main(init: std.process.Init) !void {
             loader_threshold_mb = mb;
         } else |_| {}
     }
-    var loading = gui_state_mod.isPdfPath(file_path);
+    // Un link YouTube resta in "loading" (spinner) finché openWorker non
+    // installa lo stream (o mostra l'errore nell'overlay di ricerca).
+    var loading = yt_id != null or gui_state_mod.isPdfPath(file_path);
     if (std.Io.Dir.cwd().statFile(io, clean_path, .{})) |st| {
         if (st.size >= loader_threshold_mb * 1024 * 1024) loading = true;
     } else |_| {}
@@ -1003,6 +1025,12 @@ pub fn main(init: std.process.Init) !void {
             .loading = loading,
         },
     };
+    if (yt_start) {
+        // Avvio "da zero": nessun contenuto (il worker presenta un frame
+        // trasparente sul vetro) e overlay di ricerca già aperto e pronto.
+        gui_state.shared.is_text = false;
+        gui_state.shared.yt.active = true;
+    }
     // Contenuto decodificato: parte come testo vuoto (placeholder, deinit no-op)
     // e viene sostituito da `applyDecoded` — sul thread di decodifica o qui sotto.
     defer gui_state.shared.decoded.deinit(gpa);
@@ -1038,12 +1066,13 @@ pub fn main(init: std.process.Init) !void {
         gui_state.pf.cache.deinit(gpa);
         for (gui_state.pf.want) |w| if (w) |x| gpa.free(x);
     }
-    try nav.initFileList(&gui_state);
+    // Con un URL (o all'avvio "da zero") non c'è cartella da sfogliare.
+    if (yt_id == null and !yt_start) try nav.initFileList(&gui_state);
 
     // File piccolo: decodifica sincrona prima di creare la finestra, così può
     // dimensionarsi sull'immagine. I file grandi restano placeholder (spinner)
     // e vengono decodificati sul thread di background più sotto.
-    if (!gui_state.shared.loading) {
+    if (!yt_start and !gui_state.shared.loading) {
         var d = decoder_mod.decode(file_path, io, gpa);
         if (d == .err) {
             std.debug.print("Errore: {s}\n", .{d.err});
@@ -1066,7 +1095,9 @@ pub fn main(init: std.process.Init) !void {
     // variante video (il decoder media ritorna solo un poster `.image`), quindi
     // `winKindFromDecoded` classificherebbe un video come immagine e `setupVideo`
     // non partirebbe mai (video fermo sul poster). L'estensione ha la priorità.
-    const win_kind: WinKind = if (layout.winKindFromExt(file_path) == .video)
+    const win_kind: WinKind = if (yt_start)
+        .generic // finestra widescreen neutra per la griglia di ricerca
+    else if (yt_id != null or layout.winKindFromExt(file_path) == .video)
         .video
     else if (gui_state.shared.loading)
         layout.winKindFromExt(file_path)
@@ -1077,7 +1108,9 @@ pub fn main(init: std.process.Init) !void {
     // iniziale. Niente decode async/spinner — aprire il container è veloce — così
     // il worker parte già in riproduzione. `static_rgba` diventa il frame corrente
     // che il worker aggiorna nel tempo (vedi il ramo video di renderWorker).
-    if (has_video and win_kind == .video) {
+    // (Non per i link YouTube: lì il container lo apre openWorker dopo la
+    // risoluzione yt-dlp, e lo spinner resta acceso nel frattempo.)
+    if (has_video and win_kind == .video and yt_id == null) {
         gui_state.shared.loading = false;
         gui_state.shared.is_text = false;
         // Il percorso sincrono (file piccolo) può aver GIÀ avviato il player
@@ -1136,7 +1169,14 @@ pub fn main(init: std.process.Init) !void {
     // File grande/PDF iniziale: decodifica su un thread di background mentre il
     // worker mostra lo spinner. Va gioinato prima dei defer che liberano lo stato.
     var decode_thread: ?std.Thread = null;
-    if (gui_state.shared.loading) {
+    if (yt_id) |vid| {
+        // Link YouTube: risoluzione yt-dlp + apertura container su un thread
+        // detached (stesso percorso di Invio nell'overlay di ricerca); un
+        // eventuale errore compare nell'overlay al posto dello spinner.
+        gui_state.shared.mutex.lockUncancelable(io);
+        yt_search.openById(&gui_state, vid);
+        gui_state.shared.mutex.unlock(io);
+    } else if (gui_state.shared.loading) {
         decode_thread = try std.Thread.spawn(.{}, nav.decodeInitial, .{ &gui_state, file_path });
     }
     defer if (decode_thread) |t| t.join();
@@ -1167,7 +1207,7 @@ pub fn main(init: std.process.Init) !void {
     // Percorso sincrono: il file iniziale è già pronto → precarica subito i
     // vicini. (Nel percorso async lo fa `decodeInitial` dopo aver installato
     // il contenuto, per non decodificare in parallelo al decode iniziale.)
-    if (!gui_state.shared.loading) nav.schedulePrefetchAround(&gui_state);
+    if (!yt_start and !gui_state.shared.loading) nav.schedulePrefetchAround(&gui_state);
 
     win.run() catch {};
     // Esc/chiusura: esci SUBITO. NON aspettare il join dei thread di decode: possono

@@ -3,14 +3,49 @@ const decoder = @import("decoder");
 const Decoded = decoder.Decoded;
 const DecodedC = decoder.DecodedC;
 
-pub fn decode(bytes: []const u8, allocator: std.mem.Allocator) Decoded {
-    if (!std.unicode.utf8ValidateSlice(bytes)) {
-        allocator.free(bytes);
-        const msg = allocator.dupe(u8, "Markdown non in formato UTF-8 valido.") catch "Markdown non valido";
-        return .{ .err = msg };
+fn sanitizeToUtf8(bytes: []const u8, allocator: std.mem.Allocator) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const b = bytes[i];
+        if (b == 0) {
+            try out.append(allocator, ' ');
+            i += 1;
+        } else if (b < 0x80) {
+            try out.append(allocator, b);
+            i += 1;
+        } else {
+            const seq_len = std.unicode.utf8ByteSequenceLength(b) catch 0;
+            if (seq_len > 0 and i + seq_len <= bytes.len) {
+                if (std.unicode.utf8ValidateSlice(bytes[i .. i + seq_len])) {
+                    try out.appendSlice(allocator, bytes[i .. i + seq_len]);
+                    i += seq_len;
+                    continue;
+                }
+            }
+            const c1: u8 = 0xC0 | (b >> 6);
+            const c2: u8 = 0x80 | (b & 0x3F);
+            try out.appendSlice(allocator, &.{ c1, c2 });
+            i += 1;
+        }
     }
 
-    return .{ .markdown = .{ .content = bytes } };
+    return out.toOwnedSlice(allocator);
+}
+
+pub fn decode(bytes: []const u8, allocator: std.mem.Allocator) Decoded {
+    if (!std.mem.containsAtLeast(u8, bytes, 1, &.{0}) and std.unicode.utf8ValidateSlice(bytes)) {
+        return .{ .markdown = .{ .content = bytes } };
+    }
+
+    const sanitized = sanitizeToUtf8(bytes, allocator) catch {
+        allocator.free(bytes);
+        return .{ .err = "Markdown non in formato UTF-8 valido." };
+    };
+    allocator.free(bytes);
+    return .{ .markdown = .{ .content = sanitized } };
 }
 
 fn zuer_decode(

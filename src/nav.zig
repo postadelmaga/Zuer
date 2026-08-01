@@ -13,6 +13,7 @@ const text_render = @import("text_render.zig");
 // Player video nativo (libav): la navigazione verso/da un video lo avvia/ferma.
 const videomod = @import("video.zig");
 const midi_player = @import("midi_player.zig");
+const yt_search = @import("yt_search.zig");
 // Content-kind classification (path/decode → WinKind) + geometria iniziale finestra.
 const layout = @import("layout.zig");
 const gui_state_mod = @import("gui_state.zig");
@@ -216,6 +217,10 @@ pub fn applyDecoded(state: *GuiAppState, new_decoded: decoder_mod.Decoded, stage
     // suonare). Thread-safety: siamo sotto `mutex`, lo stesso lock sotto cui
     // il worker tocca il Player in `advanceVideo` → il deinit è serializzato.
     if (has_video and state.video.isActive()) state.video.deinit();
+
+    // Il player corrente non è più uno stream YouTube: id corrente e
+    // sottotitoli non valgono per il nuovo contenuto (tasto `o`, cue).
+    yt_search.clearCurrentStream(state);
 
     // Stessa cosa per il MIDI: navigando via, il synth precedente va fermato
     // (il thread audio viene joinato da stopAndDestroy). Siamo sotto `mutex`,

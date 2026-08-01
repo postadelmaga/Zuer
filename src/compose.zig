@@ -168,8 +168,9 @@ pub fn drawTextSelection(buf: []u8, W: u32, H: u32, src_w: u32, src_h: u32, scro
         c0 = std.math.clamp(c0, 0, llen);
         c1 = std.math.clamp(c1, 0, llen);
         if (c1 <= c0) continue;
-        const x0 = m.pad_x + c0 * m.advance + dx;
-        const x1 = m.pad_x + c1 * m.advance + dx;
+        const content_pad_x = m.pad_x + m.gutter_cols * m.advance;
+        const x0 = content_pad_x + c0 * m.advance + dx;
+        const x1 = content_pad_x + c1 * m.advance + dx;
         const y0 = m.pad_y + row * m.line_h - @as(i32, @intCast(geom.off_y));
         const xa: u32 = @intCast(std.math.clamp(x0, 0, Wi));
         const xb: u32 = @intCast(std.math.clamp(x1, 0, Wi));

@@ -122,7 +122,8 @@ const shell = struct {
 };
 
 /// Apre `url` nel browser predefinito. true se l'handoff è riuscito.
-fn openBrowser(gpa: std.mem.Allocator, url: []const u8) bool {
+/// Pubblica: riusata dalla ricerca YouTube ("apri la pagina del video").
+pub fn openBrowser(gpa: std.mem.Allocator, url: []const u8) bool {
     if (comptime builtin.os.tag == .windows) {
         const url_w = std.unicode.utf8ToUtf16LeAllocZ(gpa, url) catch return false;
         defer gpa.free(url_w);

@@ -21,6 +21,8 @@ const build_options = @import("build_options");
 const has_video = build_options.video;
 const builtin = @import("builtin");
 const vtcache = @import("vtcache.zig");
+const layout_mod = @import("layout.zig");
+const crash_report = @import("crash_report.zig");
 
 /// Un risultato di ricerca (stringhe e miniatura possedute, vedi `freeResults`).
 pub const Result = struct {
@@ -32,7 +34,17 @@ pub const Result = struct {
     thumb_rgba: []u8 = &.{},
     thumb_w: u32 = 0,
     thumb_h: u32 = 0,
+    /// Un thumb worker ha già preso in carico questa miniatura (i download
+    /// girano in parallelo su più worker: niente doppi download).
+    claimed: bool = false,
 };
+
+/// Altezze video selezionabili (chips nell'overlay); indice in `YtState.quality`.
+pub const quality_heights = [_]u32{ 360, 480, 720, 1080 };
+pub const quality_labels = [_][]const u8{ "360p", "480p", "720p", "1080p" };
+
+/// Un sottotitolo: intervallo in secondi e testo (posseduto).
+pub const SubCue = struct { start: f64, end: f64, text: []u8 };
 
 /// Stato dell'overlay, dentro `Shared` (ogni accesso sotto `shared.mutex`).
 pub const YtState = struct {
@@ -66,6 +78,20 @@ pub const YtState = struct {
     follow_sel: bool = false,
     /// Trascinamento del thumb della scrollbar in corso.
     sb_drag: bool = false,
+    /// Qualità stream selezionata (indice in `quality_heights`). Con uno stream
+    /// YT attivo, cambiarla riapre il video alla stessa posizione.
+    quality: u8 = 2,
+    /// Id (posseduto) del video YouTube attualmente in riproduzione: serve al
+    /// tasto `o` (apri la pagina), ai sottotitoli e al cambio qualità.
+    /// null = il player corrente non viene da YouTube.
+    current_id: ?[]u8 = null,
+    /// Sottotitoli del video corrente (posseduti, ordinati per start) e loro
+    /// stato: `subs_on` = disegnali, `subs_loading` = yt-dlp in corso.
+    subs: []SubCue = &.{},
+    subs_on: bool = false,
+    subs_loading: bool = false,
+    /// Cache dell'ultimo cue presentato: il lookup del frame dopo riparte da qui.
+    sub_idx: usize = 0,
 };
 
 pub fn freeResults(gpa: std.mem.Allocator, results: []Result) void {
@@ -87,6 +113,26 @@ pub fn deinit(state: *GuiAppState) void {
     yt.results = &.{};
     if (yt.err) |e| state.gpa.free(e);
     yt.err = null;
+    clearCurrentStream(state);
+}
+
+/// Libera i sottotitoli caricati. Con `shared.mutex` acquisito.
+fn freeSubs(state: *GuiAppState) void {
+    const yt = &state.shared.yt;
+    for (yt.subs) |c| state.gpa.free(c.text);
+    state.gpa.free(yt.subs);
+    yt.subs = &.{};
+    yt.sub_idx = 0;
+}
+
+/// Il player corrente non è più lo stream YouTube (navigazione verso un file):
+/// invalida id corrente e sottotitoli. Con `shared.mutex` acquisito.
+pub fn clearCurrentStream(state: *GuiAppState) void {
+    const yt = &state.shared.yt;
+    if (yt.current_id) |cid| state.gpa.free(cid);
+    yt.current_id = null;
+    freeSubs(state);
+    yt.subs_on = false;
 }
 
 /// Svuota risultati/errore correnti (dopo una modifica alla query i vecchi
@@ -161,6 +207,24 @@ pub fn copyQuery(state: *GuiAppState) void {
         return;
     };
     t.detach();
+}
+
+/// Ctrl+C nell'overlay: con una card selezionata copia il LINK del video
+/// (youtube.com/watch?v=…); con la query tutta selezionata (Ctrl+A) o senza
+/// risultati copia la query. Con `shared.mutex` acquisito.
+pub fn copyQueryOrLink(state: *GuiAppState) void {
+    const yt = &state.shared.yt;
+    if (!yt.sel_all and yt.sel >= 0 and yt.sel < @as(i32, @intCast(yt.results.len))) {
+        const r = yt.results[@intCast(yt.sel)];
+        const link = std.fmt.allocPrint(state.gpa, "https://www.youtube.com/watch?v={s}", .{r.id}) catch return;
+        const t = std.Thread.spawn(.{}, copyWorker, .{ state, link }) catch {
+            state.gpa.free(link);
+            return;
+        };
+        t.detach();
+        return;
+    }
+    copyQuery(state);
 }
 
 fn copyWorker(state: *GuiAppState, txt: []u8) void {
@@ -307,11 +371,16 @@ fn searchWorker(state: *GuiAppState, query: []u8, gen: u32) void {
         state.shared.file_changed = true;
         installed = owned.len > 0;
     }
-    // Miniature in coda, fuori dal lock: un worker le scarica e le installa una
-    // per una (la griglia si riempie progressivamente).
+    // Miniature fuori dal lock, in PARALLELO: più worker si spartiscono i
+    // download tramite il flag `claimed` per-risultato (curl è I/O bound: la
+    // serialità era il collo di bottiglia del riempimento della griglia).
     if (installed) {
-        const t = std.Thread.spawn(.{}, thumbWorker, .{ state, gen }) catch return;
-        t.detach();
+        const n_workers = @min(owned.len, 4);
+        var wi: usize = 0;
+        while (wi < n_workers) : (wi += 1) {
+            const t = std.Thread.spawn(.{}, thumbWorker, .{ state, gen }) catch break;
+            t.detach();
+        }
     }
 }
 
@@ -332,9 +401,10 @@ fn thumbCacheDir(gpa: std.mem.Allocator) ?[]u8 {
     return vtcache.appCacheDir(gpa, "ytthumb");
 }
 
-/// Thread miniature: per ogni risultato della generazione `gen` scarica la
-/// `mqdefault.jpg` di YouTube (curl, con cache su disco), la decodifica col
-/// plugin immagini e la installa nel risultato. Ogni installazione ricontrolla
+/// Thread miniature (più istanze in parallelo): ognuna RECLAMA sotto lock il
+/// prossimo risultato senza miniatura (`claimed`, così nessun download doppio),
+/// scarica la `mqdefault.jpg` di YouTube (curl, con cache su disco), la
+/// decodifica col plugin immagini e la installa. Ogni installazione ricontrolla
 /// la generazione sotto lock: se l'utente ha già cambiato query non tocca nulla.
 fn thumbWorker(state: *GuiAppState, gen: u32) void {
     // `appCacheDir` crea già la catena di directory (niente subprocess: su
@@ -342,24 +412,24 @@ fn thumbWorker(state: *GuiAppState, gen: u32) void {
     const dir = thumbCacheDir(state.gpa) orelse return;
     defer state.gpa.free(dir);
 
-    var i: usize = 0;
-    while (true) : (i += 1) {
-        // Snapshot dell'id sotto lock; il download/decode avviene fuori.
+    while (true) {
+        // Reclama la prossima miniatura mancante sotto lock; download/decode fuori.
         state.shared.mutex.lockUncancelable(state.io);
         const yt = &state.shared.yt;
-        if (gen != yt.gen or i >= yt.results.len) {
+        if (gen != yt.gen) {
             state.shared.mutex.unlock(state.io);
             return;
         }
-        if (yt.results[i].thumb_w != 0) {
-            state.shared.mutex.unlock(state.io);
-            continue;
+        var id_opt: ?[]u8 = null;
+        for (yt.results) |*r| {
+            if (r.thumb_w == 0 and !r.claimed) {
+                r.claimed = true;
+                id_opt = state.gpa.dupe(u8, r.id) catch null;
+                break;
+            }
         }
-        const id = state.gpa.dupe(u8, yt.results[i].id) catch {
-            state.shared.mutex.unlock(state.io);
-            return;
-        };
         state.shared.mutex.unlock(state.io);
+        const id = id_opt orelse return; // niente più lavoro (o alloc fallita)
         defer state.gpa.free(id);
 
         const jpg = std.fmt.allocPrint(state.gpa, "{s}/{s}.jpg", .{ dir, id }) catch continue;
@@ -411,6 +481,77 @@ fn thumbWorker(state: *GuiAppState, gen: u32) void {
 
 // ── Apertura in streaming ────────────────────────────────────────────────────
 
+/// Estrae l'id video (11 caratteri) da un link YouTube: youtube.com/watch?v=…,
+/// youtu.be/…, shorts/, live/, embed/, v/, con o senza schema e con i prefissi
+/// host "www."/"m."/"music.". Ritorna una slice DENTRO `url` (nessuna
+/// allocazione), o null se non è un link video YouTube.
+pub fn videoIdFromUrl(url: []const u8) ?[]const u8 {
+    var s = std.mem.trim(u8, url, " \t\r\n");
+    if (std.mem.startsWith(u8, s, "https://")) {
+        s = s["https://".len..];
+    } else if (std.mem.startsWith(u8, s, "http://")) {
+        s = s["http://".len..];
+    }
+    if (std.mem.startsWith(u8, s, "www.")) {
+        s = s["www.".len..];
+    } else if (std.mem.startsWith(u8, s, "m.")) {
+        s = s["m.".len..];
+    } else if (std.mem.startsWith(u8, s, "music.")) {
+        s = s["music.".len..];
+    }
+
+    if (std.mem.startsWith(u8, s, "youtu.be/")) return validVideoId(s["youtu.be/".len..]);
+    if (!std.mem.startsWith(u8, s, "youtube.com/")) return null;
+    s = s["youtube.com/".len..];
+    for ([_][]const u8{ "shorts/", "live/", "embed/", "v/" }) |prefix| {
+        if (std.mem.startsWith(u8, s, prefix)) return validVideoId(s[prefix.len..]);
+    }
+    if (std.mem.startsWith(u8, s, "watch?")) {
+        var params = std.mem.tokenizeScalar(u8, s["watch?".len..], '&');
+        while (params.next()) |kv| {
+            if (std.mem.startsWith(u8, kv, "v=")) return validVideoId(kv["v=".len..]);
+        }
+    }
+    return null;
+}
+
+/// Id video valido: esattamente 11 caratteri [A-Za-z0-9_-] in testa a `rest`
+/// (ciò che segue — ?t=…, #…, / — viene ignorato).
+fn validVideoId(rest: []const u8) ?[]const u8 {
+    var end: usize = 0;
+    while (end < rest.len) : (end += 1) {
+        const c = rest[end];
+        const ok = (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or
+            (c >= '0' and c <= '9') or c == '_' or c == '-';
+        if (!ok) break;
+    }
+    if (end != 11) return null;
+    return rest[0..11];
+}
+
+/// Apre direttamente un video dal suo id (link da riga di comando o incollato
+/// nella query): titolo e URL diretti vengono chiesti a yt-dlp sul thread di
+/// apertura. Da chiamare con `shared.mutex` acquisito.
+pub fn openById(state: *GuiAppState, id: []const u8) void {
+    if (comptime !has_video) return;
+    const yt = &state.shared.yt;
+    if (yt.opening) return;
+    const id_owned = state.gpa.dupe(u8, id) catch return;
+    yt.opening = true;
+    if (yt.err) |e| {
+        state.gpa.free(e);
+        yt.err = null;
+    }
+    state.shared.file_changed = true;
+    const t = std.Thread.spawn(.{}, openWorker, .{ state, id_owned, @as(?[]u8, null), @as(f64, 0), quality_heights[yt.quality] }) catch {
+        state.gpa.free(id_owned);
+        yt.opening = false;
+        setErr(state, "impossibile avviare l'apertura");
+        return;
+    };
+    t.detach();
+}
+
 /// Apre il risultato selezionato: risolve gli URL diretti con `yt-dlp -g` e
 /// avvia il player nativo, tutto su un thread di background.
 /// Da chiamare con `shared.mutex` acquisito (thread finestra: Invio o click).
@@ -431,7 +572,7 @@ pub fn openSelected(state: *GuiAppState) void {
         yt.err = null;
     }
     state.shared.file_changed = true;
-    const t = std.Thread.spawn(.{}, openWorker, .{ state, id, title }) catch {
+    const t = std.Thread.spawn(.{}, openWorker, .{ state, id, @as(?[]u8, title), @as(f64, 0), quality_heights[yt.quality] }) catch {
         state.gpa.free(id);
         state.gpa.free(title);
         yt.opening = false;
@@ -441,52 +582,120 @@ pub fn openSelected(state: *GuiAppState) void {
     t.detach();
 }
 
+/// Imposta la qualità (indice di `quality_heights`, dai chip dell'overlay).
+/// Con uno stream YouTube attivo riapre il video alla stessa posizione con la
+/// nuova qualità. Con `shared.mutex` acquisito.
+pub fn setQuality(state: *GuiAppState, idx: u8) void {
+    const yt = &state.shared.yt;
+    if (idx >= quality_heights.len or yt.quality == idx) return;
+    yt.quality = idx;
+    state.shared.file_changed = true;
+    if (comptime !has_video) return;
+    if (yt.opening or yt.current_id == null or !state.video.isActive()) return;
+    const r_id = state.gpa.dupe(u8, yt.current_id.?) catch return;
+    // Il titolo corrente È current_file_path (installato all'apertura).
+    const r_title = state.gpa.dupe(u8, state.shared.current_file_path) catch {
+        state.gpa.free(r_id);
+        return;
+    };
+    yt.opening = true;
+    state.shared.file_changed = true;
+    const t = std.Thread.spawn(.{}, openWorker, .{ state, r_id, @as(?[]u8, r_title), state.video.pos_s, quality_heights[idx] }) catch {
+        state.gpa.free(r_id);
+        state.gpa.free(r_title);
+        yt.opening = false;
+        return;
+    };
+    t.detach();
+}
+
+/// Apre nel browser la pagina YouTube del video: la card selezionata (overlay
+/// aperto, Ctrl+O) o il video in riproduzione (tasto `o`). L'handoff al browser
+/// (subprocess) avviene su un thread. Con `shared.mutex` acquisito.
+pub fn openPageLocked(state: *GuiAppState) void {
+    const yt = &state.shared.yt;
+    const id: []const u8 = blk: {
+        if (yt.active and yt.sel >= 0 and yt.sel < @as(i32, @intCast(yt.results.len)))
+            break :blk yt.results[@intCast(yt.sel)].id;
+        break :blk yt.current_id orelse return;
+    };
+    const url = std.fmt.allocPrint(state.gpa, "https://www.youtube.com/watch?v={s}", .{id}) catch return;
+    const t = std.Thread.spawn(.{}, browserWorker, .{ state, url }) catch {
+        state.gpa.free(url);
+        return;
+    };
+    t.detach();
+}
+
+fn browserWorker(state: *GuiAppState, url: []u8) void {
+    _ = crash_report.openBrowser(state.gpa, url);
+    state.gpa.free(url);
+}
+
 fn finishOpenErr(state: *GuiAppState, msg: []const u8) void {
     state.shared.mutex.lockUncancelable(state.io);
     defer state.shared.mutex.unlock(state.io);
     state.shared.yt.opening = false;
+    // L'apertura può essere partita fuori dall'overlay (link da riga di comando,
+    // Esc durante l'attesa): spegni lo spinner d'avvio e mostra l'overlay,
+    // altrimenti l'errore resterebbe muto.
+    state.shared.loading = false;
+    state.shared.yt.active = true;
     setErr(state, msg);
     state.shared.file_changed = true;
 }
 
-/// Thread di apertura: yt-dlp -g → URL video (DASH ≤720p) + URL audio su due
-/// righe (o una sola muxed). Il container libav viene aperto QUI, fuori dal
-/// lock (rete: secondi); solo lo swap dello stato avviene sotto `mutex`.
-/// Prende possesso di `id` e `title`.
-fn openWorker(state: *GuiAppState, id: []u8, title: []u8) void {
+/// Thread di apertura: yt-dlp → URL video (DASH, altezza ≤ `height`) + URL
+/// audio su due righe (o una sola muxed). Con `title_opt == null` (apertura da
+/// link) anche il titolo viene chiesto a yt-dlp (`--print %(title)s`, prima
+/// riga). Con `resume_s > 0` (cambio qualità) la riproduzione riparte da lì. Il
+/// container libav viene aperto QUI, fuori dal lock (rete: secondi); solo lo
+/// swap dello stato avviene sotto `mutex`. Prende possesso di `id` e `title_opt`.
+fn openWorker(state: *GuiAppState, id: []u8, title_opt: ?[]u8, resume_s: f64, height: u32) void {
     defer state.gpa.free(id);
     if (comptime !has_video) {
-        state.gpa.free(title);
+        if (title_opt) |t| state.gpa.free(t);
         return;
     }
 
     const url = std.fmt.allocPrint(state.gpa, "https://www.youtube.com/watch?v={s}", .{id}) catch {
-        state.gpa.free(title);
+        if (title_opt) |t| state.gpa.free(t);
         return;
     };
     defer state.gpa.free(url);
 
-    var res = decoder_mod.runCaptureTimeout(state.gpa, &.{
-        "yt-dlp",
-        "--no-warnings",
-        "--no-playlist",
-        "-g",
-        "-f",
-        "bv*[height<=720]+ba/b",
-        url,
-    }, 30_000) catch |e| {
-        state.gpa.free(title);
+    // Selettore formato dalla qualità scelta nei chip dell'overlay.
+    var fmt_buf: [48]u8 = undefined;
+    const fmt_sel = std.fmt.bufPrint(&fmt_buf, "bv*[height<={d}]+ba/b", .{height}) catch "bv*[height<=720]+ba/b";
+
+    // `--print urls` equivale a `-g`; con titolo da scoprire lo si stampa come
+    // prima riga nella stessa estrazione (una sola chiamata yt-dlp).
+    const argv_with_title = [_][]const u8{
+        "yt-dlp", "--no-warnings", "--no-playlist", "--print", "%(title).96s", "--print", "urls", "-f", fmt_sel, url,
+    };
+    const argv_plain = [_][]const u8{
+        "yt-dlp", "--no-warnings", "--no-playlist", "-g", "-f", fmt_sel, url,
+    };
+    var res = decoder_mod.runCaptureTimeout(state.gpa, if (title_opt == null) &argv_with_title else &argv_plain, 30_000) catch |e| {
+        if (title_opt) |t| state.gpa.free(t);
         finishOpenErr(state, if (e == error.Timeout) "risoluzione stream scaduta" else "yt-dlp non eseguibile");
         return;
     };
     defer res.deinit(state.gpa);
     if (res.exit_code != 0) {
-        state.gpa.free(title);
+        if (title_opt) |t| state.gpa.free(t);
         finishOpenErr(state, "video non riproducibile (yt-dlp)");
         return;
     }
 
     var lines = std.mem.tokenizeScalar(u8, res.stdout, '\n');
+    const title: []u8 = title_opt orelse blk: {
+        const t = std.mem.trimEnd(u8, lines.next() orelse "", "\r");
+        break :blk state.gpa.dupe(u8, if (t.len > 0) t else "YouTube") catch {
+            finishOpenErr(state, "memoria esaurita");
+            return;
+        };
+    };
     const vurl = std.mem.trimEnd(u8, lines.next() orelse {
         state.gpa.free(title);
         finishOpenErr(state, "nessun URL dallo stream");
@@ -509,37 +718,286 @@ fn openWorker(state: *GuiAppState, id: []u8, title: []u8) void {
         if (ch.* == '/') ch.* = '-';
     }
 
+    {
+        state.shared.mutex.lockUncancelable(state.io);
+        defer state.shared.mutex.unlock(state.io);
+
+        // Stessa sequenza della navigazione verso un video (applyDecoded): ferma il
+        // player precedente PRIMA di installare il nuovo, sotto lo stesso mutex del
+        // worker che chiama advanceVideo/advanceAudio.
+        state.video.deinit();
+        if (state.midi) |mp| {
+            mp.stopAndDestroy();
+            state.midi = null;
+        }
+        state.video = local;
+        // Cambio qualità: riparti dalla posizione a cui si era (il seek pendente
+        // viene applicato dal worker al primo advanceVideo).
+        if (resume_s > 0.05) state.video.seek_to = resume_s;
+
+        // Sorgenti correnti per il toggle 'v' (video ↔ solo audio con oscilloscopio).
+        gui_state_mod.setAvSrc(state, vurl, aurl, true);
+
+        state.gpa.free(state.shared.static_rgba);
+        state.shared.static_rgba = first.rgba;
+        state.shared.static_w = first.w;
+        state.shared.static_h = first.h;
+
+        state.gpa.free(state.shared.current_file_path);
+        state.shared.current_file_path = title; // possesso trasferito
+        state.shared.is_text = false;
+        state.shared.is_table = false;
+        state.shared.sel_active = false;
+
+        const yt = &state.shared.yt;
+        // Id corrente (tasto `o`, sottotitoli, cambio qualità). Se è lo STESSO
+        // video (riapertura per qualità) i sottotitoli già caricati restano
+        // validi; per un video nuovo si riparte da zero (il toggle `c` riscarica).
+        const same_vid = if (yt.current_id) |cid| std.mem.eql(u8, cid, id) else false;
+        if (!same_vid) {
+            if (yt.current_id) |cid| state.gpa.free(cid);
+            yt.current_id = state.gpa.dupe(u8, id) catch null;
+            freeSubs(state);
+            yt.subs_on = false;
+        }
+        yt.opening = false;
+        yt.active = false; // overlay chiuso: si riapre con `y` (query/risultati restano)
+        state.shared.loading = false; // spinner d'avvio (apertura da link): spento
+        state.shared.file_changed = true;
+    }
+
+    // La finestra si adatta alle proporzioni reali del video appena aperto
+    // (stessa euristica di `nav.resizeToContent`). Fuori dal lock: `requestResize`
+    // è thread-safe (differisce al thread finestra) e no-op in fullscreen.
+    if (state.win) |w| {
+        const az = layout_mod.autoZoomForContent(.video, first.w, first.h);
+        const size = layout_mod.initialWindowSize(.video, layout_mod.scaleDim(first.w, az), layout_mod.scaleDim(first.h, az));
+        w.requestResize(size.w, size.h);
+    }
+}
+
+// ── Sottotitoli ──────────────────────────────────────────────────────────────
+
+/// Toggle sottotitoli (tasto `c` durante uno stream YouTube): la prima volta li
+/// scarica con yt-dlp su un thread (lingua it, poi en, inclusi gli
+/// auto-generati); le volte successive accende/spegne quelli già caricati.
+/// Con `shared.mutex` acquisito.
+pub fn toggleSubs(state: *GuiAppState) void {
+    if (comptime !has_video) return;
+    const yt = &state.shared.yt;
+    if (yt.subs.len > 0) {
+        yt.subs_on = !yt.subs_on;
+        state.shared.file_changed = true;
+        return;
+    }
+    if (yt.subs_loading) return;
+    const cid = yt.current_id orelse return; // il player corrente non è YouTube
+    const id = state.gpa.dupe(u8, cid) catch return;
+    yt.subs_loading = true;
+    const t = std.Thread.spawn(.{}, subsWorker, .{ state, id }) catch {
+        state.gpa.free(id);
+        yt.subs_loading = false;
+        return;
+    };
+    t.detach();
+}
+
+/// Thread sottotitoli: yt-dlp scarica il VTT nella cache
+/// (`~/.cache/zuer/ytsubs/<id>.<lingua>.vtt`), lo si parsa in cue e si installa
+/// solo se il video corrente è ancora `id`. Prende possesso di `id`.
+fn subsWorker(state: *GuiAppState, id: []u8) void {
+    defer state.gpa.free(id);
+    const cues = fetchSubs(state, id) catch |e| {
+        std.debug.print("[yt] sottotitoli non disponibili: {s}\n", .{@errorName(e)});
+        finishSubs(state, id, null);
+        return;
+    };
+    finishSubs(state, id, cues);
+}
+
+fn finishSubs(state: *GuiAppState, id: []const u8, cues_opt: ?[]SubCue) void {
     state.shared.mutex.lockUncancelable(state.io);
     defer state.shared.mutex.unlock(state.io);
-
-    // Stessa sequenza della navigazione verso un video (applyDecoded): ferma il
-    // player precedente PRIMA di installare il nuovo, sotto lo stesso mutex del
-    // worker che chiama advanceVideo/advanceAudio.
-    state.video.deinit();
-    if (state.midi) |mp| {
-        mp.stopAndDestroy();
-        state.midi = null;
-    }
-    state.video = local;
-
-    // Sorgenti correnti per il toggle 'v' (video ↔ solo audio con oscilloscopio).
-    gui_state_mod.setAvSrc(state, vurl, aurl, true);
-
-    state.gpa.free(state.shared.static_rgba);
-    state.shared.static_rgba = first.rgba;
-    state.shared.static_w = first.w;
-    state.shared.static_h = first.h;
-
-    state.gpa.free(state.shared.current_file_path);
-    state.shared.current_file_path = title; // possesso trasferito
-    state.shared.is_text = false;
-    state.shared.is_table = false;
-    state.shared.sel_active = false;
-
     const yt = &state.shared.yt;
-    yt.opening = false;
-    yt.active = false; // overlay chiuso: si riapre con `y` (query/risultati restano)
+    yt.subs_loading = false;
+    const still = if (yt.current_id) |cid| std.mem.eql(u8, cid, id) else false;
+    const cues = cues_opt orelse return;
+    if (!still or cues.len == 0) {
+        for (cues) |c| state.gpa.free(c.text);
+        state.gpa.free(cues);
+        return;
+    }
+    freeSubs(state);
+    yt.subs = cues;
+    yt.subs_on = true;
     state.shared.file_changed = true;
+}
+
+/// Scarica (o riusa dalla cache) il VTT del video e lo parsa in cue.
+fn fetchSubs(state: *GuiAppState, id: []const u8) ![]SubCue {
+    const gpa = state.gpa;
+    const dir = vtcache.appCacheDir(gpa, "ytsubs") orelse return error.NoCacheDir;
+    defer gpa.free(dir);
+
+    // Cache su disco: un VTT già scaricato per questo id evita yt-dlp.
+    var vtt_path = findSubFile(gpa, state.io, dir, id);
+    if (vtt_path == null) {
+        const url = try std.fmt.allocPrint(gpa, "https://www.youtube.com/watch?v={s}", .{id});
+        defer gpa.free(url);
+        const out_tpl = try std.fmt.allocPrint(gpa, "{s}/%(id)s.%(ext)s", .{dir});
+        defer gpa.free(out_tpl);
+        var res = try decoder_mod.runCaptureTimeout(gpa, &.{
+            "yt-dlp",       "--no-warnings",     "--no-playlist", "--skip-download",
+            "--write-subs", "--write-auto-subs", "--sub-langs",   "it,en,en-orig",
+            "--sub-format", "vtt/best",          "-o",            out_tpl,
+            url,
+        }, 40_000);
+        res.deinit(gpa);
+        vtt_path = findSubFile(gpa, state.io, dir, id);
+    }
+    const path = vtt_path orelse return error.NoSubtitles;
+    defer gpa.free(path);
+    const raw = try std.Io.Dir.cwd().readFileAlloc(state.io, path, gpa, .limited(8 << 20));
+    defer gpa.free(raw);
+    return parseVtt(gpa, raw);
+}
+
+/// Cerca nella cache un `<id>.<lingua>.vtt`, preferendo it → en → altro.
+/// Ritorna il percorso completo (posseduto) o null.
+fn findSubFile(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, id: []const u8) ?[]u8 {
+    var d = std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch return null;
+    defer d.close(io);
+    var best: ?[]u8 = null;
+    var best_rank: u8 = 255;
+    var it = d.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        const name = entry.name;
+        if (!std.mem.startsWith(u8, name, id) or name.len <= id.len + 4) continue;
+        if (name[id.len] != '.' or !std.mem.endsWith(u8, name, ".vtt")) continue;
+        const lang = name[id.len + 1 .. name.len - 4];
+        const rank: u8 = if (std.mem.startsWith(u8, lang, "it")) 0 else if (std.mem.startsWith(u8, lang, "en")) 1 else 2;
+        if (rank < best_rank) {
+            const full = std.fs.path.join(gpa, &.{ dir, name }) catch continue;
+            if (best) |b| gpa.free(b);
+            best = full;
+            best_rank = rank;
+        }
+    }
+    return best;
+}
+
+/// Parser minimale del WebVTT di YouTube: cue "start --> end" seguito dal testo
+/// su una o più righe. I tag inline (`<c>`, `<00:00:00.000>`) vengono strippati;
+/// i cue "rolling" degli auto-sub (testo del cue precedente ripetuto in testa)
+/// vengono deduplicati tenendo solo la parte nuova.
+fn parseVtt(gpa: std.mem.Allocator, raw: []const u8) ![]SubCue {
+    var cues: std.ArrayList(SubCue) = .empty;
+    errdefer {
+        for (cues.items) |c| gpa.free(c.text);
+        cues.deinit(gpa);
+    }
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line0| {
+        const line = std.mem.trimEnd(u8, line0, "\r");
+        const arrow = std.mem.indexOf(u8, line, "-->") orelse continue;
+        const start = parseVttTs(std.mem.trim(u8, line[0..arrow], " \t")) orelse continue;
+        var end_part = std.mem.trim(u8, line[arrow + 3 ..], " \t");
+        // Dopo il timestamp possono esserci i cue settings (align:start …).
+        if (std.mem.indexOfScalar(u8, end_part, ' ')) |sp| end_part = end_part[0..sp];
+        const end = parseVttTs(end_part) orelse continue;
+
+        // Testo del cue: righe fino alla riga vuota, tag strippati, unite da spazio.
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(gpa);
+        while (lines.next()) |tl0| {
+            const tl = std.mem.trimEnd(u8, tl0, "\r");
+            if (tl.len == 0) break;
+            if (text.items.len > 0) try text.append(gpa, ' ');
+            try appendStripped(&text, gpa, tl);
+        }
+        const clean = std.mem.trim(u8, text.items, " ");
+        if (clean.len == 0) continue;
+
+        if (cues.items.len > 0) {
+            const prev = &cues.items[cues.items.len - 1];
+            if (std.mem.eql(u8, prev.text, clean)) {
+                prev.end = @max(prev.end, end);
+                continue;
+            }
+            // Auto-sub rolling: il cue nuovo ripete il precedente in testa.
+            if (clean.len > prev.text.len and std.mem.startsWith(u8, clean, prev.text)) {
+                const rest = std.mem.trim(u8, clean[prev.text.len..], " ");
+                if (rest.len > 0) {
+                    try cues.append(gpa, .{ .start = start, .end = end, .text = try gpa.dupe(u8, rest) });
+                }
+                continue;
+            }
+        }
+        try cues.append(gpa, .{ .start = start, .end = end, .text = try gpa.dupe(u8, clean) });
+        if (cues.items.len >= 20_000) break; // tetto di sanità
+    }
+    return cues.toOwnedSlice(gpa);
+}
+
+/// "HH:MM:SS.mmm" o "MM:SS.mmm" → secondi. null se malformato.
+fn parseVttTs(s: []const u8) ?f64 {
+    var parts = std.mem.splitScalar(u8, s, ':');
+    var vals: [3]f64 = .{ 0, 0, 0 };
+    var n: usize = 0;
+    while (parts.next()) |p| {
+        if (n >= 3) return null;
+        vals[n] = std.fmt.parseFloat(f64, p) catch return null;
+        n += 1;
+    }
+    return switch (n) {
+        2 => vals[0] * 60 + vals[1],
+        3 => vals[0] * 3600 + vals[1] * 60 + vals[2],
+        else => null,
+    };
+}
+
+/// Appende `s` a `out` senza i tag `<…>` e con le entity HTML comuni decodificate.
+fn appendStripped(out: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []const u8) !void {
+    var i: usize = 0;
+    while (i < s.len) {
+        const ch = s[i];
+        if (ch == '<') {
+            if (std.mem.indexOfScalarPos(u8, s, i + 1, '>')) |e| {
+                i = e + 1;
+                continue;
+            }
+            break; // '<' senza chiusura: scarta il resto
+        }
+        if (ch == '&') {
+            const ents = .{ .{ "&amp;", "&" }, .{ "&lt;", "<" }, .{ "&gt;", ">" }, .{ "&quot;", "\"" }, .{ "&#39;", "'" }, .{ "&nbsp;", " " } };
+            var matched = false;
+            inline for (ents) |ent| {
+                if (!matched and std.mem.startsWith(u8, s[i..], ent[0])) {
+                    try out.appendSlice(gpa, ent[1]);
+                    i += ent[0].len;
+                    matched = true;
+                }
+            }
+            if (matched) continue;
+        }
+        try out.append(gpa, ch);
+        i += 1;
+    }
+}
+
+/// Testo del sottotitolo attivo a `pos_s`, o null. L'indice dell'ultimo cue è
+/// cacheato: il lookup del frame successivo riparte da lì (i cue sono ordinati).
+/// Con `shared.mutex` acquisito; la slice è valida finché i sub non cambiano.
+pub fn currentSubText(state: *GuiAppState, pos_s: f64) ?[]const u8 {
+    const yt = &state.shared.yt;
+    if (!yt.subs_on or yt.subs.len == 0) return null;
+    var i = @min(yt.sub_idx, yt.subs.len - 1);
+    while (i > 0 and yt.subs[i].start > pos_s) i -= 1;
+    while (i + 1 < yt.subs.len and yt.subs[i + 1].start <= pos_s) i += 1;
+    yt.sub_idx = i;
+    const c = yt.subs[i];
+    return if (pos_s >= c.start and pos_s <= c.end) c.text else null;
 }
 
 // ── Geometria della griglia (condivisa da draw e hit-test) ───────────────────
@@ -551,6 +1009,11 @@ const input_h: i32 = 42;
 const title_strip_h: i32 = 26;
 const status_h: i32 = 22;
 const panel_top: i32 = 28;
+// Riga dei chip qualità (sotto il campo query). Larghezze FISSE (niente metriche
+// font): la stessa geometria serve anche all'hit-test del mouse, che non ha raster.
+const qual_h: i32 = 30;
+const chip_w: i32 = 56;
+const chip_h: i32 = 22;
 
 pub const Layout = struct {
     xp: i32,
@@ -578,24 +1041,31 @@ fn layoutFor(W: u32, H: u32, n: usize, status: bool) Layout {
     const card_h = thumb_h + title_strip_h;
     const st: i32 = if (status) status_h else 0;
     const total_rows: i32 = @intCast((n + @as(usize, @intCast(grid_cols)) - 1) / @as(usize, @intCast(grid_cols)));
-    const avail = hi - panel_top - pad * 2 - input_h - st - gap;
+    const avail = hi - panel_top - pad * 2 - input_h - qual_h - st - gap;
     var vis = @max(@as(i32, 1), @divTrunc(avail, card_h + gap));
     vis = @min(vis, @max(total_rows, 1));
     const rows_shown = if (total_rows == 0) 0 else vis;
-    const hp = pad * 2 + input_h + st + (if (rows_shown > 0) gap + rows_shown * (card_h + gap) - gap else 0);
+    const hp = pad * 2 + input_h + qual_h + st + (if (rows_shown > 0) gap + rows_shown * (card_h + gap) - gap else 0);
     return .{
         .xp = xp,
         .yp = panel_top,
         .wp = wp,
         .hp = hp,
         .grid_x = xp + pad,
-        .grid_y = panel_top + pad + input_h + st + gap,
+        .grid_y = panel_top + pad + input_h + qual_h + st + gap,
         .card_w = card_w,
         .thumb_h = thumb_h,
         .card_h = card_h,
         .total_rows = total_rows,
         .vis_rows = vis,
     };
+}
+
+/// Rettangolo del chip qualità `i` (riga sotto il campo query).
+fn chipRect(lay: Layout, i: usize) [4]i32 {
+    const x = lay.xp + pad + @as(i32, @intCast(i)) * (chip_w + 8);
+    const y = lay.yp + pad + input_h + @divTrunc(qual_h - chip_h, 2);
+    return .{ x, y, chip_w, chip_h };
 }
 
 /// Rettangolo della card `i` (indice assoluto) con lo scroll `row_off`, o null
@@ -728,6 +1198,17 @@ pub fn handleMouse(state: *GuiAppState, win: *zrame.Window, event: zrame.MouseEv
                     yt.sb_drag = true;
                     yt.row_off = rowOffFromY(lay, bar, my);
                     state.shared.file_changed = true;
+                    return true;
+                }
+            }
+            // Click su un chip qualità: seleziona (e con uno stream attivo riapre
+            // il video alla stessa posizione con la nuova qualità).
+            for (0..quality_heights.len) |qi| {
+                const rc = chipRect(lay, qi);
+                if (mx >= @as(f32, @floatFromInt(rc[0])) and mx < @as(f32, @floatFromInt(rc[0] + rc[2])) and
+                    my >= @as(f32, @floatFromInt(rc[1])) and my < @as(f32, @floatFromInt(rc[1] + rc[3])))
+                {
+                    setQuality(state, @intCast(qi));
                     return true;
                 }
             }
@@ -896,9 +1377,34 @@ pub fn drawOverlay(buf: []u8, W: u32, H: u32, state: *GuiAppState, raster: *glyp
         canvas.drawSpinner(scx, scy, @as(f32, @floatFromInt(input_h)) * 0.26, 2.5, spin_phase, paint.Color.rgba(205, 210, 230, 1.0));
     }
 
+    // Riga dei chip qualità (360p…1080p) + suggerimenti tasti a destra.
+    {
+        const chip_base_y = chipRect(lay, 0)[1];
+        const chip_tb = chip_base_y + @divTrunc(chip_h - line_h, 2) + raster.ascent;
+        for (quality_labels, 0..) |lab, qi| {
+            const rc = chipRect(lay, qi);
+            const selq = yt.quality == @as(u8, @intCast(qi));
+            canvas.fillRoundedRect(@floatFromInt(rc[0]), @floatFromInt(rc[1]), @floatFromInt(rc[2]), @floatFromInt(rc[3]), 6.0, if (selq) sel_accent else input_bg);
+            const tw = @as(i32, @intCast(lab.len)) * raster.advance;
+            const tx = rc[0] + @divTrunc(rc[2] - tw, 2);
+            _ = drawText(buf, W, H, raster, tx, chip_tb, lab, if (selq) [3]u8{ 14, 17, 26 } else text_dim, rc[2]);
+        }
+        const hint = "c sottotitoli · Ctrl+O YouTube";
+        var cols: i32 = 0;
+        if (std.unicode.Utf8View.init(hint)) |v| {
+            var hit = v.iterator();
+            while (hit.nextCodepoint()) |_| cols += 1;
+        } else |_| {}
+        const hw = cols * raster.advance;
+        const hx = lay.xp + lay.wp - pad - hw;
+        if (hx > chipRect(lay, quality_labels.len - 1)[0] + chip_w + 16) {
+            _ = drawText(buf, W, H, raster, hx, chip_tb, hint, text_dim, hw + 4);
+        }
+    }
+
     // Riga di stato (errore o "apertura stream…").
     if (status) {
-        const sy = lay.yp + pad + input_h;
+        const sy = lay.yp + pad + input_h + qual_h;
         const sbase = sy + @divTrunc(status_h - line_h, 2) + raster.ascent;
         if (yt.opening) {
             _ = drawText(buf, W, H, raster, in_x, sbase, "apertura stream…", text_dim, lay.wp - pad * 2 - 24);

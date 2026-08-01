@@ -803,6 +803,70 @@ pub fn drawVideoControls(buf: []u8, W: u32, H: u32, vs: *VideoState, raster: ?*g
     }
 }
 
+/// Codepoint di una stringa UTF-8 (colonne, essendo il raster monospazio).
+fn cpCount(s: []const u8) usize {
+    var n: usize = 0;
+    var view = std.unicode.Utf8View.init(s) catch return s.len;
+    var it = view.iterator();
+    while (it.nextCodepoint()) |_| n += 1;
+    return n;
+}
+
+/// Sottotitolo stile YouTube: righe centrate in basso (sopra la riga dei
+/// controlli), testo bianco su pill scura. `text` è una riga logica già pulita
+/// (vedi yt_search.parseVtt): il wrapping a parole avviene qui, sulla larghezza
+/// del video. Al più 4 righe (le eccedenze vengono troncate).
+pub fn drawSubtitle(buf: []u8, W: u32, H: u32, raster: *glyph.Raster, text: []const u8) void {
+    const cell = raster.advance;
+    if (cell <= 0 or W < 120 or H < 120) return;
+    const max_cols: usize = @intCast(@max(@divTrunc(@as(i32, @intCast(W)) - 48, cell), 8));
+
+    // Wrapping greedy a parole: ogni riga è una slice contigua di `text`
+    // (le parole sono già separate da spazi singoli).
+    const Line = struct { s: usize, e: usize, cols: usize };
+    var lines_arr: [4]Line = undefined;
+    var nl: usize = 0;
+    var cur: ?Line = null;
+    var it = std.mem.tokenizeScalar(u8, text, ' ');
+    while (it.next()) |word| {
+        const w_cols = cpCount(word);
+        const off = @intFromPtr(word.ptr) - @intFromPtr(text.ptr);
+        if (cur) |*c| {
+            if (c.cols + 1 + w_cols <= max_cols) {
+                c.e = off + word.len;
+                c.cols += 1 + w_cols;
+                continue;
+            }
+            if (nl >= lines_arr.len) break;
+            lines_arr[nl] = c.*;
+            nl += 1;
+        }
+        cur = .{ .s = off, .e = off + word.len, .cols = w_cols };
+    }
+    if (cur) |c| {
+        if (nl < lines_arr.len) {
+            lines_arr[nl] = c;
+            nl += 1;
+        }
+    }
+    if (nl == 0) return;
+
+    const u32px: [*]u32 = @ptrCast(@alignCast(buf.ptr));
+    var canvas = paint.Canvas.initRgba8(u32px[0 .. @as(usize, W) * H], W, H);
+    const line_h = raster.ascent - raster.descent;
+    const pill_h = line_h + 8;
+    const line_gap: i32 = 4;
+    // Blocco ancorato sopra la riga dei controlli (cy = H-26, knob r 8).
+    var y = @as(i32, @intCast(H)) - 48 - @as(i32, @intCast(nl)) * (pill_h + line_gap);
+    for (lines_arr[0..nl]) |ln| {
+        const tw = @as(i32, @intCast(ln.cols)) * cell;
+        const px = @divTrunc(@as(i32, @intCast(W)) - tw, 2);
+        canvas.fillRoundedRect(@floatFromInt(px - 8), @floatFromInt(y), @floatFromInt(tw + 16), @floatFromInt(pill_h), 5.0, paint.Color.rgba(0, 0, 0, 0.72));
+        drawText(buf, W, H, raster, px, y + 4 + raster.ascent, text[ln.s..ln.e], 1.0);
+        y += pill_h + line_gap;
+    }
+}
+
 /// Hit-test dei controlli, in coordinate locali all'area video (`vw`×`vh`).
 pub const VideoHit = enum { none, toggle, timeline };
 pub fn videoControlsHit(vw: u32, vh: u32, x: f32, y: f32) VideoHit {

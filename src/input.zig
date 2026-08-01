@@ -49,6 +49,8 @@ const KEY_ENTER: u32 = 28;
 const KEY_Y: u32 = 21;
 const KEY_BACKSPACE: u32 = 14;
 const KEY_A: u32 = 30;
+const KEY_O: u32 = 24;
+const KEY_D: u32 = 32;
 
 // Stato per il rilevamento del doppio-click sinistro (solo thread finestra).
 var last_click_ms: i64 = -1000;
@@ -87,7 +89,8 @@ fn textHit(state: *GuiAppState, W: u32, H: u32, mx: f32, my: f32) [2]i32 {
     row = std.math.clamp(row, 0, @max(nrows - 1, 0));
     const llen: i32 = if (nrows > 0) compose.cpLen(state.shared.text_lines.items[@intCast(row)]) else 0;
     // Arrotonda alla colonna più vicina (mezza cella) per un aggancio naturale.
-    var col: i32 = if (m.advance > 0) @divFloor(sx - m.pad_x + @divTrunc(m.advance, 2), m.advance) else 0;
+    const content_pad_x = m.pad_x + m.gutter_cols * m.advance;
+    var col: i32 = if (m.advance > 0) @divFloor(sx - content_pad_x + @divTrunc(m.advance, 2), m.advance) else 0;
     col = std.math.clamp(col, 0, llen);
     return .{ row, col };
 }
@@ -443,8 +446,13 @@ fn handleYtKey(app_state: *GuiAppState, key: u32) bool {
                     app_state.shared.file_changed = true;
                 }
             },
-            KEY_C => yt_search.copyQuery(app_state),
+            // Con una card selezionata copia il link del video; con Ctrl+A
+            // (o senza risultati) copia la query.
+            KEY_C => yt_search.copyQueryOrLink(app_state),
             KEY_V => yt_search.startPaste(app_state),
+            // Ctrl+O: apri nel browser la pagina YouTube della card selezionata
+            // (la `o` nuda è testo per la query, quindi serve il modificatore).
+            KEY_O => yt_search.openPageLocked(app_state),
             else => {},
         }
         return true;
@@ -482,7 +490,11 @@ fn handleYtKey(app_state: *GuiAppState, key: u32) bool {
             }
         },
         KEY_ENTER => {
-            if (yt.results.len > 0 and yt.sel >= 0) {
+            // Un link YouTube incollato nella query si apre direttamente,
+            // senza passare dalla ricerca.
+            if (yt_search.videoIdFromUrl(yt.query.items)) |vid| {
+                yt_search.openById(app_state, vid);
+            } else if (yt.results.len > 0 and yt.sel >= 0) {
                 yt_search.openSelected(app_state);
             } else {
                 yt_search.startSearch(app_state);
@@ -573,6 +585,19 @@ pub fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) 
                 // Toggle video ↔ solo audio (oscilloscopio): l'audio non si ferma.
                 nav.toggleVideoTrack(app_state);
                 return;
+            } else if (key == KEY_C and !app_state.ctrl_down) {
+                // Sottotitoli YouTube (stile player web): toggle; al primo uso
+                // li scarica yt-dlp su un thread. No-op sui video non-YouTube.
+                app_state.shared.mutex.lockUncancelable(app_state.io);
+                yt_search.toggleSubs(app_state);
+                app_state.shared.mutex.unlock(app_state.io);
+                return;
+            } else if (key == KEY_O and !app_state.ctrl_down) {
+                // Apri nel browser la pagina YouTube del video in riproduzione.
+                app_state.shared.mutex.lockUncancelable(app_state.io);
+                yt_search.openPageLocked(app_state);
+                app_state.shared.mutex.unlock(app_state.io);
+                return;
             }
         }
         // MIDI: Spazio = play/pausa; a fine brano (il synth si auto-pausa col
@@ -594,16 +619,38 @@ pub fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) 
             }
             app_state.shared.mutex.unlock(app_state.io);
         }
-        // Ctrl+C: copia la selezione negli appunti.
-        if (key == KEY_C and app_state.ctrl_down and is_text) {
-            app_state.shared.mutex.lockUncancelable(app_state.io);
-            const sel = buildSelectedText(app_state, app_state.gpa);
-            app_state.shared.mutex.unlock(app_state.io);
-            if (sel) |txt| {
-                clipboard.copy(txt);
-                app_state.gpa.free(txt);
+        // Scorciatoie col Ctrl per documenti di testo (Ctrl+A = seleziona tutto, Ctrl+C = copia, Ctrl+D = deseleziona).
+        if (is_text and app_state.ctrl_down) {
+            if (key == KEY_A) {
+                app_state.shared.mutex.lockUncancelable(app_state.io);
+                const nrows: i32 = @intCast(app_state.shared.text_lines.items.len);
+                if (nrows > 0) {
+                    const last_line = app_state.shared.text_lines.items[@intCast(nrows - 1)];
+                    const last_col: i32 = @intCast(compose.cpLen(last_line));
+                    app_state.shared.sel_a = .{ 0, 0 };
+                    app_state.shared.sel_b = .{ nrows - 1, last_col };
+                    app_state.shared.sel_active = true;
+                    app_state.shared.file_changed = true;
+                }
+                app_state.shared.mutex.unlock(app_state.io);
+                return;
+            } else if (key == KEY_C) {
+                app_state.shared.mutex.lockUncancelable(app_state.io);
+                const sel = buildSelectedText(app_state, app_state.gpa);
+                app_state.shared.mutex.unlock(app_state.io);
+                if (sel) |txt| {
+                    clipboard.copy(txt);
+                    app_state.gpa.free(txt);
+                }
+                return;
+            } else if (key == KEY_D) {
+                app_state.shared.mutex.lockUncancelable(app_state.io);
+                app_state.shared.sel_active = false;
+                app_state.shared.sel_selecting = false;
+                app_state.shared.file_changed = true;
+                app_state.shared.mutex.unlock(app_state.io);
+                return;
             }
-            return;
         }
         // Navigazione archivio: nel listato ↑/↓ spostano la riga e Invio apre la
         // voce; dentro una voce Esc torna al listato. Ha priorità sul resto (il
@@ -963,19 +1010,30 @@ fn byteAtCol(s: []const u8, col: i32) usize {
 }
 
 /// Costruisce il testo selezionato (righe unite da '\n'). Con `state.shared.mutex`
-/// acquisito. Ritorna null se non c'è selezione; il chiamante libera il buffer.
+/// acquisito. Se non c'è selezione attiva o la selezione è di ampiezza zero, restituisce
+/// l'intero documento. Ritorna null se il file è vuoto. Il chiamante libera il buffer.
 fn buildSelectedText(state: *GuiAppState, gpa: std.mem.Allocator) ?[]u8 {
-    if (!state.shared.sel_active) return null;
     const lines = state.shared.text_lines.items;
     if (lines.len == 0) return null;
-    var a = state.shared.sel_a;
-    var b = state.shared.sel_b;
-    if (a[0] > b[0] or (a[0] == b[0] and a[1] > b[1])) {
-        const t = a;
-        a = b;
-        b = t;
+    var a: [2]i32 = undefined;
+    var b: [2]i32 = undefined;
+    var use_all = !state.shared.sel_active;
+    if (state.shared.sel_active) {
+        a = state.shared.sel_a;
+        b = state.shared.sel_b;
+        if (a[0] > b[0] or (a[0] == b[0] and a[1] > b[1])) {
+            const t = a;
+            a = b;
+            b = t;
+        }
+        if (a[0] == b[0] and a[1] == b[1]) use_all = true;
     }
-    if (a[0] == b[0] and a[1] == b[1]) return null;
+    if (use_all) {
+        const nrows: i32 = @intCast(lines.len);
+        a = .{ 0, 0 };
+        const last_line = lines[@intCast(nrows - 1)];
+        b = .{ nrows - 1, @intCast(compose.cpLen(last_line)) };
+    }
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
