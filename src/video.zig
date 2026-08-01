@@ -327,8 +327,18 @@ pub fn advanceVideo(sink: FrameSink, vs: *VideoState, dt: f32) bool {
         if (vs.playing) {
             vs.pos_s += dt;
             if (drained) {
+                const fps: f64 = if (vs.player) |p| p.frame_rate else 30.0;
+                const threshold: f64 = if (fps > 30.0) 0.035 else 0.065;
                 const err = audio_pos - vs.pos_s;
-                if (@abs(err) > 0.2) vs.pos_s = audio_pos else vs.pos_s += err * 0.05;
+                if (@abs(err) > threshold) {
+                    vs.pos_s = audio_pos;
+                    // Audio avanti (video indietro) → arma il catch-up per
+                    // recuperare decodificando senza presentare. Video avanti →
+                    // basta lo snap indietro, non si "recupera" all'indietro.
+                    if (err > 0) vs.catchup_until = audio_pos;
+                } else {
+                    vs.pos_s += err * 0.05;
+                }
             }
         }
     }

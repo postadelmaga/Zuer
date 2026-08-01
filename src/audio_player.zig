@@ -67,7 +67,14 @@ pub const AudioPlayer = struct {
     // sono pre-seek. Vanno scartati finché pts < soglia, altrimenti si suonano
     // campioni vecchi col clock che dice la posizione nuova → offset A/V sistematico.
     // Toccata solo dal thread audio (la richiesta passa dall'atomico `seek_ms`).
-    skip_until_s: f64 = -1,
+    //
+    // Parte a 0 (non -1): all'AVVIO ancora `submitted` al pts REALE del primo frame
+    // decodificato invece di assumere che l'audio parta da pts 0. Necessario per gli
+    // stream DASH di YouTube, dove audio e video sono container separati e il primo
+    // pts dell'audio può non essere 0: contarlo da 0 sfaserebbe il clock rispetto al
+    // video (ancorato al suo pts reale) → offset A/V costante. Con 0 nessuno scarto
+    // (niente pts < 0) e il primo frame buono riallinea `submitted` sul suo pts.
+    skip_until_s: f64 = 0,
 
     // Durata totale del brano in secondi (0 se il container non la fornisce): usata
     // dal player audio-only per la timeline dei controlli.
@@ -257,8 +264,10 @@ pub const AudioPlayer = struct {
             if (!got) {
                 _ = av.av_seek_frame(self.fmt_ctx, self.stream_idx, 0, c.AVSEEK_FLAG_BACKWARD);
                 av.avcodec_flush_buffers(self.codec_ctx);
+                // Come all'avvio: riancora `submitted` al pts reale del primo frame
+                // dopo il riavvolgimento (0 provvisorio), non assumere pts 0.
                 submitted = 0;
-                self.skip_until_s = -1;
+                self.skip_until_s = 0;
                 continue;
             }
             // Post-seek: scarta i frame del keyframe precedente (pts < soglia) e
