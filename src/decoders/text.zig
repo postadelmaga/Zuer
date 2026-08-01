@@ -28,8 +28,33 @@ fn isBinary(bytes: []const u8) bool {
     return false;
 }
 
-/// Converte/sanifica una sequenza di byte in UTF-8 valido.
-/// - Byte NULL (`0x00`) vengono sostituiti con uno spazio `' '`.
+/// Controlla se il buffer contiene sequenze di escape ANSI, caratteri di controllo non stampabili o byte non UTF-8.
+fn needsSanitization(bytes: []const u8) bool {
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const b = bytes[i];
+        if (b == 0x1B or b < 0x20 or b == 0x7F) {
+            if (b == '\n' or b == '\t') {
+                i += 1;
+                continue;
+            }
+            return true;
+        }
+        if (b >= 0x80) {
+            const seq_len = std.unicode.utf8ByteSequenceLength(b) catch return true;
+            if (seq_len == 0 or i + seq_len > bytes.len) return true;
+            if (!std.unicode.utf8ValidateSlice(bytes[i .. i + seq_len])) return true;
+            i += seq_len;
+            continue;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+/// Converte/sanifica una sequenza di byte in UTF-8 valido:
+/// - Rimuove le sequenze di escape ANSI (es. \x1b[96m, \x1b[0m) che altrimenti verrebbero mostrate come testo grezzo o '□'.
+/// - Rimuove i caratteri di controllo non stampabili (< 0x20 compreso NULL 0x00, BEL, BS ecc.), mantenendo solo \n e \t.
 /// - Sequenze UTF-8 valide vengono mantenute intatte.
 /// - Byte non UTF-8 (es. ISO-8859-1 / Windows-1252 come `è`, `à`, `°`) vengono convertiti in UTF-8.
 pub fn sanitizeToUtf8(bytes: []const u8, allocator: std.mem.Allocator) ![]u8 {
@@ -39,10 +64,69 @@ pub fn sanitizeToUtf8(bytes: []const u8, allocator: std.mem.Allocator) ![]u8 {
     var i: usize = 0;
     while (i < bytes.len) {
         const b = bytes[i];
-        if (b == 0) {
-            try out.append(allocator, ' ');
+
+        // Gestisci sequenze di escape ANSI (ESC = 0x1B)
+        if (b == 0x1B) {
+            if (i + 1 < bytes.len) {
+                const next = bytes[i + 1];
+                if (next == '[') {
+                    // CSI sequence: \x1b[ ... final_byte (0x40..0x7E)
+                    var j: usize = i + 2;
+                    while (j < bytes.len) : (j += 1) {
+                        const cb = bytes[j];
+                        if (cb >= 0x40 and cb <= 0x7E) {
+                            j += 1;
+                            break;
+                        }
+                        if (cb < 0x20 or cb > 0x7E) {
+                            break;
+                        }
+                    }
+                    i = j;
+                    continue;
+                } else if (next == ']') {
+                    // OSC sequence: \x1b] ... BEL (\x07) o ST (\x1b\)
+                    var j: usize = i + 2;
+                    while (j < bytes.len) : (j += 1) {
+                        if (bytes[j] == 0x07) {
+                            j += 1;
+                            break;
+                        }
+                        if (bytes[j] == 0x1B and j + 1 < bytes.len and bytes[j + 1] == '\\') {
+                            j += 2;
+                            break;
+                        }
+                    }
+                    i = j;
+                    continue;
+                } else if (next >= 0x40 and next <= 0x5F) {
+                    i += 2;
+                    continue;
+                }
+            }
             i += 1;
-        } else if (b < 0x80) {
+            continue;
+        }
+
+        // Caratteri di controllo non stampabili (< 0x20)
+        if (b < 0x20) {
+            if (b == '\n' or b == '\t') {
+                try out.append(allocator, b);
+            } else if (b == '\r') {
+                if (i + 1 >= bytes.len or bytes[i + 1] != '\n') {
+                    try out.append(allocator, '\n');
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        if (b == 0x7F) {
+            i += 1;
+            continue;
+        }
+
+        if (b < 0x80) {
             try out.append(allocator, b);
             i += 1;
         } else {
@@ -71,12 +155,12 @@ pub fn decode(bytes: []const u8, allocator: std.mem.Allocator) Decoded {
         return .{ .err = "Formato non riconosciuto o file binario non UTF-8." };
     }
 
-    // Se è già UTF-8 valido e senza byte NULL, ritorna la slice originale senza allocazioni aggiuntive.
-    if (!std.mem.containsAtLeast(u8, bytes, 1, &.{0}) and std.unicode.utf8ValidateSlice(bytes)) {
+    // Se è già pulito (senza ANSI, senza controlli non stampabili, UTF-8 valido), ritorna senza allocare
+    if (!needsSanitization(bytes)) {
         return .{ .text = bytes };
     }
 
-    // Altrimenti sanifica in UTF-8 (sostituisce NULL con spazi, converte ISO-8859-1/non-UTF8 in UTF-8)
+    // Altrimenti sanifica in UTF-8 (rimuove ANSI/controlli, converte ISO-8859-1/non-UTF8 in UTF-8)
     const sanitized = sanitizeToUtf8(bytes, allocator) catch {
         allocator.free(bytes);
         return .{ .err = "Impossibile allocare memoria per la sanificazione del testo." };

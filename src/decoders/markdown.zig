@@ -3,6 +3,29 @@ const decoder = @import("decoder");
 const Decoded = decoder.Decoded;
 const DecodedC = decoder.DecodedC;
 
+fn needsSanitization(bytes: []const u8) bool {
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const b = bytes[i];
+        if (b == 0x1B or b < 0x20 or b == 0x7F) {
+            if (b == '\n' or b == '\t') {
+                i += 1;
+                continue;
+            }
+            return true;
+        }
+        if (b >= 0x80) {
+            const seq_len = std.unicode.utf8ByteSequenceLength(b) catch return true;
+            if (seq_len == 0 or i + seq_len > bytes.len) return true;
+            if (!std.unicode.utf8ValidateSlice(bytes[i .. i + seq_len])) return true;
+            i += seq_len;
+            continue;
+        }
+        i += 1;
+    }
+    return false;
+}
+
 fn sanitizeToUtf8(bytes: []const u8, allocator: std.mem.Allocator) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
@@ -10,10 +33,65 @@ fn sanitizeToUtf8(bytes: []const u8, allocator: std.mem.Allocator) ![]u8 {
     var i: usize = 0;
     while (i < bytes.len) {
         const b = bytes[i];
-        if (b == 0) {
-            try out.append(allocator, ' ');
+
+        if (b == 0x1B) {
+            if (i + 1 < bytes.len) {
+                const next = bytes[i + 1];
+                if (next == '[') {
+                    var j: usize = i + 2;
+                    while (j < bytes.len) : (j += 1) {
+                        const cb = bytes[j];
+                        if (cb >= 0x40 and cb <= 0x7E) {
+                            j += 1;
+                            break;
+                        }
+                        if (cb < 0x20 or cb > 0x7E) {
+                            break;
+                        }
+                    }
+                    i = j;
+                    continue;
+                } else if (next == ']') {
+                    var j: usize = i + 2;
+                    while (j < bytes.len) : (j += 1) {
+                        if (bytes[j] == 0x07) {
+                            j += 1;
+                            break;
+                        }
+                        if (bytes[j] == 0x1B and j + 1 < bytes.len and bytes[j + 1] == '\\') {
+                            j += 2;
+                            break;
+                        }
+                    }
+                    i = j;
+                    continue;
+                } else if (next >= 0x40 and next <= 0x5F) {
+                    i += 2;
+                    continue;
+                }
+            }
             i += 1;
-        } else if (b < 0x80) {
+            continue;
+        }
+
+        if (b < 0x20) {
+            if (b == '\n' or b == '\t') {
+                try out.append(allocator, b);
+            } else if (b == '\r') {
+                if (i + 1 >= bytes.len or bytes[i + 1] != '\n') {
+                    try out.append(allocator, '\n');
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        if (b == 0x7F) {
+            i += 1;
+            continue;
+        }
+
+        if (b < 0x80) {
             try out.append(allocator, b);
             i += 1;
         } else {
@@ -36,7 +114,7 @@ fn sanitizeToUtf8(bytes: []const u8, allocator: std.mem.Allocator) ![]u8 {
 }
 
 pub fn decode(bytes: []const u8, allocator: std.mem.Allocator) Decoded {
-    if (!std.mem.containsAtLeast(u8, bytes, 1, &.{0}) and std.unicode.utf8ValidateSlice(bytes)) {
+    if (!needsSanitization(bytes)) {
         return .{ .markdown = .{ .content = bytes } };
     }
 
