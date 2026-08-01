@@ -59,6 +59,11 @@ pub const VideoState = struct {
     // Seek richiesto dall'input (secondi, <0 = nessuno) e stato scrubbing.
     seek_to: f64 = -1,
     scrubbing: bool = false,
+    // Settle post-seek: finché true il present chiama `pickInto` (anche in pausa)
+    // e mostra il PRIMO frame fresco dal target (`force_first`); poi `pos_s` viene
+    // agganciato a quel frame e il campo torna false. Tiene fermo `pos_s` durante
+    // l'attesa così la ripresa non fa un mini fast-forward pari alla latenza.
+    settle_seek: bool = false,
     // Riproduzione audio (thread + device). null se il file non ha audio o il
     // device non si apre → il video va muto. Quando presente E in avanzamento, è
     // il clock master; `audio_clk_prev` traccia il valore precedente per capire se
@@ -96,6 +101,7 @@ pub const VideoState = struct {
         // il clock audio precedente non deve inquinare la drift-correction.
         self.seek_to = -1;
         self.scrubbing = false;
+        self.settle_seek = false;
         self.audio_clk_prev = -1;
         self.audio_only = false;
         self.scope_head = 0;
@@ -240,6 +246,7 @@ pub fn advanceVideo(sink: FrameSink, vs: *VideoState, dt: f32) bool {
 
     // 1. Seek richiesto dall'input: svuota la coda del decoder e riposiziona
     // decoder e audio. `audio_clk_prev` a sentinella così la drift riparte pulita.
+    // `settle_seek` fa presentare il frame di destinazione anche in pausa.
     if (vs.seek_to >= 0) {
         dec.seekAndFlush(vs.seek_to);
         if (comptime @import("build_options").video) {
@@ -247,6 +254,7 @@ pub fn advanceVideo(sink: FrameSink, vs: *VideoState, dt: f32) bool {
         }
         vs.pos_s = vs.seek_to;
         vs.audio_clk_prev = -1;
+        vs.settle_seek = true;
         vs.seek_to = -1;
     }
 
@@ -266,7 +274,10 @@ pub fn advanceVideo(sink: FrameSink, vs: *VideoState, dt: f32) bool {
             audio_pos = ac;
         }
     }
-    if (vs.playing) {
+    // Durante il settle post-seek `pos_s` resta fermo al target finché il frame di
+    // destinazione non è pronto (poi vi si aggancia): niente avanzamento wall-clock
+    // che si accumulerebbe come fast-forward alla ripresa.
+    if (vs.playing and !vs.settle_seek) {
         vs.pos_s += dt;
         if (drained) {
             const threshold: f64 = if (dec.frame_rate > 30.0) 0.035 else 0.065;
@@ -291,12 +302,23 @@ pub fn advanceVideo(sink: FrameSink, vs: *VideoState, dt: f32) bool {
         return false;
     }
 
-    // 4. Presenta dalla coda il frame più recente con `pts <= pos_s`, scartando i
-    // più vecchi. Se non è ancora pronto (decoder indietro) tiene l'ultimo frame.
-    const picked = dec.pickInto(vs.pos_s, sink.gpa, sink.rgba, sink.w, sink.h);
-    if (picked.presented) {
-        vs.shown_pts = picked.pts_s;
-        return true;
+    // 4. In riproduzione (o durante un settle post-seek) presenta dalla coda il
+    // frame più recente con `pts <= pos_s`, scartando i più vecchi. In PAUSA senza
+    // settle NON si presenta: si tiene fermo il frame corrente all'istante — così
+    // premere spazio ferma davvero il video invece di lasciarlo "recuperare" i
+    // frame arretrati che il decoder continua a produrre.
+    if (vs.playing or vs.settle_seek) {
+        const picked = dec.pickInto(vs.pos_s, vs.settle_seek, sink.gpa, sink.rgba, sink.w, sink.h);
+        if (picked.presented) {
+            vs.shown_pts = picked.pts_s;
+            if (vs.settle_seek) {
+                // Aggancia `pos_s` al frame di destinazione e chiudi il settle: da
+                // qui la riproduzione (se attiva) riparte da questo pts.
+                vs.pos_s = @max(vs.pos_s, picked.pts_s);
+                vs.settle_seek = false;
+            }
+            return true;
+        }
     }
     return false;
 }

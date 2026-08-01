@@ -152,7 +152,12 @@ pub const VideoDecoder = struct {
     /// (e quelli stale post-seek), e lo copia nel sink (riallocando `rgba` se
     /// cambia dimensione). Ritorna `presented=false` se non c'è (ancora) un frame
     /// all'altezza del clock: il present tiene l'ultimo.
-    pub fn pickInto(self: *VideoDecoder, up_to_pts: f64, gpa: std.mem.Allocator, rgba: *[]u8, w: *u32, h: *u32) Picked {
+    ///
+    /// `force_first`: usato SUBITO dopo un seek — presenta il primo frame fresco
+    /// disponibile (il frame al/dopo il target, già filtrato dallo skip del
+    /// produttore) ANCHE se il suo pts è > up_to_pts. Serve a mostrare il frame di
+    /// destinazione anche a video in pausa, dove `pos_s` non avanza fino a coprirlo.
+    pub fn pickInto(self: *VideoDecoder, up_to_pts: f64, force_first: bool, gpa: std.mem.Allocator, rgba: *[]u8, w: *u32, h: *u32) Picked {
         const g = self.gen.load(.monotonic);
         const t = self.tail.load(.acquire);
         var hd = self.head.load(.monotonic);
@@ -161,11 +166,14 @@ pub const VideoDecoder = struct {
         // cresce in modo monotono), mai presentati.
         while (hd < t and self.ring[hd % CAP].gen != g) hd += 1;
         // Scarta i frame ormai vecchi: finché ce n'è un ALTRO subito dopo ancora
-        // <= target, quello in testa è superato.
-        while (t - hd >= 2 and self.ring[(hd + 1) % CAP].pts_s <= up_to_pts) hd += 1;
+        // <= target, quello in testa è superato. (Non in `force_first`: lì vogliamo
+        // il PRIMO frame fresco, non l'ultimo <= clock.)
+        if (!force_first) {
+            while (t - hd >= 2 and self.ring[(hd + 1) % CAP].pts_s <= up_to_pts) hd += 1;
+        }
 
         var result: Picked = .{};
-        if (hd < t and self.ring[hd % CAP].pts_s <= up_to_pts) {
+        if (hd < t and (force_first or self.ring[hd % CAP].pts_s <= up_to_pts)) {
             const s = &self.ring[hd % CAP];
             const need = @as(usize, s.w) * s.h * 4;
             if (rgba.*.len != need) {
@@ -192,12 +200,20 @@ pub const VideoDecoder = struct {
 
     fn threadMain(self: *VideoDecoder) void {
         var prod_gen: u32 = self.gen.load(.monotonic);
+        // Soglia post-seek (-1 = nessuna): `seek(BACKWARD)` atterra al keyframe
+        // PRECEDENTE il target, quindi i primi frame decodificati sono pre-target.
+        // Vanno SCARTATI qui (non accodati), altrimenti — con la coda di sole CAP
+        // posizioni — sfilerebbero nel present a velocità di decodifica (fast
+        // forward). Come lo `skip_until_s` del thread audio.
+        var prod_skip_until: f64 = -1;
         while (!self.stop.load(.monotonic)) {
             const sk = self.seek_ms.swap(-1, .monotonic);
             if (sk >= 0) {
-                self.player.seek(@as(f64, @floatFromInt(sk)) / 1000.0);
+                const target = @as(f64, @floatFromInt(sk)) / 1000.0;
+                self.player.seek(target);
                 self.eof.store(false, .monotonic);
                 prod_gen = self.gen.load(.monotonic); // adotta l'epoca del seek
+                prod_skip_until = target;
             }
             if (self.eof.load(.monotonic)) {
                 // Stream finito: niente da produrre finché il consumatore non fa
@@ -224,6 +240,12 @@ pub const VideoDecoder = struct {
             // Un seek è arrivato mentre decodificavamo: scarta questo frame (è
             // della posizione vecchia), lo gestiamo al prossimo giro.
             if (self.seek_ms.load(.monotonic) >= 0) continue;
+            // Scarta i frame tra il keyframe e il target (mai accodati): il primo
+            // frame >= target chiude lo skip e viene accodato normalmente.
+            if (prod_skip_until >= 0) {
+                if (fr.pts_s < prod_skip_until) continue;
+                prod_skip_until = -1;
+            }
 
             const w: u32 = @intCast(fr.width);
             const h: u32 = @intCast(fr.height);
