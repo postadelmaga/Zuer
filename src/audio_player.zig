@@ -60,6 +60,12 @@ pub const AudioPlayer = struct {
     thread: ?std.Thread = null,
     stop: std.atomic.Value(bool) = .init(false),
     playing: std.atomic.Value(bool) = .init(true),
+    // Auto-loop a EOF. true per l'audio-only (il thread riavvolge da sé). false
+    // quando l'audio fa da clock master a un VIDEO: lì il loop è coordinato dal
+    // present (`video.advanceVideo`), che riavvolge insieme video e audio; se
+    // l'audio riavvolgesse da solo il suo clock salterebbe a ~0 prima che il
+    // present rilevi la fine → il video si pianterebbe sull'ultimo frame.
+    loop: std.atomic.Value(bool) = .init(true),
     seek_ms: std.atomic.Value(i64) = .init(-1), // richiesta di seek (ms), -1 = nessuna
     clock_ms: std.atomic.Value(i64) = .init(0), // posizione riprodotta stimata (ms)
     // Soglia post-seek in secondi (-1 = nessuna): av_seek_frame(BACKWARD) riparte
@@ -262,6 +268,13 @@ pub const AudioPlayer = struct {
                 continue;
             };
             if (!got) {
+                // Clock master di un video (loop=false): NON riavvolgere da soli —
+                // tieni il clock all'ultimo valore e attendi il seek(0) coordinato
+                // dal present. Altrimenti il video si pianta (vedi campo `loop`).
+                if (!self.loop.load(.monotonic)) {
+                    sleepMs(8);
+                    continue;
+                }
                 _ = av.av_seek_frame(self.fmt_ctx, self.stream_idx, 0, c.AVSEEK_FLAG_BACKWARD);
                 av.avcodec_flush_buffers(self.codec_ctx);
                 // Come all'avvio: riancora `submitted` al pts reale del primo frame

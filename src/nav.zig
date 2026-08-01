@@ -442,11 +442,12 @@ pub fn toggleVideoTrack(state: *GuiAppState) void {
         return;
     }
     if (!vs.audio_only) {
-        // Video → solo audio: chiudi il container video, l'audio continua.
-        if (vs.player) |*p| p.deinit();
-        vs.player = null;
+        // Video → solo audio: ferma il thread di decodifica (che chiude il
+        // container), l'audio continua e torna a fare auto-loop da sé.
+        if (vs.decoder) |d| d.stopAndDestroy();
+        vs.decoder = null;
         vs.audio_only = true;
-        vs.catchup_until = -1;
+        if (vs.audio) |a| a.loop.store(true, .monotonic);
         state.shared.file_changed = true;
         state.shared.mutex.unlock(state.io);
         return;
@@ -474,7 +475,7 @@ pub fn toggleVideoTrack(state: *GuiAppState) void {
 fn videoReopenWorker(state: *GuiAppState, src: []u8, pos: f64) void {
     defer state.gpa.free(src);
     if (comptime !has_video) return;
-    var vo = videomod.openVideoOnly(src, state.gpa) catch |e| {
+    const vo = videomod.openVideoOnly(src, state.gpa) catch |e| {
         std.debug.print("[video] riaccensione video fallita: {s}\n", .{@errorName(e)});
         return;
     };
@@ -486,13 +487,15 @@ fn videoReopenWorker(state: *GuiAppState, src: []u8, pos: f64) void {
     // audio-only) o ri-toggleato: installa solo se siamo ancora in audio-only
     // senza container video e la sorgente corrente è la stessa di partenza.
     const same_src = if (state.shared.av_src_video) |cur| std.mem.eql(u8, cur, src) else false;
-    if (!vs.audio_only or vs.player != null or !same_src) {
-        vo.player.deinit();
+    if (!vs.audio_only or vs.decoder != null or !same_src) {
+        vo.dec.stopAndDestroy();
         state.gpa.free(vo.rgba);
         return;
     }
-    vs.player = vo.player;
+    vs.decoder = vo.dec;
     vs.audio_only = false;
+    // Il video torna clock-driven: loop coordinato dal present, non auto-loop.
+    if (vs.audio) |a| a.loop.store(false, .monotonic);
     vs.scope_head = 0;
     // Riaggancio alla posizione VERA: il clock audio ha continuato ad avanzare
     // durante l'apertura del container; `pos` è solo il fallback senza audio.

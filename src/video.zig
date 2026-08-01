@@ -15,21 +15,6 @@ const zicro = @import("zicro");
 const paint = zicro.paint;
 const glyph = @import("glyph.zig");
 
-extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
-
-/// Orologio monotono in millisecondi, stessa primitiva di `nowMs` in gui.zig
-/// (Linux: `clock_gettime(MONOTONIC)`; Windows: `GetTickCount64`). Usato per il
-/// budget di tempo del catch-up post-seek in `advanceVideo`.
-fn nowMs() i64 {
-    if (comptime builtin.os.tag == .windows) {
-        return @intCast(GetTickCount64());
-    } else {
-        var ts: std.os.linux.timespec = undefined;
-        _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-        return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
-    }
-}
-
 // player.zig fa un @cImport degli header libav: importalo solo quando il video è
 // attivo, con uno stub minimale altrimenti (vedi il gate `has_video` in gui.zig).
 const player_mod = if (@import("build_options").video) @import("decoders/player.zig") else struct {
@@ -43,15 +28,25 @@ const player_mod = if (@import("build_options").video) @import("decoders/player.
 // stub, mai usato (gui chiama il path video sotto `if (has_video)` comptime).
 const AudioPlayer = if (@import("build_options").video) @import("audio_player.zig").AudioPlayer else struct {};
 
+// Thread di decodifica video + coda di frame (vedi `video_decoder.zig`). Gated
+// come AudioPlayer: importa libav solo con il video attivo, stub vuoto altrimenti
+// (usato solo dentro i rami `has_video`, comptime-eliminati quando il video è off).
+const VideoDecoder = if (@import("build_options").video) @import("video_decoder.zig").VideoDecoder else struct {};
+
 /// Frame video decodificato al massimo a questa dimensione per lato (limita memoria
 /// e tempo di rasterizzazione: i 4K si riscalano a 1920 sul lato lungo).
 const video_max_dim: usize = 1920;
 
-/// Stato del player video nativo (libav). Il *worker* è l'unico a toccare il
-/// `Player` (decodifica, seek); il thread finestra comunica solo via flag sotto
-/// `mutex` (play/pausa, `seek_to`, attività del mouse per l'auto-hide dei controlli).
+/// Stato del player video nativo (libav). Il *thread di decodifica* (`decoder`)
+/// è l'unico a toccare il `Player`; il present e il thread finestra comunicano
+/// solo via la coda del decoder e via flag sotto `mutex` (play/pausa, `seek_to`,
+/// attività del mouse per l'auto-hide dei controlli).
 pub const VideoState = struct {
-    player: ?player_mod.Player = null,
+    // Decodifica su thread dedicato con coda di read-ahead. Il present sceglie
+    // dalla coda il frame all'altezza del clock audio (`advanceVideo`), invece
+    // di decodificare inline: uno stallo di rete non congela più il present e il
+    // video si riaggancia all'audio scartando i frame in ritardo.
+    decoder: ?*VideoDecoder = null,
     playing: bool = true,
     pos_s: f64 = 0, // posizione di riproduzione corrente (secondi)
     dur_s: f64 = 0, // durata totale (0 se ignota)
@@ -64,14 +59,6 @@ pub const VideoState = struct {
     // Seek richiesto dall'input (secondi, <0 = nessuno) e stato scrubbing.
     seek_to: f64 = -1,
     scrubbing: bool = false,
-    // Catch-up post-seek (<0 = inattivo): `p.seek` con AVSEEK_FLAG_BACKWARD
-    // atterra al keyframe PRECEDENTE il target; i frame tra keyframe e target
-    // vanno decodificati ma NON presentati (altrimenti si vedono secondi di
-    // video accelerato). Finché >= 0, `advanceVideo` decodifica a budget di
-    // tempo scartando i frame con pts < catchup_until e tiene `pos_s` ancorato
-    // al target; il primo frame con pts >= target viene presentato e il campo
-    // torna -1.
-    catchup_until: f64 = -1,
     // Riproduzione audio (thread + device). null se il file non ha audio o il
     // device non si apre → il video va muto. Quando presente E in avanzamento, è
     // il clock master; `audio_clk_prev` traccia il valore precedente per capire se
@@ -89,25 +76,26 @@ pub const VideoState = struct {
     scope_head: f64 = 0,
 
     pub fn isActive(self: *const VideoState) bool {
-        return self.player != null or self.audio_only;
+        return self.decoder != null or self.audio_only;
     }
 
-    /// Chiude il container libav (e ferma l'audio). Idempotente: azzera anche
-    /// `player` così una seconda chiamata è un no-op e lo stato è pronto per un
-    /// eventuale `setupVideo` successivo (navigazione verso un altro video).
+    /// Ferma il thread di decodifica (che chiude il container) e l'audio.
+    /// Idempotente: azzera `decoder` così una seconda chiamata è un no-op e lo
+    /// stato è pronto per un eventuale `setupVideo` successivo (navigazione).
     pub fn deinit(self: *VideoState) void {
         if (@import("build_options").video) {
             if (self.audio) |a| a.stopAndDestroy();
             self.audio = null;
+            // Ferma e joina il thread di decodifica PRIMA di tornare: dopo questo
+            // nessuno tocca più il Player (chiuso da stopAndDestroy).
+            if (self.decoder) |d| d.stopAndDestroy();
         }
-        if (self.player) |*p| p.deinit();
-        self.player = null;
+        self.decoder = null;
         // Riporta a sentinella lo stato di riproduzione residuo: un seek o uno
         // scrubbing pendenti non devono applicarsi al PROSSIMO video aperto, e
         // il clock audio precedente non deve inquinare la drift-correction.
         self.seek_to = -1;
         self.scrubbing = false;
-        self.catchup_until = -1;
         self.audio_clk_prev = -1;
         self.audio_only = false;
         self.scope_head = 0;
@@ -128,9 +116,10 @@ pub const FrameSink = struct {
 /// (diventa `static_rgba`).
 pub const VideoFirst = struct { rgba: []u8, w: u32, h: u32 };
 
-/// Apre il player video, decodifica il primo frame (poster) in RGBA e inizializza
-/// `vs` (durata, posizione, temporizzazione, `playing`). Il chiamante prende
-/// possesso di `.rgba` (→ `static_rgba`) e di `vs.player` (chiuso da `deinit`).
+/// Apre il player video su un thread di decodifica dedicato, decodifica il primo
+/// frame (poster) in RGBA e inizializza `vs` (durata, posizione, `playing`). Il
+/// chiamante prende possesso di `.rgba` (→ `static_rgba`) e del decoder in
+/// `vs.decoder` (fermato/chiuso da `deinit`).
 pub fn setupVideo(vs: *VideoState, path: []const u8, gpa: std.mem.Allocator) !VideoFirst {
     // Strippa un eventuale suffisso `#N` (pagina/frammento interno) SOLO se dopo
     // il `#` ci sono esclusivamente cifre: un nome legittimo come "video #1.mp4"
@@ -147,44 +136,33 @@ pub fn setupVideo(vs: *VideoState, path: []const u8, gpa: std.mem.Allocator) !Vi
     const path_z = try gpa.dupeZ(u8, clean);
     defer gpa.free(path_z);
 
-    var p = try player_mod.Player.open(path_z.ptr);
-    errdefer p.deinit();
-    // Il player live emette RGBA prestando il proprio scratch: copialo nel poster di
-    // proprietà del chiamante (→ `static_rgba`) prima che `p` avanzi al frame dopo.
-    const frame = (try p.nextFrame(video_max_dim, gpa)) orelse return error.NoFrameDecoded;
+    const r = try VideoDecoder.start(path_z.ptr, gpa, video_max_dim);
+    errdefer r.dec.stopAndDestroy();
 
-    const w: u32 = @intCast(frame.width);
-    const h: u32 = @intCast(frame.height);
-    const rgba = try gpa.alloc(u8, @as(usize, w) * h * 4);
-    @memcpy(rgba, frame.pixels[0 .. @as(usize, w) * h * 4]);
-
-    vs.dur_s = p.duration_s;
-    vs.pos_s = frame.pts_s;
-    vs.shown_pts = frame.pts_s;
+    vs.dur_s = r.dec.duration_s;
+    vs.pos_s = r.pts_s;
+    vs.shown_pts = r.pts_s;
     vs.playing = true;
-    vs.player = p;
+    vs.decoder = r.dec;
     // Avvia l'audio (handle libav separato + thread). null se il file è muto.
     vs.audio = AudioPlayer.start(path_z.ptr, gpa);
-    return .{ .rgba = rgba, .w = w, .h = h };
+    // Audio come clock master del video: il loop lo coordina il present, non
+    // l'auto-loop del thread audio (vedi campo `loop` in AudioPlayer).
+    if (vs.audio) |a| a.loop.store(false, .monotonic);
+    return .{ .rgba = r.rgba, .w = r.w, .h = r.h };
 }
 
-/// Player + primo frame per la RIACCENSIONE del solo video (toggle 'v'): apre il
-/// container su `path` (file o URL) e decodifica il poster; l'audio in corso non
-/// viene toccato. Il chiamante installa `player` in `VideoState` sotto `mutex`.
-pub const VideoOnly = struct { player: player_mod.Player, rgba: []u8, w: u32, h: u32 };
+/// Decoder + poster per la RIACCENSIONE del solo video (toggle 'v'): apre il
+/// container su `path` (file o URL) e avvia il thread; l'audio in corso non
+/// viene toccato. Il chiamante installa `dec` in `VideoState` sotto `mutex`.
+pub const VideoOnly = struct { dec: *VideoDecoder, rgba: []u8, w: u32, h: u32 };
 
 pub fn openVideoOnly(path: []const u8, gpa: std.mem.Allocator) !VideoOnly {
     if (comptime @import("build_options").video) {
         const path_z = try gpa.dupeZ(u8, path);
         defer gpa.free(path_z);
-        var p = try player_mod.Player.open(path_z.ptr);
-        errdefer p.deinit();
-        const frame = (try p.nextFrame(video_max_dim, gpa)) orelse return error.NoFrameDecoded;
-        const w: u32 = @intCast(frame.width);
-        const h: u32 = @intCast(frame.height);
-        const rgba = try gpa.alloc(u8, @as(usize, w) * h * 4);
-        @memcpy(rgba, frame.pixels[0 .. @as(usize, w) * h * 4]);
-        return .{ .player = p, .rgba = rgba, .w = w, .h = h };
+        const r = try VideoDecoder.start(path_z.ptr, gpa, video_max_dim);
+        return .{ .dec = r.dec, .rgba = r.rgba, .w = r.w, .h = r.h };
     }
     return error.NoVideo;
 }
@@ -201,23 +179,19 @@ pub fn setupStream(vs: *VideoState, video_url: []const u8, audio_url: []const u8
     const aurl_z = try gpa.dupeZ(u8, audio_url);
     defer gpa.free(aurl_z);
 
-    var p = try player_mod.Player.open(vurl_z.ptr);
-    errdefer p.deinit();
-    const frame = (try p.nextFrame(video_max_dim, gpa)) orelse return error.NoFrameDecoded;
+    const r = try VideoDecoder.start(vurl_z.ptr, gpa, video_max_dim);
+    errdefer r.dec.stopAndDestroy();
 
-    const w: u32 = @intCast(frame.width);
-    const h: u32 = @intCast(frame.height);
-    const rgba = try gpa.alloc(u8, @as(usize, w) * h * 4);
-    @memcpy(rgba, frame.pixels[0 .. @as(usize, w) * h * 4]);
-
-    vs.dur_s = p.duration_s;
-    vs.pos_s = frame.pts_s;
-    vs.shown_pts = frame.pts_s;
+    vs.dur_s = r.dec.duration_s;
+    vs.pos_s = r.pts_s;
+    vs.shown_pts = r.pts_s;
     vs.playing = true;
-    vs.player = p;
+    vs.decoder = r.dec;
     // Audio dal SUO URL (stream DASH separato). null se non si apre: video muto.
     vs.audio = AudioPlayer.start(aurl_z.ptr, gpa);
-    return .{ .rgba = rgba, .w = w, .h = h };
+    // Loop coordinato dal present (vedi `loop` in AudioPlayer).
+    if (vs.audio) |a| a.loop.store(false, .monotonic);
+    return .{ .rgba = r.rgba, .w = r.w, .h = r.h };
 }
 
 /// Apre SOLO l'audio di un file (mp3, wav, flac, ogg…) e mette `vs` in modalità
@@ -244,7 +218,7 @@ pub fn setupAudio(vs: *VideoState, path: []const u8, gpa: std.mem.Allocator) !Vi
 
         vs.audio = a;
         vs.audio_only = true;
-        vs.player = null;
+        vs.decoder = null;
         vs.dur_s = a.duration_s;
         vs.pos_s = 0;
         vs.shown_pts = 0;
@@ -254,193 +228,77 @@ pub fn setupAudio(vs: *VideoState, path: []const u8, gpa: std.mem.Allocator) !Vi
     return error.NoAudio;
 }
 
-/// Copia il frame corrente (RGBA, prestato dal player) in `sink.rgba`, riallocando
-/// solo se cambia la dimensione. Non prende possesso di `fr.pixels` (è lo scratch
-/// del player, valido solo fino al prossimo `nextFrame`): va copiato subito.
-fn updateVideoFrame(sink: FrameSink, fr: player_mod.Frame) void {
-    const w: u32 = @intCast(fr.width);
-    const h: u32 = @intCast(fr.height);
-    const need = @as(usize, w) * h * 4;
-    if (sink.rgba.*.len != need) {
-        sink.gpa.free(sink.rgba.*);
-        sink.rgba.* = sink.gpa.alloc(u8, need) catch {
-            sink.rgba.* = &.{};
-            sink.w.* = 0;
-            sink.h.* = 0;
-            return;
-        };
-    }
-    @memcpy(sink.rgba.*, fr.pixels[0..need]);
-    sink.w.* = w;
-    sink.h.* = h;
-}
-
 /// Avanza la riproduzione di `dt` secondi: applica un seek pendente, fa avanzare
-/// `pos_s`, gestisce il loop a fine video e decodifica in avanti finché il frame
-/// mostrato raggiunge `pos_s` (recupero, con tetto di iterazioni per non stallare).
-/// Ritorna `true` se ha aggiornato il frame in `sink.rgba` (→ serve ricomporre).
+/// `pos_s` agganciandolo al clock audio master, gestisce il loop a fine video e
+/// SCEGLIE dalla coda del decoder il frame all'altezza di `pos_s` (scartando i
+/// più vecchi). NON decodifica qui: il thread del decoder produce in anticipo,
+/// quindi uno stallo di rete/decode non blocca il present — che intanto tiene
+/// l'ultimo frame — e il video si riaggancia scartando i frame in ritardo invece
+/// di accumularlo. Ritorna `true` se ha aggiornato il frame in `sink.rgba`.
 pub fn advanceVideo(sink: FrameSink, vs: *VideoState, dt: f32) bool {
+    const dec = vs.decoder orelse return false;
+
+    // 1. Seek richiesto dall'input: svuota la coda del decoder e riposiziona
+    // decoder e audio. `audio_clk_prev` a sentinella così la drift riparte pulita.
     if (vs.seek_to >= 0) {
-        if (vs.player) |*p| p.seek(vs.seek_to);
+        dec.seekAndFlush(vs.seek_to);
         if (comptime @import("build_options").video) {
             if (vs.audio) |a| a.seek(vs.seek_to);
         }
         vs.pos_s = vs.seek_to;
-        vs.shown_pts = vs.seek_to - 1.0; // forza il decode del prossimo frame
-        // Arma il catch-up: dal keyframe (precedente) fino al target si decodifica
-        // senza presentare. Un seek arrivato DURANTE un catch-up passa di qui e
-        // aggiorna semplicemente il target.
-        vs.catchup_until = vs.seek_to;
+        vs.audio_clk_prev = -1;
         vs.seek_to = -1;
-    } else if (vs.catchup_until >= 0) {
-        // Catch-up in corso: `pos_s` resta ancorato al target (niente avanzamento
-        // wall-clock, altrimenti il traguardo si allontana mentre recuperiamo e il
-        // recupero si allunga). L'audio riceve comunque lo stato play/pausa; il
-        // clock precedente viene riallineato così la drift-correction riparte
-        // pulita a recupero finito.
-        if (comptime @import("build_options").video) {
-            if (vs.audio) |a| {
-                a.setPlaying(vs.playing);
-                vs.audio_clk_prev = a.clockSeconds();
-            }
-        }
-        vs.pos_s = vs.catchup_until;
-    } else {
-        // Timing del video. `pos_s` avanza SEMPRE col wall-clock (`dt`), così la
-        // cadenza dei frame è regolare e non eredita gli scatti del clock audio (che
-        // salta a passi di ~20 ms per blocco). Se l'audio DRENA davvero (device
-        // attivo) lo usiamo solo per correggere la DERIVA e restare in sync A/V:
-        // deriva grande (avvio/seek/loop) → resync duro, piccola → nudge morbido
-        // impercettibile. Se l'audio è fermo o assente resta il puro wall-clock, così
-        // il video non si congela mai per colpa dell'audio.
-        var drained = false;
-        var audio_pos: f64 = 0;
-        if (comptime @import("build_options").video) {
-            if (vs.audio) |a| {
-                a.setPlaying(vs.playing);
-                const ac = a.clockSeconds();
-                if (ac > vs.audio_clk_prev + 0.0005) drained = true;
-                vs.audio_clk_prev = ac;
-                audio_pos = ac;
-            }
-        }
-        if (vs.playing) {
-            vs.pos_s += dt;
-            if (drained) {
-                const fps: f64 = if (vs.player) |p| p.frame_rate else 30.0;
-                const threshold: f64 = if (fps > 30.0) 0.035 else 0.065;
-                const err = audio_pos - vs.pos_s;
-                if (@abs(err) > threshold) {
-                    vs.pos_s = audio_pos;
-                    // Audio avanti (video indietro) → arma il catch-up per
-                    // recuperare decodificando senza presentare. Video avanti →
-                    // basta lo snap indietro, non si "recupera" all'indietro.
-                    if (err > 0) vs.catchup_until = audio_pos;
-                } else {
-                    vs.pos_s += err * 0.05;
-                }
-            }
+    }
+
+    // 2. `pos_s` avanza col wall-clock (`dt`) — cadenza regolare, non eredita gli
+    // scatti da ~20 ms del clock audio — e, se l'audio DRENA davvero, si corregge
+    // verso di esso (clock master): deriva grande (avvio/seek/loop) → snap duro,
+    // piccola → nudge impercettibile. Audio fermo o assente → puro wall-clock, così
+    // il video non si congela mai per colpa dell'audio.
+    var drained = false;
+    var audio_pos: f64 = 0;
+    if (comptime @import("build_options").video) {
+        if (vs.audio) |a| {
+            a.setPlaying(vs.playing);
+            const ac = a.clockSeconds();
+            if (ac > vs.audio_clk_prev + 0.0005) drained = true;
+            vs.audio_clk_prev = ac;
+            audio_pos = ac;
         }
     }
-    if (vs.dur_s > 0 and vs.pos_s >= vs.dur_s) {
-        if (vs.player) |*p| p.seek(0);
-        // Loop coordinato video/audio: riavvolgi anche l'audio, altrimenti il suo
-        // auto-rewind a EOF e il seek del video si rincorrono (seek-spam/freeze).
+    if (vs.playing) {
+        vs.pos_s += dt;
+        if (drained) {
+            const threshold: f64 = if (dec.frame_rate > 30.0) 0.035 else 0.065;
+            const err = audio_pos - vs.pos_s;
+            if (@abs(err) > threshold) vs.pos_s = audio_pos else vs.pos_s += err * 0.05;
+        }
+    }
+
+    // 3. Loop a fine video, coordinato con l'audio: durata nota → `pos_s >= dur_s`;
+    // ignota → coda del decoder esaurita a EOF. Riavvolge entrambi e riparte da 0;
+    // la coda è vuota, niente da presentare finché il decoder non la ripopola.
+    const at_end = (vs.dur_s > 0 and vs.pos_s >= vs.dur_s) or
+        (vs.dur_s <= 0 and vs.playing and dec.drained());
+    if (at_end) {
+        dec.seekAndFlush(0);
         if (comptime @import("build_options").video) {
             if (vs.audio) |a| a.seek(0);
         }
         vs.pos_s = 0;
-        vs.shown_pts = -1;
-        // Un target di catch-up oltre la durata non è più raggiungibile dopo il
-        // riavvolgimento: disarmalo, si riparte in riproduzione normale da zero.
-        vs.catchup_until = -1;
-        // Clock audio precedente a sentinella: la drift-correction riparte pulita
-        // dopo il salto all'indietro (il vecchio valore direbbe "clock fermo").
+        vs.shown_pts = 0;
         vs.audio_clk_prev = -1;
+        return false;
     }
-    var decoded_any = false;
-    // Catch-up post-seek: decodifica in un loop a BUDGET DI TEMPO (~8 ms per
-    // chiamata, il worker gira a 120 Hz quindi il recupero prosegue ai giri
-    // successivi) SCARTANDO i frame con pts < target — niente updateVideoFrame,
-    // niente copia nel sink, quindi niente "fast-forward visibile". Il primo
-    // frame con pts >= target viene presentato subito (lo scratch del player è
-    // valido solo fino al prossimo nextFrame: non si può rimandare) e il
-    // catch-up si chiude.
-    if (vs.catchup_until >= 0) {
-        const target = vs.catchup_until;
-        const budget_ms: i64 = 8;
-        const t0 = nowMs();
-        while (nowMs() - t0 < budget_ms) {
-            const p = if (vs.player) |*pl| pl else {
-                vs.catchup_until = -1;
-                break;
-            };
-            const maybe = p.nextFrame(video_max_dim, sink.gpa) catch |err| {
-                // Errore di decode durante il catch-up: logga, disarma e torna
-                // al percorso normale (si riprova frame per frame al giro dopo).
-                std.debug.print("[video] decode in catch-up fallito: {s}\n", .{@errorName(err)});
-                vs.catchup_until = -1;
-                break;
-            };
-            if (maybe) |fr| {
-                if (fr.pts_s >= target) {
-                    // Primo frame al/oltre il target: presentalo e chiudi il catch-up.
-                    updateVideoFrame(sink, fr);
-                    vs.shown_pts = fr.pts_s;
-                    decoded_any = true;
-                    vs.catchup_until = -1;
-                    break;
-                }
-                // Frame intermedio: scartato (mai presentato). `shown_pts` resta
-                // quello del frame in `static_rgba`, coerente col suo contratto.
-            } else {
-                // EOF durante il catch-up (target oltre la coda del file): disarma
-                // e lascia che il percorso normale qui sotto gestisca il loop a 0.
-                vs.catchup_until = -1;
-                break;
-            }
-        }
+
+    // 4. Presenta dalla coda il frame più recente con `pts <= pos_s`, scartando i
+    // più vecchi. Se non è ancora pronto (decoder indietro) tiene l'ultimo frame.
+    const picked = dec.pickInto(vs.pos_s, sink.gpa, sink.rgba, sink.w, sink.h);
+    if (picked.presented) {
+        vs.shown_pts = picked.pts_s;
+        return true;
     }
-    var guard: u32 = 0;
-    // Decodifica AL PIÙ un frame per chiamata: mai un "burst" di catch-up che
-    // congela il present per centinaia di ms. La decodifica (~1 ms) + scaling
-    // (~10 ms) è più veloce del real-time (33 ms @30fps), quindi restando a 1
-    // frame/iterazione il video sta comunque al passo, ma senza scatti.
-    // Con catch-up ancora attivo (budget esaurito) questo loop NON deve girare:
-    // presenterebbe un frame intermedio, l'esatto difetto che stiamo evitando.
-    // In PAUSA non si avanza: `pos_s` (barra) è congelato ma se la decodifica era
-    // in ritardo sul wall-clock `shown_pts` gli è rimasto indietro — senza questo
-    // gate il loop continuerebbe a decodificare un frame per giro per raggiungere
-    // `pos_s`, e l'immagine "continuerebbe a girare" a barra ferma (il seek/scrub
-    // resta comunque coperto dal ramo catch-up qui sopra, che non guarda `playing`).
-    while (vs.playing and vs.catchup_until < 0 and vs.shown_pts < vs.pos_s and guard < 1) : (guard += 1) {
-        // Unwrap guardato come per ogni altro accesso a `vs.player` nella funzione.
-        const p = if (vs.player) |*pl| pl else break;
-        // Errore di decode (packet corrotto a metà file) ≠ EOF: logga e salta il
-        // frame SENZA riavvolgere — si riprova al prossimo giro. Solo il ritorno
-        // `null` (vero fine stream) fa ripartire il loop.
-        const maybe = p.nextFrame(video_max_dim, sink.gpa) catch |err| {
-            std.debug.print("[video] decode frame fallito: {s}\n", .{@errorName(err)});
-            break;
-        };
-        if (maybe) |fr| {
-            updateVideoFrame(sink, fr);
-            vs.shown_pts = fr.pts_s;
-            decoded_any = true;
-        } else {
-            p.seek(0); // EOF → loop
-            // Come nel ramo `pos_s >= dur_s`: riavvolgi anche l'audio e azzera il
-            // clock precedente, così video e audio ripartono insieme da zero.
-            if (comptime @import("build_options").video) {
-                if (vs.audio) |a| a.seek(0);
-            }
-            vs.pos_s = 0;
-            vs.shown_pts = 0;
-            vs.audio_clk_prev = -1;
-            break;
-        }
-    }
-    return decoded_any;
+    return false;
 }
 
 /// Modalità audio-only: aggiorna la temporizzazione (posizione, seek, play/pausa)

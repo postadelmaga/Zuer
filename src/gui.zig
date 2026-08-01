@@ -616,7 +616,7 @@ fn renderWorker(
             // Stato del pacer campionato ANCORA sotto lock (il worker lo rilegge
             // dopo l'unlock); il catch-up post-seek conta come "busy" così il
             // recupero prosegue a 120 Hz anche in pausa.
-            const busy = vs.playing or vs.scrubbing or ctrl_ch or vs.catchup_until >= 0 or yt_anim;
+            const busy = vs.playing or vs.scrubbing or ctrl_ch or yt_anim;
             state.shared.mutex.unlock(state.io);
             // Present FUORI dal lock: `presentRgba` copia subito il buffer (di cui
             // il worker è unico proprietario) nel mailbox di zrame → i callback
