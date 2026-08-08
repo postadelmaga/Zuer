@@ -708,7 +708,16 @@ pub const Player = struct {
 
     /// Decodifica il prossimo frame video, scalato a `max_dim`, con il suo PTS.
     /// Ritorna `null` a fine stream. Il chiamante possiede `Frame.pixels`.
-    pub fn nextFrame(self: *Player, max_dim: usize, allocator: std.mem.Allocator) Error!?Frame {
+    ///
+    /// `skip_before_pts`: se non-null, i frame con pts < questo valore vengono
+    /// scartati internamente (si continua a decodificare finché non se ne trova
+    /// uno all'altezza) SENZA il costo di download GPU→CPU/scaling — solo il
+    /// pts viene calcolato (vedi frameFromCurrent). Usato dal produttore dopo
+    /// un seek per attraversare i frame tra il keyframe di atterraggio e il
+    /// target: senza questo, con VAAPI attivo ogni frame scartato pagherebbe
+    /// comunque il transfer sincrono GPU→CPU, rendendo il seek percepibilmente
+    /// lento sui file con GOP ampie (keyframe rade).
+    pub fn nextFrame(self: *Player, max_dim: usize, allocator: std.mem.Allocator, skip_before_pts: ?f64) Error!?Frame {
         if (comptime cvp9_enabled) {
             if (self.is_vp9) return self.nextFrameCvp9(max_dim, allocator);
         }
@@ -721,7 +730,7 @@ pub const Player = struct {
                 if (r < 0) return null;
                 // Se il download hw fallisse proprio all'ultimo frame (null),
                 // il file finisce qui comunque: nessun frame da recuperare.
-                return try self.frameFromCurrent(max_dim, allocator);
+                return try self.frameFromCurrent(max_dim, allocator, skip_before_pts);
             }
             defer av.av_packet_unref(self.packet);
             if (self.packet.*.stream_index != self.video_stream) continue;
@@ -734,8 +743,8 @@ pub const Player = struct {
                 const rd = av.avcodec_receive_frame(self.codec_ctx, self.frame);
                 if (rd < 0) continue; // stato anomalo: rinuncia a questo packet
                 _ = av.avcodec_send_packet(self.codec_ctx, self.packet);
-                if (try self.frameFromCurrent(max_dim, allocator)) |fr| return fr;
-                continue; // download hw fallito: degradato, prosegui in software
+                if (try self.frameFromCurrent(max_dim, allocator, skip_before_pts)) |fr| return fr;
+                continue; // scartato per pts, o download hw fallito: prosegui
             }
             if (sr < 0) {
                 // A questo punto il device VAAPI è già stato verificato in
@@ -769,17 +778,25 @@ pub const Player = struct {
                 }
                 return Error.NoFrameDecoded;
             }
-            if (try self.frameFromCurrent(max_dim, allocator)) |fr| return fr;
-            continue; // download hw fallito: degradato, prosegui in software
+            if (try self.frameFromCurrent(max_dim, allocator, skip_before_pts)) |fr| return fr;
+            continue; // scartato per pts, o download hw fallito: prosegui
         }
     }
 
-    /// Frame appena decodificato (`self.frame`) → Frame impacchettato. Se il
-    /// decoder ha prodotto un frame VAAPI lo scarica prima in `sw_frame`
+    /// Frame appena decodificato (`self.frame`) → Frame impacchettato. Il pts
+    /// si calcola SUBITO (prima di qualunque download/scaling): se sotto
+    /// `skip_before_pts` il frame è scartato qui, a costo quasi zero — senza
+    /// questo, un frame VAAPI scartato pagherebbe comunque il transfer
+    /// sincrono GPU→CPU (vedi commento su `nextFrame`). Se il decoder ha
+    /// prodotto un frame VAAPI (e non va scartato) lo scarica in `sw_frame`
     /// (GPU→CPU, tipicamente NV12); se il download fallisce degrada l'intera
     /// riproduzione a software e ritorna null: il chiamante prosegue col
     /// prossimo packet, che verrà decodificato dal nuovo contesto software.
-    fn frameFromCurrent(self: *Player, max_dim: usize, allocator: std.mem.Allocator) Error!?Frame {
+    fn frameFromCurrent(self: *Player, max_dim: usize, allocator: std.mem.Allocator, skip_before_pts: ?f64) Error!?Frame {
+        const pts = self.ptsSeconds();
+        if (skip_before_pts) |target| {
+            if (pts < target) return null; // scartato: niente download/scale
+        }
         var src: [*c]c.AVFrame = self.frame;
         if (self.frame.*.format == c.AV_PIX_FMT_VAAPI) {
             var ok = self.sw_frame != null;
@@ -795,10 +812,6 @@ pub const Player = struct {
                 if (!self.reopenSoftware()) return Error.NoFrameDecoded;
                 return null;
             }
-            // Timestamp del frame hw anche sul frame scaricato, per coerenza
-            // (ptsSeconds legge comunque self.frame, che li possiede).
-            self.sw_frame.*.pts = self.frame.*.pts;
-            self.sw_frame.*.best_effort_timestamp = self.frame.*.best_effort_timestamp;
             src = self.sw_frame;
         } else if (self.hw_active) {
             // Il device VAAPI è già stato verificato in apertura (vedi
@@ -812,7 +825,7 @@ pub const Player = struct {
             }
             if (!self.reopenSoftware()) return Error.NoFrameDecoded;
         }
-        return try self.scaleCurrent(src, max_dim, allocator);
+        return try self.scaleCurrent(src, max_dim, allocator, pts);
     }
 
     /// Riapre il codec context in software puro dopo un fallimento runtime del
@@ -908,7 +921,7 @@ pub const Player = struct {
     /// Converte `src` (self.frame, oppure sw_frame dopo il download VAAPI) in
     /// pixel impacchettati scalati a `max_dim`. ensureSws è keyed anche sul
     /// formato sorgente, quindi il passaggio dinamico YUV420P↔NV12 è coperto.
-    fn scaleCurrent(self: *Player, src: [*c]c.AVFrame, max_dim: usize, allocator: std.mem.Allocator) Error!Frame {
+    fn scaleCurrent(self: *Player, src: [*c]c.AVFrame, max_dim: usize, allocator: std.mem.Allocator, pts_s: f64) Error!Frame {
         const src_w = src.*.width;
         const src_h = src.*.height;
         const dims = fitDims(src_w, src_h, max_dim);
@@ -922,7 +935,7 @@ pub const Player = struct {
         var dst_linesize = [_]c_int{ @intCast(w * self.out_bpp), 0, 0, 0 };
         _ = av.sws_scale(self.sws, &src.*.data[0], &src.*.linesize[0], 0, src_h, &dst_data[0], &dst_linesize[0]);
 
-        return .{ .width = w, .height = h, .pixels = pixels, .pts_s = self.ptsSeconds() };
+        return .{ .width = w, .height = h, .pixels = pixels, .pts_s = pts_s };
     }
 
     /// Riposiziona la riproduzione a `seconds` (approssimato al keyframe più
@@ -966,5 +979,5 @@ pub fn firstVideoFrame(path: [*:0]const u8, max_dim: usize, allocator: std.mem.A
     // costo di un contesto GPU cvp9.
     var player = try Player.openEx(path, false);
     defer player.deinit();
-    return (try player.nextFrame(max_dim, allocator)) orelse Error.NoFrameDecoded;
+    return (try player.nextFrame(max_dim, allocator, null)) orelse Error.NoFrameDecoded;
 }

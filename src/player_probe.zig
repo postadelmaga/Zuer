@@ -29,7 +29,7 @@ pub fn main(init: std.process.Init) !void {
     // NB: col player live `frame.pixels` è PRESTATO (scratch interno del player,
     // liberato da `p.deinit`): liberarlo qui manderebbe la sws_scale del frame
     // successivo a scrivere su memoria morta (segfault in libswscale).
-    while (try p.nextFrame(320, gpa)) |frame| {
+    while (try p.nextFrame(320, gpa, null)) |frame| {
         if (count == 0) first_dims = .{ frame.width, frame.height };
         count += 1;
         last_pts = frame.pts_s;

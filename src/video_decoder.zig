@@ -79,7 +79,7 @@ pub const VideoDecoder = struct {
     pub fn start(path_z: [*:0]const u8, gpa: std.mem.Allocator, max_dim: usize) !StartResult {
         var p = try player_mod.Player.open(path_z);
         errdefer p.deinit();
-        const frame = (try p.nextFrame(max_dim, gpa)) orelse return error.NoFrameDecoded;
+        const frame = (try p.nextFrame(max_dim, gpa, null)) orelse return error.NoFrameDecoded;
         const w: u32 = @intCast(frame.width);
         const h: u32 = @intCast(frame.height);
         const need = @as(usize, w) * h * 4;
@@ -202,9 +202,10 @@ pub const VideoDecoder = struct {
         var prod_gen: u32 = self.gen.load(.monotonic);
         // Soglia post-seek (-1 = nessuna): `seek(BACKWARD)` atterra al keyframe
         // PRECEDENTE il target, quindi i primi frame decodificati sono pre-target.
-        // Vanno SCARTATI qui (non accodati), altrimenti — con la coda di sole CAP
-        // posizioni — sfilerebbero nel present a velocità di decodifica (fast
-        // forward). Come lo `skip_until_s` del thread audio.
+        // Passata a `nextFrame`, che li scarta INTERNAMENTE a costo quasi zero
+        // (niente download/scale, vedi player.zig) — altrimenti, con la coda di
+        // sole CAP posizioni, sfilerebbero nel present a velocità di decodifica
+        // (fast forward). Come lo `skip_until_s` del thread audio.
         var prod_skip_until: f64 = -1;
         while (!self.stop.load(.monotonic)) {
             const sk = self.seek_ms.swap(-1, .monotonic);
@@ -228,7 +229,7 @@ pub const VideoDecoder = struct {
             }
             if (self.stop.load(.monotonic) or self.seek_ms.load(.monotonic) >= 0) continue;
 
-            const maybe = self.player.nextFrame(self.max_dim, self.gpa) catch {
+            const maybe = self.player.nextFrame(self.max_dim, self.gpa, if (prod_skip_until >= 0) prod_skip_until else null) catch {
                 // Errore di decode (packet corrotto) ≠ EOF: salta e riprova.
                 sleepMs(4);
                 continue;
@@ -240,12 +241,10 @@ pub const VideoDecoder = struct {
             // Un seek è arrivato mentre decodificavamo: scarta questo frame (è
             // della posizione vecchia), lo gestiamo al prossimo giro.
             if (self.seek_ms.load(.monotonic) >= 0) continue;
-            // Scarta i frame tra il keyframe e il target (mai accodati): il primo
-            // frame >= target chiude lo skip e viene accodato normalmente.
-            if (prod_skip_until >= 0) {
-                if (fr.pts_s < prod_skip_until) continue;
-                prod_skip_until = -1;
-            }
+            // Il Player ha già scartato internamente i frame pre-target (senza
+            // download/scale, vedi nextFrame/skip_before_pts): quello ricevuto
+            // è già >= target, lo skip è chiuso.
+            prod_skip_until = -1;
 
             const w: u32 = @intCast(fr.width);
             const h: u32 = @intCast(fr.height);
