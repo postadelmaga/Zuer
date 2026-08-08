@@ -479,8 +479,12 @@ pub const Player = struct {
         return self.scratch[0..need];
     }
 
-    /// `allow_cvp9` = consenti il decoder GPU per gli stream VP9. Il poster
-    /// (`firstVideoFrame`) passa false: un solo frame non giustifica un contesto GPU.
+    /// `allow_cvp9` = consenti il decoder GPU per gli stream VP9 E la sonda
+    /// hardware VAAPI per H.264/HEVC. Il poster (`firstVideoFrame`) passa
+    /// false: un solo frame non giustifica un contesto GPU, VAAPI incluso —
+    /// e il file explorer genera i thumbnail in background mentre l'utente
+    /// può avere un video in riproduzione live: niente contesa di sessioni
+    /// hardware concorrenti sulla stessa GPU.
     pub fn openEx(path: [*:0]const u8, allow_cvp9: bool) Error!Player {
         if (!ensureAv()) return Error.OpenFailed; // libav assente o soname disallineato
         var fmt_ctx: [*c]c.AVFormatContext = null;
@@ -534,27 +538,39 @@ pub const Player = struct {
         // device a metà riproduzione (perderebbe lo stato dei frame di
         // riferimento). Nessun device apribile → software puro, in silenzio (il
         // log è più giù).
+        //
+        // Solo per `allow_cvp9`: il poster one-shot (`firstVideoFrame`, un solo
+        // frame) NON prova mai VAAPI, stessa logica del commento su
+        // `allow_cvp9` sopra ("un solo frame non giustifica un contesto GPU").
+        // Il file explorer genera i thumbnail dei video in background mentre
+        // l'utente può aprirne uno in riproduzione live: più Player in hardware
+        // concorrenti sulla stessa iGPU hanno saturato in pratica il decoder
+        // fisso (VA_STATUS_ERROR_DECODING_ERROR) — il poster non ne trae comunque
+        // beneficio percepibile, quindi meglio non contendere risorse.
         var hw_devices: [max_hw_devices][max_hw_device_path]u8 = undefined;
-        const hw_device_count = if (comptime builtin.os.tag == .linux) listHwDevices(&hw_devices) else 0;
+        var hw_device_count: u8 = 0;
         var hw_device_idx: u8 = 0;
-        if (hw_device_count > 0) {
-            var i: u8 = 0;
-            while (i < hw_device_count) : (i += 1) {
-                const dev_path: [*:0]const u8 = std.mem.sliceTo(@as([*]const u8, &hw_devices[i]), 0).ptr;
-                if (probeHwDevice(codec, stream, dev_path, fmt_ctx, stream_idx, packet, frame)) |opened| {
-                    codec_ctx = opened.codec_ctx;
-                    hw_device_ctx = opened.hw_device_ctx;
-                    use_hw = true;
-                    hw_device_idx = i;
-                    break;
+        if (allow_cvp9) {
+            hw_device_count = if (comptime builtin.os.tag == .linux) listHwDevices(&hw_devices) else 0;
+            if (hw_device_count > 0) {
+                var i: u8 = 0;
+                while (i < hw_device_count) : (i += 1) {
+                    const dev_path: [*:0]const u8 = std.mem.sliceTo(@as([*]const u8, &hw_devices[i]), 0).ptr;
+                    if (probeHwDevice(codec, stream, dev_path, fmt_ctx, stream_idx, packet, frame)) |opened| {
+                        codec_ctx = opened.codec_ctx;
+                        hw_device_ctx = opened.hw_device_ctx;
+                        use_hw = true;
+                        hw_device_idx = i;
+                        break;
+                    }
                 }
+            } else if (probeHwDevice(codec, stream, null, fmt_ctx, stream_idx, packet, frame)) |opened| {
+                // Nessun render node enumerabile (non-Linux, o sistema senza DRM):
+                // prova comunque il device di default del sistema.
+                codec_ctx = opened.codec_ctx;
+                hw_device_ctx = opened.hw_device_ctx;
+                use_hw = true;
             }
-        } else if (probeHwDevice(codec, stream, null, fmt_ctx, stream_idx, packet, frame)) |opened| {
-            // Nessun render node enumerabile (non-Linux, o sistema senza DRM):
-            // prova comunque il device di default del sistema.
-            codec_ctx = opened.codec_ctx;
-            hw_device_ctx = opened.hw_device_ctx;
-            use_hw = true;
         }
 
         if (!use_hw) {
