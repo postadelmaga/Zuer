@@ -751,16 +751,16 @@ pub const Player = struct {
                 // apertura (Player.openEx prova ogni device e ne conferma la
                 // resa hardware reale prima di tornare al chiamante): un
                 // errore qui è un cedimento runtime genuino (non un profilo
-                // non supportato scoperto tardi). Degrada a software diretto,
-                // senza ritentare altri device — cambiare contesto a metà
-                // stream perde lo stato dei frame di riferimento ed è
+                // non supportato scoperto tardi). Un fallimento come questo
+                // (es. "Failed to end picture decode") lascia il codec context
+                // hwaccel in stato indefinito: continuare a sottomettere
+                // packet allo STESSO contesto corrompe la memoria (visto in
+                // pratica: double free dentro libavcodec). Degrada a software
+                // diretto, senza ritentare altri device — cambiare contesto a
+                // metà stream perde lo stato dei frame di riferimento ed è
                 // difficile da recuperare su contenuti con keyframe rade.
                 if (self.hw_active) {
-                    if (!self.hw_warned) {
-                        self.hw_warned = true;
-                        std.log.warn("zuer video: errore VAAPI runtime, degrado a decodifica software", .{});
-                    }
-                    if (!self.reopenSoftware()) return Error.NoFrameDecoded;
+                    if (!self.hwFail("errore VAAPI runtime")) return Error.NoFrameDecoded;
                 }
                 continue; // errore vero: packet inservibile
             }
@@ -769,11 +769,7 @@ pub const Player = struct {
             if (r == c.AVERROR_EOF) return null;
             if (r < 0) {
                 if (self.hw_active) {
-                    if (!self.hw_warned) {
-                        self.hw_warned = true;
-                        std.log.warn("zuer video: errore VAAPI runtime, degrado a decodifica software", .{});
-                    }
-                    if (!self.reopenSoftware()) return Error.NoFrameDecoded;
+                    if (!self.hwFail("errore VAAPI runtime")) return Error.NoFrameDecoded;
                     continue;
                 }
                 return Error.NoFrameDecoded;
@@ -805,11 +801,7 @@ pub const Player = struct {
                 ok = av.av_hwframe_transfer_data(self.sw_frame, self.frame, 0) >= 0;
             }
             if (!ok) {
-                if (!self.hw_warned) {
-                    self.hw_warned = true;
-                    std.log.warn("zuer video: download frame VAAPI fallito, degrado a decodifica software", .{});
-                }
-                if (!self.reopenSoftware()) return Error.NoFrameDecoded;
+                if (!self.hwFail("download frame VAAPI fallito")) return Error.NoFrameDecoded;
                 return null;
             }
             src = self.sw_frame;
@@ -826,6 +818,20 @@ pub const Player = struct {
             if (!self.reopenSoftware()) return Error.NoFrameDecoded;
         }
         return try self.scaleCurrent(src, max_dim, allocator, pts);
+    }
+
+    /// Logga (una sola volta) e degrada a software dopo un fallimento runtime
+    /// del percorso VAAPI. Nessun tentativo di continuare col contesto
+    /// hwaccel già fallito: un errore come "Failed to end picture decode" lo
+    /// lascia in stato indefinito, e sottomettergli altri packet corrompe la
+    /// memoria (visto in pratica). Ritorna false solo se reopenSoftware
+    /// fallisce (player non più utilizzabile).
+    fn hwFail(self: *Player, comptime msg: []const u8) bool {
+        if (!self.hw_warned) {
+            self.hw_warned = true;
+            std.log.warn("zuer video: " ++ msg ++ ", degrado a decodifica software", .{});
+        }
+        return self.reopenSoftware();
     }
 
     /// Riapre il codec context in software puro dopo un fallimento runtime del
