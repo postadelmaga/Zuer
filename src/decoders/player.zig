@@ -36,10 +36,12 @@ const cvp9 = if (cvp9_enabled) @import("cvp9.zig") else struct {};
 
 // ── libav a runtime ──────────────────────────────────────────────────────────
 // Le firme vengono dagli header (@TypeOf sui simboli del cImport), quindi
-// restano allineate da sole. Su Linux i campi puntano agli extern del link
-// diretto (LinkAv); su Windows l'exe NON linka le import lib: le DLL si
-// caricano al primo video (`ensureAv`) e l'app parte anche senza FFmpeg —
-// i file multimediali danno errore, tutto il resto funziona.
+// restano allineate da sole. Nei build a link diretto (plugin media, player_dbg)
+// i campi puntano agli extern del link diretto (LinkAv); in zuer-gui (Linux e
+// Windows) l'exe NON linka le lib: si caricano al primo video (`ensureAv`, dlopen
+// su Linux/LoadLibrary su Windows) e l'app parte anche senza FFmpeg o con un
+// FFmpeg di sistema disallineato — i file multimediali danno errore, tutto il
+// resto (incluso aprire un semplice file di testo) non tocca mai libav.
 
 const bo = @import("build_options");
 const av_dynamic = @hasDecl(bo, "av_runtime") and bo.av_runtime;
@@ -93,33 +95,39 @@ const av_static: AvApi = if (av_dynamic) undefined else blk: {
     break :blk t;
 };
 
-var av_win_table: AvApi = undefined;
+var av_runtime_table: AvApi = undefined;
 var av_state: enum { unloaded, ok, failed } = if (av_dynamic) .unloaded else .ok;
 var av_mutex: std.atomic.Mutex = .unlocked;
 
 /// Le funzioni libav, pronte all'uso DOPO un `ensureAv()` riuscito.
-pub const av: *const AvApi = if (av_dynamic) &av_win_table else &av_static;
+pub const av: *const AvApi = if (av_dynamic) &av_runtime_table else &av_static;
 
-/// Nomi DLL versionati derivati dagli header vendorati (es. "avcodec-63.dll").
-fn dllName(comptime base: []const u8, comptime major: u32) [:0]const u8 {
-    return std.fmt.comptimePrint("{s}-{d}.dll", .{ base, major });
+/// Nome di libreria versionato derivato dagli header (es. "avcodec-63.dll" su
+/// Windows, "libavcodec.so.63" su Linux): build e runtime restano allineati da
+/// soli, e un ffmpeg di sistema con soname diverso non fa fallire l'avvio —
+/// solo l'apertura di un video (vedi `ensureAvRuntime`).
+fn libName(comptime base: []const u8, comptime major: u32) [:0]const u8 {
+    return switch (builtin.os.tag) {
+        .windows => std.fmt.comptimePrint("{s}-{d}.dll", .{ base, major }),
+        else => std.fmt.comptimePrint("lib{s}.so.{d}", .{ base, major }),
+    };
 }
 
 /// In ordine di dipendenza (avutil prima di tutti). File-scope: il nome deve
-/// essere comptime-known per la conversione UTF-16 nell'inline for.
-const av_dll_names = [_][:0]const u8{
-    dllName("avutil", c.LIBAVUTIL_VERSION_MAJOR),
-    dllName("swresample", c.LIBSWRESAMPLE_VERSION_MAJOR),
-    dllName("swscale", c.LIBSWSCALE_VERSION_MAJOR),
-    dllName("avcodec", c.LIBAVCODEC_VERSION_MAJOR),
-    dllName("avformat", c.LIBAVFORMAT_VERSION_MAJOR),
+/// essere comptime-known per la conversione UTF-16 nell'inline for (Windows).
+const av_lib_names = [_][:0]const u8{
+    libName("avutil", c.LIBAVUTIL_VERSION_MAJOR),
+    libName("swresample", c.LIBSWRESAMPLE_VERSION_MAJOR),
+    libName("swscale", c.LIBSWSCALE_VERSION_MAJOR),
+    libName("avcodec", c.LIBAVCODEC_VERSION_MAJOR),
+    libName("avformat", c.LIBAVFORMAT_VERSION_MAJOR),
 };
 
-/// true se libav è utilizzabile. Su Windows carica le 5 DLL al primo uso
-/// (accanto all'exe o nel search path standard) e risolve la tabella; un
-/// fallimento è ricordato e i media restituiscono errore senza riprovare.
+/// true se libav è utilizzabile. Carica le librerie al primo uso (LoadLibrary su
+/// Windows, dlopen su Linux) e risolve la tabella; un fallimento è ricordato e i
+/// media restituiscono errore senza riprovare.
 pub fn ensureAv() bool {
-    // Ramo comptime: nei build a link diretto (Linux, plugin media, player_dbg)
+    // Ramo comptime: nei build a link diretto (plugin media, player_dbg)
     // ensureAvRuntime non viene mai analizzata (né il suo import di dynlib).
     if (comptime !av_dynamic) return true;
     return ensureAvRuntime();
@@ -133,6 +141,7 @@ fn ensureAvRuntime() bool {
         extern "kernel32" fn FreeLibrary(mod: *anyopaque) callconv(.winapi) i32;
         extern "kernel32" fn GetProcAddress(mod: *anyopaque, name: [*:0]const u8) callconv(.winapi) ?*anyopaque;
     };
+    const is_win = comptime builtin.os.tag == .windows;
 
     while (!av_mutex.tryLock()) {
         std.Thread.yield() catch {};
@@ -145,24 +154,29 @@ fn ensureAvRuntime() bool {
     }
     av_state = .failed;
 
-    var libs: [av_dll_names.len]*anyopaque = undefined;
+    var libs: [av_lib_names.len]*anyopaque = undefined;
     var opened: usize = 0;
-    inline for (av_dll_names, 0..) |n, i| {
-        const wide = comptime std.unicode.utf8ToUtf16LeStringLiteral(n);
-        libs[i] = win.LoadLibraryW(wide) orelse {
+    inline for (av_lib_names, 0..) |n, i| {
+        libs[i] = (if (is_win) blk: {
+            const wide = comptime std.unicode.utf8ToUtf16LeStringLiteral(n);
+            break :blk win.LoadLibraryW(wide);
+        } else std.c.dlopen(n.ptr, .{ .NOW = true })) orelse {
             std.debug.print("zuer: libav non disponibile ({s} mancante): niente audio/video\n", .{n});
-            for (libs[0..opened]) |l| _ = win.FreeLibrary(l);
+            for (libs[0..opened]) |l| {
+                if (is_win) _ = win.FreeLibrary(l) else _ = std.c.dlclose(l);
+            }
             return false;
         };
         opened += 1;
     }
-    // Le DLL restano caricate per la vita del processo (mai chiuse): i puntatori
-    // della tabella vivono dentro di loro.
+    // Le librerie restano caricate per la vita del processo (mai chiuse): i
+    // puntatori della tabella vivono dentro di loro.
     inline for (@typeInfo(AvApi).@"struct".fields) |f| {
         var found = false;
         for (libs) |l| {
-            if (win.GetProcAddress(l, f.name)) |p| {
-                @field(av_win_table, f.name) = @ptrCast(@alignCast(p));
+            const sym = if (is_win) win.GetProcAddress(l, f.name) else std.c.dlsym(l, f.name);
+            if (sym) |p| {
+                @field(av_runtime_table, f.name) = @ptrCast(@alignCast(p));
                 found = true;
                 break;
             }
@@ -311,7 +325,7 @@ pub const Player = struct {
     /// `allow_cvp9` = consenti il decoder GPU per gli stream VP9. Il poster
     /// (`firstVideoFrame`) passa false: un solo frame non giustifica un contesto GPU.
     pub fn openEx(path: [*:0]const u8, allow_cvp9: bool) Error!Player {
-        if (!ensureAv()) return Error.OpenFailed; // Windows: DLL FFmpeg assenti
+        if (!ensureAv()) return Error.OpenFailed; // libav assente o soname disallineato
         var fmt_ctx: [*c]c.AVFormatContext = null;
         if (av.avformat_open_input(&fmt_ctx, path, null, null) != 0) return Error.OpenFailed;
         errdefer av.avformat_close_input(&fmt_ctx);

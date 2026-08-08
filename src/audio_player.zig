@@ -96,7 +96,7 @@ pub const AudioPlayer = struct {
     /// Apre l'audio del file e avvia il thread. `null` (senza errore) se il file
     /// non ha stream audio o il device non si apre → il video va muto.
     pub fn start(path_z: [*:0]const u8, gpa: std.mem.Allocator) ?*AudioPlayer {
-        if (!player.ensureAv()) return null; // Windows: DLL FFmpeg assenti
+        if (!player.ensureAv()) return null; // libav assente o soname disallineato
         return startInner(path_z, gpa) catch null;
     }
 
