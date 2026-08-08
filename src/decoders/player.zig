@@ -250,6 +250,157 @@ fn pickVaapiFormat(ctx: [*c]c.AVCodecContext, fmts: [*c]const c.enum_AVPixelForm
 /// cambia, non a ogni open (i poster aprono un Player per ogni anteprima).
 var vaapi_last_logged: ?bool = null;
 
+const max_hw_devices = 8;
+const max_hw_device_path = 32; // "/dev/dri/renderD255\0" basta e avanza
+
+/// Enumera i render node VAAPI (/dev/dri/renderD*), ordinati per nome. Su
+/// sistemi multi-GPU (iGPU + dGPU) il device scelto di default dal driver non
+/// è detto sia quello capace del profilo dello stream: es. iGPU Intel con
+/// H.264 High Profile completo + dGPU NVIDIA via nouveau, che spesso non lo
+/// supporta. Si prova ogni device in ordine finché uno decodifica davvero in
+/// hardware (vedi probeHwDevice, chiamata da Player.openEx). Nessuna
+/// directory/device trovato → 0, in silenzio (non-Linux, o sistema senza DRM).
+fn listHwDevices(out: *[max_hw_devices][max_hw_device_path]u8) u8 {
+    // libc diretto (opendir/readdir), non std.Io.Dir: Player.openEx non riceve
+    // un `io: std.Io` (troppi chiamanti da rivedere, incl. il thread produttore
+    // in video_decoder.zig) — stesso principio di decoder.zig (readFileLibc
+    // ecc.): evita di infilare `std.Io` in un percorso che oggi non lo usa.
+    const dir = std.c.opendir("/dev/dri") orelse return 0;
+    defer _ = std.c.closedir(dir);
+    var count: u8 = 0;
+    while (count < max_hw_devices) {
+        const entry = std.c.readdir(dir) orelse break;
+        const name = std.mem.sliceTo(@as([*]const u8, &entry.name), 0);
+        if (!std.mem.startsWith(u8, name, "renderD")) continue;
+        _ = std.fmt.bufPrintZ(&out[count], "/dev/dri/{s}", .{name}) catch continue;
+        count += 1;
+    }
+    std.mem.sort([max_hw_device_path]u8, out[0..count], {}, struct {
+        fn lt(_: void, a: [max_hw_device_path]u8, b: [max_hw_device_path]u8) bool {
+            return std.mem.lessThan(u8, std.mem.sliceTo(&a, 0), std.mem.sliceTo(&b, 0));
+        }
+    }.lt);
+    return count;
+}
+
+const OpenedHw = struct { codec_ctx: [*c]c.AVCodecContext, hw_device_ctx: [*c]c.AVBufferRef };
+
+/// Tenta di aprire `codec` in hardware sul device VAAPI `device_path`
+/// (`null` = device di default del sistema). Verifica che il decoder supporti
+/// il metodo hw_device_ctx e che `avcodec_open2` riesca; NON garantisce che il
+/// profilo dello stream sia davvero decodificato in hardware (lo si scopre
+/// solo al primo frame: alcuni driver accettano il device e la open ma
+/// ricadono in software silenziosamente dentro avcodec_send_packet/
+/// receive_frame — vedi probeHwDevice, che verifica anche questo). Ritorna
+/// null e libera tutto se un qualsiasi passo fallisce: il chiamante prova il
+/// device successivo o degrada a software.
+fn tryOpenVaapiDevice(
+    codec: [*c]const c.AVCodec,
+    stream: [*c]c.AVStream,
+    device_path: ?[*:0]const u8,
+) ?OpenedHw {
+    var hw_device_ctx: [*c]c.AVBufferRef = null;
+    const dev_c: [*c]const u8 = if (device_path) |p| p else null;
+    if (av.av_hwdevice_ctx_create(&hw_device_ctx, c.AV_HWDEVICE_TYPE_VAAPI, dev_c, null, 0) < 0) return null;
+
+    var supported = false;
+    var ci: c_int = 0;
+    while (av.avcodec_get_hw_config(codec, ci)) |cfg| : (ci += 1) {
+        if ((cfg.*.methods & c.AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) != 0 and
+            cfg.*.device_type == c.AV_HWDEVICE_TYPE_VAAPI)
+        {
+            supported = true;
+            break;
+        }
+    }
+    if (!supported) {
+        av.av_buffer_unref(&hw_device_ctx);
+        return null;
+    }
+
+    const codec_ctx = av.avcodec_alloc_context3(codec) orelse {
+        av.av_buffer_unref(&hw_device_ctx);
+        return null;
+    };
+    if (av.avcodec_parameters_to_context(codec_ctx, stream.*.codecpar) < 0) {
+        var cc: [*c]c.AVCodecContext = codec_ctx;
+        av.avcodec_free_context(&cc);
+        av.av_buffer_unref(&hw_device_ctx);
+        return null;
+    }
+    const dev_ref = av.av_buffer_ref(hw_device_ctx);
+    if (dev_ref == null) {
+        var cc: [*c]c.AVCodecContext = codec_ctx;
+        av.avcodec_free_context(&cc);
+        av.av_buffer_unref(&hw_device_ctx);
+        return null;
+    }
+    codec_ctx.*.hw_device_ctx = dev_ref;
+    codec_ctx.*.get_format = pickVaapiFormat;
+    // Con VAAPI il frame-threading non serve (decodifica la GPU) e aggiunge
+    // solo latenza di pipeline: un thread solo, tipi azzerati.
+    codec_ctx.*.thread_count = 1;
+    codec_ctx.*.thread_type = 0;
+    if (av.avcodec_open2(codec_ctx, codec, null) < 0) {
+        var cc: [*c]c.AVCodecContext = codec_ctx;
+        av.avcodec_free_context(&cc);
+        av.av_buffer_unref(&hw_device_ctx);
+        return null;
+    }
+    return .{ .codec_ctx = codec_ctx, .hw_device_ctx = hw_device_ctx };
+}
+
+/// Come tryOpenVaapiDevice, ma verifica ANCHE che il primo frame dello stream
+/// sia davvero decodificato in hardware (`AV_PIX_FMT_VAAPI`), non solo che
+/// l'apertura riesca: alcuni driver (es. nouveau) accettano il device e la
+/// open ma poi ricadono in software in silenzio dentro
+/// avcodec_send_packet/receive_frame — lo si scopre solo decodificando.
+/// Riavvolge SEMPRE il demuxer all'inizio dello stream dopo il tentativo
+/// (successo o fallimento) con `av_seek_frame` + `avcodec_flush_buffers`:
+/// scambiare il codec context a metà stream perde lo stato dei frame di
+/// riferimento e su contenuti con keyframe rade il decoder non si riprende
+/// più (visto in pratica: passare device dopo aver già consumato packet
+/// troncava la riproduzione a metà file). Va quindi deciso PRIMA di
+/// consegnare il primo frame al chiamante, mai a decodifica già iniziata.
+/// `probe_packet`/`probe_frame` sono riusati (verranno anche i frame/packet
+/// definitivi del Player): a questo punto dell'apertura sono ancora vuoti.
+fn probeHwDevice(
+    codec: [*c]const c.AVCodec,
+    stream: [*c]c.AVStream,
+    device_path: ?[*:0]const u8,
+    fmt_ctx: [*c]c.AVFormatContext,
+    stream_idx: c_int,
+    probe_packet: [*c]c.AVPacket,
+    probe_frame: [*c]c.AVFrame,
+) ?OpenedHw {
+    const opened = tryOpenVaapiDevice(codec, stream, device_path) orelse return null;
+    var real_hw = false;
+    var tries: u32 = 0;
+    while (tries < 64) : (tries += 1) {
+        const rr = av.av_read_frame(fmt_ctx, probe_packet);
+        if (rr < 0) break; // EOF prematuro: niente da verificare, considera fallito
+        defer av.av_packet_unref(probe_packet);
+        if (probe_packet.*.stream_index != stream_idx) continue;
+        const sr = av.avcodec_send_packet(opened.codec_ctx, probe_packet);
+        if (sr < 0 and sr != c.AVERROR(c.EAGAIN)) break;
+        const r = av.avcodec_receive_frame(opened.codec_ctx, probe_frame);
+        if (r == c.AVERROR(c.EAGAIN)) continue;
+        if (r < 0) break;
+        real_hw = probe_frame.*.format == c.AV_PIX_FMT_VAAPI;
+        break;
+    }
+    // Sempre: il chiamante (prossimo device, o il player stesso se abbiamo
+    // vinto) deve poter iniziare la decodifica vera dal frame 0.
+    _ = av.av_seek_frame(fmt_ctx, stream_idx, 0, c.AVSEEK_FLAG_BACKWARD);
+    av.avcodec_flush_buffers(opened.codec_ctx);
+    if (real_hw) return opened;
+    var cc: [*c]c.AVCodecContext = opened.codec_ctx;
+    av.avcodec_free_context(&cc);
+    var hw_ref: [*c]c.AVBufferRef = opened.hw_device_ctx;
+    av.av_buffer_unref(&hw_ref);
+    return null;
+}
+
 pub const Player = struct {
     fmt_ctx: [*c]c.AVFormatContext,
     codec_ctx: [*c]c.AVCodecContext,
@@ -286,6 +437,12 @@ pub const Player = struct {
     sw_frame: [*c]c.AVFrame = null,
     hw_active: bool = false,
     hw_warned: bool = false,
+    // Render node VAAPI scoperti all'apertura (sistemi multi-GPU: iGPU + dGPU)
+    // e indice di quello scelto (verificato, vedi probeHwDevice), solo per il
+    // log diagnostico.
+    hw_devices: [max_hw_devices][max_hw_device_path]u8 = undefined,
+    hw_device_count: u8 = 0,
+    hw_device_idx: u8 = 0,
 
     // Formato di uscita e buffer di scaling. Il player live (`Player.open`) emette
     // RGBA (il formato di presentazione) riusando `scratch`: niente malloc per-frame
@@ -345,63 +502,65 @@ pub const Player = struct {
         if (allow_cvp9 and (stream.*.disposition & c.AV_DISPOSITION_ATTACHED_PIC) != 0)
             return Error.NoVideoStream;
 
-        var codec_ctx = av.avcodec_alloc_context3(codec) orelse return Error.AllocFailed;
+        var codec_ctx: [*c]c.AVCodecContext = null;
         errdefer {
             var cc: [*c]c.AVCodecContext = codec_ctx;
             av.avcodec_free_context(&cc);
         }
-        if (av.avcodec_parameters_to_context(codec_ctx, stream.*.codecpar) < 0) return Error.CodecOpenFailed;
-
-        // Decodifica hardware VAAPI: prova il device di default (/dev/dri) e
-        // verifica che il decoder supporti il metodo hw_device_ctx con VAAPI.
-        // Qualsiasi mancanza → software puro, in silenzio (il log è più giù).
-        // Il pix_fmt hw per VAAPI è sempre AV_PIX_FMT_VAAPI: pickVaapiFormat lo
-        // usa come costante, senza bisogno di stato condiviso col callback.
         var hw_device_ctx: [*c]c.AVBufferRef = null;
         errdefer av.av_buffer_unref(&hw_device_ctx);
         var use_hw = false;
-        if (av.av_hwdevice_ctx_create(&hw_device_ctx, c.AV_HWDEVICE_TYPE_VAAPI, null, null, 0) >= 0) {
-            var ci: c_int = 0;
-            while (av.avcodec_get_hw_config(codec, ci)) |cfg| : (ci += 1) {
-                if ((cfg.*.methods & c.AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) != 0 and
-                    cfg.*.device_type == c.AV_HWDEVICE_TYPE_VAAPI)
-                {
+
+        // Frame/packet allocati ORA (non più giù): servono già per la sonda hw
+        // qui sotto, poi diventano i frame/packet definitivi del player — nessuna
+        // doppia allocazione.
+        const frame = av.av_frame_alloc() orelse return Error.AllocFailed;
+        errdefer {
+            var f: [*c]c.AVFrame = frame;
+            av.av_frame_free(&f);
+        }
+        const packet = av.av_packet_alloc() orelse return Error.AllocFailed;
+        errdefer {
+            var p: [*c]c.AVPacket = packet;
+            av.av_packet_free(&p);
+        }
+
+        // Decodifica hardware VAAPI: su Linux prova ogni render node
+        // (/dev/dri/renderD*) finché uno decodifica DAVVERO in hardware il primo
+        // frame (probeHwDevice) — sui sistemi multi-GPU (iGPU + dGPU) il device
+        // di default non è detto sia quello capace del profilo dello stream, e
+        // alcuni driver lo scoprono solo a decodifica iniziata. Verificarlo qui,
+        // riavvolgendo il demuxer dopo ogni tentativo, evita di dover cambiare
+        // device a metà riproduzione (perderebbe lo stato dei frame di
+        // riferimento). Nessun device apribile → software puro, in silenzio (il
+        // log è più giù).
+        var hw_devices: [max_hw_devices][max_hw_device_path]u8 = undefined;
+        const hw_device_count = if (comptime builtin.os.tag == .linux) listHwDevices(&hw_devices) else 0;
+        var hw_device_idx: u8 = 0;
+        if (hw_device_count > 0) {
+            var i: u8 = 0;
+            while (i < hw_device_count) : (i += 1) {
+                const dev_path: [*:0]const u8 = std.mem.sliceTo(@as([*]const u8, &hw_devices[i]), 0).ptr;
+                if (probeHwDevice(codec, stream, dev_path, fmt_ctx, stream_idx, packet, frame)) |opened| {
+                    codec_ctx = opened.codec_ctx;
+                    hw_device_ctx = opened.hw_device_ctx;
                     use_hw = true;
+                    hw_device_idx = i;
                     break;
                 }
             }
-            if (use_hw) {
-                const dev_ref = av.av_buffer_ref(hw_device_ctx);
-                if (dev_ref != null) {
-                    codec_ctx.*.hw_device_ctx = dev_ref;
-                    codec_ctx.*.get_format = pickVaapiFormat;
-                } else use_hw = false;
-            }
-            if (!use_hw) av.av_buffer_unref(&hw_device_ctx);
+        } else if (probeHwDevice(codec, stream, null, fmt_ctx, stream_idx, packet, frame)) |opened| {
+            // Nessun render node enumerabile (non-Linux, o sistema senza DRM):
+            // prova comunque il device di default del sistema.
+            codec_ctx = opened.codec_ctx;
+            hw_device_ctx = opened.hw_device_ctx;
+            use_hw = true;
         }
 
-        if (use_hw) {
-            // Con VAAPI il frame-threading non serve (decodifica la GPU) e
-            // aggiunge solo latenza di pipeline: un thread solo, tipi azzerati.
-            codec_ctx.*.thread_count = 1;
-            codec_ctx.*.thread_type = 0;
-        } else {
+        if (!use_hw) {
             // Decodifica multi-thread: `thread_count = 0` = auto (n. core logici), con
             // threading sia a livello di frame che di slice. È la leva principale sulle
             // performance: un H.264/HEVC HD su un solo core non regge 30/60 fps.
-            codec_ctx.*.thread_count = 0;
-            codec_ctx.*.thread_type = c.FF_THREAD_FRAME | c.FF_THREAD_SLICE;
-        }
-        if (av.avcodec_open2(codec_ctx, codec, null) < 0) {
-            if (!use_hw) return Error.CodecOpenFailed;
-            // Alcuni driver accettano il device ma rifiutano il profilo solo
-            // alla open: ritenta UNA volta in software puro, con un contesto
-            // nuovo (quello fallito può essere in uno stato indefinito).
-            use_hw = false;
-            av.av_buffer_unref(&hw_device_ctx);
-            var cc: [*c]c.AVCodecContext = codec_ctx;
-            av.avcodec_free_context(&cc);
-            codec_ctx = null; // l'errdefer non deve rivedere il puntatore morto
             codec_ctx = av.avcodec_alloc_context3(codec) orelse return Error.AllocFailed;
             if (av.avcodec_parameters_to_context(codec_ctx, stream.*.codecpar) < 0) return Error.CodecOpenFailed;
             codec_ctx.*.thread_count = 0;
@@ -415,26 +574,20 @@ pub const Player = struct {
         errdefer av.av_frame_free(&sw_frame);
         if (use_hw) sw_frame = av.av_frame_alloc() orelse return Error.AllocFailed;
 
-        // Log una tantum (solo al cambio di percorso) così l'utente può
-        // verificare se la decodifica hardware è attiva.
+        // Log una tantum (solo al cambio di percorso/device) così l'utente può
+        // verificare se la decodifica hardware è attiva e su quale device.
         if (vaapi_last_logged != use_hw) {
             vaapi_last_logged = use_hw;
-            if (use_hw) {
+            if (use_hw and hw_device_count > 0) {
+                std.log.info("zuer video: decodifica VAAPI attiva (codec {s}, device {s})", .{
+                    std.mem.span(codec.*.name),
+                    std.mem.sliceTo(&hw_devices[hw_device_idx], 0),
+                });
+            } else if (use_hw) {
                 std.log.info("zuer video: decodifica VAAPI attiva (codec {s})", .{std.mem.span(codec.*.name)});
             } else {
                 std.log.info("zuer video: decodifica software (codec {s})", .{std.mem.span(codec.*.name)});
             }
-        }
-
-        const frame = av.av_frame_alloc() orelse return Error.AllocFailed;
-        errdefer {
-            var f: [*c]c.AVFrame = frame;
-            av.av_frame_free(&f);
-        }
-        const packet = av.av_packet_alloc() orelse return Error.AllocFailed;
-        errdefer {
-            var p: [*c]c.AVPacket = packet;
-            av.av_packet_free(&p);
         }
 
         const tb = stream.*.time_base;
@@ -491,6 +644,9 @@ pub const Player = struct {
             .hw_device_ctx = hw_device_ctx,
             .sw_frame = sw_frame,
             .hw_active = use_hw,
+            .hw_devices = hw_devices,
+            .hw_device_count = hw_device_count,
+            .hw_device_idx = hw_device_idx,
         };
     }
 
@@ -565,11 +721,38 @@ pub const Player = struct {
                 if (try self.frameFromCurrent(max_dim, allocator)) |fr| return fr;
                 continue; // download hw fallito: degradato, prosegui in software
             }
-            if (sr < 0) continue; // errore vero: packet inservibile
+            if (sr < 0) {
+                // A questo punto il device VAAPI è già stato verificato in
+                // apertura (Player.openEx prova ogni device e ne conferma la
+                // resa hardware reale prima di tornare al chiamante): un
+                // errore qui è un cedimento runtime genuino (non un profilo
+                // non supportato scoperto tardi). Degrada a software diretto,
+                // senza ritentare altri device — cambiare contesto a metà
+                // stream perde lo stato dei frame di riferimento ed è
+                // difficile da recuperare su contenuti con keyframe rade.
+                if (self.hw_active) {
+                    if (!self.hw_warned) {
+                        self.hw_warned = true;
+                        std.log.warn("zuer video: errore VAAPI runtime, degrado a decodifica software", .{});
+                    }
+                    if (!self.reopenSoftware()) return Error.NoFrameDecoded;
+                }
+                continue; // errore vero: packet inservibile
+            }
             const r = av.avcodec_receive_frame(self.codec_ctx, self.frame);
             if (r == c.AVERROR(c.EAGAIN)) continue; // servono altri packet
             if (r == c.AVERROR_EOF) return null;
-            if (r < 0) return Error.NoFrameDecoded;
+            if (r < 0) {
+                if (self.hw_active) {
+                    if (!self.hw_warned) {
+                        self.hw_warned = true;
+                        std.log.warn("zuer video: errore VAAPI runtime, degrado a decodifica software", .{});
+                    }
+                    if (!self.reopenSoftware()) return Error.NoFrameDecoded;
+                    continue;
+                }
+                return Error.NoFrameDecoded;
+            }
             if (try self.frameFromCurrent(max_dim, allocator)) |fr| return fr;
             continue; // download hw fallito: degradato, prosegui in software
         }
@@ -601,6 +784,17 @@ pub const Player = struct {
             self.sw_frame.*.pts = self.frame.*.pts;
             self.sw_frame.*.best_effort_timestamp = self.frame.*.best_effort_timestamp;
             src = self.sw_frame;
+        } else if (self.hw_active) {
+            // Il device VAAPI è già stato verificato in apertura (vedi
+            // probeHwDevice): se il decoder ricade comunque in software a
+            // metà riproduzione è un cedimento runtime raro (es. cambio di
+            // risoluzione/profilo a metà stream). Degrada e basta, senza
+            // ritentare altri device (vedi commento in nextFrame).
+            if (!self.hw_warned) {
+                self.hw_warned = true;
+                std.log.warn("zuer video: hwaccel VAAPI ricaduto in software a metà stream, degrado", .{});
+            }
+            if (!self.reopenSoftware()) return Error.NoFrameDecoded;
         }
         return try self.scaleCurrent(src, max_dim, allocator);
     }
