@@ -186,6 +186,29 @@ pub fn main() !void {
         }
     }
 
+    // Quinto passaggio (Linux, best-effort — issue #11): se il device supporta
+    // l'export dmabuf della color image, prova l'intera meccanica Vulkan
+    // (immagine con modifier esplicito + memoria esportabile + query
+    // modifier/layout + vkGetMemoryFdKHR) su un'immagine usa-e-getta, e
+    // verifica col KERNEL (lseek, non un semplice VkResult) che il risultato
+    // sia un dmabuf reale. Non wired nel render loop: valida solo che la parte
+    // nuova e mai esercitata prima non sia rotta, prima di cablarla in
+    // gui.zig/Zrame dietro ZUER_MESH_DMABUF.
+    if (renderer.dmabuf_capable) {
+        const probe = (try renderer.probeDmabufExport(w, h)) orelse unreachable; // dmabuf_capable=true ⇒ mai null
+        const expected_size = @as(u64, probe.stride) * h;
+        std.debug.print(
+            "[selftest] dmabuf export: stride={d} modifier=0x{x} kernel_size={d} (atteso ≥{d}) {s}\n",
+            .{ probe.stride, probe.modifier, probe.kernel_size, expected_size, if (probe.kernel_size >= expected_size) "OK" else "SOSPETTO" },
+        );
+        if (probe.kernel_size < expected_size) {
+            std.debug.print("[selftest] FALLITO: il dmabuf esportato è più piccolo dello stride*height atteso\n", .{});
+            return error.DmabufTooSmall;
+        }
+    } else {
+        std.debug.print("[selftest] dmabuf export: non supportato su questo device/driver (fallback CPU resta l'unico percorso)\n", .{});
+    }
+
     std.debug.print("[selftest] OK\n", .{});
 }
 

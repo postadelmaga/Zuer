@@ -829,6 +829,12 @@ fn renderWorker(
         // (applyDecoded, thread loader) e setVoxels/resetFrameSync (toggleVoxel).
         if (native and (mesh_push != null or mesh_voxel_push != null)) {
             state.renderer_mutex.lockUncancelable(state.io);
+            // Non-null solo per un render mesh (non voxel) riuscito con la color
+            // image dmabuf-backed attiva (issue #11, opt-in ZUER_MESH_DMABUF):
+            // letto SOTTO renderer_mutex, subito dopo render(), perché è quello
+            // stesso render (via ensureTarget) a decidere se color_image è
+            // esportabile per questa size — nessun'altra fonte di scrittura corre.
+            var mesh_dmabuf: ?gpu.Renderer.DmabufInfo = null;
             const mesh_rgba: ?[]const u8 = blk: {
                 // Difensivo: con push non-null il setMesh ha già inizializzato
                 // il renderer; se l'init era fallita, salta il frame GPU.
@@ -842,18 +848,38 @@ fn renderWorker(
                     };
                 }
                 state.renderer.vt_zoom = mesh_vt_zoom;
-                break :blk state.renderer.render(cur_w, cur_h, &mesh_push.?) catch |e| {
+                const r = state.renderer.render(cur_w, cur_h, &mesh_push.?) catch |e| {
                     // Come sopra: salta il frame invece di terminare il loop.
                     std.debug.print("[gui] render mesh fallito: {s}\n", .{@errorName(e)});
                     break :blk null;
                 };
+                mesh_dmabuf = state.renderer.colorDmabuf();
+                break :blk r;
             };
             state.renderer_mutex.unlock(state.io);
             if (mesh_rgba) |mr| {
-                // Il readback appartiene al renderer (2 slot pipelined) e il worker
-                // è l'unico a chiamare render: lo slot resta valido fino al prossimo
-                // render, quindi comporre fuori dal lock è sicuro.
-                compose.composeFrame(composited_rgba.*, cur_w, cur_h, mr, cur_w, cur_h, false, 1.0, 0.0, 0.0);
+                if (mesh_dmabuf) |d| {
+                    // Fast path zero-copy: color_image va presentata DIRETTAMENTE
+                    // via dmabuf (mr è deliberatamente stantio, vedi il commento
+                    // su Renderer.render — niente readback/composeFrame per lei).
+                    // L'area contenuto resta trasparente: il subsurface dmabuf
+                    // (piazzato SOTTO il parent da Zrame, vedi window_wayland.zig)
+                    // mostra la mesh, e qui sopra restano solo label/overlay.
+                    @memset(composited_rgba.*[0 .. @as(usize, cur_w) * cur_h * 4], 0);
+                    if (!win.presentDmabuf(0, d.fd, d.width, d.height, d.stride, d.fourcc, d.modifier)) {
+                        // Compositor senza supporto linux-dmabuf/subcompositor:
+                        // niente piano da mostrare finché non arriva un frame CPU.
+                        // Rientrare sul path CPU per QUESTO frame userebbe `mr`
+                        // stantio — meglio riarmare e aspettare il prossimo giro
+                        // (in pratica non succede: dmabuf_capable già lo implica).
+                        std.debug.print("[gui] presentDmabuf rifiutato dal compositor\n", .{});
+                    }
+                } else {
+                    // Il readback appartiene al renderer (2 slot pipelined) e il
+                    // worker è l'unico a chiamare render: lo slot resta valido
+                    // fino al prossimo render, quindi comporre fuori dal lock è sicuro.
+                    compose.composeFrame(composited_rgba.*, cur_w, cur_h, mr, cur_w, cur_h, false, 1.0, 0.0, 0.0);
+                }
                 if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, cur_w, cur_h, r, mesh_name_buf[0..mesh_name_len]);
                 // Overlay (esploratore file + YouTube) anche sulle mesh: qui il frame
                 // è composto fuori dal lock, quindi lo stato va riletto sotto mutex.

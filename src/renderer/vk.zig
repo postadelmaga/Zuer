@@ -660,6 +660,86 @@ pub extern "vulkan" fn vkDeviceWaitIdle(VkDevice) VkResult;
 
 pub const PfnGetMemoryHostPointerProperties = *const fn (VkDevice, u32, *const anyopaque, *VkMemoryHostPointerPropertiesEXT) callconv(.c) VkResult;
 
+// Export dmabuf della color image mesh (VK_KHR_external_memory_fd +
+// VK_EXT_external_memory_dma_buf + VK_EXT_image_drm_format_modifier), per
+// presentDmabuf zero-copy su Wayland — vedi issue #11. Valori numerici presi
+// da /usr/include/vulkan/vulkan_core.h (mai a memoria: un sType sbagliato nella
+// pNext chain è corruzione silenziosa, non un errore che il driver segnala).
+pub const EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT: u32 = 0x200;
+pub const ST_EXTERNAL_MEMORY_IMAGE_CREATE_INFO: VkStructureType = 1000072001;
+pub const ST_EXPORT_MEMORY_ALLOCATE_INFO: VkStructureType = 1000072002;
+pub const ST_MEMORY_GET_FD_INFO_KHR: VkStructureType = 1000074002;
+pub const ST_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT: VkStructureType = 1000158003;
+pub const ST_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT: VkStructureType = 1000158005;
+pub const IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT: u32 = 1000158000;
+// vkGetImageSubresourceLayout su un'immagine DRM_FORMAT_MODIFIER_EXT vuole
+// l'aspect del PIANO DI MEMORIA (piano fisico del modifier), non l'aspect
+// logico ASPECT_COLOR usato per la image view — sono namespace diversi.
+// Single-plane (il nostro caso, LINEAR): solo il piano 0.
+pub const ASPECT_MEMORY_PLANE_0_BIT_EXT: u32 = 0x80;
+// Da /usr/include/libdrm/drm_fourcc.h: fourcc_mod_code(NONE, 0) e
+// fourcc_code('A','B','2','4') — richiesto esplicitamente in fase di export
+// così l'unico modifier possibile è quello universalmente importabile da
+// (quasi) ogni compositor, senza negoziazione (Zrame non implementa ancora
+// zwp_linux_dmabuf_feedback_v1, vedi window_wayland.zig).
+pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+pub const DRM_FORMAT_ABGR8888: u32 = 0x34324241; // layout memoria R,G,B,A — combacia con FORMAT_R8G8B8A8_UNORM
+
+pub const VkExternalMemoryImageCreateInfo = extern struct {
+    sType: VkStructureType = ST_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+    pNext: ?*const anyopaque = null,
+    handleTypes: u32,
+};
+
+pub const VkExportMemoryAllocateInfo = extern struct {
+    sType: VkStructureType = ST_EXPORT_MEMORY_ALLOCATE_INFO,
+    pNext: ?*const anyopaque = null,
+    handleTypes: u32,
+};
+
+pub const VkImageDrmFormatModifierListCreateInfoEXT = extern struct {
+    sType: VkStructureType = ST_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
+    pNext: ?*const anyopaque = null,
+    drmFormatModifierCount: u32,
+    pDrmFormatModifiers: [*]const u64,
+};
+
+pub const VkImageDrmFormatModifierPropertiesEXT = extern struct {
+    sType: VkStructureType = ST_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT,
+    pNext: ?*anyopaque = null,
+    drmFormatModifier: u64 = 0,
+};
+
+pub const VkMemoryGetFdInfoKHR = extern struct {
+    sType: VkStructureType = ST_MEMORY_GET_FD_INFO_KHR,
+    pNext: ?*const anyopaque = null,
+    memory: VkDeviceMemory,
+    handleType: u32,
+};
+
+pub const VkImageSubresource = extern struct {
+    aspectMask: u32,
+    mipLevel: u32 = 0,
+    arrayLayer: u32 = 0,
+};
+
+pub const VkSubresourceLayout = extern struct {
+    offset: u64 = 0,
+    size: u64 = 0,
+    rowPitch: u64 = 0,
+    arrayPitch: u64 = 0,
+    depthPitch: u64 = 0,
+};
+
+// Core dal loader (nessun GetDeviceProcAddr): stesso trattamento di
+// vkGetImageMemoryRequirements più sopra.
+pub extern "vulkan" fn vkGetImageSubresourceLayout(VkDevice, VkImage, *const VkImageSubresource, *VkSubresourceLayout) void;
+
+// Estensioni: caricate via vkGetDeviceProcAddr solo se il device le supporta
+// (stesso pattern di PfnGetMemoryHostPointerProperties).
+pub const PfnGetMemoryFd = *const fn (VkDevice, *const VkMemoryGetFdInfoKHR, *i32) callconv(.c) VkResult;
+pub const PfnGetImageDrmFormatModifierProperties = *const fn (VkDevice, VkImage, *VkImageDrmFormatModifierPropertiesEXT) callconv(.c) VkResult;
+
 pub fn check(r: VkResult) !void {
     if (r != VK_SUCCESS) return error.VulkanError;
 }

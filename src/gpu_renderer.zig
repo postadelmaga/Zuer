@@ -327,6 +327,7 @@ const vkGetBufferMemoryRequirements = vk.vkGetBufferMemoryRequirements;
 const vkGetDeviceProcAddr = vk.vkGetDeviceProcAddr;
 const vkGetDeviceQueue = vk.vkGetDeviceQueue;
 const vkGetImageMemoryRequirements = vk.vkGetImageMemoryRequirements;
+const vkGetImageSubresourceLayout = vk.vkGetImageSubresourceLayout;
 const vkGetPhysicalDeviceMemoryProperties = vk.vkGetPhysicalDeviceMemoryProperties;
 const vkGetPhysicalDeviceProperties = vk.vkGetPhysicalDeviceProperties;
 const vkGetPhysicalDeviceQueueFamilyProperties = vk.vkGetPhysicalDeviceQueueFamilyProperties;
@@ -351,6 +352,11 @@ pub const Renderer = struct {
     queue_family: u32,
     mem_props: VkPhysicalDeviceMemoryProperties,
     get_host_ptr_props: ?PfnGetMemoryHostPointerProperties,
+    // Export dmabuf della color image (issue #11, opt-in — vedi ZUER_MESH_DMABUF
+    // in gui.zig e gpu_selftest.zig): rilevato una tantum in init, mai ritentato.
+    dmabuf_capable: bool,
+    get_memory_fd: ?vk.PfnGetMemoryFd,
+    get_drm_modifier_props: ?vk.PfnGetImageDrmFormatModifierProperties,
 
     cmd_pool: VkCommandPool,
     cmd: VkCommandBuffer,
@@ -368,6 +374,17 @@ pub const Renderer = struct {
     color_image: VkImage = VK_NULL,
     color_mem: VkDeviceMemory = VK_NULL,
     color_view: VkImageView = VK_NULL,
+    // Export dmabuf del color_image CORRENTE (issue #11, opt-in ZUER_MESH_DMABUF):
+    // fd >= 0 solo quando ensureTarget ha effettivamente creato un color_image
+    // esportabile per questa size — ricreato a ogni resize come color_image
+    // stesso, chiuso in destroyTarget. `recordAndSubmitFrame` salta il readback
+    // CPU quando è attivo (vedi colorDmabuf).
+    color_dmabuf_fd: i32 = -1,
+    color_dmabuf_stride: u32 = 0,
+    color_dmabuf_modifier: u64 = 0,
+    // Richiesta una tantum in init() (env var, Linux-only): l'AND con
+    // dmabuf_capable decide se ensureTarget prova il path esportabile.
+    mesh_dmabuf_requested: bool = false,
     depth_image: VkImage = VK_NULL,
     depth_mem: VkDeviceMemory = VK_NULL,
     depth_view: VkImageView = VK_NULL,
@@ -545,10 +562,25 @@ pub const Renderer = struct {
         var mem_props: VkPhysicalDeviceMemoryProperties = undefined;
         vkGetPhysicalDeviceMemoryProperties(physical, &mem_props);
 
+        // Export dmabuf della color image mesh (issue #11, percorso ancora
+        // sperimentale/opt-in — vedi gpu_selftest.zig e ZUER_MESH_DMABUF):
+        // richiede le tre estensioni insieme, Linux-only (dmabuf è un concetto
+        // DRM). Verificato solo qui sul device VINCITORE, non nel loop di
+        // scoring sopra: non deve influenzare la scelta della GPU.
+        const has_dmabuf_export = builtin.os.tag == .linux and
+            deviceHasExtension(gpa, physical, "VK_EXT_image_drm_format_modifier") and
+            deviceHasExtension(gpa, physical, "VK_EXT_external_memory_dma_buf") and
+            deviceHasExtension(gpa, physical, "VK_KHR_external_memory_fd");
+
         const priority = [_]f32{1.0};
         var dev_exts: std.ArrayList([*:0]const u8) = .empty;
         defer dev_exts.deinit(gpa);
         if (has_host_import) try dev_exts.append(gpa, "VK_EXT_external_memory_host");
+        if (has_dmabuf_export) {
+            try dev_exts.append(gpa, "VK_EXT_image_drm_format_modifier");
+            try dev_exts.append(gpa, "VK_EXT_external_memory_dma_buf");
+            try dev_exts.append(gpa, "VK_KHR_external_memory_fd");
+        }
         try dev_exts.appendSlice(gpa, opts.device_extensions);
 
         var device: VkDevice = null;
@@ -566,6 +598,23 @@ pub const Renderer = struct {
             @ptrCast(vkGetDeviceProcAddr(device, "vkGetMemoryHostPointerPropertiesEXT"))
         else
             null;
+
+        // dmabuf_capable è l'AND fra "estensioni presenti" e "i due loader
+        // hanno risolto il simbolo": alcune build Mesa registrano l'estensione
+        // ma non esportano ancora il fn pointer (driver in evoluzione) — meglio
+        // ricadere sul path CPU esistente che propagare un puntatore null.
+        const get_memory_fd: ?vk.PfnGetMemoryFd = if (has_dmabuf_export)
+            @ptrCast(vkGetDeviceProcAddr(device, "vkGetMemoryFdKHR"))
+        else
+            null;
+        const get_drm_modifier_props: ?vk.PfnGetImageDrmFormatModifierProperties = if (has_dmabuf_export)
+            @ptrCast(vkGetDeviceProcAddr(device, "vkGetImageDrmFormatModifierPropertiesEXT"))
+        else
+            null;
+        const dmabuf_capable = has_dmabuf_export and get_memory_fd != null and get_drm_modifier_props != null;
+        if (has_dmabuf_export and !dmabuf_capable) {
+            std.log.warn("zuer gpu: estensioni dmabuf presenti ma simboli mancanti, niente export zero-copy", .{});
+        }
 
         var cmd_pool: VkCommandPool = VK_NULL;
         try check(vkCreateCommandPool(device, &.{ .queueFamilyIndex = queue_family }, null, &cmd_pool));
@@ -654,6 +703,14 @@ pub const Renderer = struct {
             .queue_family = queue_family,
             .mem_props = mem_props,
             .get_host_ptr_props = get_host_ptr_props,
+            .dmabuf_capable = dmabuf_capable,
+            .get_memory_fd = get_memory_fd,
+            .get_drm_modifier_props = get_drm_modifier_props,
+            // Sperimentale/opt-in (issue #11): mesh via presentDmabuf zero-copy
+            // invece del readback CPU. `dmabuf_capable` da solo non basta ad
+            // attivarlo — serve l'opt-in esplicito finché non è provato stabile
+            // sul parco hardware reale (stesso pattern di ZUER_GPU).
+            .mesh_dmabuf_requested = getenv("ZUER_MESH_DMABUF") != null,
             .cmd_pool = cmd_pool,
             .cmd = cmd,
             .fence = fence,
@@ -1203,9 +1260,32 @@ pub const Renderer = struct {
         self.shadow_ready = true;
     }
 
+    /// Metadati per presentare via `win.presentDmabuf` il `color_image` corrente
+    /// invece di consumare i pixel ritornati da `render()` (issue #11, opt-in
+    /// ZUER_MESH_DMABUF). `null` se il path dmabuf non è attivo per questa
+    /// sessione/size — il chiamante allora usa `render()` come sempre.
+    /// L'fd resta di proprietà del Renderer (valido fino al prossimo resize o
+    /// deinit): il chiamante NON lo chiude.
+    pub const DmabufInfo = struct { fd: i32, width: u32, height: u32, stride: u32, modifier: u64, fourcc: u32 };
+
+    pub fn colorDmabuf(self: *const Renderer) ?DmabufInfo {
+        if (self.color_dmabuf_fd < 0) return null;
+        return .{
+            .fd = self.color_dmabuf_fd,
+            .width = self.width,
+            .height = self.height,
+            .stride = self.color_dmabuf_stride,
+            .modifier = self.color_dmabuf_modifier,
+            .fourcc = vk.DRM_FORMAT_ABGR8888,
+        };
+    }
+
     /// Renderizza la mesh corrente su un target `width`×`height` e ne fa il
     /// readback: ritorna i pixel RGBA (validi fino alla prossima chiamata).
     /// Ottimizzato con double buffering per non bloccare la CPU (asynchronous readback).
+    /// In dmabuf mode (vedi `colorDmabuf`) i pixel ritornati sono STANTII (il
+    /// readback è saltato): il chiamante deve controllare `colorDmabuf()` PRIMA
+    /// di usare il risultato di questa funzione.
     pub fn render(self: *Renderer, width: u32, height: u32, pc: *const PushConstants) ![]const u8 {
         if (self.mesh_buf == VK_NULL) return error.NoMesh;
         if (width == 0 or height == 0) return error.EmptyTarget;
@@ -1319,7 +1399,13 @@ pub const Renderer = struct {
         }
         vkCmdEndRenderPass(cmd);
 
-        recordReadback(cmd, self.color_image, readback_buf, width, height);
+        // dmabuf mode (issue #11): color_image è già quello che verrà
+        // presentato via win.presentDmabuf, il readback CPU sarebbe lavoro
+        // buttato (esattamente la copia che il path esisteva per evitare). Il
+        // path voxel (renderVoxel più sotto) non è affetto: legge sempre
+        // readback_ptrs, che restano validi anche se color_image è dmabuf-backed
+        // — la copy GPU non dipende da come la memoria è stata esportata.
+        if (self.color_dmabuf_fd < 0) recordReadback(cmd, self.color_image, readback_buf, width, height);
 
         try check(vkEndCommandBuffer(cmd));
         try check(vkQueueSubmit(self.queue, 1, &[_]VkSubmitInfo{.{ .pCommandBuffers = @ptrCast(&cmd) }}, fence));
@@ -1490,7 +1576,23 @@ pub const Renderer = struct {
         _ = vkDeviceWaitIdle(self.device);
         self.destroyTarget();
 
-        const color = try self.createImage(width, height, FORMAT_R8G8B8A8_UNORM, IMAGE_USAGE_COLOR_ATTACHMENT | IMAGE_USAGE_TRANSFER_SRC, ASPECT_COLOR, true);
+        // dmabuf mode (issue #11, opt-in): un fallimento qui non è fatale —
+        // ricade sul color_image normale e disattiva dmabuf_capable per il
+        // resto del processo (stesso pattern probe-once di hw_active/VAAPI in
+        // player.zig: non riprovare a ogni resize se ha già fallito una volta).
+        var color_dmabuf: ?DmabufExport = null;
+        const color: ImageBundle = blk: {
+            if (self.dmabuf_capable and self.mesh_dmabuf_requested) {
+                if (self.createImageDmabuf(width, height, FORMAT_R8G8B8A8_UNORM, IMAGE_USAGE_COLOR_ATTACHMENT | IMAGE_USAGE_TRANSFER_SRC, ASPECT_COLOR)) |r| {
+                    color_dmabuf = r.dmabuf;
+                    break :blk r.bundle;
+                } else |e| {
+                    std.log.warn("zuer gpu: export dmabuf color image fallito ({s}), niente presentDmabuf per la mesh (fallback readback CPU)", .{@errorName(e)});
+                    self.dmabuf_capable = false;
+                }
+            }
+            break :blk try self.createImage(width, height, FORMAT_R8G8B8A8_UNORM, IMAGE_USAGE_COLOR_ATTACHMENT | IMAGE_USAGE_TRANSFER_SRC, ASPECT_COLOR, true);
+        };
         errdefer self.destroyImage(color);
         const depth = try self.createImage(width, height, FORMAT_D32_SFLOAT, IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT, ASPECT_DEPTH, true);
         errdefer self.destroyImage(depth);
@@ -1534,6 +1636,15 @@ pub const Renderer = struct {
         self.color_image = color.image;
         self.color_mem = color.mem;
         self.color_view = color.view;
+        if (color_dmabuf) |d| {
+            self.color_dmabuf_fd = d.fd;
+            self.color_dmabuf_stride = d.stride;
+            self.color_dmabuf_modifier = d.modifier;
+        } else {
+            self.color_dmabuf_fd = -1;
+            self.color_dmabuf_stride = 0;
+            self.color_dmabuf_modifier = 0;
+        }
         self.depth_image = depth.image;
         self.depth_mem = depth.mem;
         self.depth_view = depth.view;
@@ -1611,11 +1722,116 @@ pub const Renderer = struct {
         vkFreeMemory(self.device, bundle.mem, null);
     }
 
+    /// Fd dmabuf + geometria di una color image esportabile (issue #11): `fd` è
+    /// di proprietà del chiamante (va chiuso, o consegnato a un import che se ne
+    /// assume la proprietà — es. Zrame/Wayland duplica il proprio all'arrivo sul
+    /// socket, quindi la nostra copia va comunque chiusa dopo l'invio).
+    pub const DmabufExport = struct { fd: i32, stride: u32, modifier: u64 };
+
+    /// Esito di `probeDmabufExport`: nessun fd (chiuso subito dopo la verifica,
+    /// vedi commento lì) ma `kernel_size` conferma indipendentemente dal
+    /// kernel (fstat sull'fd, non da Vulkan) che è un dmabuf reale e non solo
+    /// una VkResult di successo — i due possono divergere se il driver mente.
+    pub const DmabufProbe = struct { stride: u32, modifier: u64, kernel_size: u64 };
+
+    /// Come `createImage`, ma la memoria è esportabile come dmabuf Linux con
+    /// modifier LINEAR esplicito (niente negoziazione col compositor — vedi il
+    /// commento su DRM_FORMAT_MOD_LINEAR in vk.zig). Richiede
+    /// `self.dmabuf_capable`; il chiamante lo verifica prima di invocarla.
+    fn createImageDmabuf(self: *Renderer, width: u32, height: u32, format: u32, usage: u32, aspect: u32) !struct { bundle: ImageBundle, dmabuf: DmabufExport } {
+        std.debug.assert(self.dmabuf_capable);
+        const modifiers = [_]u64{vk.DRM_FORMAT_MOD_LINEAR};
+        const mod_list = vk.VkImageDrmFormatModifierListCreateInfoEXT{
+            .drmFormatModifierCount = 1,
+            .pDrmFormatModifiers = &modifiers,
+        };
+        const ext_info = vk.VkExternalMemoryImageCreateInfo{
+            .pNext = &mod_list,
+            .handleTypes = vk.EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+        };
+        var image: VkImage = VK_NULL;
+        try check(vkCreateImage(self.device, &.{
+            .pNext = &ext_info,
+            .format = format,
+            .extent = .{ .width = width, .height = height, .depth = 1 },
+            .usage = usage,
+            .tiling = vk.IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+        }, null, &image));
+        errdefer vkDestroyImage(self.device, image, null);
+
+        var req: VkMemoryRequirements = undefined;
+        vkGetImageMemoryRequirements(self.device, image, &req);
+        const mem_type = self.findMemoryType(req.memoryTypeBits, MEM_DEVICE_LOCAL) orelse
+            self.findMemoryType(req.memoryTypeBits, 0) orelse return error.NoMemoryType;
+        const export_info = vk.VkExportMemoryAllocateInfo{ .handleTypes = vk.EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT };
+        var mem: VkDeviceMemory = VK_NULL;
+        try check(vkAllocateMemory(self.device, &.{
+            .pNext = &export_info,
+            .allocationSize = req.size,
+            .memoryTypeIndex = mem_type,
+        }, null, &mem));
+        errdefer vkFreeMemory(self.device, mem, null);
+        try check(vkBindImageMemory(self.device, image, mem, 0));
+
+        var view: VkImageView = VK_NULL;
+        try check(vkCreateImageView(self.device, &.{
+            .image = image,
+            .format = format,
+            .subresourceRange = .{ .aspectMask = aspect },
+        }, null, &view));
+        errdefer vkDestroyImageView(self.device, view, null);
+
+        var mod_props: vk.VkImageDrmFormatModifierPropertiesEXT = .{};
+        try check(self.get_drm_modifier_props.?(self.device, image, &mod_props));
+
+        var layout: vk.VkSubresourceLayout = .{};
+        vkGetImageSubresourceLayout(self.device, image, &.{ .aspectMask = vk.ASPECT_MEMORY_PLANE_0_BIT_EXT }, &layout);
+
+        var fd: i32 = -1;
+        try check(self.get_memory_fd.?(self.device, &.{
+            .memory = mem,
+            .handleType = vk.EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+        }, &fd));
+
+        return .{
+            .bundle = .{ .image = image, .mem = mem, .view = view },
+            .dmabuf = .{ .fd = fd, .stride = @intCast(layout.rowPitch), .modifier = mod_props.drmFormatModifier },
+        };
+    }
+
+    /// Prova end-to-end l'export dmabuf su un'immagine usa-e-getta (crea,
+    /// esporta, distrugge, chiude l'fd) SENZA toccare lo stato persistente del
+    /// renderer: usata da gpu_selftest per validare la meccanica Vulkan prima
+    /// di cablarla nel render loop reale. `null` se `dmabuf_capable` è falso;
+    /// altrimenti l'errore di qualunque step (nessuno swallow-and-continue: un
+    /// fallimento qui è esattamente quello che vogliamo scoprire prima di
+    /// fidarci del path veloce).
+    pub fn probeDmabufExport(self: *Renderer, width: u32, height: u32) !?DmabufProbe {
+        if (!self.dmabuf_capable) return null;
+        const r = try self.createImageDmabuf(width, height, FORMAT_R8G8B8A8_UNORM, IMAGE_USAGE_COLOR_ATTACHMENT | IMAGE_USAGE_TRANSFER_SRC, ASPECT_COLOR);
+        defer self.destroyImage(r.bundle);
+        defer _ = std.c.close(r.dmabuf.fd);
+        // lseek(SEEK_END) SUL FD, non su quel che Vulkan ha dichiarato: il
+        // driver dma_buf del kernel implementa .llseek riportando la dimensione
+        // reale del buffer — conferma indipendente (kernel-side) che è un
+        // dmabuf vero, non solo un VkResult di successo che il driver grafico
+        // potrebbe riportare senza che l'export sia davvero avvenuto. std.c
+        // (non std.posix: su Linux quest'ultimo non espone fstat, vedi
+        // std/c.zig) — stesso livello usato altrove nel progetto per libc diretta.
+        const kernel_size = std.c.lseek64(r.dmabuf.fd, 0, std.c.SEEK.END);
+        if (kernel_size < 0) return error.DmabufNotSeekable;
+        return .{ .stride = r.dmabuf.stride, .modifier = r.dmabuf.modifier, .kernel_size = @intCast(kernel_size) };
+    }
+
     fn destroyTarget(self: *Renderer) void {
         if (self.width == 0) return;
         vkDestroyFramebuffer(self.device, self.framebuffer, null);
         self.destroyImage(.{ .image = self.color_image, .mem = self.color_mem, .view = self.color_view });
         self.destroyImage(.{ .image = self.depth_image, .mem = self.depth_mem, .view = self.depth_view });
+        if (self.color_dmabuf_fd >= 0) {
+            _ = std.c.close(self.color_dmabuf_fd);
+            self.color_dmabuf_fd = -1;
+        }
 
         var i: usize = 0;
         while (i < 2) : (i += 1) {
