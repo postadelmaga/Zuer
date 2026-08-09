@@ -263,11 +263,33 @@ fn pickVaapiFormat(ctx: [*c]c.AVCodecContext, fmts: [*c]const c.enum_AVPixelForm
 /// cambia, non a ogni open (i poster aprono un Player per ogni anteprima).
 var vaapi_last_logged: ?bool = null;
 
-/// `ZUER_VAAPI_DMABUF` — fase 1: abilita solo il log diagnostico DRM-PRIME
-/// (debugLogDrmPrime), nessun cambio di comportamento. Diventerà il master
-/// switch del percorso zero-copy reale nelle fasi successive. Letta una sola
-/// volta (come ZUER_VP9_LIBAV altrove in questo file): il Player vive per
-/// tutta la riproduzione di un file, mai su più thread contemporaneamente.
+/// `ZUER_VAAPI_DMABUF` — master switch del percorso zero-copy VAAPI (decode
+/// → DRM-PRIME → presentazione diretta via dmabuf, niente readback CPU).
+///
+/// Verificato funzionante su hardware reale (Intel iHD, laptop ibrido
+/// iGPU+dGPU): pipeline stabile su run lunghe (pool GPU sano, nessun
+/// leak/stallo, teardown pulito) E colore/luminosità corretti — confermato
+/// con confronto screenshot diretto contro il percorso software. La
+/// correttezza visiva richiede ENTRAMBI i protocolli Wayland lato Zrame:
+/// wp_color_representation_v1 (coefficienti/range/chroma YCbCr) da solo
+/// NON bastava (visto in pratica: video visibilmente più scuro anche con
+/// bt709/limited corretto) — serve anche wp_color_manager_v1 con
+/// un'image description esplicita (primaries=srgb, transfer_function=
+/// bt1886), altrimenti la pipeline colore avanzata del compositor (quando
+/// attiva, es. KWin recenti) applica un'ipotesi sbagliata. Trovato
+/// confrontando via WAYLAND_DEBUG col trace di `mpv --vo=dmabuf-wayland`
+/// (corretto sullo stesso hardware/compositor), non per tentativi.
+///
+/// Resta dietro questo flag (mai attivo di default) per almeno un ciclio di
+/// release, trattandosi comunque di un percorso Linux/Wayland-only che
+/// dipende da protocolli "staging" non universalmente supportati — su un
+/// compositor che non li espone la pipeline degrada semplicemente al
+/// percorso software pieno (vedi VideoDecoder.disableGpuPresent), mai un
+/// crash, ma senza il beneficio del fix.
+///
+/// Letta una sola volta (come ZUER_VP9_LIBAV altrove in questo file): il
+/// Player vive per tutta la riproduzione di un file, mai su più thread
+/// contemporaneamente.
 var vaapi_dmabuf_flag_checked: bool = false;
 var vaapi_dmabuf_flag: bool = false;
 
