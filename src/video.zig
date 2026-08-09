@@ -31,7 +31,9 @@ const AudioPlayer = if (@import("build_options").video) @import("audio_player.zi
 // Thread di decodifica video + coda di frame (vedi `video_decoder.zig`). Gated
 // come AudioPlayer: importa libav solo con il video attivo, stub vuoto altrimenti
 // (usato solo dentro i rami `has_video`, comptime-eliminati quando il video è off).
-const VideoDecoder = if (@import("build_options").video) @import("video_decoder.zig").VideoDecoder else struct {};
+const VideoDecoder = if (@import("build_options").video) @import("video_decoder.zig").VideoDecoder else struct {
+    pub const GpuPick = struct {};
+};
 
 /// Frame video decodificato al massimo a questa dimensione per lato (limita memoria
 /// e tempo di rasterizzazione: i 4K si riscalano a 1920 sul lato lungo).
@@ -234,15 +236,37 @@ pub fn setupAudio(vs: *VideoState, path: []const u8, gpa: std.mem.Allocator) !Vi
     return error.NoAudio;
 }
 
+/// Esito di `advanceVideo`. `gpu` non-null significa: il frame scelto è
+/// zero-copy — `sink.rgba` NON è stato toccato, il chiamante presenta
+/// `gpu.*` via `Window.presentDmabufPlanesDynamic` invece di comporre pixel.
+pub const AdvanceResult = struct {
+    presented: bool = false,
+    gpu: ?VideoDecoder.GpuPick = null,
+};
+
+/// True se per QUESTA chiamata conviene tentare il pick zero-copy invece del
+/// solito `pickInto`: flag globale attivo, VAAPI davvero attivo sul player di
+/// questo decoder, e la presentazione non l'ha già disabilitato per questo
+/// stream (vedi `VideoDecoder.disableGpuPresent` — un present rifiutato dal
+/// compositor o un backend finestra senza dmabuf sono permanenti per il
+/// resto della riproduzione, non ritentati frame per frame).
+fn zeroCopyWanted(dec: *VideoDecoder) bool {
+    if (comptime !@import("build_options").video) return false;
+    if (!player_mod.vaapiDmabufEnabled()) return false;
+    if (!dec.player.hw_active) return false;
+    if (dec.gpu_present_disabled.load(.monotonic)) return false;
+    return true;
+}
+
 /// Avanza la riproduzione di `dt` secondi: applica un seek pendente, fa avanzare
 /// `pos_s` agganciandolo al clock audio master, gestisce il loop a fine video e
 /// SCEGLIE dalla coda del decoder il frame all'altezza di `pos_s` (scartando i
 /// più vecchi). NON decodifica qui: il thread del decoder produce in anticipo,
 /// quindi uno stallo di rete/decode non blocca il present — che intanto tiene
 /// l'ultimo frame — e il video si riaggancia scartando i frame in ritardo invece
-/// di accumularlo. Ritorna `true` se ha aggiornato il frame in `sink.rgba`.
-pub fn advanceVideo(sink: FrameSink, vs: *VideoState, dt: f32) bool {
-    const dec = vs.decoder orelse return false;
+/// di accumularlo.
+pub fn advanceVideo(sink: FrameSink, vs: *VideoState, dt: f32) AdvanceResult {
+    const dec = vs.decoder orelse return .{};
 
     // 1. Seek richiesto dall'input: svuota la coda del decoder e riposiziona
     // decoder e audio. `audio_clk_prev` a sentinella così la drift riparte pulita.
@@ -299,7 +323,7 @@ pub fn advanceVideo(sink: FrameSink, vs: *VideoState, dt: f32) bool {
         vs.pos_s = 0;
         vs.shown_pts = 0;
         vs.audio_clk_prev = -1;
-        return false;
+        return .{};
     }
 
     // 4. In riproduzione (o durante un settle post-seek) presenta dalla coda il
@@ -308,6 +332,23 @@ pub fn advanceVideo(sink: FrameSink, vs: *VideoState, dt: f32) bool {
     // premere spazio ferma davvero il video invece di lasciarlo "recuperare" i
     // frame arretrati che il decoder continua a produrre.
     if (vs.playing or vs.settle_seek) {
+        if (comptime @import("build_options").video) {
+            if (zeroCopyWanted(dec)) {
+                if (dec.pickGpu(vs.pos_s, vs.settle_seek)) |gp| {
+                    vs.shown_pts = gp.pts_s;
+                    if (vs.settle_seek) {
+                        vs.pos_s = @max(vs.pos_s, gp.pts_s);
+                        vs.settle_seek = false;
+                    }
+                    return .{ .presented = true, .gpu = gp };
+                }
+                // Nessun frame GPU pronto all'altezza del clock: il chiamante
+                // tiene l'ultimo presentato, esattamente come pickInto quando
+                // non trova nulla — NON si ripiega su pickInto nello stesso
+                // giro (sarebbe un frame diverso, lavoro doppio).
+                return .{};
+            }
+        }
         const picked = dec.pickInto(vs.pos_s, vs.settle_seek, sink.gpa, sink.rgba, sink.w, sink.h);
         if (picked.presented) {
             vs.shown_pts = picked.pts_s;
@@ -317,10 +358,10 @@ pub fn advanceVideo(sink: FrameSink, vs: *VideoState, dt: f32) bool {
                 vs.pos_s = @max(vs.pos_s, picked.pts_s);
                 vs.settle_seek = false;
             }
-            return true;
+            return .{ .presented = true };
         }
     }
-    return false;
+    return .{};
 }
 
 /// Modalità audio-only: aggiorna la temporizzazione (posizione, seek, play/pausa)
@@ -501,6 +542,32 @@ pub fn drawOscilloscope(buf: []u8, W: u32, H: u32, vs: *VideoState) void {
             }
         }
         prev_y = y;
+    }
+}
+
+/// Compone (alpha src-over, come `blendPixel`) un buffer RGBA `src_w`×`src_h`
+/// nella posizione (`dst_x`,`dst_y`) di `dst` (`dst_w`×`dst_h`, stride
+/// `dst_w`) — clippato ai bordi di `dst`. Usato dal percorso zero-copy: i
+/// controlli/sottotitoli si disegnano in un buffer STRETTO come sempre
+/// (`drawVideoControls`/`drawSubtitle` non conoscono stride/offset), poi
+/// vanno composti sopra il buco trasparente lasciato dal chiamante dove
+/// Zrame mostra il video nella sua subsurface.
+pub fn blitOverlay(dst: []u8, dst_w: u32, dst_h: u32, dst_x: i32, dst_y: i32, src: []const u8, src_w: u32, src_h: u32) void {
+    if (src_w == 0 or src_h == 0) return;
+    var sy: u32 = 0;
+    while (sy < src_h) : (sy += 1) {
+        const dy = dst_y + @as(i32, @intCast(sy));
+        if (dy < 0 or dy >= @as(i32, @intCast(dst_h))) continue;
+        var sx: u32 = 0;
+        while (sx < src_w) : (sx += 1) {
+            const dx = dst_x + @as(i32, @intCast(sx));
+            if (dx < 0 or dx >= @as(i32, @intCast(dst_w))) continue;
+            const si = (@as(usize, sy) * src_w + sx) * 4;
+            const a = src[si + 3];
+            if (a == 0) continue;
+            const di = (@as(usize, @intCast(dy)) * dst_w + @as(usize, @intCast(dx))) * 4;
+            blendPixel(dst, di, src[si], src[si + 1], src[si + 2], a);
+        }
     }
 }
 

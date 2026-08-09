@@ -19,6 +19,10 @@ pub const c = @cImport({
     // pixel format (per riconoscere i formati hw nel callback get_format).
     @cInclude("libavutil/hwcontext.h");
     @cInclude("libavutil/pixdesc.h");
+    // Export DRM-PRIME del frame VAAPI decodificato (AVDRMFrameDescriptor):
+    // percorso zero-copy verso la presentazione, vedi debugLogDrmPrime e
+    // (fase 2+) la coda GPU in video_decoder.zig.
+    @cInclude("libavutil/hwcontext_drm.h");
     @cInclude("libswscale/swscale.h");
     // Audio: resample → f32 interleaved e gestione dei channel layout (usati da
     // src/audio_player.zig, che riusa questo @cImport per condividere i tipi).
@@ -70,7 +74,9 @@ pub const AvApi = struct {
     av_frame_alloc: *const @TypeOf(c.av_frame_alloc),
     av_frame_free: *const @TypeOf(c.av_frame_free),
     av_frame_unref: *const @TypeOf(c.av_frame_unref),
+    av_frame_ref: *const @TypeOf(c.av_frame_ref),
     av_hwdevice_ctx_create: *const @TypeOf(c.av_hwdevice_ctx_create),
+    av_hwframe_map: *const @TypeOf(c.av_hwframe_map),
     av_hwframe_transfer_data: *const @TypeOf(c.av_hwframe_transfer_data),
     av_packet_alloc: *const @TypeOf(c.av_packet_alloc),
     av_packet_free: *const @TypeOf(c.av_packet_free),
@@ -200,6 +206,13 @@ pub const Frame = struct {
     pixels: []u8,
     /// Timestamp di presentazione in secondi (0 se il container non lo fornisce).
     pts_s: f64 = 0,
+    /// True quando questo frame ha saltato del tutto il readback GPU→CPU
+    /// (percorso zero-copy riuscito, vedi `nextFrame`'s `gpu_only_ok`):
+    /// `pixels` è vuoto, SOLO `width`/`height`/`pts_s` sono validi. Il
+    /// chiamante prende il frame vero da `Player.takeGpuFrame` invece che da
+    /// `pixels` — mai il contrario: leggere `pixels` quando `gpu_only` è
+    /// true darebbe una slice vuota, non un frame nero o stantio.
+    gpu_only: bool = false,
 };
 
 pub const Error = error{
@@ -249,6 +262,64 @@ fn pickVaapiFormat(ctx: [*c]c.AVCodecContext, fmts: [*c]const c.enum_AVPixelForm
 /// Ultimo stato hwaccel loggato (null = mai): un log solo quando il percorso
 /// cambia, non a ogni open (i poster aprono un Player per ogni anteprima).
 var vaapi_last_logged: ?bool = null;
+
+/// `ZUER_VAAPI_DMABUF` — fase 1: abilita solo il log diagnostico DRM-PRIME
+/// (debugLogDrmPrime), nessun cambio di comportamento. Diventerà il master
+/// switch del percorso zero-copy reale nelle fasi successive. Letta una sola
+/// volta (come ZUER_VP9_LIBAV altrove in questo file): il Player vive per
+/// tutta la riproduzione di un file, mai su più thread contemporaneamente.
+var vaapi_dmabuf_flag_checked: bool = false;
+var vaapi_dmabuf_flag: bool = false;
+
+pub fn vaapiDmabufEnabled() bool {
+    if (!vaapi_dmabuf_flag_checked) {
+        vaapi_dmabuf_flag = std.c.getenv("ZUER_VAAPI_DMABUF") != null;
+        vaapi_dmabuf_flag_checked = true;
+    }
+    return vaapi_dmabuf_flag;
+}
+
+// DRM fourcc usati per normalizzare l'export NV12 (vedi tryExportGpuFrame).
+// Non c'è un @cInclude di drm_fourcc.h in questo file (solo l'header ffmpeg
+// hwcontext_drm.h, che non definisce le costanti fourcc) — valori verificati
+// con `wayland-info` e con il log della fase 1 su questo hardware (iHD).
+const DRM_FORMAT_NV12: u32 = 0x3231564e; // 'NV12'
+const DRM_FORMAT_R8: u32 = 0x20203852; // 'R8  ' — piano Y quando esportato separato
+const DRM_FORMAT_GR88: u32 = 0x38385247; // 'GR88' — piano UV quando esportato separato
+
+/// Un piano di un `GpuFrame`: fd DI PROPRIETÀ del `GpuFrame` che lo contiene
+/// (via `hw_ref`/`drm_frame`, non chiuso esplicitamente — vive quanto quei due
+/// AVFrame), offset/pitch nel layout del layer DRM sorgente.
+pub const GpuPlane = struct {
+    fd: c_int,
+    offset: u32,
+    pitch: u32,
+};
+
+/// Frame VAAPI mappato a DRM-PRIME, pronto per una presentazione zero-copy
+/// (fase 4). Tiene vivi, tramite due AVFrame ref-counted, sia il frame
+/// hwaccel sorgente sia il frame DRM_PRIME mappato — finché non si chiama
+/// `release()` i fd restano validi e la surface VAAPI sottostante non viene
+/// riciclata dal driver (vedi il pool a 3 slot in `VideoDecoder`, fase 2).
+pub const GpuFrame = struct {
+    width: u32,
+    height: u32,
+    fourcc: u32, // sempre DRM_FORMAT_NV12: unico layout normalizzato (vedi tryExportGpuFrame)
+    modifier: u64,
+    planes: [2]GpuPlane,
+    plane_count: u8,
+
+    hw_ref: [*c]c.AVFrame,
+    drm_frame: [*c]c.AVFrame,
+
+    pub fn release(self: *GpuFrame) void {
+        var d: [*c]c.AVFrame = self.drm_frame;
+        av.av_frame_free(&d);
+        var h: [*c]c.AVFrame = self.hw_ref;
+        av.av_frame_free(&h);
+        self.* = undefined;
+    }
+};
 
 const max_hw_devices = 8;
 const max_hw_device_path = 32; // "/dev/dri/renderD255\0" basta e avanza
@@ -341,6 +412,16 @@ fn tryOpenVaapiDevice(
     // solo latenza di pipeline: un thread solo, tipi azzerati.
     codec_ctx.*.thread_count = 1;
     codec_ctx.*.thread_type = 0;
+    // Con lo zero-copy attivo (ZUER_VAAPI_DMABUF) fino a GPU_CAP surface
+    // (video_decoder.zig) restano "in prestito" fuori dal decoder — oltre
+    // alle reference frame che il decoder tiene per sé internamente (DPB).
+    // Senza extra_hw_frames il pool di VA surface è dimensionato SOLO per
+    // quelle interne: tenerne 3 in più lo esaurisce e il decode si blocca in
+    // silenzio (visto in pratica: nextFrame semplicemente smette di produrre
+    // dopo i primi 2-3 frame zero-copy, nessun errore). Il margine (6) copre
+    // il pool a 3 slot più un po' di respiro per il ritardo di rilascio del
+    // compositor; costo trascurabile (surface NV12 1080p ≈ 3 MB l'una).
+    if (vaapiDmabufEnabled()) codec_ctx.*.extra_hw_frames = 6;
     if (av.avcodec_open2(codec_ctx, codec, null) < 0) {
         var cc: [*c]c.AVCodecContext = codec_ctx;
         av.avcodec_free_context(&cc);
@@ -437,6 +518,12 @@ pub const Player = struct {
     sw_frame: [*c]c.AVFrame = null,
     hw_active: bool = false,
     hw_warned: bool = false,
+    // Fase 2 (ZUER_VAAPI_DMABUF): candidato zero-copy per l'ULTIMO frame VAAPI
+    // decodificato, prodotto da tryExportGpuFrame subito dopo la ricezione (vedi
+    // frameFromCurrent) e consumato dal chiamante (VideoDecoder) con
+    // takeGpuFrame. Se non consumato prima del prossimo frame viene rilasciato
+    // qui per non perdere il riferimento (vedi tryExportGpuFrame).
+    last_gpu_frame: ?GpuFrame = null,
     // Render node VAAPI scoperti all'apertura (sistemi multi-GPU: iGPU + dGPU)
     // e indice di quello scelto (verificato, vedi probeHwDevice), solo per il
     // log diagnostico.
@@ -667,6 +754,10 @@ pub const Player = struct {
     }
 
     pub fn deinit(self: *Player) void {
+        // Rete di sicurezza: un candidato zero-copy prodotto per l'ultimo
+        // frame ma mai preso da takeGpuFrame (es. errore subito dopo) non deve
+        // trattenere fd/surface oltre la vita del Player.
+        if (self.last_gpu_frame) |*g| g.release();
         if (self.scratch_gpa) |g| g.free(self.scratch);
         if (comptime cvp9_enabled) {
             if (self.cvp9_ctx) |cx| cx.destroy();
@@ -717,7 +808,13 @@ pub const Player = struct {
     /// target: senza questo, con VAAPI attivo ogni frame scartato pagherebbe
     /// comunque il transfer sincrono GPU→CPU, rendendo il seek percepibilmente
     /// lento sui file con GOP ampie (keyframe rade).
-    pub fn nextFrame(self: *Player, max_dim: usize, allocator: std.mem.Allocator, skip_before_pts: ?f64) Error!?Frame {
+    /// `gpu_only_ok`: se true e il percorso zero-copy VAAPI riesce per questo
+    /// frame, il ritorno può essere un `Frame` con `gpu_only = true` (pixels
+    /// vuoto) invece del solito download+scale — vedi `Frame.gpu_only` e
+    /// `frameFromCurrent`. `false` (poster, primo frame seminato in coda) fa
+    /// SEMPRE il percorso CPU pieno, qualunque sia lo stato di
+    /// `ZUER_VAAPI_DMABUF`: il chiamante ha bisogno di pixel veri subito.
+    pub fn nextFrame(self: *Player, max_dim: usize, allocator: std.mem.Allocator, skip_before_pts: ?f64, gpu_only_ok: bool) Error!?Frame {
         if (comptime cvp9_enabled) {
             if (self.is_vp9) return self.nextFrameCvp9(max_dim, allocator);
         }
@@ -730,7 +827,7 @@ pub const Player = struct {
                 if (r < 0) return null;
                 // Se il download hw fallisse proprio all'ultimo frame (null),
                 // il file finisce qui comunque: nessun frame da recuperare.
-                return try self.frameFromCurrent(max_dim, allocator, skip_before_pts);
+                return try self.frameFromCurrent(max_dim, allocator, skip_before_pts, gpu_only_ok);
             }
             defer av.av_packet_unref(self.packet);
             if (self.packet.*.stream_index != self.video_stream) continue;
@@ -743,7 +840,7 @@ pub const Player = struct {
                 const rd = av.avcodec_receive_frame(self.codec_ctx, self.frame);
                 if (rd < 0) continue; // stato anomalo: rinuncia a questo packet
                 _ = av.avcodec_send_packet(self.codec_ctx, self.packet);
-                if (try self.frameFromCurrent(max_dim, allocator, skip_before_pts)) |fr| return fr;
+                if (try self.frameFromCurrent(max_dim, allocator, skip_before_pts, gpu_only_ok)) |fr| return fr;
                 continue; // scartato per pts, o download hw fallito: prosegui
             }
             if (sr < 0) {
@@ -774,7 +871,7 @@ pub const Player = struct {
                 }
                 return Error.NoFrameDecoded;
             }
-            if (try self.frameFromCurrent(max_dim, allocator, skip_before_pts)) |fr| return fr;
+            if (try self.frameFromCurrent(max_dim, allocator, skip_before_pts, gpu_only_ok)) |fr| return fr;
             continue; // scartato per pts, o download hw fallito: prosegui
         }
     }
@@ -788,13 +885,37 @@ pub const Player = struct {
     /// (GPU→CPU, tipicamente NV12); se il download fallisce degrada l'intera
     /// riproduzione a software e ritorna null: il chiamante prosegue col
     /// prossimo packet, che verrà decodificato dal nuovo contesto software.
-    fn frameFromCurrent(self: *Player, max_dim: usize, allocator: std.mem.Allocator, skip_before_pts: ?f64) Error!?Frame {
+    fn frameFromCurrent(self: *Player, max_dim: usize, allocator: std.mem.Allocator, skip_before_pts: ?f64, gpu_only_ok: bool) Error!?Frame {
         const pts = self.ptsSeconds();
         if (skip_before_pts) |target| {
             if (pts < target) return null; // scartato: niente download/scale
         }
         var src: [*c]c.AVFrame = self.frame;
         if (self.frame.*.format == c.AV_PIX_FMT_VAAPI) {
+            if (vaapiDmabufEnabled()) {
+                // Rilascia un eventuale candidato del giro precedente rimasto
+                // non consumato (skip, o download CPU fallito più sotto): mai
+                // più di un GpuFrame in sospeso qui, altrimenti fd leak.
+                if (self.last_gpu_frame) |*old| old.release();
+                self.last_gpu_frame = self.tryExportGpuFrame();
+                if (self.last_gpu_frame != null and gpu_only_ok) {
+                    // Zero-copy riuscito ED è ammesso per questo frame: salta
+                    // DEL TUTTO il readback GPU→CPU sotto — è esattamente la
+                    // chiamata (vaDeriveImage/vaGetImage dentro
+                    // av_hwframe_transfer_data) sospettata del bug driver che
+                    // questo intero percorso esiste per evitare. Farla
+                    // comunque "in parallelo" vanificherebbe il punto della
+                    // fase 4: l'esposizione al bug resterebbe identica a oggi.
+                    return .{
+                        .width = @intCast(self.frame.*.width),
+                        .height = @intCast(self.frame.*.height),
+                        .pixels = &.{},
+                        .pts_s = pts,
+                        .gpu_only = true,
+                    };
+                }
+                if (self.last_gpu_frame == null) self.debugLogDrmPrime(); // diagnosi: layout DRM inatteso
+            }
             var ok = self.sw_frame != null;
             if (ok) {
                 av.av_frame_unref(self.sw_frame);
@@ -818,6 +939,154 @@ pub const Player = struct {
             if (!self.reopenSoftware()) return Error.NoFrameDecoded;
         }
         return try self.scaleCurrent(src, max_dim, allocator, pts);
+    }
+
+    /// Fase 2: prende possesso dell'eventuale candidato zero-copy prodotto per
+    /// l'ultimo frame ricevuto (vedi frameFromCurrent), azzerando `last_gpu_frame`
+    /// così il chiamante ne diventa l'unico proprietario (deve chiamare
+    /// `release()` quando ha finito). `null` se non c'era nulla da prendere
+    /// (VAAPI non attivo, export fallito, o già preso da una chiamata precedente).
+    pub fn takeGpuFrame(self: *Player) ?GpuFrame {
+        const g = self.last_gpu_frame;
+        self.last_gpu_frame = null;
+        return g;
+    }
+
+    /// Fase 2: mappa il frame VAAPI corrente a DRM-PRIME e normalizza il
+    /// risultato in un `GpuFrame` NV12 a 2 piani. Il driver iHD (verificato in
+    /// fase 1 su questo hardware) esporta NV12 come due LAYER separati a un
+    /// piano ciascuno (R8 per Y, GR88 per UV) sullo stesso oggetto DRM, non
+    /// come un layer NV12 a 2 piani — qui si ricompongono i due layer in un
+    /// singolo buffer NV12 logico, il layout che `zwp_linux_dmabuf_v1` si
+    /// aspetta per una presentazione con un solo fourcc. Riconosce anche il
+    /// layout diretto (1 layer NV12 a 2 piani) per compatibilità con altri
+    /// driver. Qualunque altro layout → `null`: il chiamante ricade sul
+    /// percorso CPU per questo frame, mai un errore fatale.
+    fn tryExportGpuFrame(self: *Player) ?GpuFrame {
+        const hw_ref = av.av_frame_alloc() orelse return null;
+        if (av.av_frame_ref(hw_ref, self.frame) < 0) {
+            var h: [*c]c.AVFrame = hw_ref;
+            av.av_frame_free(&h);
+            return null;
+        }
+        const drm_frame = av.av_frame_alloc() orelse {
+            var h: [*c]c.AVFrame = hw_ref;
+            av.av_frame_free(&h);
+            return null;
+        };
+        drm_frame.*.format = c.AV_PIX_FMT_DRM_PRIME;
+        if (av.av_hwframe_map(drm_frame, hw_ref, c.AV_HWFRAME_MAP_READ) < 0) {
+            var d: [*c]c.AVFrame = drm_frame;
+            av.av_frame_free(&d);
+            var h: [*c]c.AVFrame = hw_ref;
+            av.av_frame_free(&h);
+            return null;
+        }
+
+        const data_ptrs = drm_frame.*.data;
+        const raw_desc: [*c]u8 = data_ptrs[0];
+        const desc: *const c.AVDRMFrameDescriptor = @ptrCast(@alignCast(raw_desc));
+
+        var planes: [2]GpuPlane = undefined;
+        var modifier: u64 = 0;
+        var ok = false;
+        if (desc.nb_objects == 1 and desc.nb_layers == 1 and
+            desc.layers[0].nb_planes == 2 and desc.layers[0].format == DRM_FORMAT_NV12)
+        {
+            // Layout diretto: un layer NV12 a 2 piani.
+            const obj = desc.objects[0];
+            modifier = obj.format_modifier;
+            planes[0] = .{ .fd = obj.fd, .offset = @intCast(desc.layers[0].planes[0].offset), .pitch = @intCast(desc.layers[0].planes[0].pitch) };
+            planes[1] = .{ .fd = obj.fd, .offset = @intCast(desc.layers[0].planes[1].offset), .pitch = @intCast(desc.layers[0].planes[1].pitch) };
+            ok = true;
+        } else if (desc.nb_objects == 1 and desc.nb_layers == 2 and
+            desc.layers[0].nb_planes == 1 and desc.layers[1].nb_planes == 1 and
+            desc.layers[0].format == DRM_FORMAT_R8 and desc.layers[1].format == DRM_FORMAT_GR88)
+        {
+            // Layout osservato in pratica (driver iHD su questo hardware): Y e
+            // UV come due layer indipendenti sullo stesso oggetto DRM.
+            const obj = desc.objects[0];
+            modifier = obj.format_modifier;
+            planes[0] = .{ .fd = obj.fd, .offset = @intCast(desc.layers[0].planes[0].offset), .pitch = @intCast(desc.layers[0].planes[0].pitch) };
+            planes[1] = .{ .fd = obj.fd, .offset = @intCast(desc.layers[1].planes[0].offset), .pitch = @intCast(desc.layers[1].planes[0].pitch) };
+            ok = true;
+        }
+
+        if (!ok) {
+            var d: [*c]c.AVFrame = drm_frame;
+            av.av_frame_free(&d);
+            var h: [*c]c.AVFrame = hw_ref;
+            av.av_frame_free(&h);
+            return null;
+        }
+        return GpuFrame{
+            .width = @intCast(self.frame.*.width),
+            .height = @intCast(self.frame.*.height),
+            .fourcc = DRM_FORMAT_NV12,
+            .modifier = modifier,
+            .planes = planes,
+            .plane_count = 2,
+            .hw_ref = hw_ref,
+            .drm_frame = drm_frame,
+        };
+    }
+
+    /// Fase 1 (debug, `ZUER_VAAPI_DMABUF`): mappa il frame VAAPI corrente a
+    /// DRM_PRIME e logga la descrizione risultante (oggetti/layer/piani,
+    /// fourcc, modifier, fd), poi la libera subito — non tocca in alcun modo
+    /// il `Frame` restituito da `nextFrame`. Serve solo a verificare che il
+    /// driver esporti descrittori DRM-PRIME validi su questo hardware prima
+    /// di costruire sopra la pipeline zero-copy vera (fase 2+, che terrà
+    /// questi riferimenti vivi invece di liberarli subito).
+    fn debugLogDrmPrime(self: *Player) void {
+        const drm_frame = av.av_frame_alloc() orelse return;
+        defer {
+            var f: [*c]c.AVFrame = drm_frame;
+            av.av_frame_free(&f);
+        }
+        // av_hwframe_map mappa VERSO il formato già impostato in dst: senza
+        // questo resta AV_PIX_FMT_NONE e la mappatura produce un
+        // AVDRMFrameDescriptor spazzatura (visto in pratica: nb_objects enorme,
+        // ogni campo a byte ripetuto 0x10 — memoria non inizializzata/non
+        // scritta dalla mappatura).
+        drm_frame.*.format = c.AV_PIX_FMT_DRM_PRIME;
+        if (av.av_hwframe_map(drm_frame, self.frame, c.AV_HWFRAME_MAP_READ) < 0) {
+            std.log.warn("zuer video: [dmabuf debug] av_hwframe_map fallita", .{});
+            return;
+        }
+        // Nota: `drm_frame.*.data[0]` in un'unica espressione risolve al tipo
+        // sbagliato ([8][*c]u8 invece di [*c]u8) con un puntatore [*c] — bug
+        // noto del compilatore Zig su questa catena field-poi-indice. Spezzare
+        // in due passaggi (prima il campo array, poi l'indice) lo evita.
+        const data_ptrs = drm_frame.*.data;
+        const raw_desc: [*c]u8 = data_ptrs[0];
+        const desc: *const c.AVDRMFrameDescriptor = @ptrCast(@alignCast(raw_desc));
+        var oi: usize = 0;
+        while (oi < @as(usize, @intCast(desc.nb_objects))) : (oi += 1) {
+            const obj = desc.objects[oi];
+            std.log.info("zuer video: [dmabuf debug] object[{d}] fd={d} size={d} modifier=0x{x}", .{
+                oi, obj.fd, obj.size, obj.format_modifier,
+            });
+        }
+        var li: usize = 0;
+        while (li < @as(usize, @intCast(desc.nb_layers))) : (li += 1) {
+            const layer = desc.layers[li];
+            std.log.info("zuer video: [dmabuf debug] layer[{d}] fourcc={c}{c}{c}{c} nb_planes={d}", .{
+                li,
+                @as(u8, @truncate(layer.format)),
+                @as(u8, @truncate(layer.format >> 8)),
+                @as(u8, @truncate(layer.format >> 16)),
+                @as(u8, @truncate(layer.format >> 24)),
+                layer.nb_planes,
+            });
+            var pi: usize = 0;
+            while (pi < @as(usize, @intCast(layer.nb_planes))) : (pi += 1) {
+                const pl = layer.planes[pi];
+                std.log.info("zuer video: [dmabuf debug]   plane[{d}] object_index={d} offset={d} pitch={d}", .{
+                    pi, pl.object_index, pl.offset, pl.pitch,
+                });
+            }
+        }
     }
 
     /// Logga (una sola volta) e degrada a software dopo un fallimento runtime
@@ -985,5 +1254,5 @@ pub fn firstVideoFrame(path: [*:0]const u8, max_dim: usize, allocator: std.mem.A
     // costo di un contesto GPU cvp9.
     var player = try Player.openEx(path, false);
     defer player.deinit();
-    return (try player.nextFrame(max_dim, allocator, null)) orelse Error.NoFrameDecoded;
+    return (try player.nextFrame(max_dim, allocator, null, false)) orelse Error.NoFrameDecoded;
 }

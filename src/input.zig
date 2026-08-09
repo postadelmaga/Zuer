@@ -531,6 +531,24 @@ pub fn textCallback(win: *zrame.Window, bytes: [4]u8, len: u8, user: ?*anyopaque
     yt_search.insertText(app_state, bytes[0..len]);
 }
 
+/// Callback per `Options.on_video_buffer_event` (percorso zero-copy VAAPI,
+/// dietro `ZUER_VAAPI_DMABUF`): gira sul thread finestra di Zrame quando un
+/// present dinamico (`presentDmabufPlanesDynamic`) è DAVVERO rilasciato dal
+/// compositor o rifiutato — il SOLO segnale sicuro per restituire la VA
+/// surface al decoder (mai un timeout/euristica). `released` e `failed`
+/// hanno lo stesso esito qui: la risorsa dietro il token va comunque
+/// liberata, la distinzione serve al chiamante di `pickGpu`/presentazione
+/// per decidere se disabilitare lo zero-copy per il resto della riproduzione
+/// (vedi gui.zig), non a questo rilascio. Sotto `state.shared.mutex` come
+/// ogni altro accesso a `state.video` da un thread diverso dal worker di
+/// render (`decoder` può cambiare/sparire per un cambio video concorrente).
+pub fn onVideoBufferEvent(_: *zrame.Window, token: u64, _: zrame.VideoBufferEvent, user: ?*anyopaque) void {
+    const app_state: *GuiAppState = @ptrCast(@alignCast(user orelse return));
+    app_state.shared.mutex.lockUncancelable(app_state.io);
+    defer app_state.shared.mutex.unlock(app_state.io);
+    if (app_state.video.decoder) |dec| _ = dec.releaseGpuToken(token);
+}
+
 pub fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) void {
     const app_state: *GuiAppState = @ptrCast(@alignCast(user orelse return));
     const pressed = (state == 1);

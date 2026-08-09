@@ -419,6 +419,14 @@ fn renderWorker(
     var vid_pw: u32 = 0;
     var vid_ph: u32 = 0;
     var vid_prev_ctrl: f32 = -1;
+    // Percorso zero-copy VAAPI (ZUER_VAAPI_DMABUF): buffer STRETTO, dimensionato
+    // al rettangolo che Zrame riporta per la subsurface video (`win.videoRect`),
+    // dove si disegnano controlli/sottotitoli/label esattamente come nel percorso
+    // CPU — poi composti (blitOverlay) sul buco trasparente di `composited_rgba`.
+    // Cresce on-demand come `composited_rgba` stesso; mai usato se il video non
+    // attiva mai lo zero-copy (resta vuoto, nessuna alloc sprecata).
+    var video_overlay_rgba: []u8 = &.{};
+    defer state.gpa.free(video_overlay_rgba);
     // Dopo un cambio contenuto (navigazione) ripresenta per qualche frame: il
     // frame staged viene committato dal thread finestra solo su un suo "wake", e
     // se il primo redraw è differito (entrambi gli slot buffer occupati) resterebbe
@@ -541,17 +549,21 @@ fn renderWorker(
             // finestra. `static_w/h` seguono la finestra così il fit-rect è pieno e
             // l'hit-test dei controlli (che usa le stesse dimensioni) resta corretto.
             const audio_only = vs.audio_only;
+            var adv: videomod.AdvanceResult = .{};
             const new_frame = if (audio_only) blk: {
                 const nf = videomod.advanceAudio(vs, frame_dt);
                 state.shared.static_w = cur_w;
                 state.shared.static_h = cur_h;
                 break :blk nf;
-            } else videomod.advanceVideo(.{
-                .gpa = state.gpa,
-                .rgba = &state.shared.static_rgba,
-                .w = &state.shared.static_w,
-                .h = &state.shared.static_h,
-            }, vs, frame_dt);
+            } else blk: {
+                adv = videomod.advanceVideo(.{
+                    .gpa = state.gpa,
+                    .rgba = &state.shared.static_rgba,
+                    .w = &state.shared.static_w,
+                    .h = &state.shared.static_h,
+                }, vs, frame_dt);
+                break :blk adv.presented;
+            };
             // Auto-hide: controlli visibili in pausa, durante lo scrubbing o entro
             // 2.5 s dall'ultimo movimento del mouse; poi sfumano (fade ~8/s).
             vs.idle_s += frame_dt;
@@ -574,44 +586,128 @@ fn renderWorker(
             var pres_w: u32 = 0;
             var pres_h: u32 = 0;
             if (do_present) {
-                // Buffer STRETTO in aspect-fit: zrame lo centra nel vetro e ne arrotonda
-                // gli angoli col solito content_radius — stesso frame di ogni altro tipo
-                // di file (nessun percorso speciale per il video).
-                const fr = videomod.videoFitRect(cur_w, cur_h, state.shared.static_w, state.shared.static_h);
+                const raster: ?*glyph.Raster = if (name_raster) |*r| r else null;
+                // Dove disegnare controlli/sottotitoli/label e con quale
+                // dimensione — un buffer STRETTO come sempre (le funzioni di
+                // overlay non conoscono stride/offset). Nel percorso
+                // zero-copy è un buffer scratch separato, composto poi sopra
+                // il buco trasparente di `composited_rgba` (`blit_at`
+                // non-null); altrimenti è `composited_rgba` stesso, già
+                // dimensionato all'aspect-fit stretto come da sempre.
+                var overlay_w: u32 = 0;
+                var overlay_h: u32 = 0;
+                var overlay_buf: []u8 = &.{};
+                var blit_at: ?struct { x: i32, y: i32 } = null;
+
                 if (audio_only) {
                     // Oscilloscopio disegnato a piena finestra (fr = cur_w×cur_h):
                     // niente static_rgba/composeFrame, si dipinge diretto nel buffer.
+                    const fr = videomod.videoFitRect(cur_w, cur_h, state.shared.static_w, state.shared.static_h);
                     videomod.drawOscilloscope(composited_rgba.*, fr.w, fr.h, vs);
+                    overlay_w = fr.w;
+                    overlay_h = fr.h;
+                    overlay_buf = composited_rgba.*;
+                    pres_w = fr.w;
+                    pres_h = fr.h;
+                } else if (adv.gpu) |gp| {
+                    // Zero-copy: il video vero arriva alla subsurface Wayland di
+                    // Zrame via presentDmabufPlanesDynamic, MAI attraverso questo
+                    // buffer — vedi Player.frameFromCurrent per perché il readback
+                    // GPU→CPU è saltato del tutto (non solo duplicato). Qui resta
+                    // solo un buco trasparente con sopra controlli/sottotitoli,
+                    // allineati al rettangolo che ZRAME (non videoFitRect) calcola.
+                    @memset(composited_rgba.*[0 .. @as(usize, cur_w) * cur_h * 4], 0);
+                    win.setVideoFit(.contain);
+                    // Percorso Linux-only per costruzione (adv.gpu è sempre null
+                    // altrove, vedi zeroCopyWanted in video.zig): isolato dietro
+                    // comptime perché GpuPlane.fd (player.zig, c_int — VAAPI è
+                    // un concetto Linux) non converte in std.posix.fd_t su
+                    // piattaforme dove quel tipo è un HANDLE (Windows) — non
+                    // deve nemmeno essere TIPIZZATO altrove, non solo saltato a
+                    // runtime (visto in pratica: cross-compile Windows rotta).
+                    if (comptime builtin.os.tag == .linux) {
+                        // GpuPlane (player.zig, niente modifier per piano — è per
+                        // frame) → DmabufPlane (zrame, un modifier per piano):
+                        // stesso modifier ripetuto su ogni piano, come da NV12
+                        // (un solo oggetto DRM dietro entrambi i piani, vedi
+                        // Player.tryExportGpuFrame).
+                        var zplanes: [2]zrame.DmabufPlane = undefined;
+                        for (gp.planes[0..gp.plane_count], 0..) |pl, i| {
+                            zplanes[i] = .{ .fd = pl.fd, .offset = pl.offset, .stride = pl.pitch, .modifier = gp.modifier };
+                        }
+                        const present_ok = win.presentDmabufPlanesDynamic(0, gp.token, zplanes[0..gp.plane_count], gp.width, gp.height, gp.fourcc);
+                        if (!present_ok) {
+                            // Rifiuto immediato (niente supporto dmabuf/subcompositor):
+                            // per contratto di Zrame nessun evento arriverà mai per
+                            // questo token — libera qui e basta, poi disabilita lo
+                            // zero-copy per il resto di questo stream (il produttore
+                            // torna al percorso CPU pieno dal prossimo frame).
+                            if (vs.decoder) |dec| {
+                                _ = dec.releaseGpuToken(gp.token);
+                                dec.disableGpuPresent();
+                            }
+                        }
+                    }
+                    if (win.videoRect()) |vr| {
+                        const need = @as(usize, vr.w) * vr.h * 4;
+                        if (video_overlay_rgba.len < need) {
+                            state.gpa.free(video_overlay_rgba);
+                            video_overlay_rgba = state.gpa.alignedAlloc(u8, .@"4", need) catch &.{};
+                        }
+                        if (video_overlay_rgba.len >= need) {
+                            @memset(video_overlay_rgba[0..need], 0);
+                            overlay_w = vr.w;
+                            overlay_h = vr.h;
+                            overlay_buf = video_overlay_rgba;
+                            blit_at = .{ .x = @intCast(vr.x), .y = @intCast(vr.y) };
+                        }
+                    }
+                    // Altrimenti (rect non ancora pronto, tipicamente solo il
+                    // primissimo frame prima che Zrame risponda a `created`):
+                    // niente overlay da disegnare questo giro, resta solo il
+                    // buco trasparente — si riallinea al giro successivo.
+                    pres_w = cur_w;
+                    pres_h = cur_h;
                 } else {
-                    // Buffer STRETTO in aspect-fit: zrame lo centra nel vetro e ne arrotonda
-                    // gli angoli col solito content_radius — stesso frame di ogni altro tipo
-                    // di file (nessun percorso speciale per il video).
+                    // Buffer STRETTO in aspect-fit: zrame lo centra nel vetro e ne
+                    // arrotonda gli angoli col solito content_radius — stesso frame
+                    // di ogni altro tipo di file (nessun percorso speciale).
+                    const fr = videomod.videoFitRect(cur_w, cur_h, state.shared.static_w, state.shared.static_h);
                     const px = @as(usize, fr.w) * fr.h * 4;
                     @memset(composited_rgba.*[0..px], 0);
                     compose.composeFrame(composited_rgba.*, fr.w, fr.h, state.shared.static_rgba, state.shared.static_w, state.shared.static_h, false, 1.0, 0.0, 0.0);
+                    overlay_w = fr.w;
+                    overlay_h = fr.h;
+                    overlay_buf = composited_rgba.*;
+                    pres_w = fr.w;
+                    pres_h = fr.h;
                 }
-                const raster: ?*glyph.Raster = if (name_raster) |*r| r else null;
-                // Sottotitoli YouTube (toggle `c`): cue corrente sopra i controlli,
-                // sotto ogni overlay. Stato letto sotto lock (siamo dentro `mutex`).
-                if (!audio_only and state.shared.yt.subs_on) {
-                    if (yt_search.currentSubText(state, vs.pos_s)) |sub_txt| {
-                        if (sub_raster) |*r| videomod.drawSubtitle(composited_rgba.*, fr.w, fr.h, r, sub_txt);
+
+                if (overlay_w > 0 and overlay_h > 0) {
+                    // Sottotitoli YouTube (toggle `c`): cue corrente sopra i
+                    // controlli, sotto ogni overlay. Stato letto sotto lock
+                    // (siamo dentro `mutex`).
+                    if (!audio_only and state.shared.yt.subs_on) {
+                        if (yt_search.currentSubText(state, vs.pos_s)) |sub_txt| {
+                            if (sub_raster) |*r| videomod.drawSubtitle(overlay_buf, overlay_w, overlay_h, r, sub_txt);
+                        }
                     }
-                }
-                videomod.drawVideoControls(composited_rgba.*, fr.w, fr.h, vs, raster);
-                if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, fr.w, fr.h, r, std.fs.path.basename(state.shared.current_file_path));
-                if (state.shared.fx.active) {
-                    if (name_raster) |*r| file_explorer.drawOverlay(composited_rgba.*, fr.w, fr.h, state, r);
-                }
-                if (yt_active) {
-                    if (name_raster) |*r| yt_search.drawOverlay(composited_rgba.*, fr.w, fr.h, state, r, @as(f32, @floatFromInt(spin_frame)) / 60.0);
-                    spin_frame +%= 1;
+                    videomod.drawVideoControls(overlay_buf, overlay_w, overlay_h, vs, raster);
+                    if (name_raster) |*r| drawFilenameLabel(overlay_buf, overlay_w, overlay_h, r, std.fs.path.basename(state.shared.current_file_path));
+                    if (state.shared.fx.active) {
+                        if (name_raster) |*r| file_explorer.drawOverlay(overlay_buf, overlay_w, overlay_h, state, r);
+                    }
+                    if (yt_active) {
+                        if (name_raster) |*r| yt_search.drawOverlay(overlay_buf, overlay_w, overlay_h, state, r, @as(f32, @floatFromInt(spin_frame)) / 60.0);
+                        spin_frame +%= 1;
+                    }
+                    if (blit_at) |p| {
+                        videomod.blitOverlay(composited_rgba.*, cur_w, cur_h, p.x, p.y, overlay_buf, overlay_w, overlay_h);
+                    }
                 }
                 vid_pw = cur_w;
                 vid_ph = cur_h;
                 vid_prev_ctrl = vs.controls;
-                pres_w = fr.w;
-                pres_h = fr.h;
             }
             // Stato del pacer campionato ANCORA sotto lock (il worker lo rilegge
             // dopo l'unlock); il catch-up post-seek conta come "busy" così il
@@ -866,6 +962,12 @@ fn renderWorker(
                     // (piazzato SOTTO il parent da Zrame, vedi window_wayland.zig)
                     // mostra la mesh, e qui sopra restano solo label/overlay.
                     @memset(composited_rgba.*[0 .. @as(usize, cur_w) * cur_h * 4], 0);
+                    // Difensivo: se questa stessa finestra ha mostrato un video
+                    // zero-copy prima (navigazione fra file), `video_fit` è
+                    // rimasto su `.contain` — la mesh vuole sempre `.fill`
+                    // (il suo render riempie il rettangolo contenuto, non è in
+                    // aspect-fit come un video).
+                    win.setVideoFit(.fill);
                     if (!win.presentDmabuf(0, d.fd, d.width, d.height, d.stride, d.fourcc, d.modifier)) {
                         // Compositor senza supporto linux-dmabuf/subcompositor:
                         // niente piano da mostrare finché non arriva un frame CPU.
@@ -1180,6 +1282,7 @@ pub fn main(init: std.process.Init) !void {
         .on_text = input.textCallback,
         .on_scroll = input.scrollCallback,
         .on_mouse = input.mouseCallback,
+        .on_video_buffer_event = input.onVideoBufferEvent,
         .user = &gui_state,
         .style = gui_state_mod.minimalFrame(zrame.Style.fluent()),
     });

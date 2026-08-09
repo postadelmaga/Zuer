@@ -1828,9 +1828,17 @@ pub const Renderer = struct {
         vkDestroyFramebuffer(self.device, self.framebuffer, null);
         self.destroyImage(.{ .image = self.color_image, .mem = self.color_mem, .view = self.color_view });
         self.destroyImage(.{ .image = self.depth_image, .mem = self.depth_mem, .view = self.depth_view });
-        if (self.color_dmabuf_fd >= 0) {
-            _ = std.c.close(self.color_dmabuf_fd);
-            self.color_dmabuf_fd = -1;
+        // Isolato dietro comptime (non solo la guardia a runtime sopra):
+        // std.c.close si aspetta std.c.fd_t, che su Windows è un HANDLE
+        // (*anyopaque), non l'i32 con cui il dmabuf export (solo Linux, vedi
+        // dmabuf_capable altrove in questo file) rappresenta il fd — non deve
+        // nemmeno essere TIPIZZATO lì (cross-compile Windows altrimenti rotta:
+        // color_dmabuf_fd resta sempre -1 su quella piattaforma comunque).
+        if (comptime builtin.os.tag == .linux) {
+            if (self.color_dmabuf_fd >= 0) {
+                _ = std.c.close(self.color_dmabuf_fd);
+                self.color_dmabuf_fd = -1;
+            }
         }
 
         var i: usize = 0;
