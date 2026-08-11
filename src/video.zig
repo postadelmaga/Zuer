@@ -273,6 +273,9 @@ pub fn advanceVideo(sink: FrameSink, vs: *VideoState, dt: f32) bool {
             vs.audio_clk_prev = ac;
             audio_pos = ac;
         }
+        // Propaga play/pausa al backend mpv (se attivo): il suo pacing è
+        // indipendente dal nostro ring, non basta smettere di drenarlo.
+        dec.setPlaying(vs.playing);
     }
     // Durante il settle post-seek `pos_s` resta fermo al target finché il frame di
     // destinazione non è pronto (poi vi si aggancia): niente avanzamento wall-clock
@@ -282,7 +285,15 @@ pub fn advanceVideo(sink: FrameSink, vs: *VideoState, dt: f32) bool {
         if (drained) {
             const threshold: f64 = if (dec.frame_rate > 30.0) 0.035 else 0.065;
             const err = audio_pos - vs.pos_s;
-            if (@abs(err) > threshold) vs.pos_s = audio_pos else vs.pos_s += err * 0.05;
+            if (@abs(err) > threshold) {
+                vs.pos_s = audio_pos;
+                // Grande deriva: il backend FFmpeg si riaggancia da solo
+                // scartando frame dal ring (già gestito da `pickInto` sotto),
+                // ma mpv pacing per conto proprio — va risincronizzato con un
+                // vero seek, altrimenti resta fermo sull'ultimo frame finché
+                // non raggiunge naturalmente il nuovo target.
+                dec.resyncIfMpv(audio_pos);
+            } else vs.pos_s += err * 0.05;
         }
     }
 

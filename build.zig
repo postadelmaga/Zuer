@@ -15,15 +15,25 @@ pub fn build(b: *std.Build) void {
         (os_tag == .linux or os_tag == .windows);
     const ffmpeg_enabled = b.option(bool, "ffmpeg", "Link the libav native video player") orelse
         (os_tag == .linux or os_tag == .windows);
+    // libmpv (render API, EGL) per il video hardware-accelerato: percorso
+    // Linux/Wayland-only (EGL + wl_display privato, vedi src/decoders/mpv_video.zig).
+    const mpv_enabled = b.option(bool, "mpv", "Link libmpv render API for hw video (Linux only)") orelse
+        (os_tag == .linux);
     const build_opts = b.addOptions();
     // gui.zig/player.zig read `gpu` as "Vulkan renderer available"; `video` as "libav available".
     build_opts.addOption(bool, "gpu", vulkan_enabled);
     build_opts.addOption(bool, "video", ffmpeg_enabled);
+    build_opts.addOption(bool, "mpv", mpv_enabled);
     // Solo per zuer-gui: i simboli libav si risolvono a runtime (LoadLibrary/dlopen
     // al primo video) invece che dalla import table / DT_NEEDED, su entrambi gli OS
     // — così l'eseguibile non dipende dal soname di FFmpeg installato al momento
     // della build e un file non multimediale non tocca mai libavformat.
     build_opts.addOption(bool, "av_runtime", os_tag == .windows or os_tag == .linux);
+    // Solo per zuer-gui: libmpv si risolve a runtime (dlopen al primo video con
+    // mpv, vedi ensureMpv in src/decoders/mpv_video.zig) — così l'exe parte
+    // anche senza mpv installato, ripiegando sul decoder FFmpeg esistente.
+    // EGL/GL restano linkati diretti (vedi commento sul link di gui_exe sotto).
+    build_opts.addOption(bool, "mpv_runtime", mpv_enabled and os_tag == .linux);
 
     // Variante per i consumer che linkano libav DIRETTAMENTE (plugin media,
     // tool player_dbg): per loro gli extern del cImport restano il percorso.
@@ -238,6 +248,21 @@ pub fn build(b: *std.Build) void {
         gui_exe.root_module.linkSystemLibrary("wayland-client", .{});
         gui_exe.root_module.linkSystemLibrary("asound", .{}); // backend audio zicro (ALSA)
     }
+    if (mpv_enabled) {
+        // src/decoders/mpv_video.zig: decode+render video via libmpv (render API
+        // OpenGL) su un contesto EGL indipendente (pbuffer 1x1, rendering vero
+        // in un FBO), per il percorso hardware-accelerato. Header di sistema
+        // già nel default include path (/usr/include/mpv, /usr/include/EGL,
+        // /usr/include/GL) su Linux, niente -I esplicito. EGL/GL linkate dirette
+        // (non risolte via dlopen): sono di fatto una dipendenza di qualunque
+        // desktop Linux con uno stack grafico funzionante, come Vulkan qui
+        // sopra. libmpv invece NON è detto sia installata: zuer-gui non la
+        // linka mai (niente `linkSystemLibrary("mpv")`), i simboli si
+        // risolvono a runtime al primo video con mpv (`ensureMpv`, dlopen) così
+        // l'exe parte anche senza mpv, ripiegando sul decoder FFmpeg esistente.
+        gui_exe.root_module.linkSystemLibrary("EGL", .{});
+        gui_exe.root_module.linkSystemLibrary("GL", .{});
+    }
     // Backend audio zicro su Windows (waveOut/winmm).
     if (target.result.os.tag == .windows) {
         gui_exe.root_module.linkSystemLibrary("winmm", .{});
@@ -424,6 +449,33 @@ pub fn build(b: *std.Build) void {
     } else {
         const fail = b.addFail("player-test richiede libav: ricompila senza -Dffmpeg=false");
         b.step("player-test", "Itera i frame video di un file (libav)").dependOn(&fail.step);
+    }
+
+    // Tool di sviluppo: verifica isolata del modulo mpv_video.zig (Fase 1 del
+    // piano libmpv) — carica un file, pompa qualche frame, logga dimensioni e
+    // media colore. Nessun collegamento a VideoDecoder/gui.zig ancora.
+    if (mpv_enabled) {
+        const mpv_dbg = b.addExecutable(.{
+            .name = "mpv-video-test",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/mpv_video_probe.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        mpv_dbg.root_module.linkSystemLibrary("mpv", .{});
+        mpv_dbg.root_module.linkSystemLibrary("EGL", .{});
+        mpv_dbg.root_module.linkSystemLibrary("GL", .{});
+        mpv_dbg.root_module.linkSystemLibrary("wayland-client", .{});
+        // Tool a link diretto (non passa da ensureMpv/dlopen): build_options con
+        // mpv_runtime=false fa usare a mpv_video.zig la tabella statica.
+        const mpv_dbg_opts = b.addOptions();
+        mpv_dbg_opts.addOption(bool, "mpv_runtime", false);
+        mpv_dbg.root_module.addOptions("build_options", mpv_dbg_opts);
+        const mpv_run = b.addRunArtifact(mpv_dbg);
+        if (b.args) |args| mpv_run.addArgs(args);
+        b.step("mpv-video-test", "Verifica isolata del modulo mpv_video.zig").dependOn(&mpv_run.step);
     }
 
     // `zig build android` — la libreria nativa dell'APK: `libzuer.so` per

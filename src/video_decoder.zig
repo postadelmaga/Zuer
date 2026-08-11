@@ -25,6 +25,17 @@ const std = @import("std");
 const builtin = @import("builtin");
 const player_mod = @import("decoders/player.zig");
 
+// Backend video hardware-accelerato via libmpv (render API): Linux-only, gate
+// a livello di TIPO (non solo runtime) perché mpv_video.zig fa @cImport di
+// header (mpv/EGL) che su Windows/macOS non esistono — stesso pattern già
+// usato per cvp9 in decoders/player.zig. Preferito quando disponibile;
+// altrove (o se l'init fallisce) resta il Player FFmpeg esistente sotto,
+// invariato.
+const mpv_enabled = builtin.os.tag == .linux and @import("build_options").mpv;
+const mpv_video = if (mpv_enabled) @import("decoders/mpv_video.zig") else struct {
+    pub const MpvVideo = struct {};
+};
+
 /// Slot della coda: buffer RGBA di proprietà, riusato tra i giri (la dimensione
 /// dei frame è costante per un dato video: `realloc` scatta al più una volta).
 const Slot = struct {
@@ -70,6 +81,18 @@ pub const VideoDecoder = struct {
     // guidato dal consumatore (che deve riavvolgere anche l'audio in sync).
     eof: std.atomic.Value(bool) = .init(false),
 
+    // Backend mpv (preferito quando disponibile): non-null ⇒ `threadMain`
+    // gira su mpv invece che sul `Player` FFmpeg diretto (che resta comunque
+    // aperto sopra, per il poster e come fallback se l'init mpv fallisce).
+    mpv: if (mpv_enabled) ?mpv_video.MpvVideo else void = if (mpv_enabled) null else {},
+    // Copia di proprietà del path (mpv carica il file per conto suo, con la
+    // propria `loadFile`/i propri comandi di seek — non passa dal `Player`).
+    path_owned: [:0]const u8 = &[_:0]u8{},
+    // Pausa richiesta per mpv (letta dal thread di decodifica, scritta dal
+    // present via `setPlaying`): mpv pacing è indipendente dal nostro ring,
+    // quindi la pausa lato Zuer (smettere di drenare) da sola non lo ferma.
+    mpv_pause_req: if (mpv_enabled) std.atomic.Value(bool) else void = if (mpv_enabled) .init(false) else {},
+
     /// Poster (primo frame) + decoder avviato. Il chiamante prende possesso di
     /// `.rgba` (→ `static_rgba`) e del decoder (chiuso da `stopAndDestroy`).
     pub const StartResult = struct { dec: *VideoDecoder, rgba: []u8, w: u32, h: u32, pts_s: f64 };
@@ -108,21 +131,51 @@ pub const VideoDecoder = struct {
         self.ring[0].pts_s = frame.pts_s;
         self.tail.store(1, .release);
 
-        self.thread = std.Thread.spawn(.{}, threadMain, .{self}) catch |e| {
+        // Path di proprietà per mpv (se disponibile — la sua init/loadFile
+        // girano DENTRO il thread, vedi `threadEntry`: EGL lega il contesto al
+        // thread chiamante, quindi deve essere lo STESSO thread che poi fa
+        // `mpv_render_context_render`, non quello che chiama `start()`).
+        if (comptime mpv_enabled) {
+            self.path_owned = gpa.dupeZ(u8, std.mem.span(path_z)) catch &[_:0]u8{};
+        }
+        self.thread = std.Thread.spawn(.{}, threadEntry, .{self}) catch |e| {
             gpa.free(self.ring[0].pixels);
             return e;
         };
         return .{ .dec = self, .rgba = poster, .w = w, .h = h, .pts_s = frame.pts_s };
     }
 
-    /// Ferma e joina il thread, poi libera coda e `Player`.
+    /// Ferma e joina il thread, poi libera coda, backend mpv (se attivo) e `Player`.
     pub fn stopAndDestroy(self: *VideoDecoder) void {
         self.stop.store(true, .monotonic);
         if (self.thread) |t| t.join();
         for (&self.ring) |*s| if (s.cap > 0) self.gpa.free(s.pixels);
+        if (comptime mpv_enabled) {
+            if (self.mpv) |*mv| mv.deinit();
+            if (self.path_owned.len > 0) self.gpa.free(self.path_owned);
+        }
         self.player.deinit();
         const gpa = self.gpa;
         gpa.destroy(self);
+    }
+
+    /// Propaga play/pausa al backend mpv (se attivo). No-op per il backend
+    /// FFmpeg, che già si ferma per backpressure (il ring smette di svuotarsi).
+    pub fn setPlaying(self: *VideoDecoder, playing: bool) void {
+        if (comptime mpv_enabled) self.mpv_pause_req.store(!playing, .monotonic);
+    }
+
+    /// Se il backend attivo è mpv, forza una risincronizzazione dura verso
+    /// `seconds`. mpv pacing è indipendente dal ring (non "libero" come il
+    /// `Player` FFmpeg, che decodifica al massimo consentito dalla
+    /// backpressure): una grande deriva rispetto al clock audio non si
+    /// riassorbe scartando frame dal ring come per FFmpeg, va tradotta in un
+    /// vero comando di seek verso mpv (stesso canale di `seekAndFlush`, usato
+    /// anche per i seek manuali dell'utente).
+    pub fn resyncIfMpv(self: *VideoDecoder, seconds: f64) void {
+        if (comptime mpv_enabled) {
+            if (self.mpv != null) self.seekAndFlush(seconds);
+        }
     }
 
     /// Riposiziona a `seconds`: bumpa `gen` (i frame in coda della posizione
@@ -196,6 +249,94 @@ pub const VideoDecoder = struct {
         // slot per il produttore.
         self.head.store(hd, .release);
         return result;
+    }
+
+    /// Unico entry point del thread: tenta l'init di mpv QUI (non in `start()`)
+    /// perché EGL lega il contesto al thread che chiama `eglMakeCurrent` — deve
+    /// essere lo stesso thread che poi chiama `mpv_render_context_render`,
+    /// altrimenti le chiamate GL falliscono silenziosamente (visto in pratica:
+    /// frame grigio piatto, contesto "current" sul thread sbagliato). Se mpv
+    /// non è disponibile o l'init fallisce, ripiega su `threadMain` (Player
+    /// FFmpeg diretto, già aperto da `start()`), sullo stesso thread.
+    fn threadEntry(self: *VideoDecoder) void {
+        if (comptime mpv_enabled) {
+            if (self.path_owned.len > 0) {
+                if (mpv_video.MpvVideo.init()) |mv| {
+                    self.mpv = mv;
+                    self.mpv.?.loadFile(self.path_owned);
+                    threadMainMpvLoop(self);
+                    return;
+                } else |e| {
+                    std.log.warn("zuer video: init mpv fallita ({}), uso il decoder FFmpeg esistente", .{e});
+                }
+            }
+        }
+        threadMain(self);
+    }
+
+    /// Come `threadMain`, ma il produttore è mpv (`self.mpv`) invece del
+    /// `Player` FFmpeg diretto: stessa coda, stesso protocollo gen/stale, la
+    /// differenza è solo COME si ottiene il prossimo frame RGBA. Chiamata da
+    /// `threadEntry` sullo STESSO thread che ha inizializzato mpv (vedi sopra).
+    fn threadMainMpvLoop(self: *VideoDecoder) void {
+        var prod_gen: u32 = self.gen.load(.monotonic);
+        var scratch: std.ArrayList(u8) = .empty;
+        defer scratch.deinit(self.gpa);
+        var applied_pause = false;
+        while (!self.stop.load(.monotonic)) {
+            const want_pause = self.mpv_pause_req.load(.monotonic);
+            if (want_pause != applied_pause) {
+                self.mpv.?.setPaused(want_pause);
+                applied_pause = want_pause;
+            }
+            const sk = self.seek_ms.swap(-1, .monotonic);
+            if (sk >= 0) {
+                const target = @as(f64, @floatFromInt(sk)) / 1000.0;
+                self.mpv.?.seek(target);
+                self.eof.store(false, .monotonic);
+                prod_gen = self.gen.load(.monotonic); // adotta l'epoca del seek
+            }
+            if (self.eof.load(.monotonic)) {
+                sleepMs(8);
+                continue;
+            }
+            // Backpressure: attendi spazio (il consumatore ha liberato uno slot).
+            while (self.tail.load(.monotonic) - self.head.load(.acquire) >= CAP) {
+                if (self.stop.load(.monotonic) or self.seek_ms.load(.monotonic) >= 0) break;
+                sleepMs(FULL_WAIT_MS);
+            }
+            if (self.stop.load(.monotonic) or self.seek_ms.load(.monotonic) >= 0) continue;
+
+            const fr = (self.mpv.?.pollFrame(&scratch, self.gpa) catch null) orelse {
+                if (self.mpv.?.eofReached()) {
+                    self.eof.store(true, .monotonic);
+                } else {
+                    sleepMs(4);
+                }
+                continue;
+            };
+            // Un seek è arrivato mentre pompavamo mpv: scarta questo frame (è
+            // della posizione vecchia), lo gestiamo al prossimo giro.
+            if (self.seek_ms.load(.monotonic) >= 0) continue;
+
+            const need = @as(usize, fr.width) * fr.height * 4;
+            const t = self.tail.load(.monotonic);
+            const slot = &self.ring[t % CAP];
+            if (slot.cap < need) {
+                const nb = self.gpa.realloc(slot.pixels, need) catch {
+                    sleepMs(4); // niente memoria per lo slot: rinuncia a questo frame
+                    continue;
+                };
+                slot.pixels = nb;
+                slot.cap = need;
+            }
+            @memcpy(slot.pixels[0..need], scratch.items[0..need]);
+            slot.w = fr.width;
+            slot.h = fr.height;
+            slot.pts_s = fr.pts_s;
+            slot.gen = prod_gen;
+            self.tail.store(t + 1, .release);
+        }
     }
 
     fn threadMain(self: *VideoDecoder) void {
