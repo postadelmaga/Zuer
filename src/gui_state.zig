@@ -441,24 +441,22 @@ pub fn isInsideArchive(path: []const u8) bool {
 /// Il margin resta abbastanza ampio da ospitare l'ombra senza tagliarla.
 pub fn minimalFrame(s: zrame.Style) zrame.Style {
     var out = s;
-    // Bordo minimale: gutter stretto che ospita solo un'ombra sottile. Il contenuto
-    // riempie il pannello, quindi `margin` è di fatto lo spessore del bordo visibile.
-    out.margin = 4;
-    // L'ombra deve stare nel gutter: oltre `margin` verrebbe tagliata.
-    out.shadow_blur = @min(out.shadow_blur, 4);
-    out.shadow_offset_y = @min(out.shadow_offset_y, 2);
-    // Vetro noir/fumé: spinge la tinta del preset verso il nero e la rende più
-    // coprente, così il testo chiaro stacca sul blur del compositor; della tinta
-    // originale resta solo un velo. Lo sheen dà il gradiente "fumo" verticale.
+    // Il contenuto occupa TUTTA la finestra: nessun gutter, nessuna ombra (che
+    // dovrebbe vivere nel gutter). Della cornice resta solo la forma: gli angoli
+    // arrotondati del pannello (`corner_radius`) ritagliano il contenuto in modo
+    // concentrico e anti-aliasato, senza fascia di dissolvenza lungo i bordi —
+    // il vetro/fumo del preset si vede solo negli angoli, dove il contenuto è
+    // ritagliato, non come cornice.
+    out.margin = 0;
+    out.shadow_blur = 0;
+    out.shadow_offset_y = 0;
+    // Vetro noir/fumé per ciò che resta scoperto (angoli, contenuti con alpha,
+    // documenti di testo col fondo trasparente): spinge la tinta del preset verso
+    // il nero e la rende più coprente, così il testo chiaro stacca sul blur del
+    // compositor; lo sheen dà il gradiente "fumo" verticale.
     out.glass = .{ .r = out.glass.r * 0.35, .g = out.glass.g * 0.35, .b = out.glass.b * 0.42, .a = @max(out.glass.a, 0.85) };
     out.sheen = @max(out.sheen, 0.14);
-    // Il contenuto sfuma progressivamente verso il bordo del vetro invece di
-    // terminare netto: si fonde con la finestra trasparente (px logici).
-    const fade: f32 = 12;
-    out.content_fade_width = fade;
-    // La dissolvenza segue la forma del contenuto: col raggio del pannello sarebbe
-    // quasi squadrata agli angoli, quindi il contenuto prende un raggio maggiorato
-    // (pannello + 1.5·fade) → la sfumatura fa da vignetta ben ARROTONDATA.
-    out.content_radius = out.corner_radius + fade * 1.5;
+    out.content_fade_width = 0;
+    out.content_radius = out.corner_radius; // concentrico: margine 0
     return out;
 }

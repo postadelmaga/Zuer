@@ -911,7 +911,7 @@ fn renderWorker(
             if (need_render) tr[1] += 1;
             tr_acc += frame_dt;
             if (tr_acc >= 1.0) {
-                std.debug.print("[trace] ticks={d} renders={d} size={d} file_changed={d} pulse={d} sc_tick={d} load_seq={d} nav_gen={d} scroll_y={d:.1} unproc={d:.1} vel={d:.1} file={s}\n", .{ tr[0], tr[1], tr[2], tr[3], tr[5], tr[6], state.shared.load_seq, state.nav.gen, state.shared.sc.offset[1], state.shared.sc.unprocessed[1], state.shared.sc.vel[1], std.fs.path.basename(state.shared.current_file_path) });
+                std.debug.print("[trace] ticks={d} renders={d} size={d} file_changed={d} pulse={d} sc_tick={d} load_seq={d} nav_gen={d} win={d}x{d} static={d}x{d} zoom={d:.2} pan={d:.0},{d:.0} scroll_y={d:.1} file={s}\n", .{ tr[0], tr[1], tr[2], tr[3], tr[5], tr[6], state.shared.load_seq, state.nav.gen, cur_w, cur_h, state.shared.static_w, state.shared.static_h, state.shared.zoom, state.shared.pan_x, state.shared.pan_y, state.shared.sc.offset[1], std.fs.path.basename(state.shared.current_file_path) });
                 tr = [_]u32{0} ** 7;
                 tr_acc = 0;
             }
@@ -1173,9 +1173,10 @@ pub fn main(init: std.process.Init) !void {
     const size_h = if (win_kind == .table) tbl_h else if (header_dims) |hd| hd.h else gui_state.shared.static_h;
     // Dimensioni certe già usate per la finestra → `decodeInitial` non deve
     // ridimensionarla di nuovo dopo l'apply (niente salto visibile).
-    // (PDF e documenti: la forma A4/fissa per tipo è già quella definitiva.)
+    // (Documenti di testo: la forma A4 è già quella definitiva. I PDF invece si
+    // adattano all'aspetto reale della pagina appena decodificata, come le immagini.)
     gui_state.initial_size_known = header_dims != null or !gui_state.shared.loading or
-        (ext_kind != .image and ext_kind != .video and ext_kind != .mesh);
+        (ext_kind != .image and ext_kind != .video and ext_kind != .mesh and !gui_state_mod.isPdfPath(file_path));
     // Contenuto piccolo → zoom iniziale un po' più grande, finestra aderente al
     // contenuto zoomato (stessa euristica della navigazione).
     const az0 = layout.autoZoomForContent(win_kind, size_w, size_h);
