@@ -35,8 +35,8 @@ const cvp9_enabled = builtin.os.tag == .linux and @import("build_options").gpu;
 const cvp9 = if (cvp9_enabled) @import("cvp9.zig") else struct {};
 
 // ── libav a runtime ──────────────────────────────────────────────────────────
-// Le firme vengono dagli header (@TypeOf sui simboli del cImport), quindi
-// restano allineate da sole. Nei build a link diretto (plugin media, player_dbg)
+// Le firme sono esplicite ma verificate contro gli header nei build LLVM (vedi
+// il blocco comptime sotto `AvApi`). Nei build a link diretto (plugin media, player_dbg)
 // i campi puntano agli extern del link diretto (LinkAv); in zuer-gui (Linux e
 // Windows) l'exe NON linka le lib: si caricano al primo video (`ensureAv`, dlopen
 // su Linux/LoadLibrary su Windows) e l'app parte anche senza FFmpeg o con un
@@ -48,44 +48,59 @@ const av_dynamic = @hasDecl(bo, "av_runtime") and bo.av_runtime;
 
 /// Tabella delle funzioni libav usate qui e in src/audio_player.zig.
 pub const AvApi = struct {
-    av_buffer_ref: *const @TypeOf(c.av_buffer_ref),
-    av_buffer_unref: *const @TypeOf(c.av_buffer_unref),
-    av_channel_layout_check: *const @TypeOf(c.av_channel_layout_check),
-    av_channel_layout_copy: *const @TypeOf(c.av_channel_layout_copy),
-    av_channel_layout_default: *const @TypeOf(c.av_channel_layout_default),
-    av_channel_layout_uninit: *const @TypeOf(c.av_channel_layout_uninit),
-    avcodec_alloc_context3: *const @TypeOf(c.avcodec_alloc_context3),
-    avcodec_find_decoder: *const @TypeOf(c.avcodec_find_decoder),
-    avcodec_flush_buffers: *const @TypeOf(c.avcodec_flush_buffers),
-    avcodec_free_context: *const @TypeOf(c.avcodec_free_context),
-    avcodec_get_hw_config: *const @TypeOf(c.avcodec_get_hw_config),
-    avcodec_open2: *const @TypeOf(c.avcodec_open2),
-    avcodec_parameters_to_context: *const @TypeOf(c.avcodec_parameters_to_context),
-    avcodec_receive_frame: *const @TypeOf(c.avcodec_receive_frame),
-    avcodec_send_packet: *const @TypeOf(c.avcodec_send_packet),
-    av_find_best_stream: *const @TypeOf(c.av_find_best_stream),
-    avformat_close_input: *const @TypeOf(c.avformat_close_input),
-    avformat_find_stream_info: *const @TypeOf(c.avformat_find_stream_info),
-    avformat_open_input: *const @TypeOf(c.avformat_open_input),
-    av_frame_alloc: *const @TypeOf(c.av_frame_alloc),
-    av_frame_free: *const @TypeOf(c.av_frame_free),
-    av_frame_unref: *const @TypeOf(c.av_frame_unref),
-    av_hwdevice_ctx_create: *const @TypeOf(c.av_hwdevice_ctx_create),
-    av_hwframe_transfer_data: *const @TypeOf(c.av_hwframe_transfer_data),
-    av_packet_alloc: *const @TypeOf(c.av_packet_alloc),
-    av_packet_free: *const @TypeOf(c.av_packet_free),
-    av_packet_unref: *const @TypeOf(c.av_packet_unref),
-    av_pix_fmt_desc_get: *const @TypeOf(c.av_pix_fmt_desc_get),
-    av_read_frame: *const @TypeOf(c.av_read_frame),
-    av_seek_frame: *const @TypeOf(c.av_seek_frame),
-    swr_alloc_set_opts2: *const @TypeOf(c.swr_alloc_set_opts2),
-    swr_convert: *const @TypeOf(c.swr_convert),
-    swr_free: *const @TypeOf(c.swr_free),
-    swr_init: *const @TypeOf(c.swr_init),
-    sws_freeContext: *const @TypeOf(c.sws_freeContext),
-    sws_getContext: *const @TypeOf(c.sws_getContext),
-    sws_scale: *const @TypeOf(c.sws_scale),
+    av_buffer_ref: *const fn ([*c]const c.struct_AVBufferRef) callconv(.c) [*c]c.struct_AVBufferRef,
+    av_buffer_unref: *const fn ([*c][*c]c.struct_AVBufferRef) callconv(.c) void,
+    av_channel_layout_check: *const fn ([*c]const c.struct_AVChannelLayout) callconv(.c) c_int,
+    av_channel_layout_copy: *const fn ([*c]c.struct_AVChannelLayout, [*c]const c.struct_AVChannelLayout) callconv(.c) c_int,
+    av_channel_layout_default: *const fn ([*c]c.struct_AVChannelLayout, c_int) callconv(.c) void,
+    av_channel_layout_uninit: *const fn ([*c]c.struct_AVChannelLayout) callconv(.c) void,
+    avcodec_alloc_context3: *const fn ([*c]const c.struct_AVCodec) callconv(.c) [*c]c.struct_AVCodecContext,
+    avcodec_find_decoder: *const fn (c_uint) callconv(.c) [*c]const c.struct_AVCodec,
+    avcodec_flush_buffers: *const fn ([*c]c.struct_AVCodecContext) callconv(.c) void,
+    avcodec_free_context: *const fn ([*c][*c]c.struct_AVCodecContext) callconv(.c) void,
+    avcodec_get_hw_config: *const fn ([*c]const c.struct_AVCodec, c_int) callconv(.c) [*c]const c.struct_AVCodecHWConfig,
+    avcodec_open2: *const fn ([*c]c.struct_AVCodecContext, [*c]const c.struct_AVCodec, [*c]?*c.struct_AVDictionary) callconv(.c) c_int,
+    avcodec_parameters_to_context: *const fn ([*c]c.struct_AVCodecContext, [*c]const c.struct_AVCodecParameters) callconv(.c) c_int,
+    avcodec_receive_frame: *const fn ([*c]c.struct_AVCodecContext, [*c]c.struct_AVFrame) callconv(.c) c_int,
+    avcodec_send_packet: *const fn ([*c]c.struct_AVCodecContext, [*c]const c.struct_AVPacket) callconv(.c) c_int,
+    av_find_best_stream: *const fn ([*c]c.struct_AVFormatContext, c_int, c_int, c_int, [*c][*c]const c.struct_AVCodec, c_int) callconv(.c) c_int,
+    avformat_close_input: *const fn ([*c][*c]c.struct_AVFormatContext) callconv(.c) void,
+    avformat_find_stream_info: *const fn ([*c]c.struct_AVFormatContext, [*c]?*c.struct_AVDictionary) callconv(.c) c_int,
+    avformat_open_input: *const fn ([*c][*c]c.struct_AVFormatContext, [*c]const u8, [*c]const c.struct_AVInputFormat, [*c]?*c.struct_AVDictionary) callconv(.c) c_int,
+    av_frame_alloc: *const fn () callconv(.c) [*c]c.struct_AVFrame,
+    av_frame_free: *const fn ([*c][*c]c.struct_AVFrame) callconv(.c) void,
+    av_frame_unref: *const fn ([*c]c.struct_AVFrame) callconv(.c) void,
+    av_hwdevice_ctx_create: *const fn ([*c][*c]c.struct_AVBufferRef, c_uint, [*c]const u8, ?*c.struct_AVDictionary, c_int) callconv(.c) c_int,
+    av_hwframe_transfer_data: *const fn ([*c]c.struct_AVFrame, [*c]const c.struct_AVFrame, c_int) callconv(.c) c_int,
+    av_packet_alloc: *const fn () callconv(.c) [*c]c.struct_AVPacket,
+    av_packet_free: *const fn ([*c][*c]c.struct_AVPacket) callconv(.c) void,
+    av_packet_unref: *const fn ([*c]c.struct_AVPacket) callconv(.c) void,
+    av_pix_fmt_desc_get: *const fn (c_int) callconv(.c) [*c]const c.struct_AVPixFmtDescriptor,
+    av_read_frame: *const fn ([*c]c.struct_AVFormatContext, [*c]c.struct_AVPacket) callconv(.c) c_int,
+    av_seek_frame: *const fn ([*c]c.struct_AVFormatContext, c_int, i64, c_int) callconv(.c) c_int,
+    swr_alloc_set_opts2: *const fn ([*c]?*c.struct_SwrContext, [*c]const c.struct_AVChannelLayout, c_int, c_int, [*c]const c.struct_AVChannelLayout, c_int, c_int, c_int, ?*anyopaque) callconv(.c) c_int,
+    swr_convert: *const fn (?*c.struct_SwrContext, [*c]const [*c]u8, c_int, [*c]const [*c]const u8, c_int) callconv(.c) c_int,
+    swr_free: *const fn ([*c]?*c.struct_SwrContext) callconv(.c) void,
+    swr_init: *const fn (?*c.struct_SwrContext) callconv(.c) c_int,
+    sws_freeContext: *const fn ([*c]c.struct_SwsContext) callconv(.c) void,
+    sws_getContext: *const fn (c_int, c_int, c_int, c_int, c_int, c_int, c_int, [*c]c.struct_SwsFilter, [*c]c.struct_SwsFilter, [*c]const f64) callconv(.c) [*c]c.struct_SwsContext,
+    sws_scale: *const fn ([*c]c.struct_SwsContext, [*c]const [*c]const u8, [*c]const c_int, c_int, c_int, [*c]const [*c]u8, [*c]const c_int) callconv(.c) c_int,
 };
+
+// Le firme qui sopra sono scritte a mano invece di `*const @TypeOf(c.x)`: il
+// backend self-hosted (build Debug / install.sh --fast) emette DWARF per ogni
+// `extern fn` anche solo referenziata a comptime, con una reloc al simbolo → il
+// link di zuer-gui (che NON linka libav) fallisce con "undefined symbol …
+// referenced by .debug_info". Con LLVM il riferimento è gratis: lì si verifica
+// a comptime che ogni firma combaci con gli header, così restano allineate.
+comptime {
+    if (builtin.zig_backend == .stage2_llvm) {
+        for (@typeInfo(AvApi).@"struct".fields) |f| {
+            const Expected = *const @TypeOf(@field(c, f.name));
+            if (f.type != Expected) @compileError("AvApi." ++ f.name ++ ": firma diversa dagli header, attesa " ++ @typeName(Expected));
+        }
+    }
+}
 
 const av_static: AvApi = if (av_dynamic) undefined else blk: {
     var t: AvApi = undefined;

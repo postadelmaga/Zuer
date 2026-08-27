@@ -52,18 +52,33 @@ const mpv_dynamic = @hasDecl(bo, "mpv_runtime") and bo.mpv_runtime;
 
 /// Tabella delle funzioni libmpv usate in questo file.
 pub const MpvApi = struct {
-    mpv_create: *const @TypeOf(c.mpv_create),
-    mpv_set_option_string: *const @TypeOf(c.mpv_set_option_string),
-    mpv_initialize: *const @TypeOf(c.mpv_initialize),
-    mpv_terminate_destroy: *const @TypeOf(c.mpv_terminate_destroy),
-    mpv_render_context_create: *const @TypeOf(c.mpv_render_context_create),
-    mpv_render_context_free: *const @TypeOf(c.mpv_render_context_free),
-    mpv_render_context_update: *const @TypeOf(c.mpv_render_context_update),
-    mpv_render_context_render: *const @TypeOf(c.mpv_render_context_render),
-    mpv_command: *const @TypeOf(c.mpv_command),
-    mpv_get_property: *const @TypeOf(c.mpv_get_property),
-    mpv_set_property: *const @TypeOf(c.mpv_set_property),
+    mpv_create: *const fn () callconv(.c) ?*c.struct_mpv_handle,
+    mpv_set_option_string: *const fn (?*c.struct_mpv_handle, [*c]const u8, [*c]const u8) callconv(.c) c_int,
+    mpv_initialize: *const fn (?*c.struct_mpv_handle) callconv(.c) c_int,
+    mpv_terminate_destroy: *const fn (?*c.struct_mpv_handle) callconv(.c) void,
+    mpv_render_context_create: *const fn ([*c]?*c.struct_mpv_render_context, ?*c.struct_mpv_handle, [*c]c.struct_mpv_render_param) callconv(.c) c_int,
+    mpv_render_context_free: *const fn (?*c.struct_mpv_render_context) callconv(.c) void,
+    mpv_render_context_update: *const fn (?*c.struct_mpv_render_context) callconv(.c) u64,
+    mpv_render_context_render: *const fn (?*c.struct_mpv_render_context, [*c]c.struct_mpv_render_param) callconv(.c) c_int,
+    mpv_command: *const fn (?*c.struct_mpv_handle, [*c][*c]const u8) callconv(.c) c_int,
+    mpv_get_property: *const fn (?*c.struct_mpv_handle, [*c]const u8, c_uint, ?*anyopaque) callconv(.c) c_int,
+    mpv_set_property: *const fn (?*c.struct_mpv_handle, [*c]const u8, c_uint, ?*anyopaque) callconv(.c) c_int,
 };
+
+// Le firme qui sopra sono scritte a mano invece di `*const @TypeOf(c.x)`: il
+// backend self-hosted (build Debug / install.sh --fast) emette DWARF per ogni
+// `extern fn` anche solo referenziata a comptime, con una reloc al simbolo → il
+// link di zuer-gui (che NON linka libmpv) fallisce con "undefined symbol …
+// referenced by .debug_info". Con LLVM il riferimento è gratis: lì si verifica
+// a comptime che ogni firma combaci con gli header, così restano allineate.
+comptime {
+    if (builtin.zig_backend == .stage2_llvm) {
+        for (@typeInfo(MpvApi).@"struct".fields) |f| {
+            const Expected = *const @TypeOf(@field(c, f.name));
+            if (f.type != Expected) @compileError("MpvApi." ++ f.name ++ ": firma diversa dagli header, attesa " ++ @typeName(Expected));
+        }
+    }
+}
 
 const mpv_static: MpvApi = if (mpv_dynamic) undefined else blk: {
     var t: MpvApi = undefined;
@@ -199,7 +214,7 @@ pub const MpvVideo = struct {
             .get_proc_address_ctx = null,
         };
         var params = [_]c.mpv_render_param{
-            .{ .type = c.MPV_RENDER_PARAM_API_TYPE, .data = @constCast(@ptrCast("opengl")) },
+            .{ .type = c.MPV_RENDER_PARAM_API_TYPE, .data = @ptrCast(@constCast("opengl")) },
             .{ .type = c.MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, .data = &init_params },
             .{ .type = c.MPV_RENDER_PARAM_WL_DISPLAY, .data = wl_display },
             .{ .type = c.MPV_RENDER_PARAM_INVALID, .data = null },
