@@ -10,6 +10,7 @@
 //! `has_video` è così un vero confine di modulo, non solo un flag sparso.
 
 const std = @import("std");
+const compose = @import("compose.zig");
 const builtin = @import("builtin");
 const zicro = @import("zicro");
 const paint = zicro.paint;
@@ -50,7 +51,6 @@ pub const VideoState = struct {
     playing: bool = true,
     pos_s: f64 = 0, // posizione di riproduzione corrente (secondi)
     dur_s: f64 = 0, // durata totale (0 se ignota)
-    shown_pts: f64 = 0, // PTS del frame attualmente in `static_rgba`
     // Controlli overlay (stile YouTube): `controls` = alpha di fade (0..1),
     // `idle_s` = secondi dall'ultimo movimento del mouse (guida l'auto-hide).
     // La temporizzazione è ad accumulo di `frame_dt`: nessun orologio a muro.
@@ -147,7 +147,6 @@ pub fn setupVideo(vs: *VideoState, path: []const u8, gpa: std.mem.Allocator) !Vi
 
     vs.dur_s = r.dec.duration_s;
     vs.pos_s = r.pts_s;
-    vs.shown_pts = r.pts_s;
     vs.playing = true;
     vs.decoder = r.dec;
     // Avvia l'audio (handle libav separato + thread). null se il file è muto.
@@ -190,7 +189,6 @@ pub fn setupStream(vs: *VideoState, video_url: []const u8, audio_url: []const u8
 
     vs.dur_s = r.dec.duration_s;
     vs.pos_s = r.pts_s;
-    vs.shown_pts = r.pts_s;
     vs.playing = true;
     vs.decoder = r.dec;
     // Audio dal SUO URL (stream DASH separato). null se non si apre: video muto.
@@ -227,7 +225,6 @@ pub fn setupAudio(vs: *VideoState, path: []const u8, gpa: std.mem.Allocator) !Vi
         vs.decoder = null;
         vs.dur_s = a.duration_s;
         vs.pos_s = 0;
-        vs.shown_pts = 0;
         vs.playing = true;
         return .{ .rgba = rgba, .w = w, .h = h };
     }
@@ -308,7 +305,6 @@ pub fn advanceVideo(sink: FrameSink, vs: *VideoState, dt: f32) bool {
             if (vs.audio) |a| a.seek(0);
         }
         vs.pos_s = 0;
-        vs.shown_pts = 0;
         vs.audio_clk_prev = -1;
         return false;
     }
@@ -321,7 +317,6 @@ pub fn advanceVideo(sink: FrameSink, vs: *VideoState, dt: f32) bool {
     if (vs.playing or vs.settle_seek) {
         const picked = dec.pickInto(vs.pos_s, vs.settle_seek, sink.gpa, sink.rgba, sink.w, sink.h);
         if (picked.presented) {
-            vs.shown_pts = picked.pts_s;
             if (vs.settle_seek) {
                 // Aggancia `pos_s` al frame di destinazione e chiudi il settle: da
                 // qui la riproduzione (se attiva) riparte da questo pts.
@@ -515,15 +510,7 @@ pub fn drawOscilloscope(buf: []u8, W: u32, H: u32, vs: *VideoState) void {
     }
 }
 
-/// Alpha-blend src-over di un colore sul pixel RGBA in `buf[idx..]`.
-fn blendPixel(buf: []u8, idx: usize, r: u8, g: u8, b: u8, a: u8) void {
-    const af: u32 = a;
-    const inv: u32 = 255 - af;
-    buf[idx + 0] = @intCast((@as(u32, r) * af + @as(u32, buf[idx + 0]) * inv) / 255);
-    buf[idx + 1] = @intCast((@as(u32, g) * af + @as(u32, buf[idx + 1]) * inv) / 255);
-    buf[idx + 2] = @intCast((@as(u32, b) * af + @as(u32, buf[idx + 2]) * inv) / 255);
-    buf[idx + 3] = @max(buf[idx + 3], a);
-}
+const blendPixel = compose.blendPixel;
 
 /// Triangolo "play" pieno (punta a destra) fuso sul buffer RGBA, alpha `a`.
 fn fillPlayTriangle(buf: []u8, W: u32, H: u32, cx: f32, cy: f32, s: f32, a: f32) void {
@@ -555,13 +542,13 @@ fn fillPlayTriangle(buf: []u8, W: u32, H: u32, cx: f32, cy: f32, s: f32, a: f32)
 /// Rettangolo del video in aspect-fit CENTRATO nell'area contenuto (`panel`). Il
 /// frame video è composto in un buffer STRETTO (`w`×`h`): è zrame a centrarlo nel
 /// vetro e ad arrotondarne gli angoli (content_radius), esattamente come per ogni
-/// altro tipo di file. `off_x/off_y` è l'offset di centratura che l'hit-test del
-/// mouse sottrae; la divisione intera rispecchia la centratura di `chrome.composeContent`.
-pub const FitRect = struct { off_x: f32, off_y: f32, w: u32, h: u32 };
+/// altro tipo di file. L'hit-test del mouse lavora già in coordinate del frame
+/// presentato: nessun offset di centratura da sottrarre.
+pub const FitRect = struct { w: u32, h: u32 };
 
 pub fn videoFitRect(panel_w: u32, panel_h: u32, vid_w: u32, vid_h: u32) FitRect {
     if (panel_w == 0 or panel_h == 0 or vid_w == 0 or vid_h == 0)
-        return .{ .off_x = 0, .off_y = 0, .w = @max(1, panel_w), .h = @max(1, panel_h) };
+        return .{ .w = @max(1, panel_w), .h = @max(1, panel_h) };
     const va = @as(f32, @floatFromInt(vid_w)) / @as(f32, @floatFromInt(vid_h));
     const ca = @as(f32, @floatFromInt(panel_w)) / @as(f32, @floatFromInt(panel_h));
     var w = panel_w;
@@ -571,7 +558,7 @@ pub fn videoFitRect(panel_w: u32, panel_h: u32, vid_w: u32, vid_h: u32) FitRect 
     } else {
         w = @max(1, @as(u32, @intFromFloat(@round(@as(f32, @floatFromInt(panel_h)) * va))));
     }
-    return .{ .off_x = @floatFromInt((panel_w - w) / 2), .off_y = @floatFromInt((panel_h - h) / 2), .w = w, .h = h };
+    return .{ .w = w, .h = h };
 }
 
 /// Layout della riga di controlli (coordinate locali all'area video, origine in alto

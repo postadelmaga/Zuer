@@ -736,7 +736,7 @@ fn openWorker(state: *GuiAppState, id: []u8, title_opt: ?[]u8, resume_s: f64, he
         if (resume_s > 0.05) state.video.seek_to = resume_s;
 
         // Sorgenti correnti per il toggle 'v' (video ↔ solo audio con oscilloscopio).
-        gui_state_mod.setAvSrc(state, vurl, aurl, true);
+        gui_state_mod.setAvSrc(state, vurl, true);
 
         state.gpa.free(state.shared.static_rgba);
         state.shared.static_rgba = first.rgba;

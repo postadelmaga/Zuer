@@ -2,7 +2,7 @@
 //! di Zengine `gpu/vtex_pool.zig` al wrapper Vulkan sottile di zuer (`renderer/vk.zig`).
 //!
 //! Un'unica image array 2D device-local di `capacity` slot fisici, RGBA8,
-//! `tile_size` di lato. `uploadTile` porta una tile (streamata o generata) in uno
+//! `tile_size` di lato. `uploadTilesBegin/Stage/End` porta le tile (streamate o generate) in uno
 //! slot (staging → layer, lasciato in SHADER_READ_ONLY così è subito
 //! campionabile dal fragment shader). Il gestore di residenza CPU (la logica di
 //! upload per livello in `gpu_renderer.uploadVtLevel`) decide quale tile
@@ -125,7 +125,7 @@ pub const VtexPool = struct {
         };
 
         // Porta TUTTI i layer in SHADER_READ_ONLY una volta, così il pool è
-        // sempre bindabile e ogni uploadTile parte da un layout noto.
+        // sempre bindabile e ogni batch di upload parte da un layout noto.
         try self.transitionAll(vk.IMAGE_LAYOUT_UNDEFINED, vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, vk.ACCESS_SHADER_READ, vk.STAGE_TOP, vk.STAGE_FRAGMENT_SHADER);
         return self;
     }
@@ -142,14 +142,6 @@ pub const VtexPool = struct {
     /// Descriptor combined-image-sampler per il binding del pool nello shader.
     pub fn imageInfo(self: *const VtexPool) vk.VkDescriptorImageInfo {
         return .{ .sampler = self.sampler, .imageView = self.view, .imageLayout = vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-    }
-
-    /// Carica una tile (`tile_bytes` RGBA8) nello slot `slot`. Sincrono: riusa il
-    /// command buffer + fence del Renderer, come `createSampledTexture`.
-    pub fn uploadTile(self: *VtexPool, slot: u32, bytes: []const u8) !void {
-        try self.uploadTilesBegin(slot, 1);
-        self.uploadTilesStage(0, slot, bytes);
-        try self.uploadTilesEnd();
     }
 
     /// Inizia un upload batched di `count` tile verso gli slot contigui
@@ -183,21 +175,6 @@ pub const VtexPool = struct {
     pub fn uploadTilesEnd(self: *VtexPool) !void {
         self.barrier(self.batch_first, self.batch_count, vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, vk.ACCESS_TRANSFER_WRITE, vk.ACCESS_SHADER_READ, vk.STAGE_TRANSFER, vk.STAGE_FRAGMENT_SHADER);
         try self.submitSync();
-    }
-
-    /// Rilegge una tile da uno slot (verifica/self-test).
-    pub fn readTile(self: *VtexPool, slot: u32, out: []u8) !void {
-        std.debug.assert(slot < self.capacity);
-        std.debug.assert(out.len == tile_bytes);
-        try vk.check(vk.vkBeginCommandBuffer(self.cmd, &.{}));
-        self.barrier(slot, 1, vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, vk.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vk.ACCESS_SHADER_READ, vk.ACCESS_TRANSFER_READ, vk.STAGE_FRAGMENT_SHADER, vk.STAGE_TRANSFER);
-        vk.vkCmdCopyImageToBuffer(self.cmd, self.image, vk.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, self.staging, 1, &[_]vk.VkBufferImageCopy{.{
-            .imageSubresource = .{ .aspectMask = vk.ASPECT_COLOR, .baseArrayLayer = slot, .layerCount = 1 },
-            .imageExtent = .{ .width = tile_size, .height = tile_size, .depth = 1 },
-        }});
-        self.barrier(slot, 1, vk.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, vk.ACCESS_TRANSFER_READ, vk.ACCESS_SHADER_READ, vk.STAGE_TRANSFER, vk.STAGE_FRAGMENT_SHADER);
-        try self.submitSync();
-        @memcpy(out, self.staging_ptr[0..tile_bytes]);
     }
 
     /// Garantisce che lo staging contenga almeno `tiles` tile; se serve lo ricrea

@@ -85,12 +85,6 @@ pub const BakedTexture = struct {
     pub fn tileIndexOf(self: *const BakedTexture, level: usize, tx: u32, ty: u32) u32 {
         return tileIndex(self.levels, level, tx, ty);
     }
-
-    pub fn tileCount(self: *const BakedTexture) u32 {
-        var n: u32 = 0;
-        for (self.levels) |l| n += l.tiles_x * l.tiles_y;
-        return n;
-    }
 };
 
 /// Downsample box 2×2 (dimensioni dispari clampano la seconda riga/colonna) —

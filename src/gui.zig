@@ -114,11 +114,11 @@ fn rasterizeText(state: *GuiAppState, width: u32, text_zoom: f32) void {
     // Testo/codice/markdown: layout ritenuto, niente bitmap del documento — la
     // pittura avviene per viewport a ogni compose. static_w/h restano le
     // dimensioni LOGICHE (scrollbar/selezione), static_rgba resta vuoto.
-    const is_grid_doc = switch (dec) {
+    const is_retained_doc = switch (dec) {
         .csv, .workbook => false,
         else => true,
     };
-    if (is_grid_doc) {
+    if (is_retained_doc) {
         if (text_render.layoutDoc(state.gpa, &dec, name, opts, &lines, &metrics)) |doc| {
             new_doc = doc;
         } else |err| {
@@ -174,7 +174,7 @@ fn rasterizeText(state: *GuiAppState, width: u32, text_zoom: f32) void {
     state.shared.text_lines = lines;
     state.shared.text_metrics = metrics;
     state.gpa.free(state.shared.static_rgba);
-    if (is_grid_doc) {
+    if (is_retained_doc) {
         state.shared.static_rgba = &.{};
         state.shared.static_w = @intCast(new_doc.?.width);
         state.shared.static_h = @intCast(new_doc.?.height);
@@ -314,17 +314,7 @@ fn drawLoader(buf: []u8, W: u32, H: u32, frame: u32) void {
     canvas.drawSpinner(cx, cy, radius, width, phase, paint.Color.rgba(205, 210, 230, 1.0));
 }
 
-/// Fonde un pixel RGB `(r,g,b)` con copertura `a` sopra il buffer RGBA (alpha
-/// straight): tiene il canale alpha al massimo tra esistente e copertura.
-fn blendLabelPx(buf: []u8, idx: usize, r: u8, g: u8, b: u8, a: u8) void {
-    if (a == 0) return;
-    const av: u32 = a;
-    const inv: u32 = 255 - av;
-    buf[idx + 0] = @intCast((@as(u32, buf[idx + 0]) * inv + @as(u32, r) * av) / 255);
-    buf[idx + 1] = @intCast((@as(u32, buf[idx + 1]) * inv + @as(u32, g) * av) / 255);
-    buf[idx + 2] = @intCast((@as(u32, buf[idx + 2]) * inv + @as(u32, b) * av) / 255);
-    buf[idx + 3] = @max(buf[idx + 3], a);
-}
+const blendLabelPx = compose.blendPixel;
 
 /// Disegna il nome file in alto a destra: pill scura semi-trasparente + testo
 /// monospazio (Hack) bianco. Right-aligned con margine; se il nome è più largo
@@ -583,12 +573,9 @@ fn renderWorker(
                     // niente static_rgba/composeFrame, si dipinge diretto nel buffer.
                     videomod.drawOscilloscope(composited_rgba.*, fr.w, fr.h, vs);
                 } else {
-                    // Buffer STRETTO in aspect-fit: zrame lo centra nel vetro e ne arrotonda
-                    // gli angoli col solito content_radius — stesso frame di ogni altro tipo
-                    // di file (nessun percorso speciale per il video).
-                    const px = @as(usize, fr.w) * fr.h * 4;
-                    @memset(composited_rgba.*[0..px], 0);
-                    compose.composeFrame(composited_rgba.*, fr.w, fr.h, state.shared.static_rgba, state.shared.static_w, state.shared.static_h, false, 1.0, 0.0, 0.0);
+                    // composeFrame copre l'intero buffer fr.w×fr.h (interno + margini
+                    // azzerati riga per riga): nessun memset preventivo.
+                    compose.composeFrame(composited_rgba.*, fr.w, fr.h, state.shared.static_rgba, state.shared.static_w, state.shared.static_h, 1.0, 0.0, 0.0);
                 }
                 const raster: ?*glyph.Raster = if (name_raster) |*r| r else null;
                 // Sottotitoli YouTube (toggle `c`): cue corrente sopra i controlli,
@@ -801,7 +788,7 @@ fn renderWorker(
                 } else {
                     // Mantieni l'immagine sempre centrata / dentro i bordi (no re-center manuale).
                     input.clampImagePan(&state.shared.pan_x, &state.shared.pan_y, state.shared.zoom, cur_w, cur_h, state.shared.static_w, state.shared.static_h);
-                    compose.composeFrame(composited_rgba.*, cur_w, cur_h, state.shared.static_rgba, state.shared.static_w, state.shared.static_h, false, state.shared.zoom, state.shared.pan_x, state.shared.pan_y);
+                    compose.composeFrame(composited_rgba.*, cur_w, cur_h, state.shared.static_rgba, state.shared.static_w, state.shared.static_h, state.shared.zoom, state.shared.pan_x, state.shared.pan_y);
                 }
             }
 
@@ -878,7 +865,7 @@ fn renderWorker(
                     // Il readback appartiene al renderer (2 slot pipelined) e il
                     // worker è l'unico a chiamare render: lo slot resta valido
                     // fino al prossimo render, quindi comporre fuori dal lock è sicuro.
-                    compose.composeFrame(composited_rgba.*, cur_w, cur_h, mr, cur_w, cur_h, false, 1.0, 0.0, 0.0);
+                    compose.composeFrame(composited_rgba.*, cur_w, cur_h, mr, cur_w, cur_h, 1.0, 0.0, 0.0);
                 }
                 if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, cur_w, cur_h, r, mesh_name_buf[0..mesh_name_len]);
                 // Overlay (esploratore file + YouTube) anche sulle mesh: qui il frame
@@ -1075,7 +1062,6 @@ pub fn main(init: std.process.Init) !void {
     defer yt_search.deinit(&gui_state);
     defer file_explorer.deinit(&gui_state);
     defer if (gui_state.shared.av_src_video) |s| gpa.free(s);
-    defer if (gui_state.shared.av_src_audio) |s| gpa.free(s);
 
     defer {
         gpa.free(gui_state.shared.current_file_path);

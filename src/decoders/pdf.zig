@@ -26,9 +26,6 @@ extern fn opendir(name: [*:0]const u8) ?*DIR;
 extern fn readdir(dirp: *DIR) ?*dirent;
 extern fn closedir(dirp: *DIR) c_int;
 
-const page_gap = 8;
-const gap_color = [3]u8{ 0x30, 0x30, 0x38 };
-
 pub fn decode(path: []const u8, io: std.Io, filename: []const u8, allocator: std.mem.Allocator) Decoded {
     _ = io; // subprocess e letture file usano libc diretto (decoder.*), non l'io host
     // DPI alto anche nel terminale: con kitty l'immagine viaggia a piena
@@ -136,7 +133,8 @@ fn decodeInner(clean_path: []const u8, filename: []const u8, dpi: []const u8, pa
 
     // 3. Lettura della pagina generata.
     const bytes = readPageFile(prefix, page, allocator) orelse return error.NoPagesRendered;
-    defer allocator.free(bytes);
+    // `parsePpm` prende possesso di `bytes` e lo restringe in place ai soli pixel:
+    // niente seconda copia da ~13 MB per pagina A4 a 200 DPI.
     const ppm = try parsePpm(bytes, allocator);
     errdefer allocator.free(ppm.pixels);
 
@@ -215,7 +213,11 @@ const Ppm = struct {
 };
 
 /// Parser minimale del formato PPM P6 (l'output di pdftoppm).
-fn parsePpm(bytes: []const u8, allocator: std.mem.Allocator) !Ppm {
+/// Prende possesso di `bytes` (il file PPM intero): i pixel vengono spostati in
+/// testa al buffer e il buffer viene restretto con `realloc`, così `pixels` È il
+/// buffer d'ingresso. In caso d'errore `bytes` viene liberato qui.
+fn parsePpm(bytes: []u8, allocator: std.mem.Allocator) !Ppm {
+    errdefer allocator.free(bytes);
     var pos: usize = 0;
     const magic = try ppmToken(bytes, &pos);
     if (!std.mem.eql(u8, magic, "P6")) return error.NotP6;
@@ -232,8 +234,8 @@ fn parsePpm(bytes: []const u8, allocator: std.mem.Allocator) !Ppm {
     const expected = width * height * 3;
     if (bytes.len < pos + expected) return error.TruncatedPpm;
 
-    const pixels = try allocator.alloc(u8, expected);
-    @memcpy(pixels, bytes[pos .. pos + expected]);
+    std.mem.copyForwards(u8, bytes[0..expected], bytes[pos .. pos + expected]);
+    const pixels = try allocator.realloc(bytes, expected);
     return .{ .width = width, .height = height, .pixels = pixels };
 }
 

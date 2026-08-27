@@ -281,23 +281,18 @@ pub fn paintDocViewport(dl: *DocLayout, buf: []u8, W: u32, H: u32, off_y: u32, x
         if (gx_end > 0) {
             const g_bg = Rgb.fromHex("#12131a"); // sfondo scuro neutro del gutter
             const border_col = Rgb.fromHex("#262836"); // separatore verticale sottile
-            var py: i32 = 0;
-            while (py < Hi) : (py += 1) {
-                var px: i32 = 0;
-                while (px < gx_end - 1) : (px += 1) {
-                    const idx: usize = @intCast((@as(usize, @intCast(py)) * @as(usize, @intCast(W)) + @as(usize, @intCast(px))) * 4);
-                    buf[idx] = g_bg.r;
-                    buf[idx + 1] = g_bg.g;
-                    buf[idx + 2] = g_bg.b;
-                    buf[idx + 3] = 255;
-                }
-                if (gx_end - 1 >= 0 and gx_end - 1 < Wi) {
-                    const idx: usize = @intCast((@as(usize, @intCast(py)) * @as(usize, @intCast(W)) + @as(usize, @intCast(gx_end - 1))) * 4);
-                    buf[idx] = border_col.r;
-                    buf[idx + 1] = border_col.g;
-                    buf[idx + 2] = border_col.b;
-                    buf[idx + 3] = 255;
-                }
+            // Riempimento a word u32 per riga (memset), non 4 byte per pixel: il
+            // gutter viene ridipinto a ogni frame di scroll su tutta l'altezza.
+            const bg_w: u32 = @as(u32, g_bg.r) | (@as(u32, g_bg.g) << 8) | (@as(u32, g_bg.b) << 16) | (0xFF << 24);
+            const border_w: u32 = @as(u32, border_col.r) | (@as(u32, border_col.g) << 8) | (@as(u32, border_col.b) << 16) | (0xFF << 24);
+            const words: []u32 = @as([*]u32, @ptrCast(@alignCast(buf.ptr)))[0 .. @as(usize, W) * H];
+            const fill_w: usize = @intCast(gx_end - 1);
+            const stride: usize = @intCast(W);
+            var py: usize = 0;
+            while (py < @as(usize, @intCast(Hi))) : (py += 1) {
+                const row = words[py * stride ..][0..stride];
+                @memset(row[0..fill_w], bg_w);
+                if (fill_w < stride) row[fill_w] = border_w;
             }
         }
     }
@@ -758,17 +753,11 @@ fn paintTable(gpa: std.mem.Allocator, raster: *glyph.Raster, c: decoder_mod.CsvD
     return .{ .width = width, .height = height, .pixels = pixels, .name = try gpa.dupe(u8, "table") };
 }
 
-/// Altezza (px) della barra delle linguette dei fogli. Costante: la GUI la usa
-/// per posizionare la barra e per l'hit-test dei click.
-pub fn tabBarHeight() u32 {
-    return @intCast(tab_bar_h);
-}
-
 /// Rende la barra delle linguette di un workbook: una linguetta per foglio, con
 /// il nome; quella `active` è evidenziata (sfondo del foglio + accent + testo in
 /// grassetto). Riempie `bounds_out[i]` col bordo destro X della linguetta i (per
 /// l'hit-test dei click), fino a `bounds_out.len` linguette. Immagine RGB alta
-/// `tabBarHeight()` × `width`.
+/// `tab_bar_h` × `width`.
 pub fn renderTabBar(gpa: std.mem.Allocator, sheets: []const decoder_mod.Sheet, active: usize, width: u32, bounds_out: []u32) !decoder_mod.ImageData {
     var raster = try glyph.Raster.initFamily(gpa, pxHeight(14), .sans);
     defer raster.deinit();
@@ -1179,7 +1168,8 @@ fn langFor(ext: []const u8) Lang {
         .{ .exts = &.{ "js", "mjs", "cjs", "jsx", "ts", "tsx", "php" }, .lang = .{ .line_comments = &slash_comment, .keywords = &kw_js } },
         .{ .exts = &.{"go"}, .lang = .{ .line_comments = &slash_comment, .keywords = &kw_go } },
         .{ .exts = &.{ "sh", "bash", "zsh", "fish", "ps1", "env" }, .lang = .{ .line_comments = &hash_comment, .keywords = &kw_sh } },
-        .{ .exts = &.{ "lua", "sql", "hs" }, .lang = .{ .line_comments = &dash_comment, .keywords = &kw_lua } },
+        .{ .exts = &.{ "lua", "hs" }, .lang = .{ .line_comments = &dash_comment, .keywords = &kw_lua } },
+        .{ .exts = &.{"sql"}, .lang = .{ .line_comments = &dash_comment, .keywords = &kw_sql } },
         .{ .exts = &.{ "ini", "asm", "s" }, .lang = .{ .line_comments = &semi_comment, .keywords = &kw_none } },
     };
     for (table) |case| {
