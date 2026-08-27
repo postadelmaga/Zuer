@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const decoder_mod = @import("decoder.zig");
+const compose = @import("compose.zig");
 const loader_mod = @import("loader.zig");
 const text_render = @import("text_render.zig");
 // Player video nativo (libav): la navigazione verso/da un video lo avvia/ferma.
@@ -86,17 +87,6 @@ pub fn schedulePrefetchAround(state: *GuiAppState) void {
     requestPrefetch(state, buf[0], buf[1]);
 }
 
-pub fn loadFile(state: *GuiAppState, new_path: []const u8) !void {
-    // 1. Decodifica il nuovo file (fuori dal lock: non tocca stato condiviso)
-    var new_decoded = decoder_mod.decode(new_path, state.io, state.gpa);
-    if (new_decoded == .err) {
-        std.debug.print("Errore nel caricamento del file {s}: {s}\n", .{ new_path, new_decoded.err });
-        new_decoded.deinit(state.gpa);
-        return;
-    }
-    try applyDecoded(state, new_decoded, null, new_path, null);
-}
-
 /// Posta una richiesta di caricamento asincrono al `loadWorker` e accende lo
 /// spinner. Usata dalla navigazione a cache-miss: il decode avviene fuori dal
 /// thread finestra, che resta libero di committare i frame dello spinner.
@@ -163,7 +153,7 @@ pub fn freeMeshCpuData(state: *GuiAppState) void {
 /// Installa un contenuto già decodificato nello stato condiviso (swap sotto
 /// lock). Prende possesso di `new_decoded` e, se presente, di `stage_override`
 /// (staging GPU già calcolato dal prefetch: evita di ricalcolarlo qui).
-/// Condiviso da `loadFile`, dal thread di decodifica iniziale (spinner) e dal
+/// Condiviso dal thread di decodifica iniziale (spinner) e dal
 /// percorso di navigazione con cache-hit. DEVE girare sul thread main:
 /// `setMesh` tocca il renderer Vulkan (serializzato con il render worker).
 /// `gen` (se non null) è la generazione di navigazione del chiamante:
@@ -234,6 +224,10 @@ pub fn applyDecoded(state: *GuiAppState, new_decoded: decoder_mod.Decoded, stage
     // coarse), preserva la camera così una rotazione fatta durante la coarse
     // non viene azzerata quando arriva il dettaglio pieno.
     const same_file = std.mem.eql(u8, new_path, state.shared.current_file_path);
+    // Stesso documento a meno del frammento `#page=N`: la rotazione (tasto R)
+    // sopravvive al cambio pagina di un PDF, ma non a un file diverso.
+    const same_doc = std.mem.eql(u8, stripFragment(new_path), stripFragment(state.shared.current_file_path));
+    if (!same_doc) state.shared.rotation = 0;
 
     // 2. Libera le vecchie risorse decodificate. La geometria Vulkan è
     // importata zero-copy dal memfd dello stage: va rilasciata PRIMA del
@@ -330,6 +324,13 @@ pub fn applyDecoded(state: *GuiAppState, new_decoded: decoder_mod.Decoded, stage
         state.shared.static_rgba = try rgbToRgba(state.gpa, img.pixels, @intCast(img.width), @intCast(img.height));
         state.shared.static_w = @intCast(img.width);
         state.shared.static_h = @intCast(img.height);
+        // Riapplica la rotazione corrente (nuova pagina PDF, refine progressivo).
+        if (state.shared.rotation != 0) {
+            const rot = try compose.rotateRgba(state.gpa, state.shared.static_rgba, state.shared.static_w, state.shared.static_h, state.shared.rotation);
+            state.gpa.free(state.shared.static_rgba);
+            state.shared.static_rgba = rot;
+            if (state.shared.rotation != 2) std.mem.swap(u32, &state.shared.static_w, &state.shared.static_h);
+        }
     } else {
         state.gpa.free(state.shared.static_rgba);
         state.shared.static_rgba = &.{};
@@ -406,6 +407,11 @@ fn isMidiPath(path: []const u8) bool {
     return ext.len == 3 or (ext[3] | 32) == 'i';
 }
 
+/// Percorso senza il frammento `#…` (pagina PDF, voce d'archivio).
+fn stripFragment(path: []const u8) []const u8 {
+    return if (std.mem.indexOfScalar(u8, path, '#')) |h| path[0..h] else path;
+}
+
 pub fn startVideo(state: *GuiAppState, path: []const u8) bool {
     const first = videomod.setupVideo(&state.video, path, state.gpa) catch |e| {
         // Nessuno stream video (mp3, wav, flac…): apri come audio-only →
@@ -414,14 +420,14 @@ pub fn startVideo(state: *GuiAppState, path: []const u8) bool {
             std.debug.print("Media non apribile (video: {s}, audio: {s})\n", .{ @errorName(e), @errorName(e2) });
             return false;
         };
-        gui_state_mod.setAvSrc(state, path, path, false);
+        gui_state_mod.setAvSrc(state, path, false);
         state.gpa.free(state.shared.static_rgba);
         state.shared.static_rgba = af.rgba;
         state.shared.static_w = af.w;
         state.shared.static_h = af.h;
         return true;
     };
-    gui_state_mod.setAvSrc(state, path, path, true);
+    gui_state_mod.setAvSrc(state, path, true);
     state.gpa.free(state.shared.static_rgba);
     state.shared.static_rgba = first.rgba;
     state.shared.static_w = first.w;

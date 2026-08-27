@@ -101,6 +101,10 @@ pub const GuiAppState = struct {
         pitch: f32 = 0,
         pan_x: f32 = 0,
         pan_y: f32 = 0,
+        // Rotazione della vista (tasto R): quarti di giro orari già APPLICATI a
+        // `static_rgba` (immagini/pagine PDF). Persiste tra le pagine dello stesso
+        // documento (`applyDecoded` la riapplica), si azzera su un file diverso.
+        rotation: u2 = 0,
         // Offset di scroll corrente (asse Y e X), rispecchiato dalla primitiva `sc` a
         // ogni frame del worker; i consumatori (compose/selezione/header) leggono questi.
         scroll_y: f32 = 0,
@@ -153,7 +157,6 @@ pub const GuiAppState = struct {
         // video. `av_has_video` = la sorgente HA uno stream video (per gli mp3 il
         // toggle non ha senso).
         av_src_video: ?[]u8 = null,
-        av_src_audio: ?[]u8 = null,
         av_has_video: bool = false,
     };
 
@@ -315,24 +318,16 @@ pub const GuiAppState = struct {
     }
 };
 
-/// Registra le sorgenti A/V correnti del player in `Shared` (copiate, possedute):
+/// Registra la sorgente video corrente del player in `Shared` (copiata, posseduta):
 /// il toggle 'v' (video ↔ solo audio) le usa per riaprire il container video.
 /// Da chiamare con `shared.mutex` acquisito.
-pub fn setAvSrc(state: *GuiAppState, v: []const u8, a: []const u8, src_has_video: bool) void {
+pub fn setAvSrc(state: *GuiAppState, v: []const u8, src_has_video: bool) void {
     const nv = state.gpa.dupe(u8, v) catch return;
-    const na = state.gpa.dupe(u8, a) catch {
-        state.gpa.free(nv);
-        return;
-    };
     if (state.shared.av_src_video) |o| state.gpa.free(o);
-    if (state.shared.av_src_audio) |o| state.gpa.free(o);
     state.shared.av_src_video = nv;
-    state.shared.av_src_audio = na;
     state.shared.av_has_video = src_has_video;
 }
 
-/// Riporta la scrollbar all'origine azzerando offset, kinetica e coda di smoothing.
-/// Il chiamante deve già detenere il `mutex`. Usato ai cambi di foglio/file.
 /// Inizializza il renderer Vulkan alla prima necessità (mesh/voxel/testo GPU).
 /// Da chiamare con `renderer_mutex` GIÀ acquisito. false = init impossibile
 /// (loggato una volta): il chiamante salta il lavoro GPU.
@@ -349,6 +344,8 @@ pub fn ensureRendererLocked(state: *GuiAppState) bool {
     return true;
 }
 
+/// Riporta la scrollbar all'origine azzerando offset, kinetica e coda di smoothing.
+/// Il chiamante deve già detenere il `mutex`. Usato ai cambi di foglio/file.
 pub fn resetScroll(sc: *zscroll.Scroll) void {
     sc.offset = .{ 0, 0 };
     sc.vel = .{ 0, 0 };

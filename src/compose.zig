@@ -24,8 +24,11 @@ pub const TabBarState = struct {
     count: usize = 0,
 };
 
-/// Alpha-blend src-over di un colore sul pixel RGBA in `buf[idx..]`.
-fn blendPixel(buf: []u8, idx: usize, r: u8, g: u8, b: u8, a: u8) void {
+/// Alpha-blend src-over di un colore sul pixel RGBA in `buf[idx..]` (alpha
+/// straight; il canale alpha resta il massimo tra esistente e copertura).
+/// Condiviso da selezione/evidenziazione, etichette (gui.zig) e controlli video.
+pub fn blendPixel(buf: []u8, idx: usize, r: u8, g: u8, b: u8, a: u8) void {
+    if (a == 0) return;
     const af: u32 = a;
     const inv: u32 = 255 - af;
     buf[idx + 0] = @intCast((@as(u32, r) * af + @as(u32, buf[idx + 0]) * inv) / 255);
@@ -211,9 +214,42 @@ pub fn drawTableRowHighlight(buf: []u8, W: u32, H: u32, src_w: u32, src_h: u32, 
     }
 }
 
+/// Ruota un buffer RGBA di `quarter_turns` quarti di giro in senso orario e
+/// ritorna un NUOVO buffer (dimensioni scambiate per 1 e 3 quarti). Lossless:
+/// ogni pixel di destinazione legge esattamente un pixel sorgente. Usato dal
+/// tasto R su immagini e pagine PDF (`static_rgba`).
+pub fn rotateRgba(gpa: std.mem.Allocator, src: []const u8, w: u32, h: u32, quarter_turns: u2) ![]u8 {
+    const dst = try gpa.alloc(u8, @as(usize, w) * h * 4);
+    errdefer gpa.free(dst);
+    if (quarter_turns == 0) {
+        @memcpy(dst, src[0..dst.len]);
+        return dst;
+    }
+    const dw: u32 = if (quarter_turns == 2) w else h;
+    const dh: u32 = if (quarter_turns == 2) h else w;
+    const src_px: []const u32 = @alignCast(std.mem.bytesAsSlice(u32, src[0 .. @as(usize, w) * h * 4]));
+    const dst_px: []u32 = @alignCast(std.mem.bytesAsSlice(u32, dst));
+    var dy: u32 = 0;
+    while (dy < dh) : (dy += 1) {
+        const drow = dst_px[@as(usize, dy) * dw ..][0..dw];
+        var dx: u32 = 0;
+        while (dx < dw) : (dx += 1) {
+            // Mappa (dx,dy) della destinazione ruotata sul pixel sorgente.
+            const sx: u32, const sy: u32 = switch (quarter_turns) {
+                1 => .{ dy, h - 1 - dx }, // 90° orario
+                2 => .{ w - 1 - dx, h - 1 - dy }, // 180°
+                3 => .{ w - 1 - dy, dx }, // 270° orario (= 90° antiorario)
+                0 => unreachable,
+            };
+            drow[dx] = src_px[@as(usize, sy) * w + sx];
+        }
+    }
+    return dst;
+}
+
 /// Compositing di un'immagine (o frame mesh/video) in aspect-fit a tutto schermo con
-/// zoom e pan, campionamento nearest a virgola fissa. `is_text` tratta il colore di
-/// fondo del testo (8,8,16) come trasparente.
+/// zoom e pan, campionamento nearest a virgola fissa. Copre SEMPRE l'intero buffer
+/// W×H (margini azzerati riga per riga): il chiamante non deve pulirlo prima.
 pub fn composeFrame(
     composited_rgba: []u8,
     W: u32,
@@ -221,7 +257,6 @@ pub fn composeFrame(
     src_rgba: []const u8,
     src_w: u32,
     src_h: u32,
-    is_text: bool,
     zoom: f32,
     pan_x: f32,
     pan_y: f32,
@@ -258,10 +293,13 @@ pub fn composeFrame(
     const fit_x = @divFloor(@as(i32, @intCast(W)) - @as(i32, @intCast(fit_w_zoomed)), 2) + @as(i32, @intFromFloat(pan_x));
     const fit_y = @divFloor(@as(i32, @intCast(H)) - @as(i32, @intCast(fit_h_zoomed)), 2) + @as(i32, @intFromFloat(pan_y));
 
-    const start_x: u32 = @intCast(@max(@as(i32, 0), fit_x));
-    const end_x: u32 = @intCast(@max(@as(i32, 0), @min(@as(i32, @intCast(W)), fit_x + @as(i32, @intCast(fit_w_zoomed)))));
-    const start_y: u32 = @intCast(@max(@as(i32, 0), fit_y));
-    const end_y: u32 = @intCast(@max(@as(i32, 0), @min(@as(i32, @intCast(H)), fit_y + @as(i32, @intCast(fit_h_zoomed)))));
+    // Inizio e fine clampati a [0, W/H]: con un pan che porta l'immagine del
+    // tutto fuori dal viewport (il pan è normalmente clampato a monte, ma qui
+    // non ci si fida) il frame resta un rettangolo vuoto, mai un OOB.
+    const start_x: u32 = @intCast(std.math.clamp(fit_x, 0, @as(i32, @intCast(W))));
+    const end_x: u32 = @intCast(std.math.clamp(fit_x + @as(i32, @intCast(fit_w_zoomed)), 0, @as(i32, @intCast(W))));
+    const start_y: u32 = @intCast(std.math.clamp(fit_y, 0, @as(i32, @intCast(H))));
+    const end_y: u32 = @intCast(std.math.clamp(fit_y + @as(i32, @intCast(fit_h_zoomed)), 0, @as(i32, @intCast(H))));
 
     // Clear top rows
     if (start_y > 0) {
@@ -290,9 +328,11 @@ pub fn composeFrame(
     // ReleaseFast — determinante per reggere i 30/60 fps del video senza scatti.
     @setRuntimeSafety(false);
 
-    // Color-key del percorso testo (rgb 8,8,16 → alpha 0), come word LE:
-    // low-24 = r | g<<8 | b<<16.
-    const key_low24: u32 = 8 | (8 << 8) | (16 << 16);
+    // Righe di destinazione consecutive che mappano sulla stessa riga sorgente
+    // (upscaling verticale, il caso comune: 720p su finestra più alta) producono
+    // byte identici: si copia la riga precedente invece di ricampionarla.
+    var prev_sy: u32 = std.math.maxInt(u32);
+    var prev_row_off: usize = 0;
 
     var py = start_y;
     while (py < end_y) : (py += 1) {
@@ -312,16 +352,23 @@ pub fn composeFrame(
         const sy = @min(@as(u32, @intCast((ry * inv_h) >> 32)), src_h - 1);
         const s_row_offset = sy * src_w;
 
+        const row_px = end_x - start_x;
+        const dst_off = idx_row + start_x * 4;
+        const dst_bytes = composited_rgba[dst_off..][0 .. row_px * 4];
+        if (sy == prev_sy) {
+            @memcpy(dst_bytes, composited_rgba[prev_row_off..][0 .. row_px * 4]);
+            continue;
+        }
+        prev_sy = sy;
+        prev_row_off = dst_off;
+
         const start_rx = @as(u64, @intCast(@as(i32, @intCast(start_x)) - fit_x));
         var rx_fp = start_rx * inv_w;
 
-        // Ricampionamento a WORD u32 (un load/store per pixel, non 4 byte) col
-        // branch color-key issato FUORI dal loop; scala orizzontale 1:1 → la
-        // riga sorgente è contigua e diventa un solo memcpy (è il caso mesh:
-        // il frame GPU ha già le dimensioni della finestra).
-        const row_px = end_x - start_x;
-        const dst_bytes = composited_rgba[idx_row + start_x * 4 ..][0 .. row_px * 4];
-        if (!is_text and inv_w == (@as(u64, 1) << 32)) {
+        // Ricampionamento a WORD u32 (un load/store per pixel, non 4 byte); scala
+        // orizzontale 1:1 → la riga sorgente è contigua e diventa un solo memcpy
+        // (è il caso mesh: il frame GPU ha già le dimensioni della finestra).
+        if (inv_w == (@as(u64, 1) << 32)) {
             const sx0 = @min(@as(u32, @intCast(rx_fp >> 32)), src_w - 1);
             if (sx0 + row_px <= src_w) {
                 const s_off = (@as(usize, s_row_offset) + sx0) * 4;
@@ -329,23 +376,12 @@ pub fn composeFrame(
                 continue;
             }
         }
-        if (is_text) {
-            var i: usize = 0;
-            while (i < row_px) : (i += 1) {
-                const sx = @min(@as(u32, @intCast(rx_fp >> 32)), src_w - 1);
-                rx_fp += inv_w;
-                var w32 = std.mem.readInt(u32, src_rgba[(@as(usize, s_row_offset) + sx) * 4 ..][0..4], .little);
-                if (w32 & 0x00FF_FFFF == key_low24) w32 &= 0x00FF_FFFF; // alpha 0, rgb intatti
-                std.mem.writeInt(u32, dst_bytes[i * 4 ..][0..4], w32, .little);
-            }
-        } else {
-            var i: usize = 0;
-            while (i < row_px) : (i += 1) {
-                const sx = @min(@as(u32, @intCast(rx_fp >> 32)), src_w - 1);
-                rx_fp += inv_w;
-                const w32 = std.mem.readInt(u32, src_rgba[(@as(usize, s_row_offset) + sx) * 4 ..][0..4], .little);
-                std.mem.writeInt(u32, dst_bytes[i * 4 ..][0..4], w32, .little);
-            }
+        var i: usize = 0;
+        while (i < row_px) : (i += 1) {
+            const sx = @min(@as(u32, @intCast(rx_fp >> 32)), src_w - 1);
+            rx_fp += inv_w;
+            const w32 = std.mem.readInt(u32, src_rgba[(@as(usize, s_row_offset) + sx) * 4 ..][0..4], .little);
+            std.mem.writeInt(u32, dst_bytes[i * 4 ..][0..4], w32, .little);
         }
     }
 }

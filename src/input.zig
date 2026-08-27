@@ -51,6 +51,7 @@ const KEY_BACKSPACE: u32 = 14;
 const KEY_A: u32 = 30;
 const KEY_O: u32 = 24;
 const KEY_D: u32 = 32;
+const KEY_R: u32 = 19;
 
 // Stato per il rilevamento del doppio-click sinistro (solo thread finestra).
 var last_click_ms: i64 = -1000;
@@ -146,6 +147,30 @@ fn resetView(app_state: *GuiAppState) void {
     app_state.shared.pan_x = 0;
     app_state.shared.pan_y = 0;
     app_state.shared.file_changed = true;
+}
+
+/// Tasto R: ruota la vista di immagini e pagine PDF di un quarto di giro (orario;
+/// antiorario con Shift). Ruota fisicamente `static_rgba` (lossless, dimensioni
+/// scambiate) così compose/fit/pan/doppio-click restano invariati; la rotazione
+/// accumulata vive in `shared.rotation` e `applyDecoded` la riapplica al cambio
+/// pagina. No-op su testo/tabelle, mesh e video (lì il buffer è ridisegnato).
+fn rotateView(app_state: *GuiAppState, clockwise: bool) void {
+    app_state.shared.mutex.lockUncancelable(app_state.io);
+    defer app_state.shared.mutex.unlock(app_state.io);
+    const sh = &app_state.shared;
+    if (sh.decoded != .image or sh.is_text or sh.is_mesh or sh.loading) return;
+    if (app_state.video.isActive()) return;
+    if (sh.static_w == 0 or sh.static_h == 0) return;
+    const turns: u2 = if (clockwise) 1 else 3;
+    const rot = compose.rotateRgba(app_state.gpa, sh.static_rgba, sh.static_w, sh.static_h, turns) catch return;
+    app_state.gpa.free(sh.static_rgba);
+    sh.static_rgba = rot;
+    std.mem.swap(u32, &sh.static_w, &sh.static_h);
+    sh.rotation +%= turns;
+    // Il pan era relativo all'orientamento precedente: ricentra (lo zoom resta).
+    sh.pan_x = 0;
+    sh.pan_y = 0;
+    sh.file_changed = true;
 }
 
 /// Clampa il pan dell'immagine così non possa mai scivolare nel vuoto: quando
@@ -680,6 +705,8 @@ pub fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) 
         } else if (key == KEY_MINUS) {
             const cpx = win.contentPx();
             applyZoomAt(app_state, 1.0 / 1.1, @as(f32, @floatFromInt(cpx.w)) / 2.0, @as(f32, @floatFromInt(cpx.h)) / 2.0, cpx.w, cpx.h);
+        } else if (key == KEY_R and !app_state.ctrl_down) {
+            rotateView(app_state, !app_state.shift_down);
         } else if (key == KEY_F or key == KEY_F11) {
             win.toggleFullscreen();
         } else if (key == KEY_V and is_mesh) {
@@ -845,28 +872,30 @@ pub fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopa
                 return true;
             }
             // Click sinistro sulla barra delle linguette (in fondo): cambia foglio.
-            if (btn.button == 0x110 and is_table and app_state.shared.tab_bar.count > 0) {
+            if (btn.button == 0x110 and is_table) {
                 const H = win.contentPx().h;
+                // `tab_bar` (count/h/bounds) è riscritta per intero da `rasterizeText`
+                // sul worker sotto `mutex`: va letta sotto lock, non a nudo.
+                app_state.shared.mutex.lockUncancelable(app_state.io);
                 const tb = &app_state.shared.tab_bar;
-                if (tb.h <= H and app_state.last_y >= @as(f32, @floatFromInt(H - tb.h))) {
+                const on_bar = tb.count > 0 and tb.h <= H and app_state.last_y >= @as(f32, @floatFromInt(H - tb.h));
+                if (on_bar) {
                     const mx: u32 = @intFromFloat(@max(app_state.last_x, 0));
                     var idx: usize = 0;
                     while (idx < tb.count and mx >= tb.bounds[idx]) : (idx += 1) {}
-                    if (idx < tb.count) {
-                        app_state.shared.mutex.lockUncancelable(app_state.io);
-                        if (app_state.shared.decoded == .workbook and app_state.shared.decoded.workbook.active != idx) {
-                            app_state.shared.decoded.workbook.active = idx;
-                            // Nuovo foglio: riparti dall'alto/sinistra e ri-rasterizza.
-                            app_state.shared.scroll_y = 0;
-                            app_state.shared.scroll_x = 0;
-                            resetScroll(&app_state.shared.sc);
-                            app_state.shared.load_seq +%= 1;
-                            app_state.shared.file_changed = true;
-                        }
-                        app_state.shared.mutex.unlock(app_state.io);
+                    if (idx < tb.count and app_state.shared.decoded == .workbook and app_state.shared.decoded.workbook.active != idx) {
+                        app_state.shared.decoded.workbook.active = idx;
+                        // Nuovo foglio: riparti dall'alto/sinistra e ri-rasterizza.
+                        app_state.shared.scroll_y = 0;
+                        app_state.shared.scroll_x = 0;
+                        resetScroll(&app_state.shared.sc);
+                        app_state.shared.load_seq +%= 1;
+                        app_state.shared.file_changed = true;
                     }
+                    app_state.shared.mutex.unlock(app_state.io);
                     return true; // click sulla barra consumato (niente selezione)
                 }
+                app_state.shared.mutex.unlock(app_state.io);
             }
             // Click sinistro: prima offri la pressione alla scrollbar (afferra il
             // thumb o salta sotto il cursore); se la consuma, niente selezione/drag.
