@@ -3,13 +3,35 @@
 //! l'entry giusta con la flate della std. Nessuna dipendenza esterna.
 //!
 //! - docx, pptx, odt, odp → estrazione testo (XML spogliato dai tag)
-//! - xlsx, xlsm, ods → primo foglio come tabella CSV
+//! - xlsx, xlsm, ods → foglio attivo come tabella CSV
+//!
+//! Fogli xlsx PIGRI: si decodifica per intero SOLO il foglio attivo; degli altri
+//! si tiene il nome (serve alla barra delle linguette) e i dati restano vuoti.
+//! Il foglio attivo arriva nel frammento del percorso — `cartella.xlsx#sheet=N`,
+//! N 1-based come il `#page=N` dei PDF — che l'host lascia passare fino al
+//! plugin (vedi `decoder.decodeImpl`) e rilegge lui stesso per impostare
+//! `WorkbookData.active`. Cliccare una linguetta senza dati riapre il documento
+//! con il frammento del foglio scelto, esattamente come il cambio pagina PDF.
+//! Chi consuma il documento intero e non ha linguette da cliccare (`zuer --json`)
+//! può ripristinare la decodifica di tutti i fogli con `ZUER_XLSX_ALL_SHEETS=1`.
 
 const std = @import("std");
 const decoder = @import("decoder");
 const Decoded = decoder.Decoded;
 
-pub fn decode(bytes: []const u8, filename: []const u8, allocator: std.mem.Allocator) Decoded {
+/// Foglio richiesto dal frammento `#sheet=N` del percorso (N 1-based). Null se
+/// il frammento manca o non è un riferimento a foglio: allora si mostra il primo.
+pub fn sheetFromPath(path: []const u8) ?usize {
+    const hash = std.mem.indexOfScalar(u8, path, '#') orelse return null;
+    const frag = path[hash + 1 ..];
+    if (!std.mem.startsWith(u8, frag, "sheet=")) return null;
+    const n = std.fmt.parseInt(usize, frag["sheet=".len..], 10) catch return null;
+    return if (n == 0) null else n;
+}
+
+/// `filename` è il nome del file SENZA frammento (vedi `zuer_decode`);
+/// `want_sheet` è il foglio 1-based da decodificare per intero (null = il primo).
+pub fn decode(bytes: []const u8, filename: []const u8, want_sheet: ?usize, allocator: std.mem.Allocator) Decoded {
     defer allocator.free(bytes);
 
     // Central directory parsata una volta sola: tutte le letture di entry
@@ -20,7 +42,7 @@ pub fn decode(bytes: []const u8, filename: []const u8, allocator: std.mem.Alloca
     defer allocator.free(entries);
 
     if (hasExtension(filename, ".xlsx") or hasExtension(filename, ".xlsm")) {
-        return decodeXlsx(bytes, entries, allocator);
+        return decodeXlsx(bytes, entries, want_sheet, allocator);
     }
     if (hasExtension(filename, ".ods")) {
         return decodeOds(bytes, entries, allocator);
@@ -55,8 +77,16 @@ fn extract(bytes: []const u8, entries: []const ZipEntry, filename: []const u8, a
         try xmlToText(xml, w);
     } else if (hasExtension(filename, ".pptx")) {
         // Le slide sono entry numerate: ci si ferma alla prima mancante.
+        //
+        // Niente decodifica pigra qui, a differenza degli xlsx: una presentazione
+        // diventa UN testo scorrevole (`Decoded.text`), non un modello a fogli con
+        // le linguette, quindi non esiste una "slide attiva" da cui ripartire — la
+        // vista mostra tutto insieme e servono tutte le slide in una volta. Il
+        // costo si limita allora con un tetto esplicito: oltre `max_pptx_slides`
+        // l'estrazione si ferma e lo dichiara in coda al testo, invece di
+        // inflazionare centinaia di XML che nessuno scorrerà.
         var slide: usize = 1;
-        while (slide <= 500) : (slide += 1) {
+        while (slide <= max_pptx_slides) : (slide += 1) {
             var name_buf: [48]u8 = undefined;
             const entry_name = try std.fmt.bufPrint(&name_buf, "ppt/slides/slide{d}.xml", .{slide});
             const xml = readZipEntry(bytes, entries, entry_name, allocator) catch break;
@@ -66,6 +96,12 @@ fn extract(bytes: []const u8, entries: []const ZipEntry, filename: []const u8, a
             try w.writeAll("\n");
         }
         if (slide == 1) return error.NoSlidesFound;
+        if (slide > max_pptx_slides) {
+            var name_buf: [48]u8 = undefined;
+            const next_name = try std.fmt.bufPrint(&name_buf, "ppt/slides/slide{d}.xml", .{max_pptx_slides + 1});
+            if (findEntry(entries, next_name) != null)
+                try w.print("— (oltre la slide {d}: contenuto non estratto) —\n", .{max_pptx_slides});
+        }
     } else {
         // odt / odp
         const xml = try readZipEntry(bytes, entries, "content.xml", allocator);
@@ -88,6 +124,11 @@ fn hasExtension(filename: []const u8, comptime ext: []const u8) bool {
 const eocd_sig = 0x06054b50;
 const central_sig = 0x02014b50;
 const local_sig = 0x04034b50;
+
+/// Tetto sulle slide estratte da un pptx: oltre questa soglia il testo viene
+/// troncato con una nota. Vedi il commento in `extract` per il perché non si
+/// possa essere pigri come con i fogli xlsx.
+const max_pptx_slides = 200;
 
 fn readU16(bytes: []const u8, off: usize) u16 {
     return std.mem.readInt(u16, bytes[off..][0..2], .little);
@@ -152,25 +193,31 @@ fn parseCentralDirectory(bytes: []const u8, allocator: std.mem.Allocator) ![]Zip
     return entries.toOwnedSlice(allocator);
 }
 
+/// Cerca un'entry per nome nella central directory già parsata, SENZA
+/// decomprimerla: basta a sapere che un foglio/una slide esiste.
+fn findEntry(entries: []const ZipEntry, wanted: []const u8) ?*const ZipEntry {
+    for (entries) |*e| {
+        if (std.mem.eql(u8, e.name, wanted)) return e;
+    }
+    return null;
+}
+
 /// Estrae e decomprime l'entry `wanted` cercandola nella lista già parsata.
 /// Supporta i metodi stored (0) e deflate (8).
 fn readZipEntry(bytes: []const u8, entries: []const ZipEntry, wanted: []const u8, allocator: std.mem.Allocator) ![]u8 {
-    for (entries) |e| {
-        if (!std.mem.eql(u8, e.name, wanted)) continue;
-        if (e.local_off + 30 > bytes.len or readU32(bytes, e.local_off) != local_sig) return error.CorruptZip;
-        const l_name_len: usize = readU16(bytes, e.local_off + 26);
-        const l_extra_len: usize = readU16(bytes, e.local_off + 28);
-        const data_off = e.local_off + 30 + l_name_len + l_extra_len;
-        if (data_off + e.comp_size > bytes.len) return error.CorruptZip;
-        const comp = bytes[data_off .. data_off + e.comp_size];
+    const e = findEntry(entries, wanted) orelse return error.EntryNotFound;
+    if (e.local_off + 30 > bytes.len or readU32(bytes, e.local_off) != local_sig) return error.CorruptZip;
+    const l_name_len: usize = readU16(bytes, e.local_off + 26);
+    const l_extra_len: usize = readU16(bytes, e.local_off + 28);
+    const data_off = e.local_off + 30 + l_name_len + l_extra_len;
+    if (data_off + e.comp_size > bytes.len) return error.CorruptZip;
+    const comp = bytes[data_off .. data_off + e.comp_size];
 
-        switch (e.method) {
-            0 => return allocator.dupe(u8, comp),
-            8 => return inflateRaw(comp, e.uncomp_size, allocator),
-            else => return error.UnsupportedCompression,
-        }
-    }
-    return error.EntryNotFound;
+    return switch (e.method) {
+        0 => allocator.dupe(u8, comp),
+        8 => inflateRaw(comp, e.uncomp_size, allocator),
+        else => error.UnsupportedCompression,
+    };
 }
 
 fn inflateRaw(comp: []const u8, uncomp_size: usize, allocator: std.mem.Allocator) ![]u8 {
@@ -358,12 +405,124 @@ fn colFromRef(ref: []const u8) ?usize {
 
 const max_sheets = 256;
 
-/// xlsx/xlsm: tutti i fogli. Uno solo → tabella semplice (`.csv`); più fogli →
+/// Slice vuoti STATICI per i fogli non ancora decodificati: di loro si tiene
+/// solo il nome (per la linguetta) e la tabella resta vuota. `CsvData.deinit`
+/// su una slice di lunghezza 0 non chiama l'allocator, quindi non c'è nulla da
+/// possedere e nulla da liberare.
+var no_headers: [0][]const u8 = .{};
+var no_rows: [0][][]const u8 = .{};
+
+/// Un foglio risolto ma NON ancora decodificato: nome per la linguetta (preso
+/// in prestito da `SheetRef`, o null → "Foglio N") e nome dell'entry ZIP da
+/// decomprimere quando servirà davvero.
+const SheetSlot = struct {
+    name: ?[]const u8,
+    target: []const u8,
+};
+
+// `getenv` è nella libc su tutte le piattaforme in cui questo plugin viene costruito.
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+/// `ZUER_XLSX_ALL_SHEETS=1` disattiva la decodifica pigra e analizza TUTTI i
+/// fogli in un colpo solo. Serve a chi consuma il documento intero e non ha
+/// nessuna linguetta da cliccare — tipicamente `zuer --json`, che stampa i dati
+/// di ogni foglio.
+fn allSheetsRequested() bool {
+    const raw = getenv("ZUER_XLSX_ALL_SHEETS") orelse return false;
+    const v = std.mem.span(raw);
+    return v.len > 0 and !std.mem.eql(u8, v, "0");
+}
+
+/// Decomprime e analizza il foglio `target`. Tabella VUOTA (non un errore) se
+/// l'entry manca, è illeggibile o il foglio non ha righe: le altre linguette
+/// devono restare raggiungibili, e la vista mostra "(tabella vuota)".
+fn parseSheetSlot(
+    bytes: []const u8,
+    entries: []const ZipEntry,
+    target: []const u8,
+    shared: []const []const u8,
+    allocator: std.mem.Allocator,
+) decoder.CsvData {
+    const empty: decoder.CsvData = .{ .headers = &no_headers, .rows = &no_rows };
+    const sheet_xml = readZipEntry(bytes, entries, target, allocator) catch return empty;
+    defer allocator.free(sheet_xml);
+    var d = parseSheetRows(sheet_xml, shared, allocator);
+    switch (d) {
+        .csv => |c| return c,
+        else => {
+            d.deinit(allocator);
+            return empty;
+        },
+    }
+}
+
+/// xlsx/xlsm. Un solo foglio → tabella semplice (`.csv`); più fogli →
 /// `.workbook` con le linguette. Ordine e nomi da `xl/workbook.xml`, entry dei
 /// fogli risolte via `r:id` → `xl/_rels/workbook.xml.rels` (la numerazione dei
 /// file sheetN.xml può essere sparsa dopo l'eliminazione di un foglio), testo
 /// condiviso da `xl/sharedStrings.xml`. Senza rels → enumerazione legacy.
-fn decodeXlsx(bytes: []const u8, entries: []const ZipEntry, allocator: std.mem.Allocator) Decoded {
+///
+/// Si decomprime e si analizza SOLO il foglio `want_sheet` (1-based, null = il
+/// primo): elencare i fogli costa due XML piccoli (workbook.xml + i rels) più
+/// dei lookup in central directory, mentre inflate + parse di ogni foglio —
+/// il grosso del lavoro, con un'allocazione per cella — si paga una volta sola,
+/// per quello che si guarda davvero. Gli altri fogli restano con `rows`/
+/// `headers` vuoti finché la GUI non li richiede con `percorso.xlsx#sheet=N`.
+fn decodeXlsx(bytes: []const u8, entries: []const ZipEntry, want_sheet: ?usize, allocator: std.mem.Allocator) Decoded {
+    // Riferimenti dei fogli nell'ordine di workbook.xml: nome + entry ZIP
+    // risolta dalle relationship. Assenti → fallback legacy più sotto.
+    var refs = std.ArrayList(SheetRef).empty;
+    defer {
+        for (refs.items) |r| {
+            if (r.name) |n| allocator.free(n);
+            if (r.target) |t| allocator.free(t);
+        }
+        refs.deinit(allocator);
+    }
+    readSheetRefs(bytes, entries, allocator, &refs);
+
+    // Elenco dei fogli SENZA decomprimerne nessuno: nomi e target sono presi in
+    // prestito da `refs` (percorso standard) o dai nomi di entry dentro `bytes`
+    // (fallback legacy), quindi restano validi per tutta la funzione.
+    var slots = std.ArrayList(SheetSlot).empty;
+    defer slots.deinit(allocator);
+
+    for (refs.items) |r| {
+        if (slots.items.len >= max_sheets) break;
+        const target = r.target orelse continue;
+        // Un foglio dichiarato ma con entry assente nell'archivio non è
+        // apribile: si salta subito, così gli indici delle linguette
+        // corrispondono sempre a fogli davvero leggibili.
+        if (findEntry(entries, target) == null) continue;
+        slots.append(allocator, .{ .name = r.name, .target = target }) catch break;
+    }
+
+    // Fallback legacy: rels mancante/illeggibile o nessun foglio risolto →
+    // enumerazione xl/worksheets/sheetN.xml come prima, nomi per posizione.
+    if (slots.items.len == 0) {
+        var idx: usize = 1;
+        while (idx <= max_sheets) : (idx += 1) {
+            var name_buf: [64]u8 = undefined;
+            const wanted = std.fmt.bufPrint(&name_buf, "xl/worksheets/sheet{d}.xml", .{idx}) catch break;
+            const e = findEntry(entries, wanted) orelse break; // foglio mancante → fine
+            const nm: ?[]const u8 = if (idx - 1 < refs.items.len) refs.items[idx - 1].name else null;
+            // `e.name` punta dentro `bytes`, non dentro `name_buf`: sopravvive al giro di loop.
+            slots.append(allocator, .{ .name = nm, .target = e.name }) catch break;
+        }
+    }
+
+    if (slots.items.len == 0) {
+        return .{ .err = allocator.dupe(u8, "Nessun foglio leggibile nel file xlsx.") catch "" };
+    }
+
+    // Foglio da decodificare per intero: 1-based nel frammento, clampato al
+    // primo se fuori range (frammento inventato o file cambiato sotto i piedi).
+    const active: usize = blk: {
+        const n = want_sheet orelse 1;
+        break :blk if (n - 1 < slots.items.len) n - 1 else 0;
+    };
+
+    // Le stringhe condivise servono solo a chi analizza davvero un foglio.
     const shared_xml: ?[]u8 = readZipEntry(bytes, entries, "xl/sharedStrings.xml", allocator) catch null;
     defer if (shared_xml) |sx| allocator.free(sx);
 
@@ -378,64 +537,54 @@ fn decodeXlsx(bytes: []const u8, entries: []const ZipEntry, allocator: std.mem.A
         };
     }
 
-    // Riferimenti dei fogli nell'ordine di workbook.xml: nome + entry ZIP
-    // risolta dalle relationship. Assenti → fallback legacy più sotto.
-    var refs = std.ArrayList(SheetRef).empty;
-    defer {
-        for (refs.items) |r| {
-            if (r.name) |n| allocator.free(n);
-            if (r.target) |t| allocator.free(t);
-        }
-        refs.deinit(allocator);
+    if (slots.items.len == 1) {
+        // Un foglio solo: tabella semplice, niente barra delle linguette. Qui un
+        // foglio vuoto resta un ERRORE come prima — non c'è nessun'altra
+        // linguetta da raggiungere, quindi non serve una tabella vuota.
+        const sheet_xml = readZipEntry(bytes, entries, slots.items[0].target, allocator) catch {
+            return .{ .err = allocator.dupe(u8, "Nessun foglio leggibile nel file xlsx.") catch "" };
+        };
+        defer allocator.free(sheet_xml);
+        return parseSheetRows(sheet_xml, shared.items, allocator);
     }
-    readSheetRefs(bytes, entries, allocator, &refs);
+
+    const decode_all = allSheetsRequested();
 
     var sheets = std.ArrayList(decoder.Sheet).empty;
-    errdefer {
+    var handed_over = false;
+    defer if (!handed_over) {
         for (sheets.items) |*s| s.deinit(allocator);
         sheets.deinit(allocator);
-    }
+    };
+    sheets.ensureTotalCapacityPrecise(allocator, slots.items.len) catch {
+        return .{ .err = allocator.dupe(u8, "Memoria esaurita.") catch "" };
+    };
 
-    // Percorso standard OOXML: i fogli si leggono nell'ordine di workbook.xml
-    // seguendo il target delle relationship. Un'entry mancante o illeggibile
-    // salta solo quel foglio, non interrompe gli altri.
-    for (refs.items, 0..) |r, i| {
-        if (sheets.items.len >= max_sheets) break;
-        const target = r.target orelse continue;
-        const sheet_xml = readZipEntry(bytes, entries, target, allocator) catch continue;
-        defer allocator.free(sheet_xml);
-        if (!appendParsedSheet(allocator, &sheets, sheet_xml, shared.items, r.name, i + 1)) break;
-    }
-
-    // Fallback legacy: rels mancante/illeggibile o nessun foglio risolto →
-    // enumerazione xl/worksheets/sheetN.xml come prima, nomi per posizione.
-    if (sheets.items.len == 0) {
-        var idx: usize = 1;
-        while (idx <= max_sheets) : (idx += 1) {
-            var name_buf: [64]u8 = undefined;
-            const entry = std.fmt.bufPrint(&name_buf, "xl/worksheets/sheet{d}.xml", .{idx}) catch break;
-            const sheet_xml = readZipEntry(bytes, entries, entry, allocator) catch break; // foglio mancante → fine
-            defer allocator.free(sheet_xml);
-            const nm: ?[]const u8 = if (idx - 1 < refs.items.len) refs.items[idx - 1].name else null;
-            if (!appendParsedSheet(allocator, &sheets, sheet_xml, shared.items, nm, idx)) break;
-        }
+    for (slots.items, 0..) |slot, i| {
+        const nm = if (slot.name) |src|
+            (allocator.dupe(u8, src) catch break)
+        else
+            (std.fmt.allocPrint(allocator, "Foglio {d}", .{i + 1}) catch break);
+        // Porta dati solo il foglio attivo; degli altri resta il nome, e i loro
+        // slice vuoti dicono alla GUI "non ancora caricato" (vedi input.zig).
+        const data: decoder.CsvData = if (i == active or decode_all)
+            parseSheetSlot(bytes, entries, slot.target, shared.items, allocator)
+        else
+            .{ .headers = &no_headers, .rows = &no_rows };
+        sheets.appendAssumeCapacity(.{ .name = nm, .data = data });
     }
 
     if (sheets.items.len == 0) {
-        sheets.deinit(allocator);
-        return .{ .err = allocator.dupe(u8, "Nessun foglio leggibile nel file xlsx.") catch "" };
+        return .{ .err = allocator.dupe(u8, "Memoria esaurita.") catch "" };
     }
-    if (sheets.items.len == 1) {
-        // Un foglio solo: tabella semplice, niente barra delle linguette.
-        const only = sheets.orderedRemove(0);
-        sheets.deinit(allocator);
-        allocator.free(only.name);
-        return .{ .csv = only.data };
-    }
+
     const owned = sheets.toOwnedSlice(allocator) catch {
         return .{ .err = allocator.dupe(u8, "Memoria esaurita.") catch "" };
     };
-    return .{ .workbook = .{ .sheets = owned, .active = 0 } };
+    handed_over = true;
+    // `active` è già clampato a `slots`; un `break` per memoria esaurita può aver
+    // reso `sheets` più corto, quindi si riclampa.
+    return .{ .workbook = .{ .sheets = owned, .active = @min(active, owned.len - 1) } };
 }
 
 /// Riferimento a un foglio, nell'ordine in cui compare in `xl/workbook.xml`.
@@ -531,46 +680,6 @@ fn zipPathFromTarget(target: []const u8, allocator: std.mem.Allocator) ?[]const 
     if (rest.len == 0 or ups > 1) return null;
     if (ups == 1) return allocator.dupe(u8, rest) catch null;
     return std.fmt.allocPrint(allocator, "xl/{s}", .{rest}) catch null;
-}
-
-/// Analizza `sheet_xml` e, se contiene dati, lo accoda a `sheets` col nome
-/// `name_src` (duplicato) o "Foglio N" se assente. Un foglio vuoto o
-/// illeggibile si salta senza abortire il workbook. Restituisce false solo
-/// per esaurimento memoria (il chiamante interrompe il loop, come prima).
-fn appendParsedSheet(
-    allocator: std.mem.Allocator,
-    sheets: *std.ArrayList(decoder.Sheet),
-    sheet_xml: []const u8,
-    shared: []const []const u8,
-    name_src: ?[]const u8,
-    ordinal: usize,
-) bool {
-    var d = parseSheetRows(sheet_xml, shared, allocator);
-    switch (d) {
-        .csv => |csvd| {
-            const nm = if (name_src) |src|
-                (allocator.dupe(u8, src) catch {
-                    var cc = csvd;
-                    cc.deinit(allocator);
-                    return false;
-                })
-            else
-                (std.fmt.allocPrint(allocator, "Foglio {d}", .{ordinal}) catch {
-                    var cc = csvd;
-                    cc.deinit(allocator);
-                    return false;
-                });
-            sheets.append(allocator, .{ .name = nm, .data = csvd }) catch {
-                allocator.free(nm);
-                var cc = csvd;
-                cc.deinit(allocator);
-                return false;
-            };
-        },
-        // Foglio vuoto o illeggibile: lo si salta senza abortire il workbook.
-        else => d.deinit(allocator),
-    }
-    return true;
 }
 
 /// Analizza un singolo foglio (`xl/worksheets/sheetN.xml`) in `.csv` (prima riga
@@ -842,8 +951,13 @@ export fn zuer_decode(
     _ = io_ptr;
     const allocator = @as(*const std.mem.Allocator, @ptrCast(@alignCast(allocator_ptr))).*;
     const path_slice = path.toSlice();
-    const filename = std.fs.path.basename(path_slice);
-    const decoded = decode(content.toSlice(), filename, allocator);
+    // Il percorso può portare un frammento (`cartella.xlsx#sheet=3`): l'host lo
+    // lascia passare intatto. Va tolto prima di guardare l'estensione, altrimenti
+    // `hasExtension` non riconoscerebbe più il formato.
+    const want_sheet = sheetFromPath(path_slice);
+    const clean_path = if (std.mem.indexOfScalar(u8, path_slice, '#')) |h| path_slice[0..h] else path_slice;
+    const filename = std.fs.path.basename(clean_path);
+    const decoded = decode(content.toSlice(), filename, want_sheet, allocator);
     return decoded.toDecodedC(allocator) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "error";
         return .{

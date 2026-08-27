@@ -32,6 +32,12 @@ fn decodeObj(bytes: []const u8, filename: []const u8, allocator: std.mem.Allocat
     var bbox_min = [3]f32{ std.math.inf(f32), std.math.inf(f32), std.math.inf(f32) };
     var bbox_max = [3]f32{ -std.math.inf(f32), -std.math.inf(f32), -std.math.inf(f32) };
 
+    // Buffer degli indici della faccia corrente: vive FUORI dal loop e viene
+    // solo svuotato a ogni "f" (clearRetainingCapacity), altrimenti sarebbe una
+    // coppia alloc+free per OGNI faccia dell'OBJ (milioni su mesh dense).
+    var v_indices = std.ArrayList(usize).empty;
+    defer v_indices.deinit(allocator);
+
     var line_it = std.mem.splitScalar(u8, bytes, '\n');
     while (line_it.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \r\t");
@@ -61,8 +67,7 @@ fn decodeObj(bytes: []const u8, filename: []const u8, allocator: std.mem.Allocat
         } else if (std.mem.eql(u8, prefix, "vn")) {
             num_normals += 1;
         } else if (std.mem.eql(u8, prefix, "f")) {
-            var v_indices = std.ArrayList(usize).empty;
-            defer v_indices.deinit(allocator);
+            v_indices.clearRetainingCapacity();
 
             while (token_it.next()) |token| {
                 var part_it = std.mem.splitScalar(u8, token, '/');

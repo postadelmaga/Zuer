@@ -2,105 +2,136 @@ const std = @import("std");
 const decoder = @import("decoder");
 const Decoded = decoder.Decoded;
 
-pub fn decode(bytes: []const u8, delimiter: u8, allocator: std.mem.Allocator) Decoded {
-    defer allocator.free(bytes);
+/// Come si è chiusa una cella: separatore, fine riga, fine buffer.
+const Term = enum { delim, newline, eof };
 
-    var rows = std.ArrayList([][]const u8).empty;
-    errdefer {
-        for (rows.items) |row| {
-            for (row) |cell| allocator.free(cell);
-            allocator.free(row);
-        }
-        rows.deinit(allocator);
-    }
+const Cell = struct {
+    text: []const u8,
+    term: Term,
+};
 
-    var current_row = std.ArrayList([]const u8).empty;
-    errdefer {
-        for (current_row.items) |cell| allocator.free(cell);
-        current_row.deinit(allocator);
-    }
-
-    var current_cell = std.ArrayList(u8).empty;
-    errdefer current_cell.deinit(allocator);
-
-    var in_quotes = false;
-    var i: usize = 0;
+/// Estrae la cella che inizia a `i.*` e avanza `i.*` oltre il carattere che la
+/// chiude. La cella è una SLICE DENTRO `bytes`: niente allocazione.
+///
+/// Le virgolette si tolgono compattando il testo IN PLACE dentro lo span della
+/// cella stessa. È sempre lecito: togliere caratteri accorcia, quindi la testa
+/// di scrittura non supera mai quella di lettura, e resta comunque dentro i
+/// byte di QUESTA cella (le celle già emesse finiscono prima dell'inizio di
+/// questa, che è a sua volta ≥ della loro testa di scrittura). Nel caso comune
+/// — nessuna virgoletta — le due teste coincidono e non si copia nulla.
+///
+/// La semantica ricalca quella del vecchio parser byte-per-byte: le virgolette
+/// aprono/chiudono ovunque nella cella (anche a metà: `a"b,c"d` → `ab,cd`),
+/// dentro le virgolette `""` è una virgoletta letterale e separatore/fine riga
+/// sono testo normale.
+fn scanCell(bytes: []u8, i: *usize, delimiter: u8) Cell {
     const len = bytes.len;
+    const start = i.*;
+    var w = start; // testa di scrittura (compattazione in place)
+    var p = start; // testa di lettura
+    var in_quotes = false;
+    var term: Term = .eof;
 
-    while (i < len) {
-        const char = bytes[i];
-        if (in_quotes) {
-            if (char == '"') {
-                if (i + 1 < len and bytes[i + 1] == '"') {
-                    // Escaped quote
-                    current_cell.append(allocator, '"') catch return .{ .err = "Out of memory" };
-                    i += 2;
-                    continue;
-                } else {
-                    // Close quote
-                    in_quotes = false;
-                    i += 1;
-                    continue;
-                }
-            }
-            current_cell.append(allocator, char) catch return .{ .err = "Out of memory" };
-            i += 1;
-        } else {
-            if (char == '"') {
-                in_quotes = true;
-                i += 1;
-            } else if (char == delimiter) {
-                // End of cell
-                const cell_slice = current_cell.toOwnedSlice(allocator) catch return .{ .err = "Out of memory" };
-                current_row.append(allocator, cell_slice) catch return .{ .err = "Out of memory" };
-                i += 1;
-            } else if (char == '\r' or char == '\n') {
-                // End of cell and row
-                const cell_slice = current_cell.toOwnedSlice(allocator) catch return .{ .err = "Out of memory" };
-                current_row.append(allocator, cell_slice) catch return .{ .err = "Out of memory" };
+    // Fuori dalle virgolette sono speciali separatore, virgoletta e fine riga;
+    // dentro, solo la virgoletta. Si salta da un carattere speciale al successivo
+    // invece di ispezionare un byte alla volta.
+    const specials = [_]u8{ delimiter, '"', '\n', '\r' };
 
-                if (current_row.items.len > 0) {
-                    const row_slice = current_row.toOwnedSlice(allocator) catch return .{ .err = "Out of memory" };
-                    rows.append(allocator, row_slice) catch return .{ .err = "Out of memory" };
-                }
+    while (p < len) {
+        const stop = if (in_quotes)
+            std.mem.indexOfScalarPos(u8, bytes, p, '"') orelse len
+        else
+            std.mem.indexOfAnyPos(u8, bytes, p, &specials) orelse len;
 
-                // Handle \r\n
-                if (char == '\r' and i + 1 < len and bytes[i + 1] == '\n') {
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            } else {
-                current_cell.append(allocator, char) catch return .{ .err = "Out of memory" };
-                i += 1;
-            }
+        if (stop > p) {
+            // Run di testo letterale: si ricopia solo se la compattazione ha già
+            // arretrato la testa di scrittura.
+            if (w != p) std.mem.copyForwards(u8, bytes[w .. w + (stop - p)], bytes[p..stop]);
+            w += stop - p;
+            p = stop;
         }
+        if (p >= len) break;
+
+        const c = bytes[p];
+        if (c == '"') {
+            if (in_quotes and p + 1 < len and bytes[p + 1] == '"') {
+                bytes[w] = '"'; // `""` → una virgoletta letterale
+                w += 1;
+                p += 2;
+                continue;
+            }
+            in_quotes = !in_quotes;
+            p += 1;
+            continue;
+        }
+        if (c == delimiter) {
+            term = .delim;
+            p += 1;
+            break;
+        }
+        // `\r`, `\n` o `\r\n`: fine riga.
+        term = .newline;
+        p += if (c == '\r' and p + 1 < len and bytes[p + 1] == '\n') 2 else 1;
+        break;
     }
 
-    // Flush last cell and row if any
-    if (current_cell.items.len > 0 or current_row.items.len > 0) {
-        const cell_slice = current_cell.toOwnedSlice(allocator) catch return .{ .err = "Out of memory" };
-        current_row.append(allocator, cell_slice) catch return .{ .err = "Out of memory" };
-        const row_slice = current_row.toOwnedSlice(allocator) catch return .{ .err = "Out of memory" };
-        rows.append(allocator, row_slice) catch return .{ .err = "Out of memory" };
-    } else {
-        current_cell.deinit(allocator);
+    i.* = p;
+    return .{ .text = bytes[start..w], .term = term };
+}
+
+/// Analizza un CSV/TSV. `bytes` passa di PROPRIETÀ a questa funzione e diventa
+/// il `backing` del `CsvData` risultante: tutte le celle sono slice dentro di
+/// lui (zero-copy) e vengono liberate in blocco da `CsvData.deinit`, che sul
+/// `backing` non vuoto salta la free per-cella. Sui percorsi d'errore il buffer
+/// viene liberato qui. Restano allocati solo i container di righe e intestazioni.
+pub fn decode(bytes: []u8, delimiter: u8, allocator: std.mem.Allocator) Decoded {
+    var rows = std.ArrayList([][]const u8).empty;
+    var current_row = std.ArrayList([]const u8).empty;
+
+    // Nessuna cella è allocata a sé: in caso di uscita anticipata bastano i
+    // container e il buffer di appoggio.
+    var handed_over = false;
+    defer if (!handed_over) {
+        for (rows.items) |row| allocator.free(row);
+        rows.deinit(allocator);
         current_row.deinit(allocator);
+        allocator.free(bytes);
+    };
+
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const cell = scanCell(bytes, &i, delimiter);
+        current_row.append(allocator, cell.text) catch return .{ .err = "Out of memory" };
+        switch (cell.term) {
+            .delim => {}, // la riga continua
+            .newline, .eof => {
+                const row = current_row.toOwnedSlice(allocator) catch return .{ .err = "Out of memory" };
+                rows.append(allocator, row) catch {
+                    allocator.free(row);
+                    return .{ .err = "Out of memory" };
+                };
+            },
+        }
     }
 
     if (rows.items.len == 0) {
         const msg = allocator.dupe(u8, "Tabella CSV vuota.") catch "CSV vuoto";
-        rows.deinit(allocator);
         return .{ .err = msg };
     }
 
-    // The first row is headers
+    // La prima riga sono le intestazioni.
     const headers = rows.orderedRemove(0);
-    const final_rows = rows.toOwnedSlice(allocator) catch return .{ .err = "Out of memory" };
+    const final_rows = rows.toOwnedSlice(allocator) catch {
+        allocator.free(headers);
+        return .{ .err = "Out of memory" };
+    };
 
+    handed_over = true;
+    current_row.deinit(allocator);
     return .{ .csv = .{
         .headers = headers,
         .rows = final_rows,
+        .backing = bytes,
     } };
 }
 
@@ -125,7 +156,11 @@ fn zuer_decode(
         }
     }
 
-    const decoded = decode(content_slice, delimiter, allocator);
+    // Il contratto ABI (vedi `decoder.DecodeFn`) dà al plugin la PROPRIETÀ di
+    // `content`, che l'host alloca sempre sull'heap con questo stesso allocator:
+    // il buffer è quindi scrivibile, ed è lecito de-escapare le celle quotate
+    // compattandole al suo interno. Il `const` è solo del layout C `SliceC`.
+    const decoded = decode(@constCast(content_slice), delimiter, allocator);
     return decoded.toDecodedC(allocator) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "error";
         return .{

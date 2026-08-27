@@ -75,9 +75,13 @@ pub fn decode(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ?Decoded {
         const msg = std.fmt.allocPrint(gpa, "Impossibile leggere il file: {s}", .{@errorName(err)}) catch "Errore di lettura";
         return Decoded{ .err = msg };
     };
-    // I decoder che tengono i byte (image → pixel, text → copia) li liberano da sé o ne
-    // fanno una copia; qui il buffer è nostro e va restituito in ogni caso.
-    defer gpa.free(bytes);
+    // Ownership dei byte: text/markdown li restituiscono zero-copy come contenuto
+    // e csv/tsv li tengono come `backing` delle celle → in quei casi il buffer
+    // appartiene al risultato (liberato dal suo `deinit`). Solo i decoder che
+    // copiano (image → pixel, mesh/glb → geometria) lasciano il buffer a noi.
+    // (Prima si liberava sempre: use-after-free su testo e double-free su csv.)
+    const owned_by_result = fam == .text or fam == .csv or fam == .tsv or fam == .markdown;
+    defer if (!owned_by_result) gpa.free(bytes);
 
     const name = std.fs.path.basename(path);
     return switch (fam) {

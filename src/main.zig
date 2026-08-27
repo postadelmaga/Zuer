@@ -34,6 +34,14 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("Missing input path for --json\n", .{});
                 std.process.exit(1);
             };
+            // Il dump JSON vuole tutti i fogli di un workbook; la GUI ne
+            // decodifica solo quello attivo (gli altri on-demand).
+            if (@import("builtin").os.tag != .windows) {
+                const c_setenv = struct {
+                    extern "c" fn setenv(n: [*:0]const u8, v: [*:0]const u8, overwrite: c_int) c_int;
+                };
+                _ = c_setenv.setenv("ZUER_XLSX_ALL_SHEETS", "1", 1);
+            }
             var decoded = decoder_mod.decode(in_path, io, gpa);
             defer decoded.deinit(gpa);
 

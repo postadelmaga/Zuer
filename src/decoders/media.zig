@@ -19,18 +19,35 @@ extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 /// caricato in RAM per il poster. Le strutture che i formati mettono in coda
 /// (ultima pagina Ogg, moov dei MP4 non-faststart) si leggono mirate dal path.
 pub fn decode(path: []const u8, bytes: []const u8, filename: []const u8, allocator: std.mem.Allocator) Decoded {
+    return decodeTier(path, bytes, filename, allocator, false);
+}
+
+/// Tier coarse (anteprima progressiva / miniature dell'explorer): stessa
+/// pipeline, ma il poster video si ferma a `coarse_max_dim` invece dei 1280 px
+/// del full — meno lavoro di scaling in libav e ~6× meno pixel da trasferire.
+pub fn decodeCoarse(path: []const u8, bytes: []const u8, filename: []const u8, allocator: std.mem.Allocator) Decoded {
+    return decodeTier(path, bytes, filename, allocator, true);
+}
+
+fn decodeTier(path: []const u8, bytes: []const u8, filename: []const u8, allocator: std.mem.Allocator, coarse: bool) Decoded {
     defer allocator.free(bytes);
 
     // Dimensione reale dal filesystem: `bytes` può essere solo un prefisso.
     const file_size: usize = if (decoder.fileSizeLibc(allocator, path)) |s| @intCast(s) else bytes.len;
 
     var info_opt = sniff(bytes, path, file_size, allocator);
-    if (info_opt == null and file_size > bytes.len and file_size <= 64 * 1024 * 1024) {
-        // Prefisso insufficiente (es. MP3 con tag ID3 enorme): riprova una sola
-        // volta col file intero, ma solo entro un tetto ragionevole.
+    // Il prefisso passato dall'host è volutamente piccolo (vedi
+    // `content_prefix_bytes`): copre gli header, ma due casi vogliono di più —
+    // sniff fallito del tutto (es. MP3 il cui tag ID3 con copertina spinge il
+    // primo frame audio oltre il prefisso) e MIDI, dove TinyMidiLoader vuole il
+    // file intero per la durata. In entrambi si rilegge UNA sola volta il file
+    // completo, e solo entro un tetto ragionevole.
+    if (file_size > bytes.len and file_size <= 64 * 1024 * 1024 and wantsFullFile(info_opt)) {
         if (decoder.readFileLibc(allocator, path, file_size) catch null) |full| {
             defer allocator.free(full);
-            info_opt = sniff(full, path, file_size, allocator);
+            // Se la seconda passata fallisce si tiene comunque il primo esito
+            // (parziale ma valido): mai regredire a "formato non riconosciuto".
+            if (sniff(full, path, file_size, allocator)) |better| info_opt = better;
         }
     }
     const info: MediaInfo = info_opt orelse {
@@ -39,7 +56,7 @@ pub fn decode(path: []const u8, bytes: []const u8, filename: []const u8, allocat
     };
 
     if (info.kind == .video) {
-        if (posterFrame(path, filename, allocator)) |img| {
+        if (posterFrame(path, filename, allocator, coarse)) |img| {
             return .{ .image = img };
         } else |_| {} // libav non disponibile o frame illeggibile → scheda testuale
     }
@@ -47,13 +64,26 @@ pub fn decode(path: []const u8, bytes: []const u8, filename: []const u8, allocat
     return .{ .text = render(info, filename, file_size, allocator) };
 }
 
+/// true se conviene rileggere il file intero: sniff fallito (prefisso troppo
+/// corto per arrivare agli header utili) oppure parsing riuscito ma incompleto
+/// perché richiedeva tutti i byte (`wants_full_file`, oggi solo il MIDI).
+fn wantsFullFile(info: ?MediaInfo) bool {
+    const i = info orelse return true;
+    return i.wants_full_file;
+}
+
+/// Lato coarse del poster video: abbastanza per una card dell'explorer o per
+/// un'anteprima progressiva, un quarto dei pixel del tier full.
+const coarse_max_dim: usize = 512;
+
 /// Primo frame video come immagine RGB, dimensionato in base al contesto (GUI
-/// ad alta risoluzione, terminale ridotto).
-fn posterFrame(path: []const u8, filename: []const u8, allocator: std.mem.Allocator) !decoder.ImageData {
+/// ad alta risoluzione, terminale ridotto) e al tier richiesto.
+fn posterFrame(path: []const u8, filename: []const u8, allocator: std.mem.Allocator, coarse: bool) !decoder.ImageData {
     var max_dim: usize = 160;
     if (getenv("ZUER_GUI")) |v| {
         if (std.mem.eql(u8, std.mem.span(v), "1")) max_dim = 1280;
     }
+    if (coarse) max_dim = @min(max_dim, coarse_max_dim);
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
 
@@ -74,6 +104,9 @@ const MediaInfo = struct {
     width: ?u32 = null,
     height: ?u32 = null,
     tracks: ?u16 = null,
+    /// Il parsing è riuscito ma su un prefisso troppo corto: con il file intero
+    /// darebbe di più (oggi: durata reale del MIDI). Vedi `wantsFullFile`.
+    wants_full_file: bool = false,
 };
 
 fn sniff(b: []const u8, path: []const u8, file_size: usize, allocator: std.mem.Allocator) ?MediaInfo {
@@ -221,8 +254,24 @@ fn parseMp4(b: []const u8, path: []const u8, file_size: usize, allocator: std.me
     // coda dal path e lo si localizza lì con l'euristica fourcc+size.
     var tail_buf: ?[]u8 = null;
     defer if (tail_buf) |t| allocator.free(t);
+    var head_buf: ?[]u8 = null;
+    defer if (head_buf) |h| allocator.free(h);
     var hay: []const u8 = b;
     var moov_opt = findBox(b, 0, b.len, "moov");
+    // Faststart con tabelle grandi: il moov è in TESTA ma può sforare il
+    // prefisso da 256 KiB (findBox rifiuta un box troncato). Prima della coda si
+    // rilegge quindi una testa più ampia, mirata e a tetto fisso.
+    if (moov_opt == null and file_size > b.len) {
+        if (decoder.readFileLibc(allocator, path, 8 * 1024 * 1024) catch null) |h| {
+            if (h.len > b.len) {
+                if (findBox(h, 0, h.len, "moov")) |mv| {
+                    head_buf = h;
+                    hay = h;
+                    moov_opt = mv;
+                } else allocator.free(h);
+            } else allocator.free(h);
+        }
+    }
     if (moov_opt == null and file_size > b.len) {
         if (decoder.readFileTailLibc(allocator, path, 8 * 1024 * 1024) catch null) |t| {
             tail_buf = t;
@@ -373,8 +422,9 @@ fn parseMidi(b: []const u8, file_size: usize) ?MediaInfo {
     };
     var info = MediaInfo{ .format = fmt_name, .kind = .audio, .tracks = ntrks };
     // Durata reale con TinyMidiLoader (tempo dell'ultimo evento, mappa tempi
-    // inclusa). tml vuole il file intero: si calcola solo se il prefisso lo
-    // copre tutto — i .mid reali stanno ampiamente sotto gli 8 MiB del prefisso.
+    // inclusa). tml vuole il file intero: se il prefisso non lo copre si segnala
+    // `wants_full_file` e il chiamante rilegge il file per intero una volta sola.
+    if (b.len < file_size) info.wants_full_file = true;
     if (b.len >= file_size) {
         const msgs = tml.tml_load_memory(b.ptr, @intCast(b.len));
         if (msgs != null) {
@@ -451,17 +501,16 @@ fn formatSize(buf: []u8, n: u64) []const u8 {
     return std.fmt.bufPrint(buf, "{d:.1} {s}", .{ v, units[u] }) catch "?";
 }
 
-export fn zuer_decode(
+fn decodeExport(
     path: decoder.SliceC,
     content: decoder.SliceC,
-    io_ptr: *const anyopaque,
     allocator_ptr: *const anyopaque,
-) callconv(.c) decoder.DecodedC {
-    _ = io_ptr;
+    coarse: bool,
+) decoder.DecodedC {
     const allocator = @as(*const std.mem.Allocator, @ptrCast(@alignCast(allocator_ptr))).*;
     const filename = std.fs.path.basename(path.toSlice());
 
-    const decoded = decode(path.toSlice(), content.toSlice(), filename, allocator);
+    const decoded = decodeTier(path.toSlice(), content.toSlice(), filename, allocator, coarse);
     return decoded.toDecodedC(allocator) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "error";
         return .{
@@ -471,16 +520,42 @@ export fn zuer_decode(
     };
 }
 
+export fn zuer_decode(
+    path: decoder.SliceC,
+    content: decoder.SliceC,
+    io_ptr: *const anyopaque,
+    allocator_ptr: *const anyopaque,
+) callconv(.c) decoder.DecodedC {
+    _ = io_ptr;
+    return decodeExport(path, content, allocator_ptr, false);
+}
+
+/// Tier coarse: poster video a `coarse_max_dim` per l'anteprima progressiva e
+/// per le miniature dell'explorer (il full arriva dopo).
+export fn zuer_decode_coarse(
+    path: decoder.SliceC,
+    content: decoder.SliceC,
+    io_ptr: *const anyopaque,
+    allocator_ptr: *const anyopaque,
+) callconv(.c) decoder.DecodedC {
+    _ = io_ptr;
+    return decodeExport(path, content, allocator_ptr, true);
+}
+
 pub const extensions = "mp3,wav,flac,ogg,oga,ogv,opus,m4a,mp4,m4v,mov,mkv,webm,avi,mid,midi";
 
 export fn zuer_extensions() callconv(.c) decoder.SliceC {
     return decoder.SliceC.fromSlice(extensions);
 }
 
-/// Bastano gli header per la scheda (8 MiB coprono anche tag ID3 con copertina):
-/// il poster video usa libav dal path e le strutture in coda (ultima pagina Ogg,
-/// moov non-faststart) si leggono mirate con readFileTailLibc.
-const content_prefix_bytes: usize = 8 * 1024 * 1024;
+/// Bastano gli header per la scheda: il poster video usa libav dal path e le
+/// strutture in coda (ultima pagina Ogg, moov non-faststart) si leggono mirate
+/// con readFileTailLibc. 256 KiB invece di 8 MiB — l'host leggeva 8 MiB per OGNI
+/// file multimediale (anche solo per la card dell'explorer) mentre gli header
+/// stanno nei primi KB. I casi che vogliono di più (tag ID3 con copertina grande
+/// che sposta il primo frame oltre il prefisso, durata MIDI) sono coperti dal
+/// re-read mirato in `decodeTier`, che scatta su `wantsFullFile`.
+const content_prefix_bytes: usize = 256 * 1024;
 
 export fn zuer_content_prefix() callconv(.c) usize {
     return content_prefix_bytes;

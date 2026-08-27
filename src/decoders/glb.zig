@@ -616,9 +616,17 @@ fn addPrimitive(b: *Builder, prim: GltfPrimitive, world: Mat4) !void {
 
     const vertex_offset = b.vertices.items.len;
 
+    // Le liste per-vertice crescono tutte di esattamente `count` elementi: una
+    // sola riserva a monte evita la catena di riallocazioni geometriche (e le
+    // relative copie) che gli append farebbero primitiva per primitiva.
+    try b.vertices.ensureUnusedCapacity(b.allocator, count);
+    try b.normals.ensureUnusedCapacity(b.allocator, count);
+    try b.uvs.ensureUnusedCapacity(b.allocator, count);
+    try b.tangents.ensureUnusedCapacity(b.allocator, count);
+
     for (positions) |p| {
         const wp = transformPoint(world, p);
-        try b.vertices.append(b.allocator, wp);
+        b.vertices.appendAssumeCapacity(wp);
         inline for (0..3) |c| {
             b.bbox_min[c] = @min(b.bbox_min[c], wp[c]);
             b.bbox_max[c] = @max(b.bbox_max[c], wp[c]);
@@ -629,14 +637,14 @@ fn addPrimitive(b: *Builder, prim: GltfPrimitive, world: Mat4) !void {
     if (attributeIndex(prim.attributes, "NORMAL")) |ni| {
         if (try readFloatAccessor(3, b.gltf, b.bin, ni, count, b.allocator)) |ns| {
             defer b.allocator.free(ns);
-            for (ns) |n| try b.normals.append(b.allocator, transformDir(world, n));
+            for (ns) |n| b.normals.appendAssumeCapacity(transformDir(world, n));
         } else {
             b.all_normals = false;
-            for (0..count) |_| try b.normals.append(b.allocator, .{ 0, 0, 0 });
+            @memset(b.normals.addManyAsSliceAssumeCapacity(count), .{ 0, 0, 0 });
         }
     } else {
         b.all_normals = false;
-        for (0..count) |_| try b.normals.append(b.allocator, .{ 0, 0, 0 });
+        @memset(b.normals.addManyAsSliceAssumeCapacity(count), .{ 0, 0, 0 });
     }
 
     // UV (sempre una per vertice: (0,0) se assenti).
@@ -645,12 +653,12 @@ fn addPrimitive(b: *Builder, prim: GltfPrimitive, world: Mat4) !void {
         if (try readFloatAccessor(2, b.gltf, b.bin, ui, count, b.allocator)) |us| {
             defer b.allocator.free(us);
             had_uv = true;
-            for (us) |u| try b.uvs.append(b.allocator, u);
+            for (us) |u| b.uvs.appendAssumeCapacity(u);
         } else {
-            for (0..count) |_| try b.uvs.append(b.allocator, .{ 0, 0 });
+            @memset(b.uvs.addManyAsSliceAssumeCapacity(count), .{ 0, 0 });
         }
     } else {
-        for (0..count) |_| try b.uvs.append(b.allocator, .{ 0, 0 });
+        @memset(b.uvs.addManyAsSliceAssumeCapacity(count), .{ 0, 0 });
     }
 
     // Tangenti autorali (vec4: xyz direzione + w handedness). xyz trasformate
@@ -660,15 +668,15 @@ fn addPrimitive(b: *Builder, prim: GltfPrimitive, world: Mat4) !void {
             defer b.allocator.free(ts);
             for (ts) |t| {
                 const wt = transformDir(world, .{ t[0], t[1], t[2] });
-                try b.tangents.append(b.allocator, .{ wt[0], wt[1], wt[2], t[3] });
+                b.tangents.appendAssumeCapacity(.{ wt[0], wt[1], wt[2], t[3] });
             }
         } else {
             b.all_tangents = false;
-            for (0..count) |_| try b.tangents.append(b.allocator, .{ 0, 0, 0, 1 });
+            @memset(b.tangents.addManyAsSliceAssumeCapacity(count), .{ 0, 0, 0, 1 });
         }
     } else {
         b.all_tangents = false;
-        for (0..count) |_| try b.tangents.append(b.allocator, .{ 0, 0, 0, 1 });
+        @memset(b.tangents.addManyAsSliceAssumeCapacity(count), .{ 0, 0, 0, 1 });
     }
 
     // Facce (indici con offset dei vertici del submesh).
@@ -730,17 +738,21 @@ fn addFaces(b: *Builder, prim: GltfPrimitive, pos_count: usize, vertex_offset: u
         const bv = bvs[bv_idx];
         // Somma controllata: gli offset arrivano dal JSON (usize ostili).
         const ind_offset = std.math.add(usize, bv.byteOffset orelse 0, acc.byteOffset orelse 0) catch return error.OutOfBounds;
+        // Numero di triangoli noto a priori dall'accessor: una riserva sola.
+        try b.faces.ensureUnusedCapacity(b.allocator, acc.count / 3);
         var j: usize = 0;
         while (j + 2 < acc.count) : (j += 3) {
             const v1 = try readIndex(b.bin, ind_offset, j, acc.componentType);
             const v2 = try readIndex(b.bin, ind_offset, j + 1, acc.componentType);
             const v3 = try readIndex(b.bin, ind_offset, j + 2, acc.componentType);
-            try b.faces.append(b.allocator, .{ .v1 = v1 + vertex_offset, .v2 = v2 + vertex_offset, .v3 = v3 + vertex_offset });
+            b.faces.appendAssumeCapacity(.{ .v1 = v1 + vertex_offset, .v2 = v2 + vertex_offset, .v3 = v3 + vertex_offset });
         }
     } else {
+        // Senza indici i vertici sono già in ordine di triangolo: count/3 facce.
+        try b.faces.ensureUnusedCapacity(b.allocator, pos_count / 3);
         var j: usize = 0;
         while (j + 2 < pos_count) : (j += 3) {
-            try b.faces.append(b.allocator, .{ .v1 = j + vertex_offset, .v2 = j + 1 + vertex_offset, .v3 = j + 2 + vertex_offset });
+            b.faces.appendAssumeCapacity(.{ .v1 = j + vertex_offset, .v2 = j + 1 + vertex_offset, .v3 = j + 2 + vertex_offset });
         }
     }
 }

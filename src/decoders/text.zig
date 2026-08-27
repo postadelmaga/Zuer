@@ -5,6 +5,12 @@ const DecodedC = decoder.DecodedC;
 
 /// Riconosce se un buffer di byte appartiene a un file binario (es. eseguibili, immagini, archivi).
 /// Analizza i primi byte (fino a 8KB) contando byte NULL e caratteri di controllo non stampabili.
+///
+/// NOTA: l'host applica lo STESSO criterio (`probeLooksBinary` in decoder.zig)
+/// agli 8 KB di probe che legge quando l'estensione è ignota, così un binario
+/// senza estensione non viene più caricato per intero in RAM solo per essere
+/// scartato qui. Le due implementazioni vanno tenute allineate; questa resta
+/// comunque la rete di sicurezza (percorsi che non passano dal probe, Android).
 fn isBinary(bytes: []const u8) bool {
     const sample_len = @min(bytes.len, 8192);
     if (sample_len == 0) return false;
