@@ -73,6 +73,10 @@ pub const VideoDecoder = struct {
     tail: std.atomic.Value(u64) = .init(0), // produttore: prossimo da scrivere
 
     stop: std.atomic.Value(bool) = .init(false),
+    // Taglia di presentazione (fit-rect della finestra) richiesta dal present:
+    // il produttore scala i frame direttamente a questa dimensione (0 = ignota).
+    target_w: std.atomic.Value(u32) = .init(0),
+    target_h: std.atomic.Value(u32) = .init(0),
     // Seek richiesto (ms, -1 = nessuno). Il consumatore bumpa `gen` e lo imposta;
     // il thread riposiziona il `Player` e adotta la nuova `gen`.
     seek_ms: std.atomic.Value(i64) = .init(-1),
@@ -161,6 +165,14 @@ pub const VideoDecoder = struct {
 
     /// Propaga play/pausa al backend mpv (se attivo). No-op per il backend
     /// FFmpeg, che già si ferma per backpressure (il ring smette di svuotarsi).
+    /// Comunica al produttore la taglia a cui presentare (fit-rect corrente):
+    /// i frame successivi arrivano già a quella dimensione, filtrati bene, e il
+    /// compositore li copia 1:1 invece di ricampionarli nearest.
+    pub fn setTargetSize(self: *VideoDecoder, w: u32, h: u32) void {
+        self.target_w.store(w, .monotonic);
+        self.target_h.store(h, .monotonic);
+    }
+
     pub fn setPlaying(self: *VideoDecoder, playing: bool) void {
         if (comptime mpv_enabled) self.mpv_pause_req.store(!playing, .monotonic);
     }
@@ -228,18 +240,16 @@ pub const VideoDecoder = struct {
         var result: Picked = .{};
         if (hd < t and (force_first or self.ring[hd % CAP].pts_s <= up_to_pts)) {
             const s = &self.ring[hd % CAP];
-            const need = @as(usize, s.w) * s.h * 4;
-            if (rgba.*.len != need) {
-                const nb = gpa.alloc(u8, need) catch {
-                    // OOM: NON toccare il sink (tieni l'ultimo frame) e lascia il
-                    // frame in coda; pubblica solo gli scarti e riprova al giro dopo.
-                    self.head.store(hd, .release);
-                    return .{};
-                };
-                gpa.free(rgba.*);
-                rgba.* = nb;
-            }
-            @memcpy(rgba.*, s.pixels[0..need]);
+            // Zero-copy: lo slot cede il suo buffer al sink e prende in cambio il
+            // vecchio buffer del sink (riusato al prossimo produce). Era un memcpy
+            // da ~8 MB per frame a 1080p sul thread di present, sotto lock.
+            // `rgba.len` può essere ≥ w*h*4 (capacità dello slot): i consumatori
+            // indicizzano su w/h e `free` usa la lunghezza piena dell'allocazione.
+            const old = rgba.*;
+            rgba.* = s.pixels[0..s.cap];
+            s.pixels = old;
+            s.cap = old.len;
+            _ = gpa;
             w.* = s.w;
             h.* = s.h;
             result = .{ .presented = true, .pts_s = s.pts_s };
@@ -307,7 +317,7 @@ pub const VideoDecoder = struct {
             }
             if (self.stop.load(.monotonic) or self.seek_ms.load(.monotonic) >= 0) continue;
 
-            const fr = (self.mpv.?.pollFrame(&scratch, self.gpa) catch null) orelse {
+            const fr = (self.mpv.?.pollFrame(&scratch, self.gpa, self.target_w.load(.monotonic), self.target_h.load(.monotonic)) catch null) orelse {
                 if (self.mpv.?.eofReached()) {
                     self.eof.store(true, .monotonic);
                 } else {
@@ -370,6 +380,8 @@ pub const VideoDecoder = struct {
             }
             if (self.stop.load(.monotonic) or self.seek_ms.load(.monotonic) >= 0) continue;
 
+            self.player.target_w = @intCast(self.target_w.load(.monotonic));
+            self.player.target_h = @intCast(self.target_h.load(.monotonic));
             const maybe = self.player.nextFrame(self.max_dim, self.gpa, if (prod_skip_until >= 0) prod_skip_until else null) catch {
                 // Errore di decode (packet corrotto) ≠ EOF: salta e riprova.
                 sleepMs(4);

@@ -307,7 +307,7 @@ pub const MpvVideo = struct {
     /// dal chiamante). Ritorna `null` se non c'era nulla di nuovo da mostrare
     /// (nessun nuovo frame dall'ultima chiamata) — il chiamante tiene l'ultimo
     /// frame presentato, stesso contratto di `VideoDecoder.pickInto` di oggi.
-    pub fn pollFrame(self: *MpvVideo, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !?Frame {
+    pub fn pollFrame(self: *MpvVideo, out: *std.ArrayList(u8), allocator: std.mem.Allocator, target_w: u32, target_h: u32) !?Frame {
         const flags = api.mpv_render_context_update(self.render_ctx);
         if (flags & c.MPV_RENDER_UPDATE_FRAME == 0) return null;
 
@@ -316,8 +316,19 @@ pub const MpvVideo = struct {
         _ = api.mpv_get_property(self.mpv, "dwidth", c.MPV_FORMAT_INT64, &w);
         _ = api.mpv_get_property(self.mpv, "dheight", c.MPV_FORMAT_INT64, &h);
         if (w <= 0 or h <= 0) return null;
-        const gw: c_int = @intCast(w);
-        const gh: c_int = @intCast(h);
+        var gw: c_int = @intCast(w);
+        var gh: c_int = @intCast(h);
+        // Taglia di presentazione nota: mpv scala (bene, su GPU) direttamente a
+        // quella, così il compositore non ricampiona nearest. Aspect-fit del
+        // frame nel box richiesto, ingrandimento ammesso fino a 2×.
+        if (target_w > 0 and target_h > 0) {
+            const sw: f64 = @floatFromInt(w);
+            const sh: f64 = @floatFromInt(h);
+            var scale = @min(@as(f64, @floatFromInt(target_w)) / sw, @as(f64, @floatFromInt(target_h)) / sh);
+            scale = @min(scale, 2.0);
+            gw = @max(1, @as(c_int, @intFromFloat(@round(sw * scale))));
+            gh = @max(1, @as(c_int, @intFromFloat(@round(sh * scale))));
+        }
 
         self.ensureFbo(gw, gh);
         c.glBindFramebuffer(c.GL_FRAMEBUFFER, self.fbo);

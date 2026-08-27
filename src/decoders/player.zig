@@ -231,7 +231,9 @@ pub const Error = error{
 
 /// Dimensioni scalate mantenendo l'aspect ratio, così che il lato maggiore non
 /// superi `max_dim` (mai ingrandito).
-fn fitDims(src_w: c_int, src_h: c_int, max_dim: usize) struct { w: c_int, h: c_int } {
+const Dims = struct { w: c_int, h: c_int };
+
+fn fitDims(src_w: c_int, src_h: c_int, max_dim: usize) Dims {
     if (src_w <= 0 or src_h <= 0) return .{ .w = 1, .h = 1 };
     const fmax: f64 = @floatFromInt(max_dim);
     const bigger: f64 = @floatFromInt(@max(src_w, src_h));
@@ -437,6 +439,13 @@ pub const Player = struct {
     sws_src_fmt: c_int = -1,
     sws_dst_w: c_int = 0,
     sws_dst_h: c_int = 0,
+    /// Dimensione di presentazione richiesta dalla GUI (0 = non nota → `max_dim`):
+    /// il frame viene scalato DIRETTAMENTE a questa taglia con un filtro di
+    /// qualità, così il compositore non deve ricampionare (nearest → aliasing).
+    /// Scritte dal thread di decodifica prima di ogni `nextFrame` (vedi
+    /// `VideoDecoder.setTargetSize`).
+    target_w: c_int = 0,
+    target_h: c_int = 0,
 
     // Decoder VP9 su GPU (libcompute_vp9). `is_vp9` = stiamo instradando i packet a
     // cvp9 invece che a libavcodec. Il contesto avcodec resta comunque aperto come
@@ -902,7 +911,7 @@ pub const Player = struct {
     fn scaleI420(self: *Player, f: cvp9.Frame, max_dim: usize, allocator: std.mem.Allocator) Error!Frame {
         const src_w: c_int = @intCast(f.width);
         const src_h: c_int = @intCast(f.height);
-        const dims = fitDims(src_w, src_h, max_dim);
+        const dims = self.outDims(src_w, src_h, max_dim);
         try self.ensureSws(src_w, src_h, c.AV_PIX_FMT_YUV420P, dims.w, dims.h);
 
         const w: usize = @intCast(dims.w);
@@ -930,7 +939,10 @@ pub const Player = struct {
             av.sws_freeContext(s);
             self.sws = null;
         }
-        const sws = av.sws_getContext(src_w, src_h, src_fmt, dst_w, dst_h, self.out_fmt, c.SWS_FAST_BILINEAR, null, null, null) orelse return Error.ScaleInitFailed;
+        // Filtro: AREA in riduzione (media dei pixel sorgente: niente aliasing/
+        // shimmer, era FAST_BILINEAR che campiona 2 tap), BICUBIC in ingrandimento.
+        const flags: c_int = if (dst_w < src_w or dst_h < src_h) c.SWS_AREA else c.SWS_BICUBIC;
+        const sws = av.sws_getContext(src_w, src_h, src_fmt, dst_w, dst_h, self.out_fmt, flags, null, null, null) orelse return Error.ScaleInitFailed;
         self.sws = sws;
         self.sws_src_w = src_w;
         self.sws_src_h = src_h;
@@ -942,10 +954,26 @@ pub const Player = struct {
     /// Converte `src` (self.frame, oppure sw_frame dopo il download VAAPI) in
     /// pixel impacchettati scalati a `max_dim`. ensureSws è keyed anche sul
     /// formato sorgente, quindi il passaggio dinamico YUV420P↔NV12 è coperto.
+    /// Dimensioni di uscita del frame: la taglia di presentazione (`target_*`,
+    /// aspect-fit del sorgente nel box richiesto, ingrandimento consentito fino
+    /// a 2× e mai oltre `max_dim`) se nota, altrimenti `fitDims` classico.
+    fn outDims(self: *const Player, src_w: c_int, src_h: c_int, max_dim: usize) Dims {
+        if (self.target_w <= 0 or self.target_h <= 0 or src_w <= 0 or src_h <= 0) return fitDims(src_w, src_h, max_dim);
+        const sw: f64 = @floatFromInt(src_w);
+        const sh: f64 = @floatFromInt(src_h);
+        var scale = @min(@as(f64, @floatFromInt(self.target_w)) / sw, @as(f64, @floatFromInt(self.target_h)) / sh);
+        scale = @min(scale, 2.0);
+        const fmax: f64 = @floatFromInt(max_dim);
+        scale = @min(scale, fmax / @max(sw, sh));
+        const w: c_int = @max(1, @as(c_int, @intFromFloat(@round(sw * scale))));
+        const h: c_int = @max(1, @as(c_int, @intFromFloat(@round(sh * scale))));
+        return .{ .w = w, .h = h };
+    }
+
     fn scaleCurrent(self: *Player, src: [*c]c.AVFrame, max_dim: usize, allocator: std.mem.Allocator, pts_s: f64) Error!Frame {
         const src_w = src.*.width;
         const src_h = src.*.height;
-        const dims = fitDims(src_w, src_h, max_dim);
+        const dims = self.outDims(src_w, src_h, max_dim);
         try self.ensureSws(src_w, src_h, src.*.format, dims.w, dims.h);
 
         const w: usize = @intCast(dims.w);
