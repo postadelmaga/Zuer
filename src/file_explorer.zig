@@ -8,6 +8,7 @@
 //! scrollbar, latest-wins sulla generazione per il worker delle miniature).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const decoder_mod = @import("decoder.zig");
 const glyph = @import("glyph.zig");
 const layout = @import("layout.zig");
@@ -15,6 +16,9 @@ const nav = @import("nav.zig");
 const videomod = @import("video.zig");
 const yt_search = @import("yt_search.zig");
 const gui_state_mod = @import("gui_state.zig");
+const vtcache = @import("vtcache.zig");
+// Copia host dell'helper di manutenzione cache (LRU per mtime + sweep dei tmp).
+const evict = @import("cache_evict.zig");
 const GuiAppState = gui_state_mod.GuiAppState;
 const zrame = @import("zrame");
 const zicro = @import("zicro");
@@ -36,8 +40,10 @@ const KEY_RIGHT: u32 = 106;
 const KEY_DOWN: u32 = 108;
 const KEY_PGDOWN: u32 = 109;
 
-/// Tetto alle voci mostrate (cartelle sterminate) e ai file di cui tentare la
-/// miniatura (ogni tentativo è un decode completo su thread di background).
+/// Tetto alle voci mostrate (cartelle sterminate) e alle miniature TENUTE IN RAM
+/// per generazione: `max_thumb_files` × `thumb_max`² × 4 B ≈ 24 MB nel caso
+/// peggiore. Lo stesso tetto limita anche i decode tentati (ognuno è un decode
+/// completo su thread di background).
 const max_entries: usize = 512;
 const max_thumb_files: usize = 96;
 /// Oltre questa dimensione niente miniatura (decode lento/pesante in RAM).
@@ -48,12 +54,17 @@ pub const Entry = struct {
     name: []u8,
     is_dir: bool,
     size: u64 = 0,
+    /// mtime della sorgente in ns (riempito da `fillSizes`): con `size` forma la
+    /// chiave della cache su disco, che si invalida così da sola.
+    mtime_ns: i128 = 0,
     /// Miniatura RGBA (vuota finché il thumb worker non la installa).
     thumb_rgba: []u8 = &.{},
     thumb_w: u32 = 0,
     thumb_h: u32 = 0,
     /// Il worker ha già tentato il decode (evita retry sui formati falliti).
     thumb_tried: bool = false,
+    /// Il worker ha già interrogato la cache su disco per questa voce.
+    cache_tried: bool = false,
 };
 
 /// Stato dell'overlay, dentro `Shared` (ogni accesso sotto `shared.mutex`).
@@ -68,6 +79,11 @@ pub const FxState = struct {
     row_off: i32 = 0,
     /// Generazione delle voci: il thumb worker installa solo se è ancora la sua.
     gen: u32 = 0,
+    /// Miniature installate nella generazione corrente e decode già tentati:
+    /// budget condivisi fra i thumb worker (tetto su RAM e CPU). Azzerati da
+    /// `enterDir` (il conteggio riparte da quelle ereditate dalla cartella).
+    thumb_installed: u32 = 0,
+    thumb_attempts: u32 = 0,
     /// La selezione è appena cambiata da tastiera: lo scroll la insegue.
     follow_sel: bool = false,
     /// Trascinamento del thumb della scrollbar in corso.
@@ -102,17 +118,18 @@ fn setErr(state: *GuiAppState, msg: []const u8) void {
     fx.err = state.gpa.dupe(u8, msg) catch null;
 }
 
-/// Chiude l'overlay liberando voci e miniature (decine di MB con le thumbnail
-/// installate): alla riapertura la cartella viene comunque riscandita. Il bump
-/// di generazione fa scartare al thumb worker ciò che ha ancora in volo.
-/// Con `shared.mutex` acquisito.
+/// Chiude l'overlay TENENDO voci e miniature della cartella corrente: con
+/// `thumb_max` a 256 il costo massimo è `max_thumb_files` × 256² × 4 B ≈ 24 MB,
+/// e la riapertura sulla stessa cartella le ritrova pronte (`enterDir` le
+/// trasferisce per nome, vedi `adoptThumbs`) invece di ridecodificare tutto.
+/// La memoria torna al sistema al primo `enterDir` su un'ALTRA cartella (o a
+/// `deinit`). Il bump di generazione ferma comunque il thumb worker: a overlay
+/// chiuso non deve consumare CPU. Con `shared.mutex` acquisito.
 fn closeOverlay(state: *GuiAppState) void {
     const fx = &state.shared.fx;
     fx.active = false;
     fx.sb_drag = false;
     fx.gen +%= 1;
-    freeEntries(state.gpa, fx.entries);
-    fx.entries = &.{};
     fx.sel = -1;
     fx.row_off = 0;
     if (fx.err) |e| {
@@ -138,6 +155,49 @@ fn lessNameCi(a: []const u8, b: []const u8) bool {
 fn entryLess(_: void, a: Entry, b: Entry) bool {
     if (a.is_dir != b.is_dir) return a.is_dir; // cartelle prima
     return lessNameCi(a.name, b.name);
+}
+
+/// Trasferisce alle voci `new` le miniature già in RAM delle voci `old` con lo
+/// stesso nome (riapertura del pannello sulla stessa cartella, o `enterDir`
+/// ripetuto). Entrambe le liste sono ordinate con `entryLess`: basta una
+/// fusione lineare. Le voci `old` cedute restano con `thumb_rgba` vuoto, così
+/// `freeEntries` non libera un buffer ora posseduto da `new`.
+/// Ritorna quante miniature sono passate (riparte da lì il budget RAM).
+fn adoptThumbs(old: []Entry, new: []Entry) u32 {
+    var i: usize = 0;
+    var j: usize = 0;
+    var moved: u32 = 0;
+    while (i < old.len and j < new.len) {
+        const o = &old[i];
+        const w = &new[j];
+        if (entryLess({}, o.*, w.*)) {
+            i += 1;
+            continue;
+        }
+        if (entryLess({}, w.*, o.*)) {
+            j += 1;
+            continue;
+        }
+        // Stessa posizione d'ordine: `lessNameCi` ignora il case, quindi il
+        // nome esatto va confrontato comunque ("ABC" e "abc" convivono).
+        if (o.is_dir == w.is_dir and std.mem.eql(u8, o.name, w.name)) {
+            w.size = o.size;
+            w.mtime_ns = o.mtime_ns;
+            w.thumb_tried = o.thumb_tried;
+            w.cache_tried = o.cache_tried;
+            if (o.thumb_w != 0) {
+                w.thumb_rgba = o.thumb_rgba;
+                w.thumb_w = o.thumb_w;
+                w.thumb_h = o.thumb_h;
+                o.thumb_rgba = &.{};
+                o.thumb_w = 0;
+                moved += 1;
+            }
+        }
+        i += 1;
+        j += 1;
+    }
+    return moved;
 }
 
 /// Scandisce `dir_path` e installa la griglia (attivando l'overlay). La scansione
@@ -192,10 +252,18 @@ fn enterDir(state: *GuiAppState, dir_path: []const u8) bool {
 
     state.shared.mutex.lockUncancelable(state.io);
     const fx = &state.shared.fx;
+    // Il bump di generazione è la CANCELLAZIONE del worker precedente: quello
+    // in volo esce al primo check (prima di ogni decode) senza installare nulla.
     fx.gen +%= 1;
     const gen = fx.gen;
+    // Stessa cartella (riapertura del pannello dopo `closeOverlay`, o rientro):
+    // le miniature già decodificate passano alle nuove voci invece di essere
+    // buttate. Sotto lock: il worker tocca le voci solo con lo stesso mutex.
+    const kept: u32 = if (std.mem.eql(u8, fx.dir, dir_path)) adoptThumbs(fx.entries, owned) else 0;
     freeEntries(state.gpa, fx.entries);
     fx.entries = owned;
+    fx.thumb_installed = kept;
+    fx.thumb_attempts = 0;
     state.gpa.free(fx.dir);
     fx.dir = dir_copy;
     fx.sel = if (owned.len > 0) 0 else -1;
@@ -604,9 +672,21 @@ fn thumbable(name: []const u8) bool {
 /// Downscale RGB→RGBA con media per area (campionata) entro `thumb_max`²: le
 /// decodifiche GUI arrivano fino a 4096² e a piena risoluzione peserebbero
 /// ~64 MB l'una nella griglia.
-const thumb_max: usize = 512;
+///
+/// 256 e non 512: il pannello è largo al massimo 1080 px su 4 colonne, quindi
+/// la card misura ~255×143 px — 256 è già la risoluzione nativa e 512 sprecava
+/// 4× la RAM (e 4× la cache su disco) per pixel mai visti.
+/// `makeThumb` non fa MAI upscale (`@min(1.0, …)`): una sorgente più piccola
+/// della card resta com'è e il blit di `drawOverlay` la ingrandisce in
+/// aspect-fit (nearest neighbour, come già accade per le miniature YouTube che
+/// arrivano a 320×180); le sorgenti non 16:9 restano in letterbox come oggi.
+const thumb_max: usize = 256;
 
-fn makeThumb(gpa: std.mem.Allocator, pixels: []const u8, sw: usize, sh: usize) ?struct { rgba: []u8, w: u32, h: u32 } {
+/// Miniatura pronta all'installazione (RGBA allineato a 4: `blitThumb` ci fa
+/// sopra un `bytesAsSlice(u32)`).
+const ThumbPix = struct { rgba: []u8, w: u32, h: u32 };
+
+fn makeThumb(gpa: std.mem.Allocator, pixels: []const u8, sw: usize, sh: usize) ?ThumbPix {
     if (sw == 0 or sh == 0 or pixels.len < sw * sh * 3) return null;
     const fw: f32 = @floatFromInt(sw);
     const fh: f32 = @floatFromInt(sh);
@@ -649,10 +729,122 @@ fn makeThumb(gpa: std.mem.Allocator, pixels: []const u8, sw: usize, sh: usize) ?
     return .{ .rgba = rgba, .w = @intCast(dw), .h = @intCast(dh) };
 }
 
+// ── Cache su disco delle miniature ───────────────────────────────────────────
+//
+// `…/zuer/thumbs/<hash>-<mtime>-<size>.thumb`, stesso impianto della cache
+// `ytthumb` di yt_search.zig: la directory la crea `vtcache.appCacheDir`
+// (`$HOME/.cache/zuer/thumbs` su Unix, `%LOCALAPPDATA%\zuer\thumbs` su Windows)
+// e la manutenzione la fa `cache_evict` (LRU per mtime, no-op fuori da Linux).
+//
+// Formato "ZTH1" (little-endian), minimale — nessuna compressione, la lettura
+// è una `readFileAlloc` da ~150 KB:
+//   magic[4] "ZTH1" | w u32 | h u32 | RGBA raw w·h·4
+//
+// La chiave contiene mtime e dimensione della SORGENTE: un file modificato
+// produce un nome diverso, quindi l'invalidazione è implicita (la entry vecchia
+// resta finché l'eviction LRU non la raccoglie). L'hash è sul REALPATH della
+// cartella + nome: `fx.dir` può essere relativo (".") e due cwd diversi
+// darebbero altrimenti la stessa chiave per file diversi.
+
+const thumb_magic = "ZTH1";
+const thumb_header_len: usize = 12;
+/// Tetto di lettura: header + la miniatura più grande possibile.
+const thumb_file_max: usize = thumb_header_len + thumb_max * thumb_max * 4;
+/// Cap LRU della directory `…/zuer/thumbs` (~870 miniature 256×144).
+const thumb_cache_cap_bytes: u64 = 128 * 1024 * 1024;
+
+/// Sweep dei tmp orfani fatto al più una volta per processo (alla prima scrittura).
+var tmp_sweep_done: std.atomic.Value(bool) = .init(false);
+/// Sequenza per i nomi temporanei, unica per-processo (il thread id la rende
+/// unica anche fra worker concorrenti).
+var tmp_seq: std.atomic.Value(u64) = .init(0);
+
+/// Nome del file di cache per `(realpath cartella, nome, mtime, size)`.
+/// Il chiamante libera. null solo in OOM.
+fn thumbCacheName(gpa: std.mem.Allocator, real_dir: []const u8, name: []const u8, mtime_ns: i128, size: u64) ?[]u8 {
+    var h = std.hash.Wyhash.init(0x7a756572); // "zuer"
+    h.update(real_dir);
+    h.update("/");
+    h.update(name);
+    // mtime in ns su 64 bit: basta e avanza come discriminante nel nome.
+    const mt: u64 = @bitCast(@as(i64, @truncate(mtime_ns)));
+    return std.fmt.allocPrint(gpa, "{x}-{x}-{x}.thumb", .{ h.final(), mt, size }) catch null;
+}
+
+/// Legge una miniatura dalla cache. Ritorna null se assente/corrotta/troncata
+/// (mai un errore: la cache è solo un'ottimizzazione). Il buffer ritornato è
+/// allineato a 4 come quello di `makeThumb`.
+fn thumbCacheRead(state: *GuiAppState, cdir: std.Io.Dir, fname: []const u8) ?ThumbPix {
+    const raw = cdir.readFileAlloc(state.io, fname, state.gpa, .limited(thumb_file_max)) catch return null;
+    defer state.gpa.free(raw);
+    if (raw.len < thumb_header_len or !std.mem.startsWith(u8, raw, thumb_magic)) return null;
+    const w = std.mem.readInt(u32, raw[4..][0..4], .little);
+    const h = std.mem.readInt(u32, raw[8..][0..4], .little);
+    if (w == 0 or h == 0 or @as(usize, w) > thumb_max or @as(usize, h) > thumb_max) return null;
+    const need = @as(usize, w) * @as(usize, h) * 4;
+    if (raw.len - thumb_header_len < need) return null;
+    const rgba = state.gpa.alignedAlloc(u8, .@"4", need) catch return null;
+    @memcpy(rgba, raw[thumb_header_len..][0..need]);
+    // "Touch" LRU: l'entry appena usata torna in cima (cache_evict ordina per
+    // mtime, non per atime). Best-effort.
+    // (`Dir.setTimestampsNow` di std 0.16 non compila — vtable disallineata —
+    // quindi futimens via fd, Linux-only come le altre cache del progetto.)
+    if (comptime builtin.os.tag == .linux) {
+        if (cdir.openFile(state.io, fname, .{})) |f| {
+            evict.touchFd(f.handle);
+            f.close(state.io);
+        } else |_| {}
+    }
+    return .{ .rgba = rgba, .w = w, .h = h };
+}
+
+/// Scrive la miniatura in cache in modo ATOMICO: tmp univoco (thread id + seq)
+/// e rename sul nome finale, così un crash a metà scrittura non lascia mai un
+/// .thumb parziale che la lettura successiva scambierebbe per valido.
+/// Best-effort: ogni errore è ignorato (al più si ridecodifica).
+fn thumbCacheWrite(state: *GuiAppState, cdir: std.Io.Dir, fname: []const u8, pix: ThumbPix) void {
+    const seq = tmp_seq.fetchAdd(1, .monotonic);
+    const tmp = std.fmt.allocPrint(state.gpa, "{s}.tmp{d}_{d}", .{ fname, std.Thread.getCurrentId(), seq }) catch return;
+    defer state.gpa.free(tmp);
+
+    var hdr: [thumb_header_len]u8 = undefined;
+    @memcpy(hdr[0..4], thumb_magic[0..4]);
+    std.mem.writeInt(u32, hdr[4..8], pix.w, .little);
+    std.mem.writeInt(u32, hdr[8..12], pix.h, .little);
+
+    const wrote = blk: {
+        const f = cdir.createFile(state.io, tmp, .{}) catch break :blk false;
+        defer f.close(state.io);
+        f.writeStreamingAll(state.io, &hdr) catch break :blk false;
+        f.writeStreamingAll(state.io, pix.rgba) catch break :blk false;
+        break :blk true;
+    };
+    if (!wrote) {
+        cdir.deleteFile(state.io, tmp) catch {};
+        return;
+    }
+    cdir.rename(tmp, cdir, fname, state.io) catch {
+        cdir.deleteFile(state.io, tmp) catch {};
+    };
+}
+
+// ── Thumb worker ─────────────────────────────────────────────────────────────
+
+/// true se `gen` è ancora la generazione corrente. Check di cancellazione da
+/// usare nei cicli lunghi (le `statFile` di una cartella da 512 voci).
+fn genAlive(state: *GuiAppState, gen: u32) bool {
+    state.shared.mutex.lockUncancelable(state.io);
+    defer state.shared.mutex.unlock(state.io);
+    return gen == state.shared.fx.gen;
+}
+
 /// Fase dimensioni del thumb worker: le `statFile` avvengono qui, fuori dal
 /// thread finestra, e i risultati sono installati per indice sotto lock (le
 /// voci non cambiano entro la stessa generazione). Va eseguita PRIMA delle
-/// miniature: il guard `size > max_thumb_bytes` legge questi valori.
+/// miniature: il guard `size > max_thumb_bytes` legge questi valori, e la
+/// chiave della cache su disco è fatta di mtime + size.
+/// È anche il punto di INVALIDAZIONE delle miniature ereditate da `adoptThumbs`:
+/// se il file è cambiato sul disco la miniatura in RAM è stale e si ributta.
 fn fillSizes(state: *GuiAppState, gen: u32) void {
     const Pending = struct { idx: usize, name: []u8 };
     var dir_copy: []u8 = &.{};
@@ -682,89 +874,235 @@ fn fillSizes(state: *GuiAppState, gen: u32) void {
 
     var dir = std.Io.Dir.cwd().openDir(state.io, dir_copy, .{}) catch return;
     defer dir.close(state.io);
-    const sizes = state.gpa.alloc(u64, names.items.len) catch return;
-    defer state.gpa.free(sizes);
-    for (names.items, sizes) |n, *sz| {
-        sz.* = if (dir.statFile(state.io, n.name, .{})) |st| st.size else |_| 0;
+    const Meta = struct { size: u64, mtime_ns: i128 };
+    const metas = state.gpa.alloc(Meta, names.items.len) catch return;
+    defer state.gpa.free(metas);
+    for (names.items, metas, 0..) |n, *m, k| {
+        // Cancellazione: 512 `statFile` costano (su Windows ognuna apre un
+        // handle), quindi si controlla la generazione ogni 32 voci e non solo
+        // alla fine — `enterDir` deve poter riciclare il thread in fretta.
+        if (k % 32 == 0 and k != 0 and !genAlive(state, gen)) return;
+        if (dir.statFile(state.io, n.name, .{})) |st| {
+            m.* = .{ .size = st.size, .mtime_ns = @as(i128, st.mtime.nanoseconds) };
+        } else |_| {
+            m.* = .{ .size = 0, .mtime_ns = 0 };
+        }
     }
 
     state.shared.mutex.lockUncancelable(state.io);
     defer state.shared.mutex.unlock(state.io);
     const fx = &state.shared.fx;
     if (gen != fx.gen) return;
-    for (names.items, sizes) |n, sz| {
-        if (n.idx < fx.entries.len) fx.entries[n.idx].size = sz;
+    for (names.items, metas) |n, m| {
+        if (n.idx >= fx.entries.len) continue;
+        const e = &fx.entries[n.idx];
+        // Il file è cambiato dall'ultima apertura: la miniatura ereditata da
+        // `adoptThumbs` non lo rappresenta più → si butta e si ritenta (anche
+        // in cache, dove la chiave mtime+size è ormai un'altra).
+        if (e.thumb_w != 0 and (e.size != m.size or e.mtime_ns != m.mtime_ns)) {
+            state.gpa.free(e.thumb_rgba);
+            e.thumb_rgba = &.{};
+            e.thumb_w = 0;
+            e.thumb_h = 0;
+            e.thumb_tried = false;
+            e.cache_tried = false;
+            if (fx.thumb_installed > 0) fx.thumb_installed -= 1;
+        }
+        e.size = m.size;
+        e.mtime_ns = m.mtime_ns;
     }
     state.shared.file_changed = true;
 }
 
-/// Thread miniature: decodifica in sequenza i file "thumbabili" della
-/// generazione `gen` coi normali plugin decoder e installa il risultato
-/// downscalato. Ogni installazione ricontrolla la generazione sotto lock.
+/// Fase del worker: prima si spazzola la cache su disco (nessun decode: le
+/// cartelle già visitate si riempiono quasi all'istante), poi si decodifica
+/// quello che manca.
+const Phase = enum { cache, decode };
+
+/// Voce reclamata dal worker (nome posseduto + metadati per la chiave di cache).
+const Claim = struct {
+    name: []u8,
+    mtime_ns: i128,
+    size: u64,
+};
+
+/// Reclama sotto lock la prossima voce da lavorare, PARTENDO DALLA PRIMA CARD
+/// VISIBILE (`row_off * grid_cols`) e proseguendo circolarmente fino a chiudere
+/// il giro: `row_off` è riletto ad OGNI chiamata, quindi lo scroll dell'utente
+/// ridirige subito il worker sulle card che sta guardando.
+/// La marcatura (`cache_tried`/`thumb_tried`) fa da claim, come il `claimed` dei
+/// worker YouTube: più worker sulla stessa generazione non si pestano i piedi.
+/// Ritorna null sia quando il lavoro è finito sia quando la generazione è
+/// superata: in entrambi i casi il worker deve uscire.
+fn claimNext(state: *GuiAppState, gen: u32, phase: Phase) ?Claim {
+    state.shared.mutex.lockUncancelable(state.io);
+    defer state.shared.mutex.unlock(state.io);
+    const fx = &state.shared.fx;
+    // CANCELLAZIONE: questo check sta subito PRIMA di ogni decode, non solo
+    // dopo — un `enterDir` concorrente ferma il worker entro un decode.
+    if (gen != fx.gen) return null;
+    if (@as(usize, fx.thumb_installed) >= max_thumb_files) return null; // tetto RAM
+    if (phase == .decode and @as(usize, fx.thumb_attempts) >= max_thumb_files) return null; // tetto CPU
+    const n = fx.entries.len;
+    if (n == 0) return null;
+
+    const off: usize = @intCast(@max(fx.row_off, 0));
+    const start = @min(off *| @as(usize, @intCast(grid_cols)), n - 1);
+    var k: usize = 0;
+    while (k < n) : (k += 1) {
+        const i = (start + k) % n;
+        const e = &fx.entries[i];
+        if (e.is_dir or e.thumb_w != 0 or e.size > max_thumb_bytes or !thumbable(e.name)) continue;
+        if (if (phase == .cache) e.cache_tried else e.thumb_tried) continue;
+        const name = state.gpa.dupe(u8, e.name) catch return null;
+        if (phase == .cache) {
+            e.cache_tried = true;
+        } else {
+            e.thumb_tried = true;
+            fx.thumb_attempts += 1;
+        }
+        return .{ .name = name, .mtime_ns = e.mtime_ns, .size = e.size };
+    }
+    return null;
+}
+
+/// Installa `pix` sulla voce di nome `name` della generazione `gen`. Prende in
+/// carico `pix.rgba` (lo libera se non lo installa). Ritorna false se il worker
+/// deve uscire (generazione superata).
+fn installThumb(state: *GuiAppState, gen: u32, name: []const u8, pix: ThumbPix) bool {
+    state.shared.mutex.lockUncancelable(state.io);
+    const fx = &state.shared.fx;
+    if (gen != fx.gen) {
+        state.shared.mutex.unlock(state.io);
+        state.gpa.free(pix.rgba);
+        return false;
+    }
+    // Riaggancio per nome (l'array non cambia entro la stessa generazione,
+    // ma il controllo tiene il worker onesto).
+    var installed = false;
+    for (fx.entries) |*en| {
+        if (std.mem.eql(u8, en.name, name)) {
+            if (en.thumb_w == 0) {
+                en.thumb_rgba = pix.rgba;
+                en.thumb_w = pix.w;
+                en.thumb_h = pix.h;
+                fx.thumb_installed += 1;
+                installed = true;
+            }
+            break;
+        }
+    }
+    state.shared.file_changed = true;
+    state.shared.mutex.unlock(state.io);
+    if (!installed) state.gpa.free(pix.rgba);
+    return true;
+}
+
+/// Un giro completo della fase `phase` sulle voci della generazione `gen`.
+/// `writes` accumula le scritture in cache (la manutenzione LRU si fa una volta
+/// per batch, non a ogni scrittura).
+fn thumbPass(
+    state: *GuiAppState,
+    gen: u32,
+    phase: Phase,
+    dir_copy: []const u8,
+    real_dir: []const u8,
+    cdir: ?std.Io.Dir,
+    writes: *usize,
+) void {
+    while (claimNext(state, gen, phase)) |claim| {
+        defer state.gpa.free(claim.name);
+
+        // Chiave di cache: hash(realpath cartella + nome) + mtime + size.
+        const key: ?[]u8 = if (cdir != null)
+            thumbCacheName(state.gpa, real_dir, claim.name, claim.mtime_ns, claim.size)
+        else
+            null;
+        defer if (key) |k| state.gpa.free(k);
+
+        const pix: ThumbPix = switch (phase) {
+            .cache => thumbCacheRead(state, cdir.?, key orelse continue) orelse continue,
+            .decode => blk: {
+                const full = std.fs.path.join(state.gpa, &.{ dir_copy, claim.name }) catch return;
+                defer state.gpa.free(full);
+                // Tier coarse quando il plugin lo offre (immagini: pixel ≤512²
+                // invece di 4096², ~64 MB risparmiati a decode); altrimenti il
+                // decode pieno.
+                var d = decoder_mod.decodeCoarse(full, state.io, state.gpa) orelse
+                    decoder_mod.decode(full, state.io, state.gpa);
+                defer d.deinit(state.gpa);
+                if (d != .image) continue;
+                const th = makeThumb(state.gpa, d.image.pixels, d.image.width, d.image.height) orelse continue;
+                // In cache PRIMA dell'installazione: anche se la generazione è
+                // già cambiata il lavoro fatto non va sprecato.
+                if (cdir) |cd| {
+                    if (key) |k| {
+                        thumbCacheWrite(state, cd, k, th);
+                        writes.* += 1;
+                    }
+                }
+                break :blk th;
+            },
+        };
+
+        if (!installThumb(state, gen, claim.name, pix)) return;
+    }
+}
+
+/// Thread miniature della generazione `gen`: riempie le dimensioni, poi
+/// spazzola la cache su disco e infine decodifica ciò che manca, sempre
+/// partendo dalle card visibili. Ogni claim e ogni installazione ricontrollano
+/// la generazione sotto lock (latest-wins).
+///
+/// UN SOLO worker: il decode è CPU+RAM bound (il tier coarse tiene già un
+/// decode sotto controllo, N in parallelo moltiplicherebbero il picco di RAM) e
+/// la cache su disco toglie di mezzo il costo ripetuto, che era il vero
+/// problema. Il protocollo di claim (`claimNext`) è però già multi-worker —
+/// marcatura sotto lock e budget in `FxState` condivisi — quindi passare a 2-3
+/// thread è solo spawnare più `thumbWorker` con lo stesso `gen`.
 fn thumbWorker(state: *GuiAppState, gen: u32) void {
     fillSizes(state, gen);
-    var i: usize = 0;
-    var attempts: usize = 0;
-    while (attempts < max_thumb_files) : (i += 1) {
-        // Snapshot del percorso sotto lock; il decode avviene fuori.
-        state.shared.mutex.lockUncancelable(state.io);
-        const fx = &state.shared.fx;
-        if (gen != fx.gen or i >= fx.entries.len) {
-            state.shared.mutex.unlock(state.io);
-            return;
-        }
-        const e = &fx.entries[i];
-        if (e.is_dir or e.thumb_tried or e.thumb_w != 0 or e.size > max_thumb_bytes or !thumbable(e.name)) {
-            state.shared.mutex.unlock(state.io);
-            continue;
-        }
-        e.thumb_tried = true;
-        const full = std.fs.path.join(state.gpa, &.{ fx.dir, e.name }) catch {
-            state.shared.mutex.unlock(state.io);
-            return;
-        };
-        const name = state.gpa.dupe(u8, e.name) catch {
-            state.gpa.free(full);
-            state.shared.mutex.unlock(state.io);
-            return;
-        };
-        state.shared.mutex.unlock(state.io);
-        defer state.gpa.free(full);
-        defer state.gpa.free(name);
-        attempts += 1;
 
-        // Tier coarse quando il plugin lo offre (immagini: pixel ≤512² invece
-        // di 4096², ~64 MB risparmiati a decode); altrimenti il decode pieno.
-        var d = decoder_mod.decodeCoarse(full, state.io, state.gpa) orelse
-            decoder_mod.decode(full, state.io, state.gpa);
-        defer d.deinit(state.gpa);
-        if (d != .image) continue;
-        const th = makeThumb(state.gpa, d.image.pixels, d.image.width, d.image.height) orelse continue;
-
+    // Snapshot della cartella: `fx.dir` non cambia entro la generazione.
+    var dir_copy: []u8 = &.{};
+    {
         state.shared.mutex.lockUncancelable(state.io);
-        const fx2 = &state.shared.fx;
-        if (gen != fx2.gen) {
-            state.shared.mutex.unlock(state.io);
-            state.gpa.free(th.rgba);
-            return;
+        defer state.shared.mutex.unlock(state.io);
+        if (gen != state.shared.fx.gen) return;
+        dir_copy = state.gpa.dupe(u8, state.shared.fx.dir) catch return;
+    }
+    defer state.gpa.free(dir_copy);
+
+    // Realpath della cartella per la chiave di cache (una sola risoluzione per
+    // batch); se non è disponibile si ripiega sul percorso così com'è.
+    var real_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var real_dir: []const u8 = dir_copy;
+    if (std.Io.Dir.cwd().realPathFile(state.io, dir_copy, &real_buf)) |n| {
+        real_dir = real_buf[0..n];
+    } else |_| {}
+
+    // Directory di cache (`appCacheDir` crea già la catena: niente subprocess,
+    // su Windows `mkdir` non esiste come eseguibile).
+    const cdir_path: ?[]u8 = vtcache.appCacheDir(state.gpa, "thumbs");
+    defer if (cdir_path) |p| state.gpa.free(p);
+    const cdir: ?std.Io.Dir = if (cdir_path) |p|
+        (std.Io.Dir.cwd().openDir(state.io, p, .{}) catch null)
+    else
+        null;
+    defer if (cdir) |d| d.close(state.io);
+
+    var writes: usize = 0;
+    if (cdir != null) thumbPass(state, gen, .cache, dir_copy, real_dir, cdir, &writes);
+    thumbPass(state, gen, .decode, dir_copy, real_dir, cdir, &writes);
+
+    // Manutenzione best-effort UNA VOLTA PER BATCH (non a ogni scrittura: è una
+    // scansione della directory): sweep dei tmp orfani + cap LRU. Vale anche se
+    // il batch è stato interrotto a metà da un `enterDir`.
+    if (writes > 0) {
+        if (cdir_path) |p| {
+            evict.sweepTmpOnce(&tmp_sweep_done, p);
+            evict.evictLru(p, thumb_cache_cap_bytes);
         }
-        // Riaggancio per nome (l'array non cambia entro la stessa generazione,
-        // ma il controllo tiene il worker onesto).
-        var installed = false;
-        for (fx2.entries) |*en| {
-            if (std.mem.eql(u8, en.name, name)) {
-                if (en.thumb_w == 0) {
-                    en.thumb_rgba = th.rgba;
-                    en.thumb_w = th.w;
-                    en.thumb_h = th.h;
-                    installed = true;
-                }
-                break;
-            }
-        }
-        state.shared.file_changed = true;
-        state.shared.mutex.unlock(state.io);
-        if (!installed) state.gpa.free(th.rgba);
     }
 }
 

@@ -12,6 +12,17 @@ const Rgb = glyph.Rgb;
 
 pub const max_table_col: usize = 40;
 
+/// Cache dei rasterizzatori glifo condivisa dal viewer (vedi `glyph.RasterCache`):
+/// ri-esportata qui perché `gui_state.zig` conosce già questo modulo.
+pub const RasterCache = glyph.RasterCache;
+
+/// Righe campionate per stimare le larghezze di colonna e la numericità di una
+/// tabella. Misurare TUTTE le celle di un csv da 12k righe costa quanto
+/// rasterizzarlo; l'header più le prime righe danno colonne indistinguibili
+/// nella pratica (le celle più lunghe che arrivano dopo vengono troncate come
+/// già accade oltre `max_col_px`).
+const table_sample_rows: usize = 2000;
+
 // Margini tipografici del documento (bordo attorno al testo).
 const pad_x: i32 = 6;
 const pad_y: i32 = 6;
@@ -198,43 +209,84 @@ pub fn renderDoc(gpa: std.mem.Allocator, decoded: *const decoder_mod.Decoded, na
 /// l'allocazione/blend di una bitmap alta quanto tutto il file — è il modello di
 /// ../viewer (egui), dove solo le righe in vista diventano pixel.
 pub const DocLayout = struct {
-    /// Possiede `rows` e i testi dei run (le righe visive puntano qui dentro).
+    /// Possiede le `rows` e la memoria di supporto del layout. ATTENZIONE: i
+    /// testi dei run possono PUNTARE dentro `decoded` (righe senza tab: vedi
+    /// `expandTabs`), e la parte tabellare lo fa sempre. È lecito perché il
+    /// viewer libera il layout ritenuto (`freeTextDoc`) nella stessa sezione
+    /// critica in cui sostituisce/libera `decoded` (`applyDecoded`).
     arena: std.heap.ArenaAllocator,
     rows: []const Row,
-    raster: glyph.Raster,
+    /// Rasterizzatore dei glifi: NON posseduto, vive nella `RasterCache` del
+    /// chiamante (`mono` per i documenti, `sans` per le tabelle).
+    raster: *glyph.Raster,
     /// Dimensioni LOGICHE dell'immagine documento: le stesse che avrebbe la
     /// bitmap completa — scrollbar, selezione e hit-test ragionano su queste.
     width: usize,
     height: usize,
     gutter_cols: usize = 0,
+    /// Presente SOLO per csv/workbook: in quel caso `rows` è vuoto e la pittura
+    /// passa da `paintTableViewport` invece che da `paintDocViewport`.
+    table: ?TableLayout = null,
 
     pub fn deinit(self: *DocLayout) void {
-        self.raster.deinit();
         self.arena.deinit();
     }
+};
+
+/// Layout ritenuto di una tabella (csv, o foglio attivo di un workbook):
+/// larghezze di colonna, colonne numeriche e metriche di riga, calcolati UNA
+/// volta per (dati, larghezza, zoom). La pittura avviene per viewport
+/// (`paintTableViewport`), quindi non esiste più la bitmap RGB alta quanto tutta
+/// la tabella (718 MB di RSS su un csv da 12k righe) né il suo `rgbToRgba`.
+///
+/// `csv` NON è posseduto: punta dentro `decoded` (stesso contratto di vita del
+/// `DocLayout` che lo contiene).
+pub const TableLayout = struct {
+    csv: decoder_mod.CsvData,
+    /// Larghezza in pixel di ogni colonna, padding incluso (memoria dell'arena).
+    col_w: []const i32,
+    /// Colonna allineata a destra (contenuto numerico).
+    numeric: []const bool,
+    /// Altezza di una riga (header e righe dati hanno la stessa altezza).
+    row_h: i32,
+    /// Larghezza della colonna dei numeri di riga.
+    gutter_w: i32,
 };
 
 /// Come `renderDoc` (righe di testo per selezione/copia + metriche), ma NON
 /// dipinge nulla: costruisce il layout ritenuto per `paintDocViewport`. Solo per
 /// contenuti a griglia monospazio; le tabelle (csv/workbook) restano su
 /// `renderDoc` (pittura proporzionale completa).
-pub fn layoutDoc(gpa: std.mem.Allocator, decoded: *const decoder_mod.Decoded, name: []const u8, opts: RenderOpts, out_lines: *std.ArrayList([]const u8), out_metrics: *Metrics) !DocLayout {
+pub fn layoutDoc(gpa: std.mem.Allocator, cache: *glyph.RasterCache, decoded: *const decoder_mod.Decoded, name: []const u8, opts: RenderOpts, out_lines: *std.ArrayList([]const u8), out_metrics: *Metrics) !DocLayout {
+    // Tabelle (csv / foglio attivo di un workbook): layout ritenuto dedicato.
+    const table_csv: ?decoder_mod.CsvData = switch (decoded.*) {
+        .csv => |c| c,
+        .workbook => |w| w.activeCsv(),
+        else => null,
+    };
+    if (table_csv) |c| return layoutTableDoc(gpa, cache, c, opts, out_lines, out_metrics);
+
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     errdefer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var raster = try glyph.Raster.init(gpa, docTextPx(opts.pointsize));
-    errdefer raster.deinit();
+    const raster = try cache.get(gpa, docTextPx(opts.pointsize), .mono);
 
     var rows: std.ArrayList(Row) = .empty;
-    const gutter_cols = try buildRows(arena, &rows, &raster, decoded, name, opts);
+    const gutter_cols = try buildRows(arena, &rows, raster, decoded, name, opts);
 
+    try out_lines.ensureTotalCapacityPrecise(gpa, rows.items.len);
     for (rows.items) |row| {
-        var line: std.ArrayList(u8) = .empty;
-        errdefer line.deinit(gpa);
         const start_idx: usize = if (gutter_cols > 0 and row.len > 0) 1 else 0;
-        for (row[start_idx..]) |run| try line.appendSlice(gpa, run.text);
-        try out_lines.append(gpa, try line.toOwnedSlice(gpa));
+        var n: usize = 0;
+        for (row[start_idx..]) |run| n += run.text.len;
+        const line = try gpa.alloc(u8, n);
+        var k: usize = 0;
+        for (row[start_idx..]) |run| {
+            @memcpy(line[k..][0..run.text.len], run.text);
+            k += run.text.len;
+        }
+        out_lines.appendAssumeCapacity(line);
     }
     out_metrics.* = .{ .advance = raster.advance, .line_h = raster.lineHeight(), .pad_x = pad_x, .pad_y = pad_y, .gutter_cols = @intCast(gutter_cols) };
 
@@ -249,6 +301,74 @@ pub fn layoutDoc(gpa: std.mem.Allocator, decoded: *const decoder_mod.Decoded, na
         .height = height,
         .gutter_cols = gutter_cols,
     };
+}
+
+/// Layout ritenuto di una tabella: metriche + larghezze di colonna campionate,
+/// più le righe testuali (celle unite da TAB) per selezione/copia. Non dipinge
+/// nulla: ci pensa `paintTableViewport`, riga per riga, a ogni frame.
+fn layoutTableDoc(gpa: std.mem.Allocator, cache: *glyph.RasterCache, c: decoder_mod.CsvData, opts: RenderOpts, out_lines: *std.ArrayList([]const u8), out_metrics: *Metrics) !DocLayout {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const raster = try cache.get(gpa, tableTextPx(opts.pointsize), .sans);
+    const row_h: i32 = raster.lineHeight() + row_extra;
+
+    // Righe visive = header + righe dati (senza gutter), celle separate da TAB
+    // per la copia. La selezione mappa la riga ma non il carattere esatto
+    // (font proporzionale): `advance` resta il valore convenzionale storico.
+    try appendTableLines(gpa, out_lines, c);
+    out_metrics.* = .{ .advance = 8, .line_h = row_h, .pad_x = pad_x, .pad_y = pad_y, .gutter_cols = 0 };
+
+    if (c.headers.len == 0) {
+        return .{
+            .arena = arena_state,
+            .rows = &.{},
+            .raster = raster,
+            .width = @max(opts.width, 2 * @as(usize, @intCast(pad_x)) + 1),
+            .height = @intCast(2 * pad_y + row_h),
+            .table = .{ .csv = c, .col_w = &.{}, .numeric = &.{}, .row_h = row_h, .gutter_w = 0 },
+        };
+    }
+
+    const cm = try measureColumns(arena, raster, c);
+    const n_visual: i32 = 1 + @as(i32, @intCast(c.rows.len));
+    return .{
+        .arena = arena_state,
+        .rows = &.{},
+        .raster = raster,
+        .width = @max(opts.width, @as(usize, @intCast(cm.content_w))),
+        .height = @intCast(2 * pad_y + n_visual * row_h),
+        .table = .{ .csv = c, .col_w = cm.col_w, .numeric = cm.numeric, .row_h = row_h, .gutter_w = cm.gutter_w },
+    };
+}
+
+/// Unisce le celle con TAB in un buffer di dimensione già nota (una sola
+/// allocazione per riga, senza le crescite progressive di un ArrayList).
+fn joinTabs(gpa: std.mem.Allocator, cells: []const []const u8) ![]u8 {
+    var n: usize = 0;
+    for (cells, 0..) |cell, i| {
+        if (i > 0) n += 1;
+        n += cell.len;
+    }
+    const buf = try gpa.alloc(u8, n);
+    var k: usize = 0;
+    for (cells, 0..) |cell, i| {
+        if (i > 0) {
+            buf[k] = '\t';
+            k += 1;
+        }
+        @memcpy(buf[k..][0..cell.len], cell);
+        k += cell.len;
+    }
+    return buf;
+}
+
+/// Righe testuali della tabella per selezione/copia: header + righe dati.
+fn appendTableLines(gpa: std.mem.Allocator, out_lines: *std.ArrayList([]const u8), c: decoder_mod.CsvData) !void {
+    try out_lines.ensureTotalCapacityPrecise(gpa, 1 + c.rows.len);
+    out_lines.appendAssumeCapacity(try joinTabs(gpa, c.headers));
+    for (c.rows) |row| out_lines.appendAssumeCapacity(try joinTabs(gpa, row));
 }
 
 /// Dipinge nel buffer RGBA della finestra (W×H) la porzione visibile del
@@ -316,8 +436,204 @@ pub fn paintDocViewport(dl: *DocLayout, buf: []u8, W: u32, H: u32, off_y: u32, x
                 i = end;
                 if (pen_x >= Wi) break :run_loop; // resto della riga fuori a destra
                 if (pen_x + advance < 0) continue; // ancora fuori a sinistra
-                try drawCodepointRgba(&dl.raster, buf, Wi, Hi, pen_x, baseline, run.style, cp, run.color);
+                try drawCodepointRgba(dl.raster, buf, Wi, Hi, pen_x, baseline, run.style, cp, run.color);
             }
+        }
+    }
+}
+
+/// Dipinge nel buffer RGBA della finestra (W×H) la porzione visibile di una
+/// tabella: sfondo, zebra, gridline, header ancorato in cima (`header_band`) e
+/// testo delle SOLE righe che intersecano il viewport. Scrive direttamente a
+/// word u32 nel frame — niente bitmap intermedia alta quanto la tabella, niente
+/// `rgbToRgba`. `off_y`/`x_src`/`x_dst` vengono da `compose.textBlitGeom`, la
+/// stessa geometria di selezione, evidenziazione riga e hit-test: la riga r sta
+/// a y = pad_y + (1 + r) * row_h nello spazio LOGICO, come nella vecchia bitmap.
+pub fn paintTableViewport(dl: *DocLayout, buf: []u8, W: u32, H: u32, off_y: u32, x_src: u32, x_dst: u32, header_band: u32) !void {
+    if (dl.table == null) return;
+    const tl = &dl.table.?;
+    const raster = dl.raster;
+
+    const Wi: i32 = @intCast(W);
+    const Hi: i32 = @intCast(H);
+    const src_w: i32 = @intCast(dl.width);
+    const src_h: i32 = @intCast(dl.height);
+    const xd: i32 = @intCast(x_dst);
+    const xs: i32 = @intCast(x_src);
+    const off_i: i32 = @intCast(off_y);
+    // Banda header ancorata: quelle righe di destinazione campionano il
+    // documento SENZA scroll, esattamente come faceva `composeTextFrame`.
+    const hb: i32 = @min(@as(i32, @intCast(header_band)), Hi);
+    const copy_w: i32 = @min(src_w, Wi);
+    const dx: i32 = xd - xs; // da x logica dell'immagine tabella a x nella finestra
+    const cx0: i32 = @max(xd, 0);
+    const cx1: i32 = @min(xd + copy_w, Wi);
+
+    const row_h = tl.row_h;
+    // Linee visive: 1 (header) + righe dati; senza colonne la tabella è un
+    // riquadro con la sola scritta "(tabella vuota)".
+    const n_visual: i32 = if (tl.col_w.len == 0) 1 else 1 + @as(i32, @intCast(tl.csv.rows.len));
+    const body_bot: i32 = pad_y + n_visual * row_h;
+
+    const words: []u32 = @as([*]u32, @ptrCast(@alignCast(buf.ptr)))[0 .. @as(usize, W) * H];
+    const stride: usize = @intCast(W);
+
+    // 1) Fondo per riga di destinazione: azzeramento (margini e area oltre la
+    //    tabella restano vetro, alpha 0) e poi un solo memset a word con il
+    //    colore della riga logica corrispondente (header / zebra / normale).
+    var py: i32 = 0;
+    while (py < Hi) : (py += 1) {
+        const row = words[@as(usize, @intCast(py)) * stride ..][0..stride];
+        @memset(row, 0);
+        if (cx1 <= cx0) continue;
+        const sy: i32 = if (py < hb) py else py + off_i;
+        if (sy < 0 or sy >= src_h) continue;
+        @memset(row[@intCast(cx0)..@intCast(cx1)], tableRowBgWord(sy, row_h, n_visual, tl.col_w.len == 0));
+    }
+
+    // Tabella senza colonne: solo la scritta segnaposto.
+    if (tl.col_w.len == 0) {
+        try drawTextRgbaClip(raster, buf, Wi, cx0, cx1, 0, Hi, pad_x + dx, pad_y + raster.ascent, .regular, "(tabella vuota)", fg, Wi);
+        return;
+    }
+
+    // 2) Gridline verticali ai confini di colonna (1 px, colore della griglia).
+    {
+        const grid_w = opaqueWord(c_grid);
+        var gx: i32 = pad_x + tl.gutter_w;
+        var bi: usize = 0;
+        while (true) {
+            const wx = gx - 1 + dx;
+            if (wx >= cx1) break; // i confini successivi sono ancora più a destra
+            if (wx >= cx0) {
+                var py2: i32 = 0;
+                while (py2 < Hi) : (py2 += 1) {
+                    const sy: i32 = if (py2 < hb) py2 else py2 + off_i;
+                    if (sy < pad_y or sy >= body_bot) continue;
+                    words[@as(usize, @intCast(py2)) * stride + @as(usize, @intCast(wx))] = grid_w;
+                }
+            }
+            if (bi >= tl.col_w.len) break;
+            gx += tl.col_w[bi];
+            bi += 1;
+        }
+    }
+
+    // 3) Testo delle sole linee che intersecano il viewport. `text_dy` è lo
+    //    stesso scarto baseline della bitmap, così i glifi non si spostano.
+    const text_dy = @divTrunc(row_extra, 2) + raster.ascent;
+    var line: i32 = if (off_i + hb > pad_y) @divFloor(off_i + hb - pad_y, row_h) else 0;
+    if (line < 0) line = 0;
+    while (line < n_visual) : (line += 1) {
+        const y_doc = pad_y + line * row_h;
+        if (y_doc - off_i >= Hi) break;
+        try paintTableLine(tl, raster, buf, Wi, dx, cx0, cx1, hb, Hi, line, y_doc + text_dy - off_i);
+    }
+    // 4) Header ancorato: ridisegnato non scrollato dentro la sola banda in alto.
+    if (hb > 0) {
+        try paintTableLine(tl, raster, buf, Wi, dx, cx0, cx1, 0, hb, 0, pad_y + text_dy);
+    }
+}
+
+/// Colore di fondo (word RGBA opaca) della riga di pixel LOGICA `sy`: barra
+/// d'intestazione, sua sottolineatura, zebra delle righe dispari o fondo pieno.
+fn tableRowBgWord(sy: i32, row_h: i32, n_visual: i32, empty: bool) u32 {
+    if (empty) return opaqueWord(table_bg);
+    const body_bot = pad_y + n_visual * row_h;
+    if (sy < pad_y or sy >= body_bot) return opaqueWord(table_bg);
+    if (sy == pad_y + row_h - 1) return opaqueWord(c_grid); // sottolineatura header
+    const line = @divTrunc(sy - pad_y, row_h);
+    if (line == 0) return opaqueWord(table_header_bg);
+    const ri = line - 1;
+    return opaqueWord(if (@mod(ri, 2) == 1) table_zebra else table_bg);
+}
+
+/// Word RGBA opaca (byte order R,G,B,A → little-endian r | g<<8 | b<<16 | ff<<24).
+inline fn opaqueWord(color: Rgb) u32 {
+    return @as(u32, color.r) | (@as(u32, color.g) << 8) | (@as(u32, color.b) << 16) | (@as(u32, 0xff) << 24);
+}
+
+/// Testo di una linea visiva della tabella (0 = header, n = riga dati n-1):
+/// numero di riga nel gutter + celle, clippato al rettangolo del viewport.
+fn paintTableLine(tl: *const TableLayout, raster: *glyph.Raster, buf: []u8, Wi: i32, dx: i32, cx0: i32, cx1: i32, cy0: i32, cy1: i32, line: i32, base: i32) !void {
+    const is_header = line == 0;
+    var nb: [24]u8 = undefined;
+    const gtext: []const u8 = if (is_header) "#" else (std.fmt.bufPrint(&nb, "{d}", .{line}) catch "");
+    try drawCellTextRgba(raster, buf, Wi, dx, cx0, cx1, cy0, cy1, pad_x, tl.gutter_w, base, if (is_header) .bold else .regular, gtext, c_gutter, true);
+
+    var x: i32 = pad_x + tl.gutter_w;
+    if (is_header) {
+        for (tl.col_w, 0..) |wd, i| {
+            if (x + dx >= cx1) break; // resto della riga fuori a destra
+            const cell = if (i < tl.csv.headers.len) tl.csv.headers[i] else "";
+            try drawCellTextRgba(raster, buf, Wi, dx, cx0, cx1, cy0, cy1, x, wd, base, .bold, cell, c_th, false);
+            x += wd;
+        }
+        return;
+    }
+    const row = tl.csv.rows[@intCast(line - 1)];
+    for (tl.col_w, 0..) |wd, i| {
+        if (x + dx >= cx1) break;
+        const cell = if (i < row.len) row[i] else "";
+        try drawCellTextRgba(raster, buf, Wi, dx, cx0, cx1, cy0, cy1, x, wd, base, .regular, cell, fg, tl.numeric[i]);
+        x += wd;
+    }
+}
+
+/// Come `drawCellText` ma su buffer RGBA e con clipping esplicito: `cell_x` e
+/// `cell_w` sono in coordinate LOGICHE della tabella, `dx` le porta nel frame.
+fn drawCellTextRgba(raster: *glyph.Raster, buf: []u8, Wi: i32, dx: i32, cx0: i32, cx1: i32, cy0: i32, cy1: i32, cell_x: i32, cell_w: i32, base: i32, style: glyph.Style, s: []const u8, color: Rgb, right: bool) !void {
+    if (s.len == 0) return;
+    const avail = cell_w - 2 * cell_pad_x;
+    const tw = try measureText(raster, style, s);
+    const max_x = cell_x + cell_w - cell_pad_x;
+    const start_x = if (right and tw <= avail)
+        cell_x + cell_w - cell_pad_x - tw
+    else
+        cell_x + cell_pad_x;
+    try drawTextRgbaClip(raster, buf, Wi, cx0, cx1, cy0, cy1, start_x + dx, base, style, s, color, max_x + dx);
+}
+
+/// Disegna `s` in RGBA dalla penna `x` (baseline `base`), troncando a `max_x` e
+/// clippando al rettangolo [cx0,cx1)×[cy0,cy1) del frame.
+fn drawTextRgbaClip(raster: *glyph.Raster, buf: []u8, Wi: i32, cx0: i32, cx1: i32, cy0: i32, cy1: i32, x: i32, base: i32, style: glyph.Style, s: []const u8, color: Rgb, max_x: i32) !void {
+    var pen: i32 = x;
+    var i: usize = 0;
+    while (i < s.len) {
+        const seq = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        const end = @min(i + seq, s.len);
+        const cp: u32 = std.unicode.utf8Decode(s[i..end]) catch s[i];
+        const g = try raster.getGlyph(style, cp);
+        if (pen + g.advance > max_x) break;
+        if (pen >= cx1) break;
+        if (pen + g.advance > cx0) {
+            try drawCodepointRgbaClip(raster, buf, Wi, cx0, cx1, cy0, cy1, pen, base, style, cp, color);
+        }
+        pen += g.advance;
+        i = end;
+    }
+}
+
+/// Come `drawCodepointRgba` ma su fondo OPACO (tabelle): niente color-key —
+/// il pixel toccato resta opaco, perché lo sfondo tabellare non è vetro.
+fn drawCodepointRgbaClip(raster: *glyph.Raster, buf: []u8, buf_w: i32, x0: i32, x1: i32, y0: i32, y1: i32, pen_x: i32, baseline_y: i32, style: glyph.Style, cp: u32, color: Rgb) !void {
+    const g = try raster.getGlyph(style, cp);
+    if (g.bitmap.len == 0) return;
+    const gx0 = pen_x + g.xoff;
+    const gy0 = baseline_y + g.yoff;
+    var gy: i32 = 0;
+    while (gy < g.h) : (gy += 1) {
+        const py = gy0 + gy;
+        if (py < y0 or py >= y1) continue;
+        var gx: i32 = 0;
+        while (gx < g.w) : (gx += 1) {
+            const px = gx0 + gx;
+            if (px < x0 or px >= x1) continue;
+            const cov = g.bitmap[@intCast(gy * g.w + gx)];
+            if (cov == 0) continue;
+            const idx: usize = @intCast((py * buf_w + px) * 4);
+            glyph.blend(buf[idx .. idx + 3], color, cov);
+            buf[idx + 3] = 255;
         }
     }
 }
@@ -610,16 +926,89 @@ fn drawText(raster: *glyph.Raster, pixels: []u8, w: i32, h: i32, x: i32, baselin
 
 /// Una cella è numerica se `s` (trimmato) è un numero (per allineamento a destra).
 fn cellIsNumeric(s: []const u8) bool {
-    const t = std.mem.trim(u8, s, " \t");
+    return numericTrimmed(std.mem.trim(u8, s, " \t"));
+}
+
+/// Come `cellIsNumeric` su testo già trimmato. Un pre-filtro sui caratteri
+/// precede `parseFloat`: nelle tabelle reali la maggior parte delle celle è
+/// testo, e il parse completo era il costo dominante della misura delle colonne.
+/// Restano escluse le forme che iniziano per lettera ("inf", "nan"): irrilevanti
+/// per l'allineamento di una colonna di un foglio di calcolo.
+fn numericTrimmed(t: []const u8) bool {
     if (t.len == 0) return false;
+    switch (t[0]) {
+        '0'...'9', '+', '-', '.' => {},
+        else => return false,
+    }
+    for (t) |ch| switch (ch) {
+        '0'...'9', '+', '-', '.', '_', 'a'...'d', 'A'...'D', 'e', 'E', 'f', 'F', 'p', 'P', 'x', 'X' => {},
+        else => return false,
+    };
     _ = std.fmt.parseFloat(f64, t) catch return false;
     return true;
+}
+
+/// Misure di colonna di una tabella: larghezze (padding incluso), colonne
+/// numeriche, gutter e larghezza naturale totale. Le larghezze e la numericità
+/// sono stimate su un CAMPIONE (header + prime `table_sample_rows` righe): su un
+/// csv da 12k righe misurare ogni cella costa quanto rasterizzare la tabella.
+/// `col_w` e `numeric` sono allocati con `alloc` (arena o gpa del chiamante).
+const ColMetrics = struct {
+    col_w: []i32,
+    numeric: []bool,
+    gutter_w: i32,
+    content_w: i32,
+};
+
+fn measureColumns(alloc: std.mem.Allocator, raster: *glyph.Raster, c: decoder_mod.CsvData) !ColMetrics {
+    const ncols = c.headers.len;
+    const col_w = try alloc.alloc(i32, ncols);
+    errdefer alloc.free(col_w);
+    const numeric = try alloc.alloc(bool, ncols);
+    errdefer alloc.free(numeric);
+    const has_data = try alloc.alloc(bool, ncols);
+    defer alloc.free(has_data);
+
+    for (c.headers, 0..) |hh, i| {
+        col_w[i] = try measureText(raster, .bold, hh);
+        numeric[i] = true;
+        has_data[i] = false;
+    }
+    const sample = c.rows[0..@min(c.rows.len, table_sample_rows)];
+    for (sample) |row| {
+        for (row, 0..) |cell, i| {
+            if (i >= ncols) break;
+            col_w[i] = @max(col_w[i], try measureText(raster, .regular, cell));
+            // Colonna già dichiarata non numerica: nessun altro parse su di essa.
+            if (!numeric[i]) continue;
+            const t = std.mem.trim(u8, cell, " \t");
+            if (t.len == 0) continue;
+            has_data[i] = true;
+            if (!numericTrimmed(t)) numeric[i] = false;
+        }
+    }
+    for (col_w, 0..) |*wd, i| {
+        wd.* = @min(wd.*, max_col_px) + 2 * cell_pad_x;
+        if (!has_data[i]) numeric[i] = false;
+    }
+
+    // Gutter: largo abbastanza per "#" e il numero di riga più alto.
+    var num_buf: [24]u8 = undefined;
+    const last_num = std.fmt.bufPrint(&num_buf, "{d}", .{c.rows.len}) catch "0";
+    const gutter_w: i32 = @max(try measureText(raster, .bold, "#"), try measureText(raster, .regular, last_num)) + 2 * cell_pad_x;
+
+    var content_w: i32 = pad_x + gutter_w;
+    for (col_w) |wd| content_w += wd;
+    content_w += pad_x;
+    return .{ .col_w = col_w, .numeric = numeric, .gutter_w = gutter_w, .content_w = content_w };
 }
 
 /// Dimensione NATURALE della tabella in pixel (larghezza = gutter + tutte le
 /// colonne ai loro ampiezza reale + margini; altezza = header + righe). Usata per
 /// dimensionare la finestra sulle colonne. Mantiene la stessa logica di `paintTable`.
 pub fn tableNaturalSize(gpa: std.mem.Allocator, c: decoder_mod.CsvData, opts: RenderOpts) !struct { w: usize, h: usize } {
+    // Raster locale (non la cache del worker): questa è chiamata anche dal thread
+    // finestra/main per dimensionare la finestra, e la cache non è thread-safe.
     var raster = try glyph.Raster.initFamily(gpa, tableTextPx(opts.pointsize), .sans);
     defer raster.deinit();
     const row_h: i32 = raster.lineHeight() + row_extra;
@@ -627,19 +1016,12 @@ pub fn tableNaturalSize(gpa: std.mem.Allocator, c: decoder_mod.CsvData, opts: Re
     const height: i32 = 2 * pad_y + (1 + @as(i32, @intCast(c.rows.len))) * row_h;
     if (ncols == 0) return .{ .w = 480, .h = @intCast(@max(height, 2 * pad_y + row_h)) };
 
-    var total: i32 = pad_x;
-    var num_buf: [24]u8 = undefined;
-    const last_num = std.fmt.bufPrint(&num_buf, "{d}", .{c.rows.len}) catch "0";
-    total += @max(try measureText(&raster, .bold, "#"), try measureText(&raster, .regular, last_num)) + 2 * cell_pad_x;
-    for (c.headers, 0..) |h, i| {
-        var wd = try measureText(&raster, .bold, h);
-        for (c.rows) |row| {
-            if (i < row.len) wd = @max(wd, try measureText(&raster, .regular, row[i]));
-        }
-        total += @min(wd, max_col_px) + 2 * cell_pad_x;
-    }
-    total += pad_x;
-    return .{ .w = @intCast(total), .h = @intCast(height) };
+    // Stesso campionamento del layout ritenuto: la larghezza naturale deve
+    // combaciare con quella che poi userà `paintTableViewport`.
+    const cm = try measureColumns(gpa, &raster, c);
+    defer gpa.free(cm.col_w);
+    defer gpa.free(cm.numeric);
+    return .{ .w = @intCast(cm.content_w), .h = @intCast(height) };
 }
 
 /// Rende una tabella CSV con font proporzionale e chrome da foglio di calcolo.
@@ -660,43 +1042,17 @@ fn paintTable(gpa: std.mem.Allocator, raster: *glyph.Raster, c: decoder_mod.CsvD
         return .{ .width = width, .height = height, .pixels = pixels, .name = try gpa.dupe(u8, "table") };
     }
 
-    // Larghezze colonna (pixel) e rilevamento colonne numeriche.
-    const col_w = try gpa.alloc(i32, ncols);
-    defer gpa.free(col_w);
-    const numeric = try gpa.alloc(bool, ncols);
-    defer gpa.free(numeric);
-    const has_data = try gpa.alloc(bool, ncols);
-    defer gpa.free(has_data);
-    for (c.headers, 0..) |hh, i| {
-        col_w[i] = try measureText(raster, .bold, hh);
-        numeric[i] = true;
-        has_data[i] = false;
-    }
-    for (c.rows) |row| {
-        for (row, 0..) |cell, i| {
-            if (i >= ncols) break;
-            col_w[i] = @max(col_w[i], try measureText(raster, .regular, cell));
-            if (std.mem.trim(u8, cell, " \t").len > 0) {
-                has_data[i] = true;
-                if (!cellIsNumeric(cell)) numeric[i] = false;
-            }
-        }
-    }
-    for (col_w, 0..) |*wd, i| {
-        wd.* = @min(wd.*, max_col_px) + 2 * cell_pad_x;
-        if (!has_data[i]) numeric[i] = false;
-    }
-
-    // Gutter: largo abbastanza per "#" e il numero di riga più alto.
-    var num_buf: [24]u8 = undefined;
-    const last_num = std.fmt.bufPrint(&num_buf, "{d}", .{c.rows.len}) catch "0";
-    const gutter_w: i32 = @max(try measureText(raster, .bold, "#"), try measureText(raster, .regular, last_num)) + 2 * cell_pad_x;
+    // Larghezze colonna (pixel) e rilevamento colonne numeriche: stesse misure
+    // (campionate) del layout ritenuto, così bitmap e viewport non divergono.
+    const cm = try measureColumns(gpa, raster, c);
+    defer gpa.free(cm.col_w);
+    defer gpa.free(cm.numeric);
+    const col_w = cm.col_w;
+    const numeric = cm.numeric;
+    const gutter_w = cm.gutter_w;
 
     // Dimensioni immagine: larghezza almeno quella della finestra.
-    var content_w: i32 = pad_x + gutter_w;
-    for (col_w) |wd| content_w += wd;
-    content_w += pad_x;
-    const width: usize = @max(opts.width, @as(usize, @intCast(content_w)));
+    const width: usize = @max(opts.width, @as(usize, @intCast(cm.content_w)));
     const n_visual: i32 = 1 + @as(i32, @intCast(c.rows.len));
     const height: usize = @intCast(2 * pad_y + n_visual * row_h);
     const w_i: i32 = @intCast(width);
@@ -758,9 +1114,8 @@ fn paintTable(gpa: std.mem.Allocator, raster: *glyph.Raster, c: decoder_mod.CsvD
 /// grassetto). Riempie `bounds_out[i]` col bordo destro X della linguetta i (per
 /// l'hit-test dei click), fino a `bounds_out.len` linguette. Immagine RGB alta
 /// `tab_bar_h` × `width`.
-pub fn renderTabBar(gpa: std.mem.Allocator, sheets: []const decoder_mod.Sheet, active: usize, width: u32, bounds_out: []u32) !decoder_mod.ImageData {
-    var raster = try glyph.Raster.initFamily(gpa, pxHeight(14), .sans);
-    defer raster.deinit();
+pub fn renderTabBar(gpa: std.mem.Allocator, cache: *glyph.RasterCache, sheets: []const decoder_mod.Sheet, active: usize, width: u32, bounds_out: []u32) !decoder_mod.ImageData {
+    const raster = try cache.get(gpa, pxHeight(14), .sans);
 
     const h_i: i32 = tab_bar_h;
     const w: usize = @max(width, 1);
@@ -775,7 +1130,7 @@ pub fn renderTabBar(gpa: std.mem.Allocator, sheets: []const decoder_mod.Sheet, a
     var x: i32 = 0;
     for (sheets, 0..) |s, i| {
         if (x >= w_i) break;
-        const tw = try measureText(&raster, if (i == active) .bold else .regular, s.name);
+        const tw = try measureText(raster, if (i == active) .bold else .regular, s.name);
         const x_end = @min(x + tw + 2 * tab_pad_x, w_i);
         if (i == active) {
             fillRect(pixels, w, h, x, 0, x_end, h_i, c_tab_active_bg);
@@ -785,7 +1140,7 @@ pub fn renderTabBar(gpa: std.mem.Allocator, sheets: []const decoder_mod.Sheet, a
         // Separatore verticale a destra della linguetta.
         fillRect(pixels, w, h, x_end - 1, 0, x_end, h_i, c_grid);
         const col = if (i == active) c_tab_text_active else c_tab_text;
-        try drawText(&raster, pixels, w_i, h_i, x + tab_pad_x, base, if (i == active) .bold else .regular, s.name, col, x_end - tab_pad_x / 2);
+        try drawText(raster, pixels, w_i, h_i, x + tab_pad_x, base, if (i == active) .bold else .regular, s.name, col, x_end - tab_pad_x / 2);
         if (i < bounds_out.len) bounds_out[i] = @intCast(@max(x_end, 0));
         x = x_end;
     }
@@ -835,6 +1190,23 @@ fn layoutCode(arena: std.mem.Allocator, rows: *std.ArrayList(Row), raster: *glyp
     const gutter_cols: usize = if (gutter) digits + 1 else 0;
     const code_cols = if (total_cols > gutter_cols + 16) total_cols - gutter_cols else 16;
 
+    // Numeri di riga: UNA sola allocazione a blocco per tutto il documento
+    // (prima una per riga) più un `blank` condiviso da tutte le continuazioni.
+    const gnum_block: []u8 = if (gutter) try arena.alloc(u8, total_lines * gutter_cols) else &.{};
+    if (gutter) {
+        @memset(gnum_block, ' ');
+        for (0..total_lines) |li| {
+            var v = li + 1;
+            var i = digits;
+            const slot = gnum_block[li * gutter_cols ..][0..gutter_cols];
+            while (v > 0) : (v /= 10) {
+                i -= 1;
+                slot[i] = '0' + @as(u8, @intCast(v % 10));
+            }
+        }
+    }
+    const blank: []const u8 = if (gutter) try blankGutter(arena, gutter_cols) else &.{};
+
     var line_no: usize = 0;
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |raw_line| {
@@ -851,10 +1223,10 @@ fn layoutCode(arena: std.mem.Allocator, rows: *std.ArrayList(Row), raster: *glyp
 
             var run_list: std.ArrayList(Run) = .empty;
             if (gutter) {
-                const g = if (first)
-                    try gutterNumber(arena, line_no, digits)
+                const g: []const u8 = if (first and line_no <= total_lines)
+                    gnum_block[(line_no - 1) * gutter_cols ..][0..gutter_cols]
                 else
-                    try blankGutter(arena, gutter_cols);
+                    blank;
                 try run_list.append(arena, .{ .text = g, .color = c_line_no });
             }
             if (lang) |l| {
@@ -870,23 +1242,6 @@ fn layoutCode(arena: std.mem.Allocator, rows: *std.ArrayList(Row), raster: *glyp
         }
     }
     return gutter_cols;
-}
-
-/// Numero di riga allineato a destra su `digits` cifre, seguito da uno spazio.
-fn gutterNumber(arena: std.mem.Allocator, line_no: usize, digits: usize) ![]u8 {
-    const buf = try arena.alloc(u8, digits + 1);
-    @memset(buf, ' ');
-    var v = line_no;
-    var i = digits;
-    if (v == 0) {
-        buf[digits - 1] = '0';
-    } else {
-        while (v > 0) : (v /= 10) {
-            i -= 1;
-            buf[i] = '0' + @as(u8, @intCast(v % 10));
-        }
-    }
-    return buf;
 }
 
 fn blankGutter(arena: std.mem.Allocator, cols: usize) ![]u8 {
@@ -942,14 +1297,7 @@ fn tokenize(arena: std.mem.Allocator, runs: *std.ArrayList(Run), chunk: []const 
             var end = i + 1;
             while (end < chunk.len and (std.ascii.isAlphanumeric(chunk[end]) or chunk[end] == '_')) end += 1;
             const word = chunk[i..end];
-            var is_kw = false;
-            for (lang.keywords) |kw| {
-                if (std.mem.eql(u8, word, kw)) {
-                    is_kw = true;
-                    break;
-                }
-            }
-            if (is_kw) {
+            if (lang.keywords.get(word) != null) {
                 try flushPlain(arena, runs, chunk, plain_start, i);
                 try runs.append(arena, .{ .text = word, .color = c_keyword, .style = .bold });
                 plain_start = end;
@@ -1111,16 +1459,26 @@ fn wrapRuns(arena: std.mem.Allocator, rows: *std.ArrayList(Row), line_runs: []co
 
 // --- Tabelle / helper --------------------------------------------------------
 
-fn expandTabs(arena: std.mem.Allocator, line: []const u8) ![]u8 {
+/// Espande i tab a 4 spazi. Le righe SENZA tab (la quasi totalità) tornano
+/// come slice della sorgente, senza copia: su un file grande erano una
+/// allocazione + una copia per riga. Il risultato può quindi puntare dentro
+/// `decoded` — vedi il contratto di vita in `DocLayout`.
+fn expandTabs(arena: std.mem.Allocator, line: []const u8) ![]const u8 {
+    var n_tabs: usize = 0;
+    for (line) |ch| {
+        if (ch == '\t') n_tabs += 1;
+    }
+    if (n_tabs == 0) return line;
     var out: std.ArrayList(u8) = .empty;
-    for (line) |c| {
-        if (c == '\t') {
-            try out.appendSlice(arena, "    ");
+    try out.ensureTotalCapacityPrecise(arena, line.len + n_tabs * 3);
+    for (line) |ch| {
+        if (ch == '\t') {
+            out.appendSliceAssumeCapacity("    ");
         } else {
-            try out.append(arena, c);
+            out.appendAssumeCapacity(ch);
         }
     }
-    return out.toOwnedSlice(arena);
+    return out.items;
 }
 
 /// Fine del segmento che copre al più `cols` codepoint da `start`, senza
@@ -1138,19 +1496,29 @@ fn sliceByColumns(line: []const u8, start: usize, cols: usize) usize {
 
 const Lang = struct {
     line_comments: []const []const u8,
-    keywords: []const []const u8,
+    /// Insieme di keyword: mappa statica perfetta costruita a comptime — il
+    /// vecchio confronto lineare su ~40 voci girava per OGNI identificatore del
+    /// documento durante l'impaginazione.
+    keywords: std.StaticStringMap(void),
 };
 
-const kw_zig = [_][]const u8{ "fn", "pub", "const", "var", "if", "else", "while", "for", "return", "try", "catch", "defer", "errdefer", "struct", "enum", "union", "switch", "break", "continue", "orelse", "and", "or", "comptime", "test", "export", "extern", "inline", "null", "undefined", "true", "false", "error", "anyerror", "unreachable", "usingnamespace" };
-const kw_rust = [_][]const u8{ "fn", "pub", "let", "mut", "const", "if", "else", "while", "for", "loop", "return", "match", "struct", "enum", "impl", "trait", "use", "mod", "crate", "self", "super", "where", "async", "await", "move", "ref", "dyn", "true", "false", "in", "as", "break", "continue", "static", "type", "unsafe", "extern" };
-const kw_c = [_][]const u8{ "if", "else", "while", "for", "return", "struct", "enum", "union", "typedef", "static", "const", "void", "int", "char", "long", "short", "unsigned", "signed", "float", "double", "sizeof", "switch", "case", "break", "continue", "default", "do", "goto", "extern", "inline", "volatile", "class", "public", "private", "protected", "template", "typename", "namespace", "using", "new", "delete", "virtual", "override", "nullptr", "true", "false", "auto", "this", "bool" };
-const kw_py = [_][]const u8{ "def", "class", "if", "elif", "else", "while", "for", "return", "import", "from", "as", "with", "try", "except", "finally", "raise", "pass", "break", "continue", "lambda", "global", "nonlocal", "yield", "async", "await", "in", "is", "not", "and", "or", "None", "True", "False", "del", "assert", "match", "case" };
-const kw_js = [_][]const u8{ "function", "const", "let", "var", "if", "else", "while", "for", "return", "class", "extends", "import", "from", "export", "default", "new", "this", "typeof", "instanceof", "try", "catch", "finally", "throw", "async", "await", "yield", "switch", "case", "break", "continue", "delete", "in", "of", "null", "undefined", "true", "false", "interface", "type", "enum", "implements", "readonly", "static" };
-const kw_go = [_][]const u8{ "func", "package", "import", "var", "const", "if", "else", "for", "range", "return", "struct", "interface", "map", "chan", "go", "defer", "select", "switch", "case", "break", "continue", "type", "nil", "true", "false", "fallthrough", "goto" };
-const kw_sh = [_][]const u8{ "if", "then", "else", "elif", "fi", "for", "while", "do", "done", "case", "esac", "function", "local", "return", "echo", "export", "in", "read", "exit", "set" };
-const kw_lua = [_][]const u8{ "function", "local", "if", "then", "else", "elseif", "end", "while", "for", "do", "return", "nil", "true", "false", "and", "or", "not", "repeat", "until", "break", "in" };
-const kw_sql = [_][]const u8{ "select", "from", "where", "insert", "update", "delete", "join", "left", "right", "inner", "outer", "group", "by", "order", "having", "limit", "create", "table", "drop", "alter", "index", "as", "and", "or", "not", "null", "into", "values", "set", "on", "distinct", "union" };
-const kw_none = [_][]const u8{};
+/// Costruisce a comptime l'insieme di keyword da un elenco di stringhe.
+fn kwSet(comptime words: []const []const u8) std.StaticStringMap(void) {
+    comptime var kvs: [words.len]struct { []const u8 } = undefined;
+    inline for (words, 0..) |w, i| kvs[i] = .{w};
+    return std.StaticStringMap(void).initComptime(kvs);
+}
+
+const kw_zig = kwSet(&[_][]const u8{ "fn", "pub", "const", "var", "if", "else", "while", "for", "return", "try", "catch", "defer", "errdefer", "struct", "enum", "union", "switch", "break", "continue", "orelse", "and", "or", "comptime", "test", "export", "extern", "inline", "null", "undefined", "true", "false", "error", "anyerror", "unreachable", "usingnamespace" });
+const kw_rust = kwSet(&[_][]const u8{ "fn", "pub", "let", "mut", "const", "if", "else", "while", "for", "loop", "return", "match", "struct", "enum", "impl", "trait", "use", "mod", "crate", "self", "super", "where", "async", "await", "move", "ref", "dyn", "true", "false", "in", "as", "break", "continue", "static", "type", "unsafe", "extern" });
+const kw_c = kwSet(&[_][]const u8{ "if", "else", "while", "for", "return", "struct", "enum", "union", "typedef", "static", "const", "void", "int", "char", "long", "short", "unsigned", "signed", "float", "double", "sizeof", "switch", "case", "break", "continue", "default", "do", "goto", "extern", "inline", "volatile", "class", "public", "private", "protected", "template", "typename", "namespace", "using", "new", "delete", "virtual", "override", "nullptr", "true", "false", "auto", "this", "bool" });
+const kw_py = kwSet(&[_][]const u8{ "def", "class", "if", "elif", "else", "while", "for", "return", "import", "from", "as", "with", "try", "except", "finally", "raise", "pass", "break", "continue", "lambda", "global", "nonlocal", "yield", "async", "await", "in", "is", "not", "and", "or", "None", "True", "False", "del", "assert", "match", "case" });
+const kw_js = kwSet(&[_][]const u8{ "function", "const", "let", "var", "if", "else", "while", "for", "return", "class", "extends", "import", "from", "export", "default", "new", "this", "typeof", "instanceof", "try", "catch", "finally", "throw", "async", "await", "yield", "switch", "case", "break", "continue", "delete", "in", "of", "null", "undefined", "true", "false", "interface", "type", "enum", "implements", "readonly", "static" });
+const kw_go = kwSet(&[_][]const u8{ "func", "package", "import", "var", "const", "if", "else", "for", "range", "return", "struct", "interface", "map", "chan", "go", "defer", "select", "switch", "case", "break", "continue", "type", "nil", "true", "false", "fallthrough", "goto" });
+const kw_sh = kwSet(&[_][]const u8{ "if", "then", "else", "elif", "fi", "for", "while", "do", "done", "case", "esac", "function", "local", "return", "echo", "export", "in", "read", "exit", "set" });
+const kw_lua = kwSet(&[_][]const u8{ "function", "local", "if", "then", "else", "elseif", "end", "while", "for", "do", "return", "nil", "true", "false", "and", "or", "not", "repeat", "until", "break", "in" });
+const kw_sql = kwSet(&[_][]const u8{ "select", "from", "where", "insert", "update", "delete", "join", "left", "right", "inner", "outer", "group", "by", "order", "having", "limit", "create", "table", "drop", "alter", "index", "as", "and", "or", "not", "null", "into", "values", "set", "on", "distinct", "union" });
+const kw_none = kwSet(&[_][]const u8{});
 
 const slash_comment = [_][]const u8{"//"};
 const hash_comment = [_][]const u8{"#"};
@@ -1161,16 +1529,16 @@ const no_comment = [_][]const u8{};
 fn langFor(ext: []const u8) Lang {
     const Case = struct { exts: []const []const u8, lang: Lang };
     const table = [_]Case{
-        .{ .exts = &.{"zig"}, .lang = .{ .line_comments = &slash_comment, .keywords = &kw_zig } },
-        .{ .exts = &.{"rs"}, .lang = .{ .line_comments = &slash_comment, .keywords = &kw_rust } },
-        .{ .exts = &.{ "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "java", "cs", "kt", "kts", "swift", "scala", "dart", "proto" }, .lang = .{ .line_comments = &slash_comment, .keywords = &kw_c } },
-        .{ .exts = &.{ "py", "pyi", "rb", "toml", "yaml", "yml", "cfg", "conf", "properties", "gitignore", "gitattributes", "editorconfig", "dockerfile", "mk", "make", "cmake", "r", "jl", "nim", "ex", "exs" }, .lang = .{ .line_comments = &hash_comment, .keywords = &kw_py } },
-        .{ .exts = &.{ "js", "mjs", "cjs", "jsx", "ts", "tsx", "php" }, .lang = .{ .line_comments = &slash_comment, .keywords = &kw_js } },
-        .{ .exts = &.{"go"}, .lang = .{ .line_comments = &slash_comment, .keywords = &kw_go } },
-        .{ .exts = &.{ "sh", "bash", "zsh", "fish", "ps1", "env" }, .lang = .{ .line_comments = &hash_comment, .keywords = &kw_sh } },
-        .{ .exts = &.{ "lua", "hs" }, .lang = .{ .line_comments = &dash_comment, .keywords = &kw_lua } },
-        .{ .exts = &.{"sql"}, .lang = .{ .line_comments = &dash_comment, .keywords = &kw_sql } },
-        .{ .exts = &.{ "ini", "asm", "s" }, .lang = .{ .line_comments = &semi_comment, .keywords = &kw_none } },
+        .{ .exts = &.{"zig"}, .lang = .{ .line_comments = &slash_comment, .keywords = kw_zig } },
+        .{ .exts = &.{"rs"}, .lang = .{ .line_comments = &slash_comment, .keywords = kw_rust } },
+        .{ .exts = &.{ "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "java", "cs", "kt", "kts", "swift", "scala", "dart", "proto" }, .lang = .{ .line_comments = &slash_comment, .keywords = kw_c } },
+        .{ .exts = &.{ "py", "pyi", "rb", "toml", "yaml", "yml", "cfg", "conf", "properties", "gitignore", "gitattributes", "editorconfig", "dockerfile", "mk", "make", "cmake", "r", "jl", "nim", "ex", "exs" }, .lang = .{ .line_comments = &hash_comment, .keywords = kw_py } },
+        .{ .exts = &.{ "js", "mjs", "cjs", "jsx", "ts", "tsx", "php" }, .lang = .{ .line_comments = &slash_comment, .keywords = kw_js } },
+        .{ .exts = &.{"go"}, .lang = .{ .line_comments = &slash_comment, .keywords = kw_go } },
+        .{ .exts = &.{ "sh", "bash", "zsh", "fish", "ps1", "env" }, .lang = .{ .line_comments = &hash_comment, .keywords = kw_sh } },
+        .{ .exts = &.{ "lua", "hs" }, .lang = .{ .line_comments = &dash_comment, .keywords = kw_lua } },
+        .{ .exts = &.{"sql"}, .lang = .{ .line_comments = &dash_comment, .keywords = kw_sql } },
+        .{ .exts = &.{ "ini", "asm", "s" }, .lang = .{ .line_comments = &semi_comment, .keywords = kw_none } },
     };
     for (table) |case| {
         for (case.exts) |e| {
@@ -1178,7 +1546,7 @@ fn langFor(ext: []const u8) Lang {
         }
     }
     // Testo generico: niente keyword, niente commenti — restano gutter e wrap.
-    return .{ .line_comments = &no_comment, .keywords = &kw_none };
+    return .{ .line_comments = &no_comment, .keywords = kw_none };
 }
 
 fn extOf(name: []const u8) []const u8 {

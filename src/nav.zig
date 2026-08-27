@@ -18,11 +18,13 @@ const yt_search = @import("yt_search.zig");
 // Content-kind classification (path/decode → WinKind) + geometria iniziale finestra.
 const layout = @import("layout.zig");
 const gui_state_mod = @import("gui_state.zig");
+const vtcache = @import("vtcache.zig");
 const GuiAppState = gui_state_mod.GuiAppState;
 const Prefetched = gui_state_mod.Prefetched;
 const resetScroll = gui_state_mod.resetScroll;
 const freeTextLines = gui_state_mod.freeTextLines;
 const rgbToRgba = gui_state_mod.rgbToRgba;
+const isPdfPath = gui_state_mod.isPdfPath;
 const build_options = @import("build_options");
 /// Vulkan mesh/text renderer available (Linux + Windows). Comptime so the GPU code links
 /// only when enabled. Distinct from `has_video`: on Windows Vulkan is on but video is off.
@@ -68,13 +70,45 @@ pub fn schedulePrefetchAround(state: *GuiAppState) void {
     {
         state.shared.mutex.lockUncancelable(state.io);
         defer state.shared.mutex.unlock(state.io);
-        const idx = state.current_file_index orelse return;
+        // PDF multipagina: i "vicini" sono le pagine ±1 (cambio pagina istantaneo).
+        if (!pdfPageNeighborsLocked(state, &buf)) {
+            folderNeighborsLocked(state, &buf) catch return;
+        }
+    }
+    defer for (buf) |p| if (p) |x| state.gpa.free(x);
+    requestPrefetch(state, buf[0], buf[1]);
+}
+
+/// Riempie `buf` con `path#page=N±1` se il contenuto corrente è una pagina di un
+/// PDF con più pagine. Sotto `shared.mutex`. false = non è un PDF paginato.
+fn pdfPageNeighborsLocked(state: *GuiAppState, buf: *[2]?[]u8) bool {
+    const cur = state.shared.current_file_path;
+    if (!isPdfPath(cur) or state.shared.decoded != .image) return false;
+    const total = state.shared.decoded.image.total_pages;
+    if (total <= 1) return false;
+    var clean = cur;
+    var page: usize = 1;
+    if (std.mem.indexOfScalar(u8, cur, '#')) |h| {
+        clean = cur[0..h];
+        var s = cur[h + 1 ..];
+        if (std.mem.startsWith(u8, s, "page=")) s = s["page=".len..];
+        page = std.fmt.parseInt(usize, s, 10) catch 1;
+    }
+    if (page > 1) buf[0] = std.fmt.allocPrint(state.gpa, "{s}#page={d}", .{ clean, page - 1 }) catch null;
+    if (page < total) buf[1] = std.fmt.allocPrint(state.gpa, "{s}#page={d}", .{ clean, page + 1 }) catch null;
+    return true;
+}
+
+/// Vicini nella lista della cartella (prev/next), sotto `shared.mutex`.
+fn folderNeighborsLocked(state: *GuiAppState, buf: *[2]?[]u8) !void {
+    {
+        const idx = state.current_file_index orelse return error.NoIndex;
         const n = state.file_list.items.len;
-        if (n <= 1) return;
+        if (n <= 1) return error.NoNeighbors;
         const dir_path = std.fs.path.dirname(state.shared.current_file_path);
         const prev_i = if (idx == 0) n - 1 else idx - 1;
         const next_i = (idx + 1) % n;
-        for (&buf, [2]usize{ prev_i, next_i }) |*out, i| {
+        for (buf, [2]usize{ prev_i, next_i }) |*out, i| {
             if (i == idx) continue; // liste di 2: prev==next==state va evitato
             const filename = state.file_list.items[i];
             out.* = if (dir_path) |dp|
@@ -83,14 +117,19 @@ pub fn schedulePrefetchAround(state: *GuiAppState) void {
                 state.gpa.dupe(u8, filename) catch null;
         }
     }
-    defer for (buf) |p| if (p) |x| state.gpa.free(x);
-    requestPrefetch(state, buf[0], buf[1]);
 }
 
 /// Posta una richiesta di caricamento asincrono al `loadWorker` e accende lo
 /// spinner. Usata dalla navigazione a cache-miss: il decode avviene fuori dal
 /// thread finestra, che resta libero di committare i frame dello spinner.
 pub fn postLoad(state: *GuiAppState, new_path: []const u8) void {
+    // Cache-hit (pagina PDF ±1 prefetchata, file appena lasciato, vicino già
+    // pronto): swap sincrono senza spinner. Tutti i chiamanti sono sul thread
+    // finestra, quello designato per `applyDecoded`.
+    if (cacheTake(state, new_path)) |pf| {
+        installFromCache(state, pf, new_path);
+        return;
+    }
     // Duplica prima di toccare lo stato: se l'alloc fallisce nessuna
     // richiesta viene accodata, quindi `loading` non va acceso (spinner
     // infinito senza nessuno che lo spenga).
@@ -150,17 +189,190 @@ pub fn freeMeshCpuData(state: *GuiAppState) void {
     }
 }
 
+/// Player A/V già aperto FUORI da `shared.mutex` (thread loader): `applyDecoded`
+/// lo installa con uno swap invece di aprire il container (dlopen libav, probe,
+/// primo frame: centinaia di ms) in sezione critica. `VideoState` è spostabile:
+/// decoder e audio sono puntatori heap, nessun thread punta alla struct.
+pub const PreparedVideo = struct { vs: videomod.VideoState, first: videomod.VideoFirst, has_video: bool };
+
+/// Tutto ciò che `applyDecoded` userebbe altrimenti calcolare/aprire sotto lock:
+/// staging GPU della mesh, RGBA dell'immagine, player A/V, synth MIDI. Viene
+/// preparato dal chiamante sul thread di decode (`prepareFor`); `applyDecoded`
+/// prende possesso di ciò che usa e libera il resto (anche se abortisce).
+pub const Prepared = struct {
+    stage: ?loader_mod.GpuStage = null,
+    rgba: ?[]u8 = null,
+    video: ?PreparedVideo = null,
+    midi: ?*midi_player.MidiPlayer = null,
+
+    pub fn deinit(self: *Prepared, state: *GuiAppState) void {
+        if (self.stage) |*s| s.buffer.deinit(state.gpa);
+        self.stage = null;
+        if (self.rgba) |r| state.gpa.free(r);
+        self.rgba = null;
+        if (self.video) |*pv| {
+            if (has_video) pv.vs.deinit();
+            state.gpa.free(pv.first.rgba);
+        }
+        self.video = null;
+        if (self.midi) |m| m.stopAndDestroy();
+        self.midi = null;
+    }
+};
+
+/// Prepara fuori lock ciò che serve a installare `d` (vedi `Prepared`). `av`:
+/// apri anche player video/MIDI — SOLO quando l'install è imminente (loader,
+/// decode iniziale): il prefetch NON deve far partire l'audio di un vicino.
+pub fn prepareFor(state: *GuiAppState, d: *decoder_mod.Decoded, path: []const u8, av: bool) Prepared {
+    var pre: Prepared = .{};
+    switch (d.*) {
+        .mesh => |*m| {
+            pre.stage = loader_mod.stageToGpu(state.gpa, d);
+            // Bake della cache VT (piramide mip + scrittura .vtc su disco, secondi
+            // sui modelli texturizzati) qui, così `setMeshMaterials` sotto lock
+            // trova i file già pronti e li apre soltanto.
+            if (native) prewarmVt(state.gpa, m);
+        },
+        .image => |img| {
+            pre.rgba = rgbToRgba(state.gpa, img.pixels, @intCast(img.width), @intCast(img.height)) catch null;
+        },
+        else => {},
+    }
+    if (has_video and av and layout.winKindFromExt(path) == .video) pre.video = openVideo(state.gpa, path);
+    if (av and isMidiPath(path)) pre.midi = midi_player.MidiPlayer.start(path, state.gpa);
+    return pre;
+}
+
+/// Apre (senza toccare lo stato condiviso) il player video, o quello solo-audio
+/// come fallback — stessa logica di `startVideo`, ma su una `VideoState` locale.
+fn openVideo(gpa: std.mem.Allocator, path: []const u8) ?PreparedVideo {
+    var vs: videomod.VideoState = .{};
+    const first = videomod.setupVideo(&vs, path, gpa) catch |e| {
+        const af = videomod.setupAudio(&vs, path, gpa) catch |e2| {
+            std.debug.print("Media non apribile (video: {s}, audio: {s})\n", .{ @errorName(e), @errorName(e2) });
+            return null;
+        };
+        return .{ .vs = vs, .first = af, .has_video = false };
+    };
+    return .{ .vs = vs, .first = first, .has_video = true };
+}
+
+/// Crea (se mancano) i file .vtc delle texture base-color dei submesh: stessa
+/// chiave di `setupVtBaseColor` in gpu_renderer, che poi li aprirà soltanto.
+/// Atlanti condivisi tra submesh (dedup glTF) vengono processati una volta sola.
+fn prewarmVt(gpa: std.mem.Allocator, m: *const decoder_mod.MeshData) void {
+    var seen: [32][*]const u8 = undefined;
+    var n_seen: usize = 0;
+    for (m.submeshes) |sm| {
+        if (sm.tex_pixels.len == 0 or sm.tex_width == 0 or sm.tex_height == 0) continue;
+        var dup = false;
+        for (seen[0..n_seen]) |p| if (p == sm.tex_pixels.ptr) {
+            dup = true;
+        };
+        if (dup) continue;
+        if (n_seen < seen.len) {
+            seen[n_seen] = sm.tex_pixels.ptr;
+            n_seen += 1;
+        }
+        var map = vtcache.openOrBake(gpa, sm.tex_pixels, @intCast(sm.tex_width), @intCast(sm.tex_height)) catch continue;
+        map.deinit();
+    }
+}
+
+/// Installa il player preparato (se c'è, per questo percorso) o apre il
+/// container qui (fallback sincrono, come `startVideo`). Sotto `shared.mutex`.
+fn installVideo(state: *GuiAppState, path: []const u8, pre: *Prepared) bool {
+    if (pre.video) |pv| {
+        pre.video = null;
+        state.video = pv.vs;
+        gui_state_mod.setAvSrc(state, path, pv.has_video);
+        state.gpa.free(state.shared.static_rgba);
+        state.shared.static_rgba = pv.first.rgba;
+        state.shared.static_w = pv.first.w;
+        state.shared.static_h = pv.first.h;
+        return true;
+    }
+    return startVideo(state, path);
+}
+
+/// Byte effettivi occupati da un contenuto decodificato (cap RAM della cache).
+pub fn decodedBytes(d: *const decoder_mod.Decoded) usize {
+    return switch (d.*) {
+        .image => |img| img.pixels.len,
+        .text => |s| s.len,
+        .markdown => |m| m.content.len,
+        .csv => |c| csvBytes(c),
+        .workbook => |w| blk: {
+            var n: usize = 0;
+            for (w.sheets) |s| n += csvBytes(s.data);
+            break :blk n;
+        },
+        .mesh => |m| blk: {
+            var n: usize = std.mem.sliceAsBytes(m.vertices).len + std.mem.sliceAsBytes(m.faces).len +
+                std.mem.sliceAsBytes(m.normals).len + std.mem.sliceAsBytes(m.uvs).len +
+                std.mem.sliceAsBytes(m.tangents).len + m.tex_pixels.len;
+            for (m.submeshes) |sm| n += sm.tex_pixels.len + sm.nrm_tex_pixels.len;
+            break :blk n;
+        },
+        .err => 0,
+    };
+}
+
+fn csvBytes(c: decoder_mod.CsvData) usize {
+    // Stima: somma delle prime 1000 righe estrapolata (evita O(celle) esatto).
+    var n: usize = 0;
+    for (c.headers) |h| n += h.len + 16;
+    const sample = @min(c.rows.len, 1000);
+    var s: usize = 0;
+    for (c.rows[0..sample]) |row| {
+        for (row) |cell| s += cell.len + 16;
+    }
+    if (sample > 0) n += s * c.rows.len / sample;
+    return n;
+}
+
+/// Cap di RAM della cache di prefetch (`ZUER_PREFETCH_MAX_MB`, default 48 MB),
+/// applicato ai byte DECODIFICATI (non alla taglia su disco). Letto una volta.
+var prefetch_max_cached: ?u64 = null;
+pub fn prefetchMaxBytes() u64 {
+    if (prefetch_max_cached) |v| return v;
+    var mb: u64 = 48;
+    if (getenv("ZUER_PREFETCH_MAX_MB")) |v| {
+        if (std.fmt.parseInt(u64, std.mem.span(v), 10) catch null) |n| mb = n;
+    }
+    prefetch_max_cached = mb * 1024 * 1024;
+    return prefetch_max_cached.?;
+}
+
+/// Vale la pena chiamare `decodeCoarse`? Solo dove il tier coarse è davvero più
+/// economico del full: mesh (cache disco calda) e PDF (pdftoppm a bassa
+/// risoluzione). Per le immagini il plugin decodifica comunque a piena
+/// risoluzione e poi riduce: costerebbe quanto il full e verrebbe buttato
+/// (era il caso: ogni immagine su cache-miss veniva decodificata DUE volte).
+fn coarseWorthwhile(path: []const u8) bool {
+    return layout.winKindFromExt(path) == .mesh or isPdfPath(path);
+}
+
+/// Il risultato coarse va mostrato come anteprima progressiva? Mesh sempre;
+/// pagina PDF a bassa risoluzione sì (il full la rimpiazza subito dopo).
+fn coarseAcceptable(coarse: *const decoder_mod.Decoded, path: []const u8) bool {
+    return coarse.* == .mesh or (coarse.* == .image and isPdfPath(path));
+}
+
 /// Installa un contenuto già decodificato nello stato condiviso (swap sotto
-/// lock). Prende possesso di `new_decoded` e, se presente, di `stage_override`
-/// (staging GPU già calcolato dal prefetch: evita di ricalcolarlo qui).
+/// lock). Prende possesso di `new_decoded` e di `pre_in` (staging GPU, RGBA,
+/// player: già calcolati fuori lock dal prefetch/loader, vedi `Prepared`).
 /// Condiviso dal thread di decodifica iniziale (spinner) e dal
 /// percorso di navigazione con cache-hit. DEVE girare sul thread main:
 /// `setMesh` tocca il renderer Vulkan (serializzato con il render worker).
 /// `gen` (se non null) è la generazione di navigazione del chiamante:
 /// viene RIVERIFICATA qui sotto `mutex` (latest-wins senza TOCTOU — vedi sotto).
-pub fn applyDecoded(state: *GuiAppState, new_decoded: decoder_mod.Decoded, stage_override: ?loader_mod.GpuStage, new_path: []const u8, gen: ?u32) !void {
+pub fn applyDecoded(state: *GuiAppState, new_decoded: decoder_mod.Decoded, pre_in: Prepared, new_path: []const u8, gen: ?u32) !void {
     state.shared.mutex.lockUncancelable(state.io);
     defer state.shared.mutex.unlock(state.io);
+    // Ciò che non viene consumato (abort, errori, campi non usati) si libera qui.
+    var pre = pre_in;
+    defer pre.deinit(state);
 
     // Latest-wins senza TOCTOU: il check `navSuperseded` fatto dal chiamante
     // PRIMA di questo lock può essere già stantio (un cache-hit di `navigate`
@@ -173,10 +385,6 @@ pub fn applyDecoded(state: *GuiAppState, new_decoded: decoder_mod.Decoded, stage
         if (navSuperseded(state, g)) {
             var nd = new_decoded;
             nd.deinit(state.gpa);
-            if (stage_override) |s| {
-                var st = s;
-                st.buffer.deinit(state.gpa);
-            }
             return;
         }
     }
@@ -193,10 +401,6 @@ pub fn applyDecoded(state: *GuiAppState, new_decoded: decoder_mod.Decoded, stage
     const path_copy = state.gpa.dupe(u8, new_path) catch |e| {
         var nd = new_decoded;
         nd.deinit(state.gpa);
-        if (stage_override) |s| {
-            var st = s;
-            st.buffer.deinit(state.gpa);
-        }
         return e;
     };
 
@@ -239,7 +443,7 @@ pub fn applyDecoded(state: *GuiAppState, new_decoded: decoder_mod.Decoded, stage
     // (secondo swap nella stessa finestra): si libera subito.
     if (state.shared.decoded_pinned and state.shared.decoded_retired == null) {
         state.shared.decoded_retired = state.shared.decoded;
-    } else {
+    } else if (!parkOutgoingLocked(state, new_path)) {
         state.shared.decoded.deinit(state.gpa);
     }
     if (state.shared.stage_opt) |*s| {
@@ -275,10 +479,8 @@ pub fn applyDecoded(state: *GuiAppState, new_decoded: decoder_mod.Decoded, stage
     // Il prefetch prepara lo staging solo per le mesh: se per qualsiasi motivo
     // arriva uno stage per un non-mesh, liberalo qui (solo il ramo mesh lo usa).
     if (!state.shared.is_mesh) {
-        if (stage_override) |s| {
-            var st = s;
-            st.buffer.deinit(state.gpa);
-        }
+        if (pre.stage) |*s| s.buffer.deinit(state.gpa);
+        pre.stage = null;
     }
 
     // 6. Aggiorna i dati per GPU/CPU. I contenuti testuali non vengono
@@ -294,7 +496,10 @@ pub fn applyDecoded(state: *GuiAppState, new_decoded: decoder_mod.Decoded, stage
         // di normali/tangenti qui, sul thread main): swap istantaneo.
         // stageToGpu is Linux/memfd-only → a mesh cleanly fails to load on a CPU-only
         // build; the GPU upload below is also comptime-excluded when !native.
-        state.shared.stage_opt = if (stage_override) |s| s else (loader_mod.stageToGpu(state.gpa, &state.shared.decoded) orelse return error.StageFailed);
+        state.shared.stage_opt = if (pre.stage) |s| blk: {
+            pre.stage = null;
+            break :blk s;
+        } else (loader_mod.stageToGpu(state.gpa, &state.shared.decoded) orelse return error.StageFailed);
         const stage = &state.shared.stage_opt.?;
         if (native) {
             state.renderer_mutex.lockUncancelable(state.io);
@@ -321,7 +526,11 @@ pub fn applyDecoded(state: *GuiAppState, new_decoded: decoder_mod.Decoded, stage
         // pixel vuoti (il compose andrebbe out-of-bounds).
         state.shared.static_w = 0;
         state.shared.static_h = 0;
-        state.shared.static_rgba = try rgbToRgba(state.gpa, img.pixels, @intCast(img.width), @intCast(img.height));
+        // RGBA già pronta dal thread di decode/prefetch (fuori lock): swap.
+        state.shared.static_rgba = if (pre.rgba) |r| blk: {
+            pre.rgba = null;
+            break :blk r;
+        } else try rgbToRgba(state.gpa, img.pixels, @intCast(img.width), @intCast(img.height));
         state.shared.static_w = @intCast(img.width);
         state.shared.static_h = @intCast(img.height);
         // Riapplica la rotazione corrente (nuova pagina PDF, refine progressivo).
@@ -346,7 +555,7 @@ pub fn applyDecoded(state: *GuiAppState, new_decoded: decoder_mod.Decoded, stage
     // e lo stato video/buffer condivisi, tutti protetti dal `mutex` già
     // acquisito qui (nessuna risorsa legata al thread finestra).
     if (has_video and layout.winKindFromExt(new_path) == .video) {
-        if (startVideo(state, new_path)) {
+        if (installVideo(state, new_path, &pre)) {
             // Instrada tastiera/compose sul percorso video (il decode può
             // aver prodotto un poster `.image` o un errore testuale).
             state.shared.is_text = false;
@@ -359,7 +568,12 @@ pub fn applyDecoded(state: *GuiAppState, new_decoded: decoder_mod.Decoded, stage
     // (autoplay, come il video). `null` = SoundFont mancante o file invalido:
     // si resta sulla card, con un hint su stderr.
     if (isMidiPath(new_path)) {
-        state.midi = midi_player.MidiPlayer.start(new_path, state.gpa);
+        // Synth preparato fuori lock (SoundFont da ~150 MB letto su disco) se
+        // il chiamante l'ha fatto; altrimenti caricalo qui.
+        state.midi = if (pre.midi) |m| blk: {
+            pre.midi = null;
+            break :blk m;
+        } else midi_player.MidiPlayer.start(new_path, state.gpa);
         if (state.midi == null) std.debug.print(
             "MIDI non riproducibile: SoundFont mancante? Imposta ZUER_SOUNDFONT " ++
                 "o installa un GM .sf2 (es. soundfont-fluid) in /usr/share/soundfonts/\n",
@@ -581,34 +795,17 @@ pub fn navigate(state: *GuiAppState, direction: i2) void {
             state.shared.mutex.unlock(state.io);
             return;
         };
+    // L'indice è letto da `schedulePrefetchAround` (thread loader) sotto
+    // `shared.mutex`: scriverlo qui, nella stessa sezione critica, evita il
+    // prefetch dei vicini sbagliati durante uno spam di frecce.
+    state.current_file_index = next_idx;
     state.shared.mutex.unlock(state.io);
     defer state.gpa.free(new_path);
-
-    state.current_file_index = next_idx;
 
     // Cache-hit: il vicino è già decodificato (e staged) → swap istantaneo e
     // sincrono (nessuno spinner: è già pronto).
     if (cacheTake(state, new_path)) |pf| {
-        // Latest-wins anche qui: invalida ogni load async in volo, altrimenti
-        // un decode full del file PRECEDENTE potrebbe atterrare dopo e
-        // sovrascrivere quello appena mostrato dalla cache.
-        state.nav.mutex.lockUncancelable(state.io);
-        if (state.nav.req) |old| {
-            state.gpa.free(old);
-            state.nav.req = null;
-        }
-        state.nav.gen +%= 1;
-        state.nav.mutex.unlock(state.io);
-        // gen = null: questo swap È la navigazione più recente per costruzione
-        // (la generazione è appena stata invalidata qui sopra, e `navigate`
-        // gira solo sul thread finestra) → installa sempre.
-        applyDecoded(state, pf.decoded, pf.stage, new_path, null) catch |err|
-            std.debug.print("Impossibile applicare il file (cache): {s}\n", .{@errorName(err)});
-        // Contenuto nuovo installato: ridimensiona la finestra sulla forma del
-        // contenuto (stessa euristica del sizing iniziale) con un'animazione.
-        resizeToContent(state);
-        // Precarica i nuovi vicini per rendere istantanea la prossima freccia.
-        schedulePrefetchAround(state);
+        installFromCache(state, pf, new_path);
     } else {
         // Cache-miss (scroll più veloce del prefetch, o file troppo grande per
         // il prefetch): carica in ASINCRONO col loader thread, così il worker
@@ -616,6 +813,94 @@ pub fn navigate(state: *GuiAppState, direction: i2) void {
         // prefetch li fa `loadWorker` dopo l'apply.
         postLoad(state, new_path);
     }
+}
+
+/// Parcheggia nella cache di prefetch il contenuto che sta per essere sostituito
+/// (chiave: percorso corrente), invece di distruggerlo: tornando indietro con
+/// la freccia è un cache-hit, e il prefetch non deve ridecodificarlo (prima ogni
+/// passo avanti ridecodificava da zero il file appena lasciato). Sotto
+/// `shared.mutex`; `pf.mutex` viene preso annidato — l'ordine inverso non
+/// esiste mai (il prefetch worker non tocca `shared.mutex`). Ritorna true se
+/// ha preso possesso di `decoded` (e dell'RGBA statica per le immagini).
+fn parkOutgoingLocked(state: *GuiAppState, new_path: []const u8) bool {
+    const old_path = state.shared.current_file_path;
+    if (old_path.len == 0 or std.mem.eql(u8, old_path, new_path)) return false;
+    const d = &state.shared.decoded;
+    switch (d.*) {
+        .image, .text, .markdown, .csv, .workbook => {},
+        else => return false, // mesh: dati CPU già liberati dopo l'upload; err: inutile
+    }
+    if (layout.winKindFromExt(old_path) == .video) return false; // il player è già fermato
+    if (d.* == .text and d.text.len == 0) return false;
+    const bytes = decodedBytes(d);
+    if (bytes > prefetchMaxBytes()) return false;
+
+    var pf = Prefetched{ .decoded = d.*, .bytes = bytes };
+    // L'RGBA statica è esattamente l'espansione dell'immagine solo se non ruotata.
+    if (d.* == .image and state.shared.rotation == 0 and state.shared.static_w != 0 and state.shared.static_rgba.len != 0) {
+        pf.rgba = state.shared.static_rgba;
+        state.shared.static_rgba = &.{};
+        state.shared.static_w = 0;
+        state.shared.static_h = 0;
+    }
+
+    state.pf.mutex.lockUncancelable(state.io);
+    defer state.pf.mutex.unlock(state.io);
+    if (state.pf.cache.count() >= 4 or state.pf.cache.contains(old_path)) {
+        // Cache piena o già presente: restituisci l'RGBA e lascia distruggere.
+        if (pf.rgba) |r| {
+            state.shared.static_rgba = r;
+            state.shared.static_w = @intCast(d.image.width);
+            state.shared.static_h = @intCast(d.image.height);
+        }
+        return false;
+    }
+    const key = state.gpa.dupe(u8, old_path) catch {
+        if (pf.rgba) |r| {
+            state.shared.static_rgba = r;
+            state.shared.static_w = @intCast(d.image.width);
+            state.shared.static_h = @intCast(d.image.height);
+        }
+        return false;
+    };
+    state.pf.cache.put(state.gpa, key, pf) catch {
+        state.gpa.free(key);
+        if (pf.rgba) |r| {
+            state.shared.static_rgba = r;
+            state.shared.static_w = @intCast(d.image.width);
+            state.shared.static_h = @intCast(d.image.height);
+        }
+        return false;
+    };
+    // Il valore ora appartiene alla cache: il chiamante NON deve fare deinit.
+    d.* = .{ .text = "" };
+    return true;
+}
+
+/// Installa un contenuto preso dalla cache di prefetch (cache-hit): swap
+/// sincrono sul thread finestra, niente spinner, poi resize + nuovi vicini.
+fn installFromCache(state: *GuiAppState, pf: Prefetched, path: []const u8) void {
+    // Latest-wins anche qui: invalida ogni load async in volo, altrimenti
+    // un decode full del file PRECEDENTE potrebbe atterrare dopo e
+    // sovrascrivere quello appena mostrato dalla cache.
+    state.nav.mutex.lockUncancelable(state.io);
+    if (state.nav.req) |old| {
+        state.gpa.free(old);
+        state.nav.req = null;
+    }
+    state.nav.gen +%= 1;
+    state.nav.mutex.unlock(state.io);
+    // gen = null: questo swap È la navigazione più recente per costruzione
+    // (la generazione è appena stata invalidata qui sopra, e la navigazione
+    // gira solo sul thread finestra) → installa sempre. Player A/V e MIDI
+    // non sono mai preparati dal prefetch: `applyDecoded` li apre qui.
+    applyDecoded(state, pf.decoded, .{ .stage = pf.stage, .rgba = pf.rgba }, path, null) catch |err|
+        std.debug.print("Impossibile applicare il file (cache): {s}\n", .{@errorName(err)});
+    // Contenuto nuovo installato: ridimensiona la finestra sulla forma del
+    // contenuto (stessa euristica del sizing iniziale) con un'animazione.
+    resizeToContent(state);
+    // Precarica i nuovi vicini per rendere istantanea la prossima freccia.
+    schedulePrefetchAround(state);
 }
 
 /// Ridimensiona (con animazione) la finestra sulla forma del contenuto
@@ -720,13 +1005,14 @@ pub fn decodeInitial(state: *GuiAppState, path: []const u8) void {
     // resa a bassa risoluzione quasi istantanea; poi la fase 2 raffina a pieno.
     // decodeCoarse ritorna null se il formato non la supporta, o .err se la cache
     // è fredda (prima apertura) → in entrambi i casi si salta alla fase full.
-    if (decoder_mod.decodeCoarse(path, state.io, state.gpa)) |coarse| {
-        if (!navSuperseded(state, gen) and coarse == .mesh)
-            applyDecoded(state, coarse, null, path, gen) catch |e|
-                std.debug.print("apply coarse: {s}\n", .{@errorName(e)})
-        else {
+    if (coarseWorthwhile(path)) {
+        if (decoder_mod.decodeCoarse(path, state.io, state.gpa)) |coarse| {
             var c = coarse;
-            c.deinit(state.gpa);
+            if (!navSuperseded(state, gen) and coarseAcceptable(&c, path)) {
+                const pre = prepareFor(state, &c, path, false);
+                applyDecoded(state, c, pre, path, gen) catch |e|
+                    std.debug.print("apply coarse: {s}\n", .{@errorName(e)});
+            } else c.deinit(state.gpa);
         }
     }
 
@@ -741,11 +1027,18 @@ pub fn decodeInitial(state: *GuiAppState, path: []const u8) void {
     if (d == .err) {
         const msg: []const u8 = std.fmt.allocPrint(state.gpa, "Errore nel caricamento del file:\n{s}", .{d.err}) catch "";
         d.deinit(state.gpa);
-        applyDecoded(state, .{ .text = msg }, null, path, gen) catch {};
+        applyDecoded(state, .{ .text = msg }, .{}, path, gen) catch {};
         return;
     }
-    applyDecoded(state, d, null, path, gen) catch |e|
+    // Staging GPU, RGBA, player A/V e MIDI preparati QUI, fuori lock.
+    const pre = prepareFor(state, &d, path, true);
+    applyDecoded(state, d, pre, path, gen) catch |e|
         std.debug.print("Impossibile applicare il file decodificato: {s}\n", .{@errorName(e)});
+    if (navSuperseded(state, gen)) return;
+    // La finestra è nata sulla forma stimata (estensione): adattala al contenuto
+    // reale, a meno che main l'abbia già dimensionata su dimensioni certe
+    // (header immagine, tabella sincrona).
+    if (!state.initial_size_known) resizeToContent(state);
     // Contenuto iniziale pronto: precarica i vicini per una navigazione fluida.
     schedulePrefetchAround(state);
 }
@@ -781,13 +1074,14 @@ pub fn loadWorker(state: *GuiAppState) void {
         // blurry quasi istantanea → tornando a un modello con le frecce lo spinner
         // si ferma subito invece di attendere il decode full. Se superata nel
         // frattempo o non disponibile, si scarta.
-        if (decoder_mod.decodeCoarse(path, io, gpa)) |coarse| {
-            if (!navSuperseded(state, gen) and coarse == .mesh)
-                applyDecoded(state, coarse, null, path, gen) catch |e|
-                    std.debug.print("apply coarse (async): {s}\n", .{@errorName(e)})
-            else {
+        if (coarseWorthwhile(path)) {
+            if (decoder_mod.decodeCoarse(path, io, gpa)) |coarse| {
                 var c = coarse;
-                c.deinit(gpa);
+                if (!navSuperseded(state, gen) and coarseAcceptable(&c, path)) {
+                    const pre = prepareFor(state, &c, path, false);
+                    applyDecoded(state, c, pre, path, gen) catch |e|
+                        std.debug.print("apply coarse (async): {s}\n", .{@errorName(e)});
+                } else c.deinit(gpa);
             }
         }
 
@@ -808,9 +1102,12 @@ pub fn loadWorker(state: *GuiAppState) void {
         if (d == .err) {
             const msg: []const u8 = std.fmt.allocPrint(gpa, "Errore nel caricamento del file:\n{s}", .{d.err}) catch "";
             d.deinit(gpa);
-            applyDecoded(state, .{ .text = msg }, null, path, gen) catch {};
+            applyDecoded(state, .{ .text = msg }, .{}, path, gen) catch {};
         } else {
-            applyDecoded(state, d, null, path, gen) catch |e|
+            // Staging GPU, RGBA, player A/V e MIDI preparati fuori lock (era
+            // tutto dentro `applyDecoded`, con spinner e input congelati).
+            const pre = prepareFor(state, &d, path, true);
+            applyDecoded(state, d, pre, path, gen) catch |e|
                 std.debug.print("Impossibile applicare il file (async): {s}\n", .{@errorName(e)});
         }
         // Se nel frattempo la richiesta è stata superata, l'install è stato
@@ -830,13 +1127,9 @@ pub fn prefetchWorker(state: *GuiAppState) void {
     const io = state.io;
     const gpa = state.gpa;
     // Soglia oltre cui NON precaricare (file enormi: lenti e pesanti in RAM;
-    // tenerne 2 in cache gonfierebbe la memoria). Configurabile via env.
-    const max_mb: u64 = blk: {
-        if (getenv("ZUER_PREFETCH_MAX_MB")) |v| {
-            if (std.fmt.parseInt(u64, std.mem.span(v), 10) catch null) |n| break :blk n;
-        }
-        break :blk 48;
-    };
+    // tenerne 2 in cache gonfierebbe la memoria). Configurabile via env; vale
+    // sia come pre-check sulla taglia su disco sia sui byte decodificati.
+    const max_bytes: u64 = prefetchMaxBytes();
     while (true) {
         // Attende una richiesta (o lo stop) e ne prende una copia dei percorsi.
         state.pf.mutex.lockUncancelable(io);
@@ -873,18 +1166,25 @@ pub fn prefetchWorker(state: *GuiAppState) void {
         state.pf.mutex.unlock(io);
         defer for (want) |w| if (w) |x| gpa.free(x);
 
+        // Lascia al file corrente il tempo di comporre e presentare il primo
+        // frame prima di contendergli CPU e allocatore (misurato: 133% CPU
+        // all'apertura con i vicini in decode). Coalesce anche lo spam frecce.
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(150), .awake) catch {};
+
         // Decodifica (fuori dal lock) i vicini mancanti.
         for (want) |maybe_path| {
             const path = maybe_path orelse continue;
             state.pf.mutex.lockUncancelable(io);
-            const already = state.pf.cache.contains(path) or state.pf.stop;
+            // Ricontrolla anche `want` corrente: se l'utente ha già navigato
+            // oltre, questo vicino è obsoleto e non va decodificato per intero.
+            const already = state.pf.cache.contains(path) or state.pf.stop or !wantContains(&state.pf.want, path);
             state.pf.mutex.unlock(io);
             if (already) continue;
 
             // Salta i file troppo grandi (memoria) — verranno decodificati
             // sincronamente alla navigazione, come prima.
             if (fileSizeBytes(io, path)) |sz| {
-                if (sz > max_mb * 1024 * 1024) continue;
+                if (sz > max_bytes) continue;
             }
 
             var d = decoder_mod.decode(path, io, gpa);
@@ -892,8 +1192,17 @@ pub fn prefetchWorker(state: *GuiAppState) void {
                 d.deinit(gpa);
                 continue;
             }
-            var pf = Prefetched{ .decoded = d };
-            if (d == .mesh) pf.stage = loader_mod.stageToGpu(gpa, &pf.decoded);
+            // Cap sui byte DECODIFICATI (un GLB da 40 MB espande in centinaia di MB).
+            const bytes = decodedBytes(&d);
+            if (bytes > max_bytes) {
+                d.deinit(gpa);
+                continue;
+            }
+            var pf = Prefetched{ .decoded = d, .bytes = bytes };
+            // Staging mesh + RGBA immagine qui, fuori lock (mai player/MIDI).
+            const pre = prepareFor(state, &pf.decoded, path, false);
+            pf.stage = pre.stage;
+            pf.rgba = pre.rgba;
 
             // Reinserisce solo se ancora desiderato e la richiesta non è cambiata.
             state.pf.mutex.lockUncancelable(io);

@@ -77,6 +77,12 @@ pub const Raster = struct {
     /// Avanzamento di cella monospazio in pixel (tutte le facce Hack coincidono).
     advance: i32,
     cache: std.AutoHashMapUnmanaged(CacheKey, Glyph),
+    /// Fast-path ASCII: i codepoint < 128 (la quasi totalità del testo latino)
+    /// saltano l'hash + il probe della hashmap e si risolvono con due indici.
+    /// I glifi qui dentro sono posseduti dalla cache esattamente come quelli in
+    /// `cache` (stesso allocatore, liberati da `deinit`), e vanno enumerati
+    /// insieme a quelli (vedi `glyphIter`, usato da `buildAtlas`).
+    ascii: [4][128]?Glyph,
 
     pub fn init(gpa: std.mem.Allocator, px_height: f32) !Raster {
         return initFamily(gpa, px_height, .mono);
@@ -122,6 +128,7 @@ pub const Raster = struct {
             .line_gap = @intFromFloat(@round(@as(f32, @floatFromInt(gap)) * s0)),
             .advance = @intFromFloat(@round(@as(f32, @floatFromInt(adv)) * s0)),
             .cache = .empty,
+            .ascii = .{[_]?Glyph{null} ** 128} ** 4,
         };
     }
 
@@ -129,6 +136,11 @@ pub const Raster = struct {
         var it = self.cache.valueIterator();
         while (it.next()) |g| if (g.bitmap.len > 0) self.gpa.free(g.bitmap);
         self.cache.deinit(self.gpa);
+        for (&self.ascii) |*face| {
+            for (face) |*slot| {
+                if (slot.*) |g| if (g.bitmap.len > 0) self.gpa.free(g.bitmap);
+            }
+        }
     }
 
     /// Altezza di riga (avanzamento verticale) in pixel.
@@ -137,10 +149,14 @@ pub const Raster = struct {
     }
 
     pub fn getGlyph(self: *Raster, style: Style, cp: u32) !*const Glyph {
-        const key = CacheKey{ .style = style, .cp = cp };
-        if (self.cache.getPtr(key)) |g| return g;
-
         const si = @intFromEnum(style);
+        // ASCII: indice diretto, niente hashing (percorso caldo del layout).
+        if (cp < 128) {
+            if (self.ascii[si][cp]) |*g| return g;
+        } else {
+            if (self.cache.getPtr(.{ .style = style, .cp = cp })) |g| return g;
+        }
+
         var w: c_int = 0;
         var h: c_int = 0;
         var xoff: c_int = 0;
@@ -162,9 +178,46 @@ pub const Raster = struct {
         const advance: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(adv)) * self.scale[si]));
 
         const g = Glyph{ .w = w, .h = h, .xoff = xoff, .yoff = yoff, .advance = advance, .bitmap = owned };
+        if (cp < 128) {
+            self.ascii[si][cp] = g;
+            return &self.ascii[si][cp].?;
+        }
+        const key = CacheKey{ .style = style, .cp = cp };
         try self.cache.put(self.gpa, key, g);
         return self.cache.getPtr(key).?;
     }
+
+    /// Enumera TUTTI i glifi in cache: prima il fast-path ASCII, poi la hashmap.
+    /// Il percorso GPU (`buildAtlas`) deve vedere entrambi, altrimenti l'atlante
+    /// perderebbe proprio i caratteri più usati.
+    pub fn glyphIter(self: *const Raster) CacheIter {
+        return .{ .raster = self, .map_it = self.cache.iterator() };
+    }
+
+    pub const CacheIter = struct {
+        raster: *const Raster,
+        si: usize = 0,
+        cp: u32 = 0,
+        map_it: std.AutoHashMapUnmanaged(CacheKey, Glyph).Iterator,
+
+        pub const Entry = struct { key: CacheKey, glyph: *const Glyph };
+
+        pub fn next(self: *CacheIter) ?Entry {
+            while (self.si < 4) {
+                while (self.cp < 128) {
+                    const cp = self.cp;
+                    self.cp += 1;
+                    if (self.raster.ascii[self.si][cp]) |*g| {
+                        return .{ .key = .{ .style = @enumFromInt(@as(u2, @intCast(self.si))), .cp = cp }, .glyph = g };
+                    }
+                }
+                self.si += 1;
+                self.cp = 0;
+            }
+            if (self.map_it.next()) |e| return .{ .key = e.key_ptr.*, .glyph = e.value_ptr };
+            return null;
+        }
+    };
 
     /// Disegna un codepoint dentro il buffer RGB (buf_w*buf_h*3) fondendo il
     /// colore sopra lo sfondo esistente secondo la copertura del glifo. pen_x è il
@@ -199,6 +252,45 @@ pub const Raster = struct {
                 blend(buf[idx .. idx + 3], color, cov);
             }
         }
+    }
+};
+
+/// Cache dei rasterizzatori, chiave (famiglia, corpo in px): senza di essa ogni
+/// impaginazione rifà `Raster.initFamily` — quattro `stbtt_InitFont` e, peggio,
+/// la perdita completa della cache dei glifi già rasterizzati, che va così
+/// ricostruita da zero a ogni scroll/zoom/cambio file.
+///
+/// NON è thread-safe: nel viewer vive dentro `GuiAppState` ed è usata SOLO dal
+/// render worker (`rasterizeText` e la pittura per viewport girano entrambe lì).
+/// I `Raster` sono allocati sull'heap e mai sfrattati: il puntatore restituito
+/// resta valido per tutta la vita della cache, così i layout ritenuti possono
+/// tenerlo senza possederlo. Le dimensioni distinte sono poche (i passi di zoom),
+/// quindi la crescita è limitata.
+pub const RasterCache = struct {
+    const Entry = struct { family: Family, px: f32, raster: *Raster };
+
+    entries: std.ArrayList(Entry) = .empty,
+
+    /// Rasterizzatore per (famiglia, corpo): riusa quello in cache o lo crea.
+    /// Il chiamante NON possiede il puntatore.
+    pub fn get(self: *RasterCache, gpa: std.mem.Allocator, px_height: f32, family: Family) !*Raster {
+        for (self.entries.items) |e| {
+            if (e.family == family and e.px == px_height) return e.raster;
+        }
+        const r = try gpa.create(Raster);
+        errdefer gpa.destroy(r);
+        r.* = try Raster.initFamily(gpa, px_height, family);
+        errdefer r.deinit();
+        try self.entries.append(gpa, .{ .family = family, .px = px_height, .raster = r });
+        return r;
+    }
+
+    pub fn deinit(self: *RasterCache, gpa: std.mem.Allocator) void {
+        for (self.entries.items) |e| {
+            e.raster.deinit();
+            gpa.destroy(e.raster);
+        }
+        self.entries.deinit(gpa);
     }
 };
 
@@ -246,13 +338,13 @@ pub fn buildAtlas(raster: *Raster) !Atlas {
     var x: usize = pad;
     var y: usize = pad;
     var shelf_h: usize = 0;
-    var it = raster.cache.iterator();
+    var it = raster.glyphIter();
     while (it.next()) |e| {
-        const g = e.value_ptr.*;
+        const g = e.glyph.*;
         const gw: usize = @intCast(@max(g.w, 0));
         const gh: usize = @intCast(@max(g.h, 0));
         if (g.bitmap.len == 0 or gw == 0 or gh == 0) {
-            try map.put(gpa, e.key_ptr.*, .{ .ax = 0, .ay = 0, .w = 0, .h = 0, .xoff = g.xoff, .yoff = g.yoff });
+            try map.put(gpa, e.key, .{ .ax = 0, .ay = 0, .w = 0, .h = 0, .xoff = g.xoff, .yoff = g.yoff });
             continue;
         }
         if (x + gw + pad > atlas_w) {
@@ -260,7 +352,7 @@ pub fn buildAtlas(raster: *Raster) !Atlas {
             y += shelf_h + pad;
             shelf_h = 0;
         }
-        try map.put(gpa, e.key_ptr.*, .{
+        try map.put(gpa, e.key, .{
             .ax = @intCast(x),
             .ay = @intCast(y),
             .w = @intCast(gw),
@@ -278,11 +370,11 @@ pub fn buildAtlas(raster: *Raster) !Atlas {
     @memset(pixels, 0);
 
     // Passo 2: copia le coperture dei glifi nelle posizioni assegnate.
-    var it2 = raster.cache.iterator();
+    var it2 = raster.glyphIter();
     while (it2.next()) |e| {
-        const g = e.value_ptr.*;
+        const g = e.glyph.*;
         if (g.bitmap.len == 0) continue;
-        const ag = map.get(e.key_ptr.*).?;
+        const ag = map.get(e.key).?;
         const gw: usize = ag.w;
         const gh: usize = ag.h;
         var row: usize = 0;

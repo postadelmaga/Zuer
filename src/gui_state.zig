@@ -32,10 +32,20 @@ const zscroll = zicro.scroll;
 pub const Prefetched = struct {
     decoded: decoder_mod.Decoded,
     stage: ?loader_mod.GpuStage = null,
+    /// Immagini: pixel già espansi in RGBA (calcolati fuori lock dal prefetch o
+    /// parcheggiati alla navigazione), così il cache-hit è uno swap di puntatore
+    /// invece di una passata `rgbToRgba` sotto `shared.mutex`.
+    rgba: ?[]u8 = null,
+    /// Byte effettivi occupati dal contenuto decodificato (per il cap di RAM
+    /// della cache, `ZUER_PREFETCH_MAX_MB`): la dimensione su disco non basta,
+    /// un GLB da 40 MB espande in centinaia di MB.
+    bytes: usize = 0,
 
     pub fn deinit(self: *Prefetched, gpa: std.mem.Allocator) void {
         self.decoded.deinit(gpa);
         if (self.stage) |*s| s.buffer.deinit(gpa);
+        if (self.rgba) |r| gpa.free(r);
+        self.rgba = null;
     }
 };
 
@@ -125,7 +135,8 @@ pub const GuiAppState = struct {
         // (`paintDocViewport`), mai sull'intero documento — `static_rgba` per
         // questi contenuti resta vuoto e `static_w/h` sono le dimensioni LOGICHE
         // del documento (scrollbar/selezione/hit-test ragionano su quelle).
-        // Tabelle (csv/workbook) restano sul percorso a bitmap completa.
+        // Anche le tabelle (csv/workbook) sono un layout ritenuto (`TableLayout`),
+        // dipinte per viewport da `paintTableViewport`: niente bitmap intera.
         text_doc: ?text_render.DocLayout = null,
 
         // Selezione testo (solo percorso CPU): testo semplice per riga visiva e
@@ -196,6 +207,15 @@ pub const GuiAppState = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
 
+    /// Cache dei rasterizzatori glifo, chiave (famiglia, corpo in px). Senza di
+    /// essa ogni impaginazione rifà il parse dei TTF e soprattutto RIBUTTA la
+    /// cache dei glifi già rasterizzati. CONFINATA AL RENDER WORKER: la usano
+    /// solo `rasterizeText` e la pittura per viewport, che girano entrambe lì —
+    /// per questo non è protetta da lock. I `Raster` non vengono mai sfrattati,
+    /// così i layout ritenuti possono tenerne il puntatore senza possederlo.
+    /// Da liberare a fine vita con `raster_cache.deinit(gpa)`.
+    raster_cache: text_render.RasterCache = .{},
+
     // Finestra zrame, impostata dopo la sua creazione — dal main, PRIMA di
     // `win.run()` (quindi prima che partano callback e worker); da lì in poi
     // solo letta. Serve alla navigazione per ridimensionare (con animazione)
@@ -241,6 +261,10 @@ pub const GuiAppState = struct {
     // thread loader senza lock — comportamento storico.
     file_list: std.ArrayList([]const u8) = .empty,
     current_file_index: ?usize = null,
+    /// Vero se la finestra iniziale è già stata dimensionata sulle dimensioni
+    /// reali del contenuto (header immagine letto in main, tabella sincrona):
+    /// `decodeInitial` allora NON richiede un resize dopo l'apply.
+    initial_size_known: bool = false,
 
     // Stato di trascinamento e ultima posizione nota del puntatore: toccati
     // SOLO dal thread finestra (callback input). -1 = puntatore ancora fuori:

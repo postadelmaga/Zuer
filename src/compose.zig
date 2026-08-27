@@ -163,8 +163,15 @@ pub fn drawTextSelection(buf: []u8, W: u32, H: u32, src_w: u32, src_h: u32, scro
     const Wi: i32 = @intCast(W);
     const Hi: i32 = @intCast(H);
     const dx: i32 = @as(i32, @intCast(geom.x_dst)) - @as(i32, @intCast(geom.x_src));
-    var row: i32 = @max(a[0], 0);
-    while (row <= b[0] and row < nrows) : (row += 1) {
+    // Solo le righe che intersecano DAVVERO il viewport: fuori da qui i
+    // rettangoli sarebbero clampati a zero, ma `cpLen` scandirebbe comunque la
+    // riga — su un "seleziona tutto" di 12k righe è il costo dominante.
+    const off_i: i32 = @intCast(geom.off_y);
+    const first_vis: i32 = @divFloor(off_i - m.pad_y, m.line_h);
+    const last_vis: i32 = @divFloor(off_i + Hi - m.pad_y, m.line_h);
+    var row: i32 = @max(a[0], @max(first_vis, 0));
+    const row_last: i32 = @min(b[0], @min(last_vis, nrows - 1));
+    while (row <= row_last) : (row += 1) {
         const llen = cpLen(lines[@intCast(row)]);
         var c0: i32 = if (row == a[0]) a[1] else 0;
         var c1: i32 = if (row == b[0]) b[1] else llen;

@@ -87,7 +87,7 @@ fn rasterizeText(state: *GuiAppState, width: u32, text_zoom: f32) void {
     // Layout/raster (centinaia di ms sui documenti grandi) FUORI dal lock:
     // si PINNA `decoded` — `applyDecoded`, se swappa nel frattempo, parcheggia
     // il vecchio valore in `decoded_retired` invece di liberarlo — e si lavora
-    // su uno snapshot shallow (layoutDoc/renderDoc prendono `*const`; i payload
+    // su uno snapshot shallow (layoutDoc prende `*const`; i payload
     // puntati restano vivi per contratto del pin). I risultati si installano al
     // rientro nel lock SOLO se `load_seq` non è cambiato: altrimenti descrivono
     // il contenuto vecchio e si buttano (il worker rifà il raster al giro dopo).
@@ -106,45 +106,23 @@ fn rasterizeText(state: *GuiAppState, width: u32, text_zoom: f32) void {
     var lines: std.ArrayList([]const u8) = .empty;
     var metrics: text_render.Metrics = .{ .advance = 1, .line_h = 1, .pad_x = 20, .pad_y = 14 };
     var new_doc: ?text_render.DocLayout = null;
-    var new_rgba: []u8 = &.{};
-    var new_w: u32 = 0;
-    var new_h: u32 = 0;
     var ok = true;
 
-    // Testo/codice/markdown: layout ritenuto, niente bitmap del documento — la
-    // pittura avviene per viewport a ogni compose. static_w/h restano le
-    // dimensioni LOGICHE (scrollbar/selezione), static_rgba resta vuoto.
-    const is_retained_doc = switch (dec) {
-        .csv, .workbook => false,
-        else => true,
-    };
-    if (is_retained_doc) {
-        if (text_render.layoutDoc(state.gpa, &dec, name, opts, &lines, &metrics)) |doc| {
-            new_doc = doc;
-        } else |err| {
-            std.debug.print("Impossibile impaginare il testo: {s}\n", .{@errorName(err)});
-            ok = false;
-        }
-    } else {
-        if (text_render.renderDoc(state.gpa, &dec, name, opts, &lines, &metrics)) |img_val| {
-            var img = img_val;
-            defer img.deinit(state.gpa);
-            new_w = @intCast(img.width);
-            new_h = @intCast(img.height);
-            new_rgba = rgbToRgba(state.gpa, img.pixels, new_w, new_h) catch blk: {
-                ok = false;
-                break :blk &.{};
-            };
-        } else |err| {
-            std.debug.print("Impossibile rasterizzare il testo: {s}\n", .{@errorName(err)});
-            ok = false;
-        }
+    // TUTTI i contenuti testuali (testo/codice/markdown E tabelle csv/workbook)
+    // passano dal layout ritenuto: niente bitmap del documento — la pittura
+    // avviene per viewport a ogni compose. static_w/h restano le dimensioni
+    // LOGICHE (scrollbar/selezione/hit-test), static_rgba resta vuoto.
+    if (text_render.layoutDoc(state.gpa, &state.raster_cache, &dec, name, opts, &lines, &metrics)) |doc| {
+        new_doc = doc;
+    } else |err| {
+        std.debug.print("Impossibile impaginare il testo: {s}\n", .{@errorName(err)});
+        ok = false;
     }
     // Barra delle linguette dei workbook: anch'essa fuori lock, sullo snapshot.
     var tb_local: compose.TabBarState = .{};
     if (ok and dec == .workbook) {
         const wb = &dec.workbook;
-        if (text_render.renderTabBar(state.gpa, wb.sheets, wb.active, @max(width, 64), &tb_local.bounds)) |img_val| {
+        if (text_render.renderTabBar(state.gpa, &state.raster_cache, wb.sheets, wb.active, @max(width, 64), &tb_local.bounds)) |img_val| {
             var img = img_val;
             defer img.deinit(state.gpa);
             tb_local.w = @intCast(img.width);
@@ -165,7 +143,6 @@ fn rasterizeText(state: *GuiAppState, width: u32, text_zoom: f32) void {
         for (lines.items) |l| state.gpa.free(l);
         lines.deinit(state.gpa);
         if (new_doc) |*d| d.deinit();
-        if (new_rgba.len > 0) state.gpa.free(new_rgba);
         if (tb_local.rgba.len > 0) state.gpa.free(tb_local.rgba);
         return;
     }
@@ -174,16 +151,10 @@ fn rasterizeText(state: *GuiAppState, width: u32, text_zoom: f32) void {
     state.shared.text_lines = lines;
     state.shared.text_metrics = metrics;
     state.gpa.free(state.shared.static_rgba);
-    if (is_retained_doc) {
-        state.shared.static_rgba = &.{};
-        state.shared.static_w = @intCast(new_doc.?.width);
-        state.shared.static_h = @intCast(new_doc.?.height);
-        state.shared.text_doc = new_doc;
-    } else {
-        state.shared.static_rgba = new_rgba;
-        state.shared.static_w = new_w;
-        state.shared.static_h = new_h;
-    }
+    state.shared.static_rgba = &.{};
+    state.shared.static_w = @intCast(new_doc.?.width);
+    state.shared.static_h = @intCast(new_doc.?.height);
+    state.shared.text_doc = new_doc;
     state.gpa.free(state.shared.tab_bar.rgba);
     state.shared.tab_bar = tb_local;
 }
@@ -388,6 +359,10 @@ fn renderWorker(
     var last_h: u32 = 0;
     var last_text_w: u32 = 0;
     var last_text_zoom: f32 = 0;
+    // ZUER_TRACE=1: stampa ogni secondo quante ricomposizioni e per quale motivo.
+    const trace_on = getenv("ZUER_TRACE") != null;
+    var tr_acc: f32 = 0;
+    var tr = [_]u32{0} ** 7; // ticks, renders, size, file_changed, mesh, pulse, sc_tick
     var last_seq: u32 = 0;
     // Ultima camera renderizzata: le mesh si ri-renderizzano SOLO quando cambia
     // (NaN iniziale ⇒ primo frame sempre reso). Senza questo il worker presenta
@@ -531,6 +506,15 @@ fn renderWorker(
             // finestra. `static_w/h` seguono la finestra così il fit-rect è pieno e
             // l'hit-test dei controlli (che usa le stesse dimensioni) resta corretto.
             const audio_only = vs.audio_only;
+            // Taglia di presentazione al produttore: i prossimi frame arrivano
+            // già alla dimensione del fit-rect (scalati con filtro di qualità nel
+            // decoder / da mpv), niente ricampionamento nearest nel compose.
+            if (!audio_only) {
+                if (vs.decoder) |dec| {
+                    const tf = videomod.videoFitRect(cur_w, cur_h, state.shared.static_w, state.shared.static_h);
+                    dec.setTargetSize(tf.w, tf.h);
+                }
+            }
             const new_frame = if (audio_only) blk: {
                 const nf = videomod.advanceAudio(vs, frame_dt);
                 state.shared.static_w = cur_w;
@@ -648,6 +632,13 @@ fn renderWorker(
         // Spinner dell'overlay YouTube: anima finché ricerca/apertura sono in corso.
         if (state.shared.yt.active and (state.shared.yt.searching or state.shared.yt.opening)) need_render = true;
         var text_animating = false;
+        if (trace_on) {
+            tr[0] += 1;
+            if (size_changed) tr[2] += 1;
+            if (state.shared.file_changed) tr[3] += 1;
+            if (mesh_moved) tr[4] += 1;
+            if (present_pulse > 0) tr[5] += 1;
+        }
 
         // Modalità follow (-f): sonda la crescita del file (~2 volte/s) e accoda i
         // byte nuovi al testo; il bump di load_seq fa ripartire il layout ritenuto
@@ -697,6 +688,7 @@ fn renderWorker(
             if (state.shared.sc.tick(frame_dt)) {
                 need_render = true;
                 text_animating = true;
+                if (trace_on) tr[6] += 1;
             }
             state.shared.scroll_y = state.shared.sc.scrollY();
             state.shared.scroll_x = state.shared.sc.scrollX();
@@ -754,14 +746,27 @@ fn renderWorker(
                     break :blk if (hb > 0) @min(@as(u32, @intCast(hb)), cur_h) else 0;
                 } else 0;
                 if (state.shared.text_doc) |*doc| {
-                    // Documento a layout ritenuto: dipingi SOLO le righe visibili
-                    // direttamente nel frame (stessa geometria di selezione/hit-test).
+                    // Layout ritenuto: dipingi SOLO le righe visibili direttamente
+                    // nel frame (stessa geometria di selezione/hit-test). Le
+                    // tabelle hanno il loro pittore (fondo/zebra/griglia/celle +
+                    // header ancorato); documenti e markdown quello a griglia.
                     const geom = compose.textBlitGeom(cur_w, cur_h, state.shared.static_w, state.shared.static_h, state.shared.scroll_y, state.shared.scroll_x);
-                    text_render.paintDocViewport(doc, composited_rgba.*, cur_w, cur_h, geom.off_y, geom.x_src, geom.x_dst) catch |e| {
-                        std.debug.print("[gui] paintDocViewport fallito: {s}\n", .{@errorName(e)});
-                    };
-                } else {
+                    if (doc.table != null) {
+                        text_render.paintTableViewport(doc, composited_rgba.*, cur_w, cur_h, geom.off_y, geom.x_src, geom.x_dst, header_band) catch |e| {
+                            std.debug.print("[gui] paintTableViewport fallito: {s}\n", .{@errorName(e)});
+                        };
+                    } else {
+                        text_render.paintDocViewport(doc, composited_rgba.*, cur_w, cur_h, geom.off_y, geom.x_src, geom.x_dst) catch |e| {
+                            std.debug.print("[gui] paintDocViewport fallito: {s}\n", .{@errorName(e)});
+                        };
+                    }
+                } else if (state.shared.static_rgba.len >= @as(usize, state.shared.static_w) * state.shared.static_h * 4) {
                     compose.composeTextFrame(composited_rgba.*, cur_w, cur_h, state.shared.static_rgba, state.shared.static_w, state.shared.static_h, state.shared.scroll_y, state.shared.scroll_x, header_band);
+                } else {
+                    // Nessuna sorgente coerente (impaginazione fallita o scartata
+                    // per cambio contenuto): frame vuoto invece di leggere oltre
+                    // la fine di `static_rgba`.
+                    @memset(composited_rgba.*[0 .. @as(usize, cur_w) * cur_h * 4], 0);
                 }
                 // Listato archivio: evidenzia la riga selezionata (overlay, nessuna
                 // ri-rasterizzazione della tabella bitmap).
@@ -902,7 +907,20 @@ fn renderWorker(
         // dt restituito alimenta l'animazione delle scrollbar al giro successivo.
         // Clamp: il pacer inattivo (l'altro ramo) porta un `last` vecchio → dt enorme
         // al primo tick dopo un cambio di ritmo; limitalo così i fade non scattano.
-        frame_dt = @min(0.1, @as(f32, @floatCast(if (mesh_moved or text_animating or present_pulse > 0)
+        if (trace_on) {
+            if (need_render) tr[1] += 1;
+            tr_acc += frame_dt;
+            if (tr_acc >= 1.0) {
+                std.debug.print("[trace] ticks={d} renders={d} size={d} file_changed={d} pulse={d} sc_tick={d} load_seq={d} nav_gen={d} scroll_y={d:.1} unproc={d:.1} vel={d:.1} file={s}\n", .{ tr[0], tr[1], tr[2], tr[3], tr[5], tr[6], state.shared.load_seq, state.nav.gen, state.shared.sc.offset[1], state.shared.sc.unprocessed[1], state.shared.sc.vel[1], std.fs.path.basename(state.shared.current_file_path) });
+                tr = [_]u32{0} ** 7;
+                tr_acc = 0;
+            }
+        }
+        // Anche durante un caricamento (`now_loading`): così il contenuto appena
+        // installato dal thread di decode viene composto entro ~16 ms invece
+        // che fino a 50 ms dopo — pesa proprio sui file veloci, sotto la soglia
+        // dello spinner.
+        frame_dt = @min(0.1, @as(f32, @floatCast(if (mesh_moved or text_animating or present_pulse > 0 or now_loading)
             pacer_60.tick()
         else
             pacer_20.tick())));
@@ -1019,6 +1037,18 @@ pub fn main(init: std.process.Init) !void {
     if (std.Io.Dir.cwd().statFile(io, clean_path, .{})) |st| {
         if (st.size >= loader_threshold_mb * 1024 * 1024) loading = true;
     } else |_| {}
+    // Immagini, video e mesh: SEMPRE in background, la finestra deve apparire
+    // subito. La forma giusta la si conosce comunque: per le immagini si leggono
+    // le dimensioni dal solo header (PNG/JPEG/GIF/BMP/WebP), per video e mesh
+    // basta la stima per tipo (il decode poi chiama `resizeToContent`). Prima
+    // un JPEG piccolo teneva lo schermo vuoto per tutto il decode e un MP4 per
+    // dlopen di libav + probe + primo frame (~440 ms), tutto sul thread main.
+    const ext_kind = layout.winKindFromExt(file_path);
+    var header_dims: ?layout.ImageDims = null;
+    if (!yt_start and yt_id == null and (ext_kind == .image or ext_kind == .video or ext_kind == .mesh)) {
+        loading = true;
+        if (ext_kind == .image) header_dims = layout.imageDimsFromFile(gpa, clean_path);
+    }
 
     // Stato dell'app posseduto da un'unica struct (vedi gui_state.zig): i campi
     // partono dai default dichiarati lì; qui si impostano solo quelli calcolati
@@ -1057,6 +1087,9 @@ pub fn main(init: std.process.Init) !void {
     defer if (native and gui_state.renderer_ready) gui_state.renderer.deinit();
 
     defer gpa.free(gui_state.shared.static_rgba);
+    // Registrata PRIMA di freeTextDoc (LIFO): i layout prendono in prestito i
+    // Raster dalla cache, che va liberata dopo di loro.
+    defer gui_state.raster_cache.deinit(gpa);
     defer gui_state_mod.freeTextDoc(&gui_state);
     defer if (has_video) gui_state.video.deinit();
     defer yt_search.deinit(&gui_state);
@@ -1091,7 +1124,7 @@ pub fn main(init: std.process.Init) !void {
             d.deinit(gpa);
             std.process.exit(1);
         }
-        nav.applyDecoded(&gui_state, d, null, file_path, null) catch |e| {
+        nav.applyDecoded(&gui_state, d, .{}, file_path, null) catch |e| {
             std.debug.print("Errore inizializzazione file: {s}\n", .{@errorName(e)});
             std.process.exit(1);
         };
@@ -1116,20 +1149,10 @@ pub fn main(init: std.process.Init) !void {
     else
         layout.winKindFromDecoded(&gui_state.shared.decoded);
 
-    // Video: apri il player nativo (libav) e usa il primo frame come poster
-    // iniziale. Niente decode async/spinner — aprire il container è veloce — così
-    // il worker parte già in riproduzione. `static_rgba` diventa il frame corrente
-    // che il worker aggiorna nel tempo (vedi il ramo video di renderWorker).
-    // (Non per i link YouTube: lì il container lo apre openWorker dopo la
-    // risoluzione yt-dlp, e lo spinner resta acceso nel frattempo.)
-    if (has_video and win_kind == .video and yt_id == null) {
-        gui_state.shared.loading = false;
-        gui_state.shared.is_text = false;
-        // Il percorso sincrono (file piccolo) può aver GIÀ avviato il player
-        // dentro `applyDecoded` (rilevamento per estensione): non aprirlo due
-        // volte. Qui siamo prima dello spawn dei thread → niente lock necessario.
-        if (!gui_state.video.isActive()) _ = nav.startVideo(&gui_state, file_path);
-    }
+    // Video: il container libav si apre sul thread di decode iniziale
+    // (`decodeInitial` → `prepareFor`, fuori lock) e `applyDecoded` lo installa;
+    // qui la finestra nasce subito con lo spinner. (Per i link YouTube lo fa
+    // openWorker dopo la risoluzione yt-dlp.)
     // Per le tabelle (percorso sincrono) la finestra si dimensiona sulla larghezza
     // reale delle colonne, non su un valore fisso.
     var tbl_w: u32 = 0;
@@ -1146,8 +1169,13 @@ pub fn main(init: std.process.Init) !void {
             tbl_h = @intCast(ns.h);
         } else |_| {}
     }
-    const size_w = if (win_kind == .table) tbl_w else gui_state.shared.static_w;
-    const size_h = if (win_kind == .table) tbl_h else gui_state.shared.static_h;
+    const size_w = if (win_kind == .table) tbl_w else if (header_dims) |hd| hd.w else gui_state.shared.static_w;
+    const size_h = if (win_kind == .table) tbl_h else if (header_dims) |hd| hd.h else gui_state.shared.static_h;
+    // Dimensioni certe già usate per la finestra → `decodeInitial` non deve
+    // ridimensionarla di nuovo dopo l'apply (niente salto visibile).
+    // (PDF e documenti: la forma A4/fissa per tipo è già quella definitiva.)
+    gui_state.initial_size_known = header_dims != null or !gui_state.shared.loading or
+        (ext_kind != .image and ext_kind != .video and ext_kind != .mesh);
     // Contenuto piccolo → zoom iniziale un po' più grande, finestra aderente al
     // contenuto zoomato (stessa euristica della navigazione).
     const az0 = layout.autoZoomForContent(win_kind, size_w, size_h);

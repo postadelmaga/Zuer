@@ -883,16 +883,45 @@ pub fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopa
                     const mx: u32 = @intFromFloat(@max(app_state.last_x, 0));
                     var idx: usize = 0;
                     while (idx < tb.count and mx >= tb.bounds[idx]) : (idx += 1) {}
-                    if (idx < tb.count and app_state.shared.decoded == .workbook and app_state.shared.decoded.workbook.active != idx) {
-                        app_state.shared.decoded.workbook.active = idx;
-                        // Nuovo foglio: riparti dall'alto/sinistra e ri-rasterizza.
-                        app_state.shared.scroll_y = 0;
-                        app_state.shared.scroll_x = 0;
-                        resetScroll(&app_state.shared.sc);
-                        app_state.shared.load_seq +%= 1;
-                        app_state.shared.file_changed = true;
+                    // Percorso da (ri)aprire quando il foglio scelto non è ancora
+                    // stato decodificato; null = niente da caricare.
+                    var lazy_req: ?[]u8 = null;
+                    if (idx < tb.count and app_state.shared.decoded == .workbook) {
+                        const wb = &app_state.shared.decoded.workbook;
+                        if (idx < wb.sheets.len and wb.active != idx) {
+                            const sheet = wb.sheets[idx];
+                            if (sheet.data.headers.len == 0 and sheet.data.rows.len == 0) {
+                                // Foglio ancora senza dati: il plugin office decodifica
+                                // per intero solo quello attivo e degli altri tiene il
+                                // solo nome (per la linguetta). Si chiede al loader
+                                // asincrono il documento col frammento del foglio,
+                                // `percorso.xlsx#sheet=N` (N 1-based), con lo stesso
+                                // meccanismo del cambio pagina dei PDF: `applyDecoded`
+                                // tratta come STESSO documento i percorsi che
+                                // differiscono solo per il frammento, e l'host rilegge
+                                // di lì il foglio attivo.
+                                const cur = app_state.shared.current_file_path;
+                                const base = if (std.mem.indexOfScalar(u8, cur, '#')) |h| cur[0..h] else cur;
+                                lazy_req = std.fmt.allocPrint(app_state.gpa, "{s}#sheet={d}", .{ base, idx + 1 }) catch null;
+                            } else {
+                                // Foglio già in memoria (tipicamente il primo): cambio
+                                // immediato, nessuna ridecodifica.
+                                wb.active = idx;
+                                // Nuovo foglio: riparti dall'alto/sinistra e ri-rasterizza.
+                                app_state.shared.scroll_y = 0;
+                                app_state.shared.scroll_x = 0;
+                                resetScroll(&app_state.shared.sc);
+                                app_state.shared.load_seq +%= 1;
+                                app_state.shared.file_changed = true;
+                            }
+                        }
                     }
                     app_state.shared.mutex.unlock(app_state.io);
+                    // Fuori dal lock: `postLoad` riacquisisce lo stesso mutex.
+                    if (lazy_req) |req| {
+                        defer app_state.gpa.free(req);
+                        nav.postLoad(app_state, req);
+                    }
                     return true; // click sulla barra consumato (niente selezione)
                 }
                 app_state.shared.mutex.unlock(app_state.io);
