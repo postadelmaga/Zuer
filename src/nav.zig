@@ -600,6 +600,7 @@ pub fn applyDecoded(state: *GuiAppState, new_decoded: decoder_mod.Decoded, pre_i
     state.shared.sel_active = false;
     state.shared.sel_selecting = false;
     state.shared.load_seq +%= 1;
+    state.shared.ui_idle_s = 0; // nuovo contenuto: mostra l'etichetta nome file
     state.shared.file_changed = true;
 }
 

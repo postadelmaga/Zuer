@@ -290,8 +290,16 @@ const blendLabelPx = compose.blendPixel;
 /// Disegna il nome file in alto a destra: pill scura semi-trasparente + testo
 /// monospazio (Hack) bianco. Right-aligned con margine; se il nome è più largo
 /// della finestra si ancora a sinistra. Chiamato dal worker su ogni frame reso.
-fn drawFilenameLabel(buf: []u8, W: u32, H: u32, raster: *glyph.Raster, name: []const u8) void {
-    if (name.len == 0 or W == 0 or H == 0) return;
+/// Opacità dell'etichetta nome file in funzione dell'inattività: piena per 2.5 s
+/// dall'ultimo mouse/tasto/nuovo file, poi dissolvenza di 0.3 s (come i controlli
+/// video): il contenuto resta pulito quando non si sta interagendo.
+fn labelAlpha(idle_s: f32) f32 {
+    if (idle_s < 2.5) return 1.0;
+    return std.math.clamp(1.0 - (idle_s - 2.5) / 0.3, 0.0, 1.0);
+}
+
+fn drawFilenameLabel(buf: []u8, W: u32, H: u32, raster: *glyph.Raster, name: []const u8, alpha: f32) void {
+    if (name.len == 0 or W == 0 or H == 0 or alpha <= 0.01) return;
     var view = std.unicode.Utf8View.init(name) catch return;
 
     const cell = raster.advance;
@@ -317,7 +325,7 @@ fn drawFilenameLabel(buf: []u8, W: u32, H: u32, raster: *glyph.Raster, name: []c
     // Sfondo pill scuro via il Canvas straight di zicro (buffer 4-allineato).
     const u32px: [*]u32 = @ptrCast(@alignCast(buf.ptr));
     var canvas = paint.Canvas.initRgba8(u32px[0 .. @as(usize, W) * H], W, H);
-    canvas.fillRoundedRect(@floatFromInt(box_x), @floatFromInt(box_y), @floatFromInt(box_w), @floatFromInt(box_h), 6.0, paint.Color.rgba(16, 18, 26, 0.62));
+    canvas.fillRoundedRect(@floatFromInt(box_x), @floatFromInt(box_y), @floatFromInt(box_w), @floatFromInt(box_h), 6.0, paint.Color.rgba(16, 18, 26, 0.62 * alpha));
 
     // Testo monospazio bianco.
     const hi: i32 = @intCast(H);
@@ -340,8 +348,9 @@ fn drawFilenameLabel(buf: []u8, W: u32, H: u32, raster: *glyph.Raster, name: []c
                 while (gx < gph.w) : (gx += 1) {
                     const px = gx0 + gx;
                     if (px < 0 or px >= wi) continue;
-                    const cov = gph.bitmap[@intCast(gy * gph.w + gx)];
-                    if (cov == 0) continue;
+                    const cov0 = gph.bitmap[@intCast(gy * gph.w + gx)];
+                    if (cov0 == 0) continue;
+                    const cov: u8 = @intFromFloat(@as(f32, @floatFromInt(cov0)) * alpha);
                     blendLabelPx(buf, @intCast((py * wi + px) * 4), 235, 238, 245, cov);
                 }
             }
@@ -359,6 +368,7 @@ fn renderWorker(
     var last_h: u32 = 0;
     var last_text_w: u32 = 0;
     var last_text_zoom: f32 = 0;
+    var last_label_alpha: f32 = 1;
     // ZUER_TRACE=1: stampa ogni secondo quante ricomposizioni e per quale motivo.
     const trace_on = getenv("ZUER_TRACE") != null;
     var tr_acc: f32 = 0;
@@ -452,6 +462,10 @@ fn renderWorker(
         if (now_loading and !was_loading) load_elapsed = 0;
         load_elapsed = if (now_loading) load_elapsed + frame_dt else 0;
         was_loading = now_loading;
+        // Inattività per l'auto-hide dell'etichetta nome file (reset da input/nav).
+        state.shared.ui_idle_s += frame_dt;
+        const label_alpha = labelAlpha(state.shared.ui_idle_s);
+        const label_ch = @abs(label_alpha - last_label_alpha) > 0.002;
 
         // Caricamento in corso da oltre la soglia: anima lo spinner a 60 Hz finché
         // `applyDecoded` non azzera il flag. Sotto soglia si prosegue mostrando il
@@ -544,7 +558,8 @@ fn renderWorker(
             const yt_anim = yt_active and (state.shared.yt.searching or state.shared.yt.opening);
             const yt_ch = state.shared.file_changed;
             state.shared.file_changed = false;
-            const do_present = new_frame or size_ch or ctrl_ch or vs.scrubbing or yt_ch or yt_anim;
+            const do_present = new_frame or size_ch or ctrl_ch or vs.scrubbing or yt_ch or yt_anim or label_ch;
+            if (do_present) last_label_alpha = label_alpha;
             var pres_w: u32 = 0;
             var pres_h: u32 = 0;
             if (do_present) {
@@ -559,7 +574,7 @@ fn renderWorker(
                 } else {
                     // composeFrame copre l'intero buffer fr.w×fr.h (interno + margini
                     // azzerati riga per riga): nessun memset preventivo.
-                    compose.composeFrame(composited_rgba.*, fr.w, fr.h, state.shared.static_rgba, state.shared.static_w, state.shared.static_h, 1.0, 0.0, 0.0);
+                    compose.composeFrame(composited_rgba.*, fr.w, fr.h, state.shared.static_rgba, state.shared.static_w, state.shared.static_h, 1.0, 0.0, 0.0, null);
                 }
                 const raster: ?*glyph.Raster = if (name_raster) |*r| r else null;
                 // Sottotitoli YouTube (toggle `c`): cue corrente sopra i controlli,
@@ -570,7 +585,7 @@ fn renderWorker(
                     }
                 }
                 videomod.drawVideoControls(composited_rgba.*, fr.w, fr.h, vs, raster);
-                if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, fr.w, fr.h, r, std.fs.path.basename(state.shared.current_file_path));
+                if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, fr.w, fr.h, r, std.fs.path.basename(state.shared.current_file_path), label_alpha);
                 if (state.shared.fx.active) {
                     if (name_raster) |*r| file_explorer.drawOverlay(composited_rgba.*, fr.w, fr.h, state, r);
                 }
@@ -632,6 +647,11 @@ fn renderWorker(
         // Spinner dell'overlay YouTube: anima finché ricerca/apertura sono in corso.
         if (state.shared.yt.active and (state.shared.yt.searching or state.shared.yt.opening)) need_render = true;
         var text_animating = false;
+        // Dissolvenza dell'etichetta: ridisegna (a 60 Hz) finché l'alpha cambia.
+        if (label_ch) {
+            need_render = true;
+            text_animating = true;
+        }
         if (trace_on) {
             tr[0] += 1;
             if (size_changed) tr[2] += 1;
@@ -793,14 +813,17 @@ fn renderWorker(
                 } else {
                     // Mantieni l'immagine sempre centrata / dentro i bordi (no re-center manuale).
                     input.clampImagePan(&state.shared.pan_x, &state.shared.pan_y, state.shared.zoom, cur_w, cur_h, state.shared.static_w, state.shared.static_h);
-                    compose.composeFrame(composited_rgba.*, cur_w, cur_h, state.shared.static_rgba, state.shared.static_w, state.shared.static_h, state.shared.zoom, state.shared.pan_x, state.shared.pan_y);
+                    // Catena mip (pigra: si rifà solo se `static_rgba` è cambiato) →
+                    // campionamento bilineare dal livello giusto: niente aliasing.
+                    state.shared.mips.ensure(state.gpa, state.shared.static_rgba, state.shared.static_w, state.shared.static_h);
+                    compose.composeFrame(composited_rgba.*, cur_w, cur_h, state.shared.static_rgba, state.shared.static_w, state.shared.static_h, state.shared.zoom, state.shared.pan_x, state.shared.pan_y, &state.shared.mips);
                 }
             }
 
             // Nome file in alto a destra (monospazio), sopra ogni contenuto. Nel
             // ramo mesh il frame viene composto DOPO l'unlock: label e flag lì.
             if (mesh_push == null and mesh_voxel_push == null) {
-                if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, cur_w, cur_h, r, std.fs.path.basename(state.shared.current_file_path));
+                if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, cur_w, cur_h, r, std.fs.path.basename(state.shared.current_file_path), label_alpha);
                 // Esploratore file sotto l'eventuale overlay YouTube (siamo sotto lock).
                 if (state.shared.fx.active) {
                     if (name_raster) |*r| file_explorer.drawOverlay(composited_rgba.*, cur_w, cur_h, state, r);
@@ -870,9 +893,9 @@ fn renderWorker(
                     // Il readback appartiene al renderer (2 slot pipelined) e il
                     // worker è l'unico a chiamare render: lo slot resta valido
                     // fino al prossimo render, quindi comporre fuori dal lock è sicuro.
-                    compose.composeFrame(composited_rgba.*, cur_w, cur_h, mr, cur_w, cur_h, 1.0, 0.0, 0.0);
+                    compose.composeFrame(composited_rgba.*, cur_w, cur_h, mr, cur_w, cur_h, 1.0, 0.0, 0.0, null);
                 }
-                if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, cur_w, cur_h, r, mesh_name_buf[0..mesh_name_len]);
+                if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, cur_w, cur_h, r, mesh_name_buf[0..mesh_name_len], label_alpha);
                 // Overlay (esploratore file + YouTube) anche sulle mesh: qui il frame
                 // è composto fuori dal lock, quindi lo stato va riletto sotto mutex.
                 state.shared.mutex.lockUncancelable(state.io);
@@ -900,6 +923,7 @@ fn renderWorker(
         if (did_compose) {
             win.presentRgba(cur_w, cur_h, composited_rgba.*);
             if (present_pulse > 0) present_pulse -= 1;
+            last_label_alpha = label_alpha;
         }
 
         // 60 Hz mentre la mesh si muove (drag/zoom) o durante l'animazione dello
@@ -1087,6 +1111,7 @@ pub fn main(init: std.process.Init) !void {
     defer if (native and gui_state.renderer_ready) gui_state.renderer.deinit();
 
     defer gpa.free(gui_state.shared.static_rgba);
+    defer gui_state.shared.mips.deinit(gpa);
     // Registrata PRIMA di freeTextDoc (LIFO): i layout prendono in prestito i
     // Raster dalla cache, che va liberata dopo di loro.
     defer gui_state.raster_cache.deinit(gpa);

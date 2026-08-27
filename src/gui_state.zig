@@ -115,6 +115,13 @@ pub const GuiAppState = struct {
         // `static_rgba` (immagini/pagine PDF). Persiste tra le pagine dello stesso
         // documento (`applyDecoded` la riapplica), si azzera su un file diverso.
         rotation: u2 = 0,
+        // Secondi dall'ultima attività dell'utente (mouse/tasti/nuovo file): guida
+        // l'auto-hide dell'etichetta nome file (visibile 2.5 s, poi sfuma).
+        ui_idle_s: f32 = 0,
+        // Catena mip dell'immagine statica (box-filter 2×, costruita pigramente
+        // dal worker quando `static_rgba` cambia): compose campiona bilineare dal
+        // livello più vicino alla scala di presentazione → niente aliasing.
+        mips: compose.MipChain = .{},
         // Offset di scroll corrente (asse Y e X), rispecchiato dalla primitiva `sc` a
         // ogni frame del worker; i consumatori (compose/selezione/header) leggono questi.
         scroll_y: f32 = 0,
@@ -447,6 +454,10 @@ pub fn minimalFrame(s: zrame.Style) zrame.Style {
     // concentrico e anti-aliasato, senza fascia di dissolvenza lungo i bordi —
     // il vetro/fumo del preset si vede solo negli angoli, dove il contenuto è
     // ritagliato, non come cornice.
+    // Nessun gutter e nessuna ombra: con una fascia trasparente intorno al
+    // pannello il compositor vi applicava blur/tinta e l'ombra diventava una banda
+    // scura netta (provato: non va). La definizione la danno l'anello da 1 px e
+    // la dissolvenza degli angoli qui sotto.
     out.margin = 0;
     out.shadow_blur = 0;
     out.shadow_offset_y = 0;
@@ -458,5 +469,13 @@ pub fn minimalFrame(s: zrame.Style) zrame.Style {
     out.sheen = @max(out.sheen, 0.14);
     out.content_fade_width = 0;
     out.content_radius = out.corner_radius; // concentrico: margine 0
+    // Niente dissolvenza negli angoli: il pannello di vetro (noir, quasi opaco)
+    // sta SOTTO il contenuto, quindi sfumare il contenuto scopre il vetro scuro e
+    // l'angolo mostra un arco nero invece di fondersi col desktop (provato: non
+    // va). Il ritaglio anti-aliasato del pannello basta.
+    out.corner_fade_width = 0;
+    // Anello di definizione 1 px sopra il contenuto (chiaro in alto, scuro in
+    // basso): una finestra chiara senza cornice altrimenti "sparisce" su fondo chiaro.
+    out.edge_ring_alpha = 0.10;
     return out;
 }

@@ -254,9 +254,87 @@ pub fn rotateRgba(gpa: std.mem.Allocator, src: []const u8, w: u32, h: u32, quart
     return dst;
 }
 
+/// Catena mip dell'immagine statica: livello 0 = il buffer sorgente (NON
+/// posseduto), i successivi sono riduzioni box-filter 2× possedute. `composeFrame`
+/// campiona bilineare dal livello più vicino alla scala di presentazione, così le
+/// foto ridotte nella finestra non mostrano aliasing/shimmer (nearest solo oltre
+/// 4× di ingrandimento, dove i pixel sono l'informazione). Ricostruita pigramente
+/// quando il buffer sorgente cambia (`ensure`); ~1/3 della memoria dell'immagine.
+pub const MipChain = struct {
+    const max_levels = 8;
+    levels: [max_levels][]const u8 = .{&[_]u8{}} ** max_levels,
+    ws: [max_levels]u32 = .{0} ** max_levels,
+    hs: [max_levels]u32 = .{0} ** max_levels,
+    n: u8 = 0,
+    src_ptr: ?[*]const u8 = null,
+
+    /// (Ri)costruisce la catena se `src` (puntatore/dimensioni) è cambiato.
+    pub fn ensure(self: *MipChain, gpa: std.mem.Allocator, src: []const u8, w: u32, h: u32) void {
+        if (self.src_ptr) |p| {
+            if (p == src.ptr and self.ws[0] == w and self.hs[0] == h) return;
+        }
+        self.release(gpa);
+        if (w == 0 or h == 0 or src.len < @as(usize, w) * h * 4) return;
+        self.levels[0] = src;
+        self.ws[0] = w;
+        self.hs[0] = h;
+        self.n = 1;
+        self.src_ptr = src.ptr;
+        while (self.n < max_levels) {
+            const pw = self.ws[self.n - 1];
+            const ph = self.hs[self.n - 1];
+            // Sotto i 512 px un ulteriore livello non serve a nessuna finestra reale.
+            if (pw < 512 and ph < 512) break;
+            const nw = pw / 2;
+            const nh = ph / 2;
+            if (nw == 0 or nh == 0) break;
+            const buf = gpa.alloc(u8, @as(usize, nw) * nh * 4) catch break;
+            downsample2x(self.levels[self.n - 1], pw, buf, nw, nh);
+            self.levels[self.n] = buf;
+            self.ws[self.n] = nw;
+            self.hs[self.n] = nh;
+            self.n += 1;
+        }
+    }
+
+    /// Libera i livelli posseduti (≥ 1); il livello 0 appartiene al chiamante.
+    pub fn release(self: *MipChain, gpa: std.mem.Allocator) void {
+        var i: usize = 1;
+        while (i < self.n) : (i += 1) gpa.free(self.levels[i]);
+        self.n = 0;
+        self.src_ptr = null;
+    }
+
+    pub fn deinit(self: *MipChain, gpa: std.mem.Allocator) void {
+        self.release(gpa);
+    }
+};
+
+/// Riduzione 2× a media di blocchi 2×2 (box filter), RGBA8.
+fn downsample2x(src: []const u8, sw: u32, dst: []u8, dw: u32, dh: u32) void {
+    @setRuntimeSafety(false);
+    const stride: usize = @as(usize, sw) * 4;
+    var y: u32 = 0;
+    while (y < dh) : (y += 1) {
+        const r0 = @as(usize, y) * 2 * stride;
+        const r1 = r0 + stride;
+        var x: u32 = 0;
+        while (x < dw) : (x += 1) {
+            const c0 = r0 + @as(usize, x) * 8;
+            const c1 = r1 + @as(usize, x) * 8;
+            const o = (@as(usize, y) * dw + x) * 4;
+            inline for (0..4) |k| {
+                dst[o + k] = @intCast((@as(u32, src[c0 + k]) + src[c0 + 4 + k] + src[c1 + k] + src[c1 + 4 + k] + 2) >> 2);
+            }
+        }
+    }
+}
+
 /// Compositing di un'immagine (o frame mesh/video) in aspect-fit a tutto schermo con
-/// zoom e pan, campionamento nearest a virgola fissa. Copre SEMPRE l'intero buffer
-/// W×H (margini azzerati riga per riga): il chiamante non deve pulirlo prima.
+/// zoom e pan. Copre SEMPRE l'intero buffer W×H (margini azzerati riga per riga): il
+/// chiamante non deve pulirlo prima. Con `mips` (catena costruita su `src_rgba`)
+/// campiona bilineare dal livello mip più vicino alla scala; senza, bilineare sul
+/// sorgente; nearest a scala 1:1 esatta (memcpy) e oltre 4× di ingrandimento.
 pub fn composeFrame(
     composited_rgba: []u8,
     W: u32,
@@ -267,6 +345,7 @@ pub fn composeFrame(
     zoom: f32,
     pan_x: f32,
     pan_y: f32,
+    mips: ?*const MipChain,
 ) void {
     // Sorgente vuota (es. video non apribile → dims 0): riempi lo sfondo e
     // basta — l'aspect 0/0 darebbe NaN e il panic di @intFromFloat qui sotto.
@@ -326,18 +405,83 @@ pub fn composeFrame(
         return;
     }
 
-    const inv_w = (@as(u64, src_w) << 32) / fit_w_zoomed;
-    const inv_h = (@as(u64, src_h) << 32) / fit_h_zoomed;
+    // Livello mip: il più piccolo che sia ancora ≥ della taglia di presentazione
+    // (così il bilineare lavora tra scala 0.5 e 1, dove è un vero filtro).
+    var src = src_rgba;
+    var sw = src_w;
+    var sh = src_h;
+    if (mips) |mc| {
+        if (mc.n > 0 and mc.src_ptr == src_rgba.ptr) {
+            var li: usize = 0;
+            while (li + 1 < mc.n and mc.ws[li + 1] >= fit_w_zoomed and mc.hs[li + 1] >= fit_h_zoomed) : (li += 1) {}
+            src = mc.levels[li];
+            sw = mc.ws[li];
+            sh = mc.hs[li];
+        }
+    }
+
+    const inv_w = (@as(u64, sw) << 32) / fit_w_zoomed;
+    const inv_h = (@as(u64, sh) << 32) / fit_h_zoomed;
+    const exact = inv_w == (@as(u64, 1) << 32) and inv_h == (@as(u64, 1) << 32);
+    const scale = @as(f32, @floatFromInt(fit_w_zoomed)) / @as(f32, @floatFromInt(sw));
+    const bilinear = !exact and scale < 4.0;
 
     // Loop caldo per-pixel (ricampionamento del frame ogni present): gli indici sono
-    // già clampati (`@min` con src_w-1/src_h-1), quindi disattiviamo i controlli di
+    // già clampati (`@min` con sw-1/sh-1), quindi disattiviamo i controlli di
     // sicurezza runtime così anche la build ReleaseSafe scala alla velocità di
     // ReleaseFast — determinante per reggere i 30/60 fps del video senza scatti.
     @setRuntimeSafety(false);
 
+    const row_px = end_x - start_x;
+    const start_rx = @as(u64, @intCast(@as(i32, @intCast(start_x)) - fit_x));
+
+    if (bilinear) {
+        // Bilineare a virgola fissa 32.32: centro del pixel destinazione → coordinate
+        // sorgente continue (−0.5 per allineare i centri), 4 texel pesati con frazioni
+        // a 8 bit. Clamp ai bordi (niente wrap).
+        const half: i64 = 1 << 31;
+        var py = start_y;
+        while (py < end_y) : (py += 1) {
+            const idx_row = py * W * 4;
+            if (start_x > 0) @memset(composited_rgba[idx_row .. idx_row + start_x * 4], 0);
+            if (end_x < W) @memset(composited_rgba[idx_row + end_x * 4 .. idx_row + W * 4], 0);
+
+            const ry = @as(u64, @intCast(@as(i32, @intCast(py)) - fit_y));
+            var sy_fp: i64 = @as(i64, @intCast((ry * 2 + 1) * inv_h / 2)) - half;
+            if (sy_fp < 0) sy_fp = 0;
+            const y0: u32 = @min(@as(u32, @intCast(sy_fp >> 32)), sh - 1);
+            const y1: u32 = @min(y0 + 1, sh - 1);
+            const wy: u32 = @intCast((sy_fp >> 24) & 0xFF);
+            const row0 = src[@as(usize, y0) * sw * 4 ..];
+            const row1 = src[@as(usize, y1) * sw * 4 ..];
+            const dst_bytes = composited_rgba[idx_row + start_x * 4 ..][0 .. row_px * 4];
+
+            var sx_fp: i64 = @as(i64, @intCast((start_rx * 2 + 1) * inv_w / 2)) - half;
+            const step: i64 = @intCast(inv_w);
+            var i: usize = 0;
+            while (i < row_px) : (i += 1) {
+                const sxc: i64 = if (sx_fp < 0) 0 else sx_fp;
+                const x0: u32 = @min(@as(u32, @intCast(sxc >> 32)), sw - 1);
+                const x1: u32 = @min(x0 + 1, sw - 1);
+                const wx: u32 = @intCast((sxc >> 24) & 0xFF);
+                const a = row0[@as(usize, x0) * 4 ..][0..4];
+                const b = row0[@as(usize, x1) * 4 ..][0..4];
+                const c = row1[@as(usize, x0) * 4 ..][0..4];
+                const d = row1[@as(usize, x1) * 4 ..][0..4];
+                inline for (0..4) |k| {
+                    const top = @as(u32, a[k]) * (256 - wx) + @as(u32, b[k]) * wx;
+                    const bot = @as(u32, c[k]) * (256 - wx) + @as(u32, d[k]) * wx;
+                    dst_bytes[i * 4 + k] = @intCast((top * (256 - wy) + bot * wy) >> 16);
+                }
+                sx_fp += step;
+            }
+        }
+        return;
+    }
+
+    // Nearest: 1:1 esatto (memcpy di riga) o ingrandimento ≥ 4× (pixel-art).
     // Righe di destinazione consecutive che mappano sulla stessa riga sorgente
-    // (upscaling verticale, il caso comune: 720p su finestra più alta) producono
-    // byte identici: si copia la riga precedente invece di ricampionarla.
+    // producono byte identici: si copia la riga precedente invece di ricampionarla.
     var prev_sy: u32 = std.math.maxInt(u32);
     var prev_row_off: usize = 0;
 
@@ -356,10 +500,9 @@ pub fn composeFrame(
         }
 
         const ry = @as(u64, @intCast(@as(i32, @intCast(py)) - fit_y));
-        const sy = @min(@as(u32, @intCast((ry * inv_h) >> 32)), src_h - 1);
-        const s_row_offset = sy * src_w;
+        const sy = @min(@as(u32, @intCast((ry * inv_h) >> 32)), sh - 1);
+        const s_row_offset = sy * sw;
 
-        const row_px = end_x - start_x;
         const dst_off = idx_row + start_x * 4;
         const dst_bytes = composited_rgba[dst_off..][0 .. row_px * 4];
         if (sy == prev_sy) {
@@ -369,25 +512,23 @@ pub fn composeFrame(
         prev_sy = sy;
         prev_row_off = dst_off;
 
-        const start_rx = @as(u64, @intCast(@as(i32, @intCast(start_x)) - fit_x));
         var rx_fp = start_rx * inv_w;
 
-        // Ricampionamento a WORD u32 (un load/store per pixel, non 4 byte); scala
-        // orizzontale 1:1 → la riga sorgente è contigua e diventa un solo memcpy
-        // (è il caso mesh: il frame GPU ha già le dimensioni della finestra).
+        // Scala orizzontale 1:1 → la riga sorgente è contigua e diventa un solo
+        // memcpy (è il caso mesh/video: il frame ha già le dimensioni del fit-rect).
         if (inv_w == (@as(u64, 1) << 32)) {
-            const sx0 = @min(@as(u32, @intCast(rx_fp >> 32)), src_w - 1);
-            if (sx0 + row_px <= src_w) {
+            const sx0 = @min(@as(u32, @intCast(rx_fp >> 32)), sw - 1);
+            if (sx0 + row_px <= sw) {
                 const s_off = (@as(usize, s_row_offset) + sx0) * 4;
-                @memcpy(dst_bytes, src_rgba[s_off..][0 .. row_px * 4]);
+                @memcpy(dst_bytes, src[s_off..][0 .. row_px * 4]);
                 continue;
             }
         }
         var i: usize = 0;
         while (i < row_px) : (i += 1) {
-            const sx = @min(@as(u32, @intCast(rx_fp >> 32)), src_w - 1);
+            const sx = @min(@as(u32, @intCast(rx_fp >> 32)), sw - 1);
             rx_fp += inv_w;
-            const w32 = std.mem.readInt(u32, src_rgba[(@as(usize, s_row_offset) + sx) * 4 ..][0..4], .little);
+            const w32 = std.mem.readInt(u32, src[(@as(usize, s_row_offset) + sx) * 4 ..][0..4], .little);
             std.mem.writeInt(u32, dst_bytes[i * 4 ..][0..4], w32, .little);
         }
     }

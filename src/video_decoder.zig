@@ -169,6 +169,8 @@ pub const VideoDecoder = struct {
     /// i frame successivi arrivano già a quella dimensione, filtrati bene, e il
     /// compositore li copia 1:1 invece di ricampionarli nearest.
     pub fn setTargetSize(self: *VideoDecoder, w: u32, h: u32) void {
+        if (self.target_w.load(.monotonic) == w and self.target_h.load(.monotonic) == h) return;
+        if (std.c.getenv("ZUER_TRACE") != null) std.debug.print("[trace] video target {d}x{d}\n", .{ w, h });
         self.target_w.store(w, .monotonic);
         self.target_h.store(h, .monotonic);
     }

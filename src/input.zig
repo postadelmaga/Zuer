@@ -583,6 +583,7 @@ pub fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) 
         // flag di tipo (is_text/is_mesh) riscritti da `applyDecoded` (thread
         // loader) sotto `mutex` — mai leggerli a nudo.
         app_state.shared.mutex.lockUncancelable(app_state.io);
+        app_state.shared.ui_idle_s = 0; // ogni tasto rivela l'etichetta nome file
         const is_text = app_state.shared.is_text;
         const is_mesh = app_state.shared.is_mesh;
         const is_pdf = isPdfPath(app_state.shared.current_file_path);
@@ -979,6 +980,7 @@ pub fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopa
                 const vid = &app_state.video;
                 app_state.shared.mutex.lockUncancelable(app_state.io);
                 vid.idle_s = 0;
+                app_state.shared.ui_idle_s = 0;
                 const scrub = vid.scrubbing;
                 if (scrub) {
                     const cpx = win.contentPx();
@@ -994,6 +996,7 @@ pub fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopa
             // trascinando il cursore, muove l'offset. Se lo consuma (sopra la barra o
             // in drag), non facciamo selezione/pan.
             app_state.shared.mutex.lockUncancelable(app_state.io);
+            app_state.shared.ui_idle_s = 0; // mostra l'etichetta nome file
             const sc_consumed = app_state.shared.sc.onMotion(mot.x, mot.y);
             if (sc_consumed) app_state.shared.file_changed = true;
             app_state.shared.mutex.unlock(app_state.io);
