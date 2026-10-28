@@ -112,24 +112,33 @@ Terminal=false
 Categories=Graphics;Viewer;
 EOF
 
-# KDE: voce "Apri con Zuer" nel menu contestuale di Dolphin (service menu)…
+# KDE: una sola voce "Anteprima rapida (Quick Look)" nel menu contestuale di
+# Dolphin (service menu). Niente doppioni: le vecchie voci ("Apri con Zuer",
+# "Anteprima con zuer", "Apri con viewer") vengono rimosse qui sotto — in
+# passato erano file separati e si accavallavano tutte nello stesso menu.
 SVCMENU_DIR="$HOME/.local/share/kio/servicemenus"
 mkdir -p "$SVCMENU_DIR"
-cat <<EOF > "$SVCMENU_DIR/zuer.desktop"
+rm -f "$SVCMENU_DIR/zuer.desktop" \
+      "$SVCMENU_DIR/zuer-preview.desktop" \
+      "$SVCMENU_DIR/viewer.desktop" \
+      "$HOME/.local/share/kservices5/ServiceMenus/zuer-preview.desktop" \
+      "$HOME/.local/share/kservices5/ServiceMenus/zuer.desktop" \
+      "$HOME/.local/share/kservices5/ServiceMenus/viewer.desktop"
+cat <<EOF > "$SVCMENU_DIR/zuer-quicklook.desktop"
 [Desktop Entry]
 Type=Service
 ServiceTypes=KonqPopupMenu/Plugin
 X-KDE-ServiceTypes=KonqPopupMenu/Plugin
 MimeType=all/allfiles;inode/directory;
-Actions=openWithZuer;
+Actions=zuerQuickLook;
 X-KDE-Priority=TopLevel
 
-[Desktop Action openWithZuer]
-Name=Apri con Zuer
-Icon=viewimage
+[Desktop Action zuerQuickLook]
+Name=Anteprima rapida (Quick Look)
+Icon=quickview
 Exec=$INSTALL_DIR/zuer-gui %f
 EOF
-chmod +x "$SVCMENU_DIR/zuer.desktop" # Dolphin recente esige il bit eseguibile
+chmod +x "$SVCMENU_DIR/zuer-quicklook.desktop" # Dolphin recente esige il bit eseguibile
 
 # …e scorciatoia globale Meta+Z → Zuer (Sfoglia). Solo la registrazione nel
 # config: kwin/kglobalaccel la carica al volo o al prossimo login. NON Ctrl+Z
@@ -137,6 +146,36 @@ chmod +x "$SVCMENU_DIR/zuer.desktop" # Dolphin recente esige il bit eseguibile
 if command -v kwriteconfig6 &> /dev/null; then
   echo "Registering global shortcut Meta+Z (KDE)..."
   kwriteconfig6 --file kglobalshortcutsrc --group services --group zuer-browse.desktop --key _launch "Meta+Z"
+fi
+
+# Quick Look su Meta+Space: lo script recupera il file selezionato dalla
+# finestra Dolphin attiva (vedi scripts/zuer-quicklook) e lo apre in Zuer.
+echo "Installing Quick Look helper..."
+install -m 755 "$(dirname "$0")/scripts/zuer-quicklook" "$INSTALL_DIR/zuer-quicklook"
+cat <<EOF > "$APP_DIR/zuer-quicklook.desktop"
+[Desktop Entry]
+Type=Application
+Name=Zuer — Anteprima rapida (Quick Look)
+Comment=Apre l'anteprima Zuer sul file selezionato in Dolphin
+Exec=$INSTALL_DIR/zuer-quicklook
+Icon=quickview
+Terminal=false
+NoDisplay=true
+Categories=Graphics;Viewer;
+EOF
+if command -v kwriteconfig6 &> /dev/null; then
+  echo "Registering global shortcut Meta+Space (Quick Look)..."
+  kwriteconfig6 --file kglobalshortcutsrc --group services --group zuer-quicklook.desktop \
+    --key _launch "Meta+Space,none,Zuer — Anteprima rapida (Quick Look)"
+  # Su Plasma 6 le scorciatoie le gestisce KWin: scrivere il file non basta,
+  # va registrata anche a runtime (Meta+Space = Qt::Key_Space|Qt::MetaModifier).
+  if command -v gdbus &> /dev/null; then
+    QL_ID="['zuer-quicklook.desktop','_launch','Zuer — Anteprima rapida (Quick Look)','Zuer — Anteprima rapida (Quick Look)']"
+    gdbus call --session --dest org.kde.kglobalaccel --object-path /kglobalaccel \
+      --method org.kde.KGlobalAccel.doRegister "$QL_ID" &> /dev/null
+    gdbus call --session --dest org.kde.kglobalaccel --object-path /kglobalaccel \
+      --method org.kde.KGlobalAccel.setForeignShortcutKeys "$QL_ID" "[([268435488],)]" &> /dev/null
+  fi
 fi
 
 # Rebuild KDE sycoca cache if applicable
