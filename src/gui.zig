@@ -362,7 +362,7 @@ fn drawFilenameLabel(buf: []u8, W: u32, H: u32, raster: *glyph.Raster, name: []c
 fn renderWorker(
     win: *zrame.Window,
     state: *GuiAppState,
-    composited_rgba: *[]u8,
+    composited_rgba: *[]align(4) u8,
 ) void {
     var last_w: u32 = 0;
     var last_h: u32 = 0;
@@ -1155,7 +1155,7 @@ pub fn main(init: std.process.Init) !void {
         };
     }
 
-    var composited_rgba: []u8 = &.{};
+    var composited_rgba: []align(4) u8 = &.{};
     defer gpa.free(composited_rgba);
 
     // Proporzioni intelligenti per tipo di contenuto: nel percorso sincrono il

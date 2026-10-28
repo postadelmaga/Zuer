@@ -35,7 +35,7 @@ pub const Prefetched = struct {
     /// Immagini: pixel già espansi in RGBA (calcolati fuori lock dal prefetch o
     /// parcheggiati alla navigazione), così il cache-hit è uno swap di puntatore
     /// invece di una passata `rgbToRgba` sotto `shared.mutex`.
-    rgba: ?[]u8 = null,
+    rgba: ?[]align(4) u8 = null,
     /// Byte effettivi occupati dal contenuto decodificato (per il cap di RAM
     /// della cache, `ZUER_PREFETCH_MAX_MB`): la dimensione su disco non basta,
     /// un GLB da 40 MB espande in centinaia di MB.
@@ -93,7 +93,11 @@ pub const GuiAppState = struct {
         // cambiano file, larghezza o zoom — mai per un semplice scroll.
         load_seq: u32 = 1,
         zoom: f32 = 1.0,
-        static_rgba: []u8 = &.{},
+        // Allineato a 4 nel TIPO, non solo nell'alloc: compose/text_render
+        // aliasano questo buffer come `[]u32` (color-key, blit a word), e da Zig
+        // 0.17 `SafeAllocator` verifica l'allineamento anche in `free` — un campo
+        // `[]u8` lo farebbe decadere a 1 e il free andrebbe in panico.
+        static_rgba: []align(4) u8 = &.{},
         static_w: u32 = 0,
         static_h: u32 = 0,
         mesh_center: [3]f32 = .{ 0, 0, 0 },
@@ -387,7 +391,7 @@ pub fn resetScroll(sc: *zscroll.Scroll) void {
 /// Il chiamante possiede e libera lo slice restituito. Scrive un pixel per volta
 /// come word u32 (`r | g<<8 | b<<16 | 0xff<<24`, byte order R,G,B,A) invece di 4
 /// scritture byte: buffer allineato a 4 così la vista []u32 è valida.
-pub fn rgbToRgba(gpa: std.mem.Allocator, pixels: []const u8, w: u32, h: u32) ![]u8 {
+pub fn rgbToRgba(gpa: std.mem.Allocator, pixels: []const u8, w: u32, h: u32) ![]align(4) u8 {
     const n: usize = @as(usize, w) * h;
     const rgba = try gpa.alignedAlloc(u8, .@"4", n * 4);
     const words: []u32 = @as([*]u32, @ptrCast(@alignCast(rgba.ptr)))[0..n];

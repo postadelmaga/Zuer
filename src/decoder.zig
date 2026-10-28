@@ -563,13 +563,20 @@ pub const DecodedC = extern struct {
     }
 };
 
-/// Versione dell'ABI plugin (layout di `DecodedC` e firma di `DecodeFn`).
-/// Va incrementata a ogni modifica incompatibile del contratto C: l'host
-/// scarta i plugin compilati contro una versione diversa (un .so stantio con
-/// un layout `DecodedC` vecchio corromperebbe la memoria).
+/// Versione dell'ABI plugin (layout di `DecodedC`, firma di `DecodeFn` E layout
+/// dei tipi std che attraversano il confine — `io_ptr` e `allocator_ptr` puntano
+/// a `std.Io` e `std.mem.Allocator`, quindi il contratto dipende anche dalla
+/// VERSIONE DI ZIG con cui host e plugin sono compilati).
+/// Va incrementata a ogni modifica incompatibile: l'host scarta i plugin
+/// compilati contro una versione diversa (un .so stantio con un layout
+/// `DecodedC` vecchio corromperebbe la memoria).
 /// v2: aggiunto `total_pages: u32` in coda a `ImageDataC`.
 /// v3: aggiunto `backing: SliceC` in coda a `CsvDataC` (celle CSV zero-copy).
-pub const abi_version: u32 = 3;
+/// v4: Zig 0.17 — `std.mem.Allocator`/`std.Io` hanno cambiato layout. Un plugin
+///     pre-0.17 passa un `Alignment` che l'host interpreta come spazzatura e
+///     `SafeAllocator.alloc` muore in `@alignCast` ("incorrect alignment"):
+///     `DecodedC` era identico, quindi solo il bump lo fa scartare.
+pub const abi_version: u32 = 4;
 
 /// True quando i decoder sono compilati come **plugin** caricabili con `dlopen` — il caso
 /// del desktop. Su Android no: l'APK porta una libreria sola e i decoder ci finiscono

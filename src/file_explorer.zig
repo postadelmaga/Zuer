@@ -58,7 +58,7 @@ pub const Entry = struct {
     /// chiave della cache su disco, che si invalida così da sola.
     mtime_ns: i128 = 0,
     /// Miniatura RGBA (vuota finché il thumb worker non la installa).
-    thumb_rgba: []u8 = &.{},
+    thumb_rgba: []align(4) u8 = &.{},
     thumb_w: u32 = 0,
     thumb_h: u32 = 0,
     /// Il worker ha già tentato il decode (evita retry sui formati falliti).
@@ -684,7 +684,7 @@ const thumb_max: usize = 256;
 
 /// Miniatura pronta all'installazione (RGBA allineato a 4: `blitThumb` ci fa
 /// sopra un `bytesAsSlice(u32)`).
-const ThumbPix = struct { rgba: []u8, w: u32, h: u32 };
+const ThumbPix = struct { rgba: []align(4) u8, w: u32, h: u32 };
 
 fn makeThumb(gpa: std.mem.Allocator, pixels: []const u8, sw: usize, sh: usize) ?ThumbPix {
     if (sw == 0 or sh == 0 or pixels.len < sw * sh * 3) return null;

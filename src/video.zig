@@ -113,14 +113,14 @@ pub const VideoState = struct {
 /// `GuiAppState` completo — tocca solo questi campi.
 pub const FrameSink = struct {
     gpa: std.mem.Allocator,
-    rgba: *[]u8,
+    rgba: *[]align(4) u8,
     w: *u32,
     h: *u32,
 };
 
 /// Primo frame (poster) restituito da `setupVideo`: il chiamante ne prende possesso
 /// (diventa `static_rgba`).
-pub const VideoFirst = struct { rgba: []u8, w: u32, h: u32 };
+pub const VideoFirst = struct { rgba: []align(4) u8, w: u32, h: u32 };
 
 /// Apre il player video su un thread di decodifica dedicato, decodifica il primo
 /// frame (poster) in RGBA e inizializza `vs` (durata, posizione, `playing`). Il
@@ -160,7 +160,7 @@ pub fn setupVideo(vs: *VideoState, path: []const u8, gpa: std.mem.Allocator) !Vi
 /// Decoder + poster per la RIACCENSIONE del solo video (toggle 'v'): apre il
 /// container su `path` (file o URL) e avvia il thread; l'audio in corso non
 /// viene toccato. Il chiamante installa `dec` in `VideoState` sotto `mutex`.
-pub const VideoOnly = struct { dec: *VideoDecoder, rgba: []u8, w: u32, h: u32 };
+pub const VideoOnly = struct { dec: *VideoDecoder, rgba: []align(4) u8, w: u32, h: u32 };
 
 pub fn openVideoOnly(path: []const u8, gpa: std.mem.Allocator) !VideoOnly {
     if (comptime @import("build_options").video) {

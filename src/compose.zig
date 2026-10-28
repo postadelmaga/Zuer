@@ -17,7 +17,7 @@ pub const max_tabs: usize = 64;
 /// in fondo alla finestra + confini X di ogni linguetta per l'hit-test dei click.
 /// Rigenerata da `rasterizeTabBar` a ogni cambio foglio/larghezza.
 pub const TabBarState = struct {
-    rgba: []u8 = &.{},
+    rgba: []align(4) u8 = &.{},
     w: u32 = 0,
     h: u32 = 0,
     bounds: [max_tabs]u32 = @splat(0),
@@ -77,7 +77,7 @@ pub fn textBlitGeom(W: u32, H: u32, src_w: u32, src_h: u32, scroll_y: f32, scrol
 /// corpo scorre (header tabella); 0 = nessun ancoraggio. L'header scorre comunque in
 /// ORIZZONTALE col corpo, così le colonne restano allineate.
 pub fn composeTextFrame(
-    composited_rgba: []u8,
+    composited_rgba: []align(4) u8,
     W: u32,
     H: u32,
     src_rgba: []const u8,
@@ -225,8 +225,8 @@ pub fn drawTableRowHighlight(buf: []u8, W: u32, H: u32, src_w: u32, src_h: u32, 
 /// ritorna un NUOVO buffer (dimensioni scambiate per 1 e 3 quarti). Lossless:
 /// ogni pixel di destinazione legge esattamente un pixel sorgente. Usato dal
 /// tasto R su immagini e pagine PDF (`static_rgba`).
-pub fn rotateRgba(gpa: std.mem.Allocator, src: []const u8, w: u32, h: u32, quarter_turns: u2) ![]u8 {
-    const dst = try gpa.alloc(u8, @as(usize, w) * h * 4);
+pub fn rotateRgba(gpa: std.mem.Allocator, src: []const u8, w: u32, h: u32, quarter_turns: u2) ![]align(4) u8 {
+    const dst = try gpa.alignedAlloc(u8, .@"4", @as(usize, w) * h * 4);
     errdefer gpa.free(dst);
     if (quarter_turns == 0) {
         @memcpy(dst, src[0..dst.len]);
@@ -336,7 +336,7 @@ fn downsample2x(src: []const u8, sw: u32, dst: []u8, dw: u32, dh: u32) void {
 /// campiona bilineare dal livello mip più vicino alla scala; senza, bilineare sul
 /// sorgente; nearest a scala 1:1 esatta (memcpy) e oltre 4× di ingrandimento.
 pub fn composeFrame(
-    composited_rgba: []u8,
+    composited_rgba: []align(4) u8,
     W: u32,
     H: u32,
     src_rgba: []const u8,

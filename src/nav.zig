@@ -201,7 +201,7 @@ pub const PreparedVideo = struct { vs: videomod.VideoState, first: videomod.Vide
 /// prende possesso di ciò che usa e libera il resto (anche se abortisce).
 pub const Prepared = struct {
     stage: ?loader_mod.GpuStage = null,
-    rgba: ?[]u8 = null,
+    rgba: ?[]align(4) u8 = null,
     video: ?PreparedVideo = null,
     midi: ?*midi_player.MidiPlayer = null,
 

@@ -38,8 +38,11 @@ const mpv_video = if (mpv_enabled) @import("decoders/mpv_video.zig") else struct
 
 /// Slot della coda: buffer RGBA di proprietà, riusato tra i giri (la dimensione
 /// dei frame è costante per un dato video: `realloc` scatta al più una volta).
+/// Allineato a 4 nel TIPO: `pickInto` SCAMBIA questo buffer con quello del sink
+/// (`static_rgba`), quindi i due devono avere lo stesso allineamento o il `free`
+/// finale dichiarerebbe un allineamento diverso da quello dell'alloc.
 const Slot = struct {
-    pixels: []u8 = &.{},
+    pixels: []align(4) u8 = &.{},
     cap: usize = 0,
     w: u32 = 0,
     h: u32 = 0,
@@ -99,7 +102,7 @@ pub const VideoDecoder = struct {
 
     /// Poster (primo frame) + decoder avviato. Il chiamante prende possesso di
     /// `.rgba` (→ `static_rgba`) e del decoder (chiuso da `stopAndDestroy`).
-    pub const StartResult = struct { dec: *VideoDecoder, rgba: []u8, w: u32, h: u32, pts_s: f64 };
+    pub const StartResult = struct { dec: *VideoDecoder, rgba: []align(4) u8, w: u32, h: u32, pts_s: f64 };
 
     /// Apre il container su `path_z`, decodifica il primo frame come poster (e lo
     /// semina nella coda così il present lo mostra subito), poi avvia il thread.
@@ -111,7 +114,8 @@ pub const VideoDecoder = struct {
         const h: u32 = @intCast(frame.height);
         const need = @as(usize, w) * h * 4;
 
-        const poster = try gpa.alloc(u8, need);
+        // Allineato a 4: finisce in `static_rgba`, che compose aliasa come []u32.
+        const poster = try gpa.alignedAlloc(u8, .@"4", need);
         errdefer gpa.free(poster);
         @memcpy(poster, frame.pixels[0..need]);
 
@@ -127,7 +131,7 @@ pub const VideoDecoder = struct {
         // Semina il primo frame come slot 0 (gen 0, pubblicato con tail = 1). Il
         // thread continuerà a scrivere dallo slot 1. Se l'alloc fallisce, poster
         // e decoder sono già coperti dagli errdefer sopra.
-        self.ring[0].pixels = try gpa.alloc(u8, need);
+        self.ring[0].pixels = try gpa.alignedAlloc(u8, .@"4", need);
         self.ring[0].cap = need;
         @memcpy(self.ring[0].pixels, frame.pixels[0..need]);
         self.ring[0].w = w;
@@ -224,7 +228,7 @@ pub const VideoDecoder = struct {
     /// disponibile (il frame al/dopo il target, già filtrato dallo skip del
     /// produttore) ANCHE se il suo pts è > up_to_pts. Serve a mostrare il frame di
     /// destinazione anche a video in pausa, dove `pos_s` non avanza fino a coprirlo.
-    pub fn pickInto(self: *VideoDecoder, up_to_pts: f64, force_first: bool, gpa: std.mem.Allocator, rgba: *[]u8, w: *u32, h: *u32) Picked {
+    pub fn pickInto(self: *VideoDecoder, up_to_pts: f64, force_first: bool, gpa: std.mem.Allocator, rgba: *[]align(4) u8, w: *u32, h: *u32) Picked {
         const g = self.gen.load(.monotonic);
         const t = self.tail.load(.acquire);
         var hd = self.head.load(.monotonic);

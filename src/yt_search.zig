@@ -31,7 +31,7 @@ pub const Result = struct {
     duration: []u8,
     channel: []u8,
     /// Miniatura RGBA (vuota finché il thumb worker non la installa).
-    thumb_rgba: []u8 = &.{},
+    thumb_rgba: []align(4) u8 = &.{},
     thumb_w: u32 = 0,
     thumb_h: u32 = 0,
     /// Un thumb worker ha già preso in carico questa miniatura (i download
