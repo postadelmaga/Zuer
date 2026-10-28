@@ -148,38 +148,31 @@ if command -v kwriteconfig6 &> /dev/null; then
   kwriteconfig6 --file kglobalshortcutsrc --group services --group zuer-browse.desktop --key _launch "Meta+Z"
 fi
 
-# Quick Look su Meta+Space: lo script recupera il file selezionato dalla
-# finestra Dolphin attiva (vedi scripts/zuer-quicklook) e lo apre in Zuer.
-echo "Installing Quick Look helper..."
-install -m 755 "$(dirname "$0")/scripts/zuer-quicklook" "$INSTALL_DIR/zuer-quicklook"
-cat <<EOF > "$APP_DIR/zuer-quicklook.desktop"
-[Desktop Entry]
-Type=Application
-Name=Zuer — Anteprima rapida (Quick Look)
-Comment=Apre l'anteprima Zuer sul file selezionato in Dolphin
-Exec=$INSTALL_DIR/zuer-quicklook
-Icon=quickview
-Terminal=false
-NoDisplay=true
-Categories=Graphics;Viewer;
-EOF
+# La scorciatoia per il Quick Look si assegna DENTRO Dolphin, non come
+# scorciatoia globale. Dolphin espone le voci dei service menu nel suo editor
+# (Impostazioni > Configura le scorciatoie, cerca "Quick Look") e le salva in
+# ~/.local/share/kxmlgui5/dolphin/dolphinui.rc come
+#   <Action name="servicemenu_zuer-quicklook.desktop::zuerQuickLook" shortcut="Meta+Space"/>
+#
+# Qui NON la si scrive, deliberatamente: quel file lo possiede Dolphin, che lo
+# riscrive quando l'utente cambia scorciatoie o barre: un'iniezione fatta
+# mentre Dolphin è aperto verrebbe sovrascritta all'uscita, in silenzio.
+#
+# La via globale (uno script che recuperava la selezione dalla finestra Dolphin
+# attiva, su una scorciatoia in kglobalshortcutsrc) è stata RIMOSSA: su Plasma 6
+# kglobalaccel vive dentro KWin e attiva i componenti "services" solo quando li
+# carica all'avvio, quindi una voce aggiunta a sessione avviata resta
+# `isActive=false` — elencata, invocabile via D-Bus e muta al tasto fino al
+# logout. La scorciatoia di Dolphin invoca l'azione del service menu
+# direttamente, con %f già espanso: niente script, niente appunti, niente focus.
+rm -f "$INSTALL_DIR/zuer-quicklook" "$APP_DIR/zuer-quicklook.desktop"
 if command -v kwriteconfig6 &> /dev/null; then
-  echo "Registering global shortcut Meta+Space (Quick Look)..."
-  kwriteconfig6 --file kglobalshortcutsrc --group services --group zuer-quicklook.desktop \
-    --key _launch "Meta+Space,none,Zuer — Anteprima rapida (Quick Look)"
-  # NB: la scorciatoia diventa attiva al PROSSIMO LOGIN, non subito.
-  #
-  # Su Plasma 6 kglobalacceld non esiste più come processo separato (sta dentro
-  # KWin) e attiva i componenti di tipo "services" solo quando LI CARICA
-  # all'avvio, leggendo kglobalshortcutsrc. Una voce aggiunta dopo si può
-  # registrare via D-Bus (doRegister + setForeignShortcutKeys) e compare in
-  # getGlobalShortcutsByKey, ma il suo componente resta `isActive=false`: è
-  # invocabile esplicitamente via Component.invokeShortcut e NON riceve il
-  # tasto. Non c'è API per attivarlo — né activateGlobalShortcutContext né
-  # Component.cleanUp seguito da una nuova registrazione lo spostano (provati).
-  # Per questo qui si scrive solo il file: la registrazione a runtime darebbe
-  # l'illusione di una scorciatoia pronta che invece resta muta fino al logout.
-  SHORTCUT_PENDING=1
+  kwriteconfig6 --file kglobalshortcutsrc --group services \
+    --group zuer-quicklook.desktop --key _launch --delete &> /dev/null || true
+fi
+if ! grep -q "servicemenu_zuer-quicklook.desktop::zuerQuickLook" \
+     "$HOME/.local/share/kxmlgui5/dolphin/dolphinui.rc" 2> /dev/null; then
+  QUICKLOOK_HINT=1
 fi
 
 # Rebuild KDE sycoca cache if applicable
@@ -191,12 +184,12 @@ fi
 echo "--------------------------------------------------------"
 echo "Success! zuer installed to: $INSTALL_DIR/zuer"
 echo "Success! zuer-gui installed to: $INSTALL_DIR/zuer-gui"
-if [ -n "${SHORTCUT_PENDING:-}" ]; then
+if [ -n "${QUICKLOOK_HINT:-}" ]; then
   echo "--------------------------------------------------------"
-  echo "NB: la scorciatoia Meta+Space (Quick Look) si attiva al prossimo login."
-  echo "    Per averla subito: Impostazioni di sistema > Scorciatoie, cerca"
-  echo "    \"Quick Look\" e riassegna Meta+Space (quel percorso attiva il"
-  echo "    componente, cosa che la registrazione via D-Bus non fa)."
+  echo "Per il Quick Look da tastiera: in Dolphin, Impostazioni > Configura le"
+  echo "scorciatoie, cerca \"Quick Look\" e assegnale il tasto che preferisci."
+  echo "(Va impostata lì, non nelle scorciatoie globali: la voce del menu"
+  echo "contestuale riceve il file selezionato, una scorciatoia globale no.)"
 fi
 echo "--------------------------------------------------------"
 
