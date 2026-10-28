@@ -59,6 +59,7 @@ vkGetBufferMemoryRequirements
 vkGetDeviceProcAddr
 vkGetDeviceQueue
 vkGetImageMemoryRequirements
+vkGetImageSubresourceLayout
 vkGetPhysicalDeviceMemoryProperties
 vkGetPhysicalDeviceProperties
 vkGetPhysicalDeviceQueueFamilyProperties

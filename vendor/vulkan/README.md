@@ -4,7 +4,7 @@
 Windows linker needs a `vulkan.lib` import library resolving them to the loader
 DLL (`vulkan-1.dll`, shipped with GPU drivers / provided by Wine's winevulkan).
 
-- `vulkan.def` — the export list (the 66 core symbols zuer links) with
+- `vulkan.def` — the export list (the 68 core symbols zuer links) with
   `LIBRARY vulkan-1.dll`. This is the source of truth.
 - `vulkan.lib` — the import library generated from it, committed so the build
   needs no dlltool step. Regenerate after editing the .def with:

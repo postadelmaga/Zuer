@@ -32,7 +32,11 @@ pub fn main(init: std.process.Init) !void {
     var got: u32 = 0;
     var tries: u32 = 0;
     while (got < 10 and tries < 2000) : (tries += 1) {
-        const fr = mv.pollFrame(&out, gpa) catch |e| {
+        // 0,0 = nessun box di presentazione: mpv consegna la taglia nativa
+        // (dwidth/dheight). È quello che un probe deve misurare — l'output del
+        // decoder, non un ridimensionamento scelto qui. Il consumatore vero
+        // (video_decoder.zig) passa invece la taglia della finestra.
+        const fr = mv.pollFrame(&out, gpa, 0, 0) catch |e| {
             std.debug.print("pollFrame errore: {}\n", .{e});
             continue;
         };
