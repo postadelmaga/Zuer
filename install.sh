@@ -141,11 +141,26 @@ EOF
 chmod +x "$SVCMENU_DIR/zuer-quicklook.desktop" # Dolphin recente esige il bit eseguibile
 
 # …e scorciatoia globale Meta+Z → Zuer (Sfoglia). Solo la registrazione nel
-# config: kwin/kglobalaccel la carica al volo o al prossimo login. NON Ctrl+Z
-# (è l'Annulla di sistema); Meta+Z è libera.
+# config: su Plasma 6 diventa attiva al prossimo login (kglobalaccel attiva i
+# componenti "services" quando li carica all'avvio). NON Ctrl+Z (è l'Annulla di
+# sistema); Meta+Z è libera.
+#
+# Il doppione va tolto: Meta+Z era finita anche su zuer-gui.desktop, cioè sul
+# LANCIATORE dell'app (`Exec=zuer-gui %f`), mentre deve stare su
+# zuer-browse.desktop (`Exec=zuer-gui $HOME`, "Sfoglia"). Due componenti sullo
+# stesso tasto: quale dei due parta non è definito.
 if command -v kwriteconfig6 &> /dev/null; then
   echo "Registering global shortcut Meta+Z (KDE)..."
   kwriteconfig6 --file kglobalshortcutsrc --group services --group zuer-browse.desktop --key _launch "Meta+Z"
+  kwriteconfig6 --file kglobalshortcutsrc --group services \
+    --group zuer-gui.desktop --key _launch --delete &> /dev/null || true
+  # …e a runtime, perché quel componente è attivo e il grab sopravvive al
+  # file finché non si rifà il login (lista di tasti vuota = nessun tasto).
+  if command -v gdbus &> /dev/null; then
+    gdbus call --session --dest org.kde.kglobalaccel --object-path /kglobalaccel \
+      --method org.kde.KGlobalAccel.setForeignShortcutKeys \
+      "['zuer-gui.desktop','_launch','Zuer GUI','Zuer GUI']" "@a(ai) []" &> /dev/null || true
+  fi
 fi
 
 # La scorciatoia per il Quick Look si assegna DENTRO Dolphin, non come
