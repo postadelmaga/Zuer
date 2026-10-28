@@ -90,7 +90,7 @@ pub const AudioPlayer = struct {
     // prodotti. Il thread audio scrive, il thread finestra legge con `copyScope`.
     // Nessun lock: un campione strappato è invisibile in un visualizzatore; solo
     // l'indice di scrittura `scope_w` usa un atomico per un avanzamento coerente.
-    scope: [scope_len]f32 = [_]f32{0} ** scope_len,
+    scope: [scope_len]f32 = @splat(0),
     scope_w: std.atomic.Value(usize) = .init(0),
 
     /// Apre l'audio del file e avvia il thread. `null` (senza errore) se il file

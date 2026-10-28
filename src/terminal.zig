@@ -66,8 +66,8 @@ pub const Terminal = struct {
                 raw.iflag.IXON = false;
                 raw.iflag.ICRNL = false;
                 // Non-blocking read: return immediately if no input is ready.
-                raw.cc[@intFromEnum(std.posix.V.MIN)] = 0;
-                raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
+                raw.cc[@backingInt(std.posix.V.MIN)] = 0;
+                raw.cc[@backingInt(std.posix.V.TIME)] = 0;
                 try std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
                 self.saved = original;
             },

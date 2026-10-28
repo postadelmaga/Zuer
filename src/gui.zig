@@ -372,7 +372,7 @@ fn renderWorker(
     // ZUER_TRACE=1: stampa ogni secondo quante ricomposizioni e per quale motivo.
     const trace_on = getenv("ZUER_TRACE") != null;
     var tr_acc: f32 = 0;
-    var tr = [_]u32{0} ** 7; // ticks, renders, size, file_changed, mesh, pulse, sc_tick
+    var tr: [7]u32 = @splat(0); // ticks, renders, size, file_changed, mesh, pulse, sc_tick
     var last_seq: u32 = 0;
     // Ultima camera renderizzata: le mesh si ri-renderizzano SOLO quando cambia
     // (NaN iniziale ⇒ primo frame sempre reso). Senza questo il worker presenta
@@ -936,7 +936,7 @@ fn renderWorker(
             tr_acc += frame_dt;
             if (tr_acc >= 1.0) {
                 std.debug.print("[trace] ticks={d} renders={d} size={d} file_changed={d} pulse={d} sc_tick={d} load_seq={d} nav_gen={d} win={d}x{d} static={d}x{d} zoom={d:.2} pan={d:.0},{d:.0} scroll_y={d:.1} file={s}\n", .{ tr[0], tr[1], tr[2], tr[3], tr[5], tr[6], state.shared.load_seq, state.nav.gen, cur_w, cur_h, state.shared.static_w, state.shared.static_h, state.shared.zoom, state.shared.pan_x, state.shared.pan_y, state.shared.sc.offset[1], std.fs.path.basename(state.shared.current_file_path) });
-                tr = [_]u32{0} ** 7;
+                tr = @splat(0);
                 tr_acc = 0;
             }
         }

@@ -12,7 +12,7 @@ pub fn main(init: std.process.Init) !void {
     defer args.deinit();
     _ = args.skip();
     const path = args.next() orelse return error.MissingArg;
-    const path_z = try gpa.dupeZ(u8, path);
+    const path_z = try gpa.dupeSentinel(u8, path, 0);
     defer gpa.free(path_z);
 
     var p = player.Player.open(path_z.ptr) catch |e| {

@@ -28,7 +28,7 @@ frecce `← →`.
 
 ## Requisiti
 
-- **Zig 0.16-dev** (vedi `minimum_zig_version` in `build.zig.zon`)
+- **Zig 0.17** (vedi `minimum_zig_version` in `build.zig.zon`)
 - **glslc** (shaderc) — compila gli shader GLSL → SPIR-V durante la build
 - I framework **zicro** e **zrame** come repository fratelli in `../Zicro` e `../Zrame`
 - **Linux**: loader Vulkan di sistema, FFmpeg (pkg-config), `wayland-client`;

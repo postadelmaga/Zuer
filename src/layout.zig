@@ -107,7 +107,7 @@ pub fn imageDimsFromHeader(bytes: []const u8) ?ImageDims {
 /// le dimensioni con `imageDimsFromHeader`. 256 KB bastano anche ai JPEG con
 /// blocchi EXIF grandi prima del SOF.
 pub fn imageDimsFromFile(gpa: std.mem.Allocator, path: []const u8) ?ImageDims {
-    const pz = gpa.dupeZ(u8, path) catch return null;
+    const pz = gpa.dupeSentinel(u8, path, 0) catch return null;
     defer gpa.free(pz);
     const f = fopen(pz.ptr, "rb") orelse return null;
     defer _ = fclose(f);

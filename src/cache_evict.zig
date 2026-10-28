@@ -102,7 +102,7 @@ fn listFiles(arena: std.mem.Allocator, dirfd: linux.fd_t, files: *std.ArrayList(
             if (!stx.mask.TYPE or !stx.mask.SIZE or !stx.mask.MTIME) continue;
             if (stx.mode & linux.S.IFMT != linux.S.IFREG) continue; // copre anche DT.UNKNOWN
             try files.append(arena, .{
-                .name = try arena.dupeZ(u8, name),
+                .name = try arena.dupeSentinel(u8, name, 0),
                 .mtime_ns = @as(i128, stx.mtime.sec) * std.time.ns_per_s + stx.mtime.nsec,
                 .size = stx.size,
             });

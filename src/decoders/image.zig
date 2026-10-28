@@ -44,7 +44,7 @@ const canon = switch (@import("builtin").os.tag) {
 /// sparito nel frattempo), usa il path originale ma prefissato con `./` quando
 /// è relativo e inizia con `-`. Il chiamante libera con lo stesso allocator.
 fn absPath(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
-    const pz = try gpa.dupeZ(u8, path);
+    const pz = try gpa.dupeSentinel(u8, path, 0);
     defer gpa.free(pz);
     var buf: [4096]u8 = undefined; // PATH_MAX
     if (canon.resolve(pz.ptr, &buf)) |res|

@@ -20,7 +20,7 @@ pub const TabBarState = struct {
     rgba: []u8 = &.{},
     w: u32 = 0,
     h: u32 = 0,
-    bounds: [max_tabs]u32 = [_]u32{0} ** max_tabs,
+    bounds: [max_tabs]u32 = @splat(0),
     count: usize = 0,
 };
 
@@ -262,9 +262,9 @@ pub fn rotateRgba(gpa: std.mem.Allocator, src: []const u8, w: u32, h: u32, quart
 /// quando il buffer sorgente cambia (`ensure`); ~1/3 della memoria dell'immagine.
 pub const MipChain = struct {
     const max_levels = 8;
-    levels: [max_levels][]const u8 = .{&[_]u8{}} ** max_levels,
-    ws: [max_levels]u32 = .{0} ** max_levels,
-    hs: [max_levels]u32 = .{0} ** max_levels,
+    levels: [max_levels][]const u8 = @splat(&[_]u8{}),
+    ws: [max_levels]u32 = @splat(0),
+    hs: [max_levels]u32 = @splat(0),
     n: u8 = 0,
     src_ptr: ?[*]const u8 = null,
 

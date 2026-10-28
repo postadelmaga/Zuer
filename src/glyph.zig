@@ -8,9 +8,8 @@ const std = @import("std");
 // Curve gamma/stem-darkening condivise da zicro.paint: stesse LUT del chrome e
 // dei panel di zrame, così la resa tipografica è identica per costruzione.
 const paint = @import("zicro").paint;
-const c = @cImport({
-    @cInclude("stb_truetype.h");
-});
+// Tradotto dallo step translate-c di `addStbTruetype` (vedi src/c/stb.h).
+const c = @import("stb_c");
 
 /// Facce disponibili (Hack): il codice usa regular+bold, il markdown anche i corsivi.
 pub const Style = enum(u2) { regular = 0, bold = 1, italic = 2, bold_italic = 3 };
@@ -128,7 +127,7 @@ pub const Raster = struct {
             .line_gap = @intFromFloat(@round(@as(f32, @floatFromInt(gap)) * s0)),
             .advance = @intFromFloat(@round(@as(f32, @floatFromInt(adv)) * s0)),
             .cache = .empty,
-            .ascii = .{[_]?Glyph{null} ** 128} ** 4,
+            .ascii = @splat(@splat(null)),
         };
     }
 
@@ -149,7 +148,7 @@ pub const Raster = struct {
     }
 
     pub fn getGlyph(self: *Raster, style: Style, cp: u32) !*const Glyph {
-        const si = @intFromEnum(style);
+        const si = @backingInt(style);
         // ASCII: indice diretto, niente hashing (percorso caldo del layout).
         if (cp < 128) {
             if (self.ascii[si][cp]) |*g| return g;
@@ -208,7 +207,7 @@ pub const Raster = struct {
                     const cp = self.cp;
                     self.cp += 1;
                     if (self.raster.ascii[self.si][cp]) |*g| {
-                        return .{ .key = .{ .style = @enumFromInt(@as(u2, @intCast(self.si))), .cp = cp }, .glyph = g };
+                        return .{ .key = .{ .style = @fromBackingInt(@intCast(@as(u2, @intCast(self.si)))), .cp = cp }, .glyph = g };
                     }
                 }
                 self.si += 1;

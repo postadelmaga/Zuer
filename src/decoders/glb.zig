@@ -375,7 +375,7 @@ fn buildTexCache(gltf: GltfStructure, bin_data: []const u8, allocator: std.mem.A
     // finestra per minuti, percepito come "si impalla"). Il thread corrente
     // drena comunque la coda, così anche con 0 spawn (budget esaurito) tutte le
     // texture vengono decodificate, solo più lentamente.
-    var pool: [31]?std.Thread = .{null} ** 31;
+    var pool: [31]?std.Thread = @splat(null);
     const want = @min(n -| 1, pool.len);
     const spawn_n = reserveTexWorkers(want);
     defer releaseTexWorkers(spawn_n);

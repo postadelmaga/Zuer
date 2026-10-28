@@ -36,15 +36,15 @@ const win = struct {
 };
 
 /// Percorso del log in `buf`, con la directory creata best-effort. La dir
-/// passa da un buffer proprio: due bufPrintZ sullo stesso buffer si aliasano.
+/// passa da un buffer proprio: due printSentinel sullo stesso buffer si aliasano.
 /// null se manca la variabile d'ambiente di base o il path non entra.
 fn logPath(buf: []u8) ?[:0]const u8 {
     const base = getenv(if (is_win) "LOCALAPPDATA" else "HOME") orelse return null;
     const sub = if (is_win) "\\zuer" else "/.cache/zuer";
     var dir_buf: [520]u8 = undefined;
-    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}{s}", .{ std.mem.span(base), sub }) catch return null;
+    const dir = std.mem.printSentinel(&dir_buf, "{s}{s}", .{ std.mem.span(base), sub }, 0) catch return null;
     mkdirOne(dir);
-    return std.fmt.bufPrintZ(buf, "{s}{s}", .{ dir, if (is_win) "\\crash.log" else "/crash.log" }) catch null;
+    return std.mem.printSentinel(buf, "{s}{s}", .{ dir, if (is_win) "\\crash.log" else "/crash.log" }, 0) catch null;
 }
 
 fn mkdirOne(path: [:0]const u8) void {

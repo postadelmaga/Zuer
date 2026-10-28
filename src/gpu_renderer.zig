@@ -1828,7 +1828,10 @@ pub const Renderer = struct {
         vkDestroyFramebuffer(self.device, self.framebuffer, null);
         self.destroyImage(.{ .image = self.color_image, .mem = self.color_mem, .view = self.color_view });
         self.destroyImage(.{ .image = self.depth_image, .mem = self.depth_mem, .view = self.depth_view });
-        if (self.color_dmabuf_fd >= 0) {
+        // dmabuf è Linux-only (l'fd lo assegna solo `has_dmabuf_export`): il gate
+        // serve a COMPILARE altrove, dove `std.c.fd_t` non è un i32 — su Windows
+        // è una HANDLE, e `std.c.close` rifiuta l'intero.
+        if (builtin.os.tag == .linux and self.color_dmabuf_fd >= 0) {
             _ = std.c.close(self.color_dmabuf_fd);
             self.color_dmabuf_fd = -1;
         }

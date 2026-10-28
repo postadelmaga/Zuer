@@ -1261,7 +1261,7 @@ const sub = switch (builtin.os.tag) {
                 for (argvZ[0..argv.len]) |a| if (a) |p| allocator.free(std.mem.span(p));
                 allocator.free(argvZ);
             }
-            for (argv, 0..) |a, i| argvZ[i] = (try allocator.dupeZ(u8, a)).ptr;
+            for (argv, 0..) |a, i| argvZ[i] = (try allocator.dupeSentinel(u8, a, 0)).ptr;
 
             var fds: [2]c_int = undefined;
             if (pipeCloexec(&fds) != 0) return error.PipeFailed;
@@ -1341,7 +1341,7 @@ const sub = switch (builtin.os.tag) {
         }
 
         fn readFile(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-            const path_z = try allocator.dupeZ(u8, path);
+            const path_z = try allocator.dupeSentinel(u8, path, 0);
             defer allocator.free(path_z);
 
             const fd = open(path_z.ptr, 0); // O_RDONLY
@@ -1382,7 +1382,7 @@ const sub = switch (builtin.os.tag) {
         extern "c" fn lseek(fd: c_int, offset: i64, whence: c_int) i64;
 
         fn fileSize(allocator: std.mem.Allocator, path: []const u8) !u64 {
-            const path_z = try allocator.dupeZ(u8, path);
+            const path_z = try allocator.dupeSentinel(u8, path, 0);
             defer allocator.free(path_z);
             const fd = open(path_z.ptr, 0);
             if (fd < 0) return error.OpenFailed;
@@ -1393,7 +1393,7 @@ const sub = switch (builtin.os.tag) {
         }
 
         fn readFileTail(allocator: std.mem.Allocator, path: []const u8, n: usize) ![]u8 {
-            const path_z = try allocator.dupeZ(u8, path);
+            const path_z = try allocator.dupeSentinel(u8, path, 0);
             defer allocator.free(path_z);
             const fd = open(path_z.ptr, 0);
             if (fd < 0) return error.OpenFailed;

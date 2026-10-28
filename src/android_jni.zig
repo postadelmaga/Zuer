@@ -17,11 +17,8 @@
 
 const std = @import("std");
 
-pub const c = @cImport({
-    @cInclude("jni.h");
-    @cInclude("android/native_activity.h");
-    @cInclude("android/bitmap.h"); // libjnigraphics: i pixel di un android.graphics.Bitmap
-});
+// src/c/android.h, tradotto dallo step translate-c dello step `android` in build.zig.
+pub const c = @import("jni_c");
 
 /// Chiama un metodo JNI gestendo l'eccezione Java che potrebbe lasciare pendente: una
 /// eccezione non ripulita fa abortire il processo alla prossima chiamata JNI, con un
@@ -128,7 +125,7 @@ pub fn requestAllFilesAccess(activity_ptr: *anyopaque) void {
     const pkg: c.jstring = @ptrCast(fns.CallObjectMethod.?(env, activity.clazz, get_pkg));
     const chars = fns.GetStringUTFChars.?(env, pkg, null) orelse return;
     var buf: [256]u8 = undefined;
-    const uri_str = std.fmt.bufPrintZ(&buf, "package:{s}", .{std.mem.span(chars)}) catch "package:dev.zuer.viewer";
+    const uri_str = std.mem.printSentinel(&buf, "package:{s}", .{std.mem.span(chars)}, 0) catch "package:dev.zuer.viewer";
     fns.ReleaseStringUTFChars.?(env, pkg, chars);
 
     const jstr = fns.NewStringUTF.?(env, uri_str.ptr) orelse return;
@@ -266,7 +263,7 @@ fn setDataSource(env: *c.JNIEnv, cls: c.jclass, obj: c.jobject, path: []const u8
     const fns = env.*.*;
     var buf: [512]u8 = undefined;
     if (path.len >= buf.len) return false;
-    const zpath = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return false;
+    const zpath = std.mem.printSentinel(&buf, "{s}", .{path}, 0) catch return false;
     const jpath = fns.NewStringUTF.?(env, zpath.ptr) orelse return false;
     const set = fns.GetMethodID.?(env, cls, "setDataSource", "(Ljava/lang/String;)V") orelse return false;
     fns.CallVoidMethod.?(env, obj, set, jpath);
@@ -286,7 +283,7 @@ pub fn pdfPage(activity_ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u
     // ParcelFileDescriptor.open(new File(path), MODE_READ_ONLY)
     var buf: [512]u8 = undefined;
     if (path.len >= buf.len) return null;
-    const zpath = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return null;
+    const zpath = std.mem.printSentinel(&buf, "{s}", .{path}, 0) catch return null;
     const jpath = fns.NewStringUTF.?(env, zpath.ptr) orelse return null;
     const file_cls = fns.FindClass.?(env, "java/io/File") orelse return null;
     const file_ctor = fns.GetMethodID.?(env, file_cls, "<init>", "(Ljava/lang/String;)V") orelse return null;
@@ -377,7 +374,7 @@ pub fn decodeImageFile(activity_ptr: *anyopaque, gpa: std.mem.Allocator, path: [
 
     var buf: [512]u8 = undefined;
     if (path.len >= buf.len) return null;
-    const zpath = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return null;
+    const zpath = std.mem.printSentinel(&buf, "{s}", .{path}, 0) catch return null;
     const jpath = fns.NewStringUTF.?(env, zpath.ptr) orelse return null;
 
     const bf_cls = fns.FindClass.?(env, "android/graphics/BitmapFactory") orelse return null;

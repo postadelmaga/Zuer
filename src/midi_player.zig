@@ -23,10 +23,9 @@ const builtin = @import("builtin");
 const zicro = @import("zicro");
 const DeviceOut = zicro.audio_device.DeviceOut;
 
-const c = @cImport({
-    @cInclude("tsf.h");
-    @cInclude("tml.h");
-});
+// Tradotto dallo step translate-c di `addTsf` (vedi src/c/midi.h): Zig 0.17 ha
+// rimosso `@cImport`, gli header arrivano come modulo.
+const c = @import("tsf_c");
 
 extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
@@ -147,12 +146,12 @@ pub const MidiPlayer = struct {
     fn startInner(path: []const u8, gpa: std.mem.Allocator) anyerror!*MidiPlayer {
         const sf_path = findSoundfont(gpa) orelse return error.NoSoundfont;
         defer gpa.free(sf_path);
-        const sf_z = try gpa.dupeZ(u8, sf_path);
+        const sf_z = try gpa.dupeSentinel(u8, sf_path, 0);
         defer gpa.free(sf_z);
         const synth = c.tsf_load_filename(sf_z.ptr) orelse return error.SoundfontLoadFailed;
         errdefer c.tsf_close(synth);
 
-        const path_z = try gpa.dupeZ(u8, path);
+        const path_z = try gpa.dupeSentinel(u8, path, 0);
         defer gpa.free(path_z);
         const head_c = c.tml_load_filename(path_z.ptr) orelse return error.MidiLoadFailed;
         errdefer c.tml_free(head_c);

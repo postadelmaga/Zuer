@@ -133,7 +133,7 @@ fn decodeTier(path: []const u8, io: std.Io, filename: []const u8, allocator: std
 /// frattempo), usa il path originale ma prefissato con `./` quando è relativo
 /// e inizia con `-`. Il chiamante libera con lo stesso allocator.
 fn absPath(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
-    const pz = try gpa.dupeZ(u8, path);
+    const pz = try gpa.dupeSentinel(u8, path, 0);
     defer gpa.free(pz);
     var buf: [4096]u8 = undefined; // PATH_MAX
     if (realpath(pz.ptr, &buf)) |res|
@@ -365,7 +365,7 @@ fn renderPage(gpa: std.mem.Allocator, abs_path: []const u8, key: u64, flag: []co
     // non sa scrivere su stdout: il prefisso `-` genera un file chiamato
     // letteralmente `-.ppm`, verificato su poppler 26.08.)
     var dir_template: [32]u8 = undefined;
-    const tmpl = try std.fmt.bufPrintZ(&dir_template, "/tmp/zuer_pdf_XXXXXX", .{});
+    const tmpl = try std.mem.printSentinel(&dir_template, "/tmp/zuer_pdf_XXXXXX", .{}, 0);
     if (mkdtemp(tmpl.ptr) == null) return error.TempDirFailed;
     defer cleanupTmpDir(tmpl.ptr);
 
@@ -465,7 +465,7 @@ fn cleanupTmpDir(tmpl: [*:0]const u8) void {
             const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&ent.d_name)), 0);
             if (!std.mem.startsWith(u8, name, "page")) continue;
             var buf: [320]u8 = undefined;
-            const full = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ std.mem.span(tmpl), name }) catch continue;
+            const full = std.mem.printSentinel(&buf, "{s}/{s}", .{ std.mem.span(tmpl), name }, 0) catch continue;
             _ = unlink(full.ptr);
         }
         _ = closedir(d);

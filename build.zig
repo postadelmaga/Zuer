@@ -60,8 +60,8 @@ pub fn build(b: *std.Build) void {
     // tool di sviluppo (player-test) continuano a linkare direttamente.
     const LinkAv = struct {
         fn link(bld: *std.Build, m: *std.Build.Module, tgt: std.Build.ResolvedTarget) void {
+            headersOnly(bld, m, tgt);
             if (tgt.result.os.tag == .windows) {
-                headersOnly(bld, m, tgt);
                 m.addLibraryPath(bld.path("vendor/ffmpeg/lib"));
                 m.linkSystemLibrary("avformat", .{});
                 m.linkSystemLibrary("avcodec", .{});
@@ -77,10 +77,13 @@ pub fn build(b: *std.Build) void {
             }
         }
 
-        /// Solo gli header (per il @cImport), niente link. Su Windows sono i vendorati;
+        /// Solo gli header (modulo translate-c + include path), niente link. Su Windows sono i vendorati;
         /// su Linux quelli di sistema in /usr/include, già nel default search path del
         /// compilatore (nessun -I esplicito serve: pkg-config qui non è coinvolto).
         fn headersOnly(bld: *std.Build, m: *std.Build.Module, tgt: std.Build.ResolvedTarget) void {
+            if (translateC(bld, m, "av_c", "src/c/av.h")) |tc| {
+                if (tgt.result.os.tag == .windows) tc.addIncludePath(bld.path("vendor/ffmpeg/include"));
+            }
             if (tgt.result.os.tag == .windows) {
                 m.addIncludePath(bld.path("vendor/ffmpeg/include"));
             }
@@ -242,7 +245,10 @@ pub fn build(b: *std.Build) void {
         LinkAv.headersOnly(b, gui_exe.root_module, target);
         // Decoder VP9 su GPU compute (Vulkan): Linux-only (compute_vp9 non è portato su
         // Windows). Altrove player.zig ripiega sul decoder VP9 di libav (gate cvp9 in player).
-        if (os_tag == .linux) gui_exe.root_module.linkSystemLibrary("compute_vp9", .{});
+        if (os_tag == .linux) {
+            gui_exe.root_module.linkSystemLibrary("compute_vp9", .{});
+            addCvp9C(b, gui_exe.root_module);
+        }
     }
     if (target.result.os.tag == .linux) {
         gui_exe.root_module.linkSystemLibrary("wayland-client", .{});
@@ -262,6 +268,7 @@ pub fn build(b: *std.Build) void {
         // l'exe parte anche senza mpv, ripiegando sul decoder FFmpeg esistente.
         gui_exe.root_module.linkSystemLibrary("EGL", .{});
         gui_exe.root_module.linkSystemLibrary("GL", .{});
+        addMpvC(b, gui_exe.root_module);
     }
     // Backend audio zicro su Windows (waveOut/winmm).
     if (target.result.os.tag == .windows) {
@@ -269,7 +276,7 @@ pub fn build(b: *std.Build) void {
         // App GUI: senza questo l'exe è "console" e ogni avvio da Explorer/menu
         // Start apre anche un terminale. Gli errori su stdout spariscono, ma
         // sono già invisibili in quel contesto.
-        gui_exe.subsystem = .Windows;
+        gui_exe.subsystem = .windows;
     }
     // Player MIDI nativo (src/midi_player.zig): synth TinySoundFont + parser
     // TinyMidiLoader, vendorizzati in vendor/tsf.
@@ -277,9 +284,9 @@ pub fn build(b: *std.Build) void {
     // Motore di testo nativo: stb_truetype rasterizza i glifi Hack (embeddati),
     // sostituendo ImageMagick/Pango. NB: `zuer-gui` linka zrame, che ora compila
     // la propria copia di stb_truetype_impl.c per il suo motore di testo. Per
-    // evitare simboli duplicati nel binario, qui aggiungiamo SOLO l'include path
-    // (serve al @cImport di glyph.zig): l'implementazione la fornisce zrame.
-    gui_exe.root_module.addIncludePath(b.path("vendor/stb"));
+    // evitare simboli duplicati nel binario, qui aggiungiamo SOLO gli header
+    // (servono a glyph.zig): l'implementazione la fornisce zrame.
+    addStbTruetypeHeaders(b, gui_exe.root_module);
 
     b.installArtifact(gui_exe);
 
@@ -301,12 +308,18 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    addStbTruetype(b, raster_dbg.root_module);
+    // glyph.zig (raggiunto da raster_debug.zig) prende le LUT gamma da zicro.paint:
+    // senza questo import lo step non compila — era già così prima di 0.17, lo step
+    // semplicemente non veniva mai costruito.
+    raster_dbg.root_module.addImport("zicro", dep_zicro.module("zicro"));
+    // Solo gli header: l'implementazione di stb_truetype la porta già zicro, e
+    // compilarla due volte duplica i simboli (stesso motivo di zuer-gui/zrame).
+    addStbTruetypeHeaders(b, raster_dbg.root_module);
     // Anche il percorso GPU (gpu_renderer + shader) per confrontare CPU vs atlante.
     shaders.addTo(raster_dbg.root_module);
     LinkVk.link(b, raster_dbg.root_module, target);
     const raster_dbg_run = b.addRunArtifact(raster_dbg);
-    if (b.args) |args| raster_dbg_run.addArgs(args);
+    raster_dbg_run.addPassthruArgs();
     b.step("raster-debug", "Rasterizza un file su PPM (stdout)").dependOn(&raster_dbg_run.step);
 
     // Self-test headless del percorso GPU mesh (normali + shading PBR-ish):
@@ -343,7 +356,7 @@ pub fn build(b: *std.Build) void {
     // Niente installArtifact: è un tool di sviluppo, lo step `gpu-shot` lo
     // compila già on demand senza pesare su ogni `zig build`.
     const gpu_shot_run = b.addRunArtifact(gpu_shot);
-    if (b.args) |a| gpu_shot_run.addArgs(a);
+    gpu_shot_run.addPassthruArgs();
     b.step("gpu-shot", "Screenshot headless PPM di una mesh (decode+VT)").dependOn(&gpu_shot_run.step);
 
     const decoder_mod = b.createModule(.{
@@ -390,7 +403,10 @@ pub fn build(b: *std.Build) void {
                 // media importa player.zig (poster): serve build_options per il
                 // gate cvp9 e il link della lib (il poster resta però su libav).
                 lib.root_module.addOptions("build_options", build_opts_linked);
-                if (os_tag == .linux) lib.root_module.linkSystemLibrary("compute_vp9", .{});
+                if (os_tag == .linux) {
+                    lib.root_module.linkSystemLibrary("compute_vp9", .{});
+                    addCvp9C(b, lib.root_module);
+                }
                 // TinyMidiLoader (vendor/tsf): la scheda MIDI mostra la durata
                 // reale parsando il file con tml (vedi parseMidi in media.zig).
                 addTsf(b, lib.root_module);
@@ -405,9 +421,7 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const run_step = b.step("run", "Run zuer");
     run_step.dependOn(&run_cmd.step);
@@ -423,7 +437,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const decode_run = b.addRunArtifact(decode_dbg);
-    if (b.args) |args| decode_run.addArgs(args);
+    decode_run.addPassthruArgs();
     b.step("decode-test", "Decodifica un file e stampa il risultato").dependOn(&decode_run.step);
 
     // Tool di sviluppo: itera i frame di un video col motore player.zig (libav).
@@ -442,9 +456,12 @@ pub fn build(b: *std.Build) void {
         });
         LinkAv.link(b, player_dbg.root_module, target);
         player_dbg.root_module.addOptions("build_options", build_opts_linked);
-        if (os_tag == .linux) player_dbg.root_module.linkSystemLibrary("compute_vp9", .{});
+        if (os_tag == .linux) {
+            player_dbg.root_module.linkSystemLibrary("compute_vp9", .{});
+            addCvp9C(b, player_dbg.root_module);
+        }
         const player_run = b.addRunArtifact(player_dbg);
-        if (b.args) |args| player_run.addArgs(args);
+        player_run.addPassthruArgs();
         b.step("player-test", "Itera i frame video di un file (libav)").dependOn(&player_run.step);
     } else {
         const fail = b.addFail("player-test richiede libav: ricompila senza -Dffmpeg=false");
@@ -464,6 +481,7 @@ pub fn build(b: *std.Build) void {
                 .link_libc = true,
             }),
         });
+        addMpvC(b, mpv_dbg.root_module);
         mpv_dbg.root_module.linkSystemLibrary("mpv", .{});
         mpv_dbg.root_module.linkSystemLibrary("EGL", .{});
         mpv_dbg.root_module.linkSystemLibrary("GL", .{});
@@ -474,7 +492,7 @@ pub fn build(b: *std.Build) void {
         mpv_dbg_opts.addOption(bool, "mpv_runtime", false);
         mpv_dbg.root_module.addOptions("build_options", mpv_dbg_opts);
         const mpv_run = b.addRunArtifact(mpv_dbg);
-        if (b.args) |args| mpv_run.addArgs(args);
+        mpv_run.addPassthruArgs();
         b.step("mpv-video-test", "Verifica isolata del modulo mpv_video.zig").dependOn(&mpv_run.step);
     }
 
@@ -520,16 +538,22 @@ pub fn build(b: *std.Build) void {
             // Zig non porta con sé una bionic: la libc di Android è quella del NDK, indicata
             // con un file libc (header + crt/lib dell'API level scelto). È il modo previsto
             // da Zig per una libc esterna — senza, `zig build-lib` rifiuta il target con
-            // "unable to provide libc for target …-android".
+            // "unable to provide libc for target …-android". NB: in Zig 0.17 i campi sono
+            // cambiati (`gcc_dir` → `cc_dir`, più `darwin_sdk_dir`): mancarne uno fa
+            // fallire il parsing del file.
             const libc_conf = b.addWriteFiles().add("android-libc.conf", b.fmt(
                 \\include_dir={s}
                 \\sys_include_dir={s}
                 \\crt_dir={s}
                 \\msvc_lib_dir=
                 \\kernel32_lib_dir=
-                \\gcc_dir=
+                \\cc_dir={s}
+                \\darwin_sdk_dir=
                 \\
-            , .{ sysroot_inc, sysroot_inc, sysroot_lib }));
+                // cc_dir è la dir di crtbegin/crtend: su Android (crtbegin_so.o,
+                // crtend_so.o) è la stessa di crt_dir. In 0.17 non può più essere
+                // vuota per i target linux, Android compreso.
+            , .{ sysroot_inc, sysroot_inc, sysroot_lib, sysroot_lib }));
             lib.setLibCFile(libc_conf);
             // Header per-architettura del NDK (asm/*.h, tirati dentro da linux/types.h e
             // poll.h): stanno in una dir a parte che il file libc non copre. Serve a ENTRAMBI
@@ -550,9 +574,38 @@ pub fn build(b: *std.Build) void {
 
             const zicro_android = dep_zicro.module("zicro_android");
             zicro_android.addIncludePath(arch_inc);
+            // Zig 0.17 ha rimosso `@cImport`: il modulo translate-c di text.zig va
+            // creato DAL LATO NOSTRO, perché il target di `zicro_android` lo decide
+            // il consumatore (qui) — Zicro non lo conosce. Lo step si crea sul
+            // builder della dipendenza, così `vendor/stb` e `src/c/text.h` si
+            // risolvono rispetto alla sua radice e non alla nostra.
+            if (!zicro_android.import_table.contains("text_c")) {
+                const zb = dep_zicro.builder;
+                const text_c = zb.addTranslateC(.{
+                    .root_source_file = zb.path("src/c/text.h"),
+                    .target = android_target,
+                    .optimize = .ReleaseFast,
+                    .link_libc = true,
+                });
+                text_c.addIncludePath(zb.path("vendor/stb"));
+                text_c.addIncludePath(arch_inc); // header per-architettura del NDK
+                // Il sysroot del NDK pretende l'API level come macro: agli step di
+                // compilazione arriva dal file libc, che translate-c non riceve
+                // ("Unversioned target triples are not supported" da cdefs.h).
+                text_c.defineCMacro("__ANDROID_API__", "24");
+                text_c.defineCMacro("__ANDROID_MIN_SDK_VERSION__", "24");
+                zicro_android.addImport("text_c", text_c.createModule());
+            }
             lib.root_module.addImport("zicro", zicro_android);
             lib.root_module.addIncludePath(arch_inc);
             lib.root_module.addIncludePath(.{ .cwd_relative = glue_dir });
+            // JNI/NDK per src/android_jni.zig (vedi src/c/android.h).
+            if (translateC(b, lib.root_module, "jni_c", "src/c/android.h")) |tc| {
+                tc.addIncludePath(arch_inc);
+                tc.addIncludePath(.{ .cwd_relative = sysroot_inc });
+                tc.defineCMacro("__ANDROID_API__", "24"); // vedi text_c qui sopra
+                tc.defineCMacro("__ANDROID_MIN_SDK_VERSION__", "24");
+            }
             lib.root_module.addCSourceFile(.{
                 .file = .{ .cwd_relative = b.pathJoin(&.{ glue_dir, "android_native_app_glue.c" }) },
                 .flags = &.{ "-O2", "-fno-sanitize=undefined" },
@@ -583,7 +636,44 @@ pub fn build(b: *std.Build) void {
 /// il classico offsetof "a mano" su puntatore nullo (UB benigno che UBSan
 /// altrimenti intercetterebbe a runtime). tsf usa le funzioni math C → libm
 /// esplicita dove non è già dentro libc (su Windows sta nel CRT).
+/// Un header C tradotto come modulo Zig.
+///
+/// Zig 0.17 ha rimosso il builtin `@cImport`: gli header che i sorgenti
+/// includevano in-line passano ora da uno step translate-c e si importano per
+/// nome. Gli umbrella header stanno in `src/c/` (uno per ogni vecchio blocco
+/// `@cImport`). Ritorna lo step perché il chiamante vi aggiunga include path e
+/// macro; `null` se il modulo ha già quell'import (gli helper sono chiamati su
+/// moduli che a volte si sovrappongono) o se non ha ancora un target risolto.
+fn translateC(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    name: []const u8,
+    header: []const u8,
+) ?*std.Build.Step.TranslateC {
+    if (mod.import_table.contains(name)) return null;
+    const tgt = mod.resolved_target orelse return null;
+    const tc = b.addTranslateC(.{
+        .root_source_file = b.path(header),
+        .target = tgt,
+        .optimize = mod.optimize orelse .debug,
+        .link_libc = true,
+    });
+    mod.addImport(name, tc.createModule());
+    return tc;
+}
+
+/// compute_vp9 (src/decoders/cvp9.zig): header del decoder VP9 su GPU compute.
+fn addCvp9C(b: *std.Build, mod: *std.Build.Module) void {
+    _ = translateC(b, mod, "cvp9_c", "src/c/cvp9.h");
+}
+
+/// libmpv + EGL + GL (src/decoders/mpv_video.zig): header di sistema, nessun -I.
+fn addMpvC(b: *std.Build, mod: *std.Build.Module) void {
+    _ = translateC(b, mod, "mpv_c", "src/c/mpv.h");
+}
+
 fn addTsf(b: *std.Build, mod: *std.Build.Module) void {
+    if (translateC(b, mod, "tsf_c", "src/c/midi.h")) |tc| tc.addIncludePath(b.path("vendor/tsf"));
     mod.addIncludePath(b.path("vendor/tsf"));
     mod.addCSourceFile(.{
         .file = b.path("vendor/tsf/tsf_impl.c"),
@@ -594,11 +684,11 @@ fn addTsf(b: *std.Build, mod: *std.Build.Module) void {
     }
 }
 
-/// Compila stb_truetype nel modulo e ne espone gli header a @cImport.
-fn addStbTruetype(b: *std.Build, mod: *std.Build.Module) void {
+/// Solo gli HEADER di stb_truetype: l'include path più il modulo translate-c
+/// (`stb_c`, per glyph.zig). Nessuno dei due consumatori vuole anche
+/// `stb_truetype_impl.c`: `zuer-gui` lo riceve da zrame e `raster-debug` da
+/// zicro, e compilarlo una seconda volta duplica i simboli nel binario.
+fn addStbTruetypeHeaders(b: *std.Build, mod: *std.Build.Module) void {
+    if (translateC(b, mod, "stb_c", "src/c/stb.h")) |tc| tc.addIncludePath(b.path("vendor/stb"));
     mod.addIncludePath(b.path("vendor/stb"));
-    mod.addCSourceFile(.{
-        .file = b.path("vendor/stb/stb_truetype_impl.c"),
-        .flags = &.{ "-O2", "-fno-sanitize=undefined" },
-    });
 }

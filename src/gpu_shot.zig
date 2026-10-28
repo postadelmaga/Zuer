@@ -13,7 +13,7 @@ extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
 extern "c" fn close(fd: c_int) c_int;
 
 fn writeFile(gpa: std.mem.Allocator, path: []const u8, bytes: []const u8) !void {
-    const zpath = try gpa.dupeZ(u8, path);
+    const zpath = try gpa.dupeSentinel(u8, path, 0);
     defer gpa.free(zpath);
     const fd = open(zpath.ptr, 1 | 0o100 | 0o1000, 0o644); // O_WRONLY|O_CREAT|O_TRUNC
     if (fd < 0) return error.CreateFailed;

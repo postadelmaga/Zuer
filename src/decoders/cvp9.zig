@@ -11,9 +11,7 @@
 
 const std = @import("std");
 
-pub const c = @cImport({
-    @cInclude("compute_vp9/decoder.h");
-});
+pub const c = @import("cvp9_c"); // src/c/cvp9.h, vedi addCvp9 in build.zig
 
 /// Esito di un tentativo di prelievo frame.
 pub const Status = enum { ok, again, none };

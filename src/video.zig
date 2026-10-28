@@ -139,7 +139,7 @@ pub fn setupVideo(vs: *VideoState, path: []const u8, gpa: std.mem.Allocator) !Vi
         };
         if (all_digits) clean = path[0..h];
     }
-    const path_z = try gpa.dupeZ(u8, clean);
+    const path_z = try gpa.dupeSentinel(u8, clean, 0);
     defer gpa.free(path_z);
 
     const r = try VideoDecoder.start(path_z.ptr, gpa, video_max_dim);
@@ -164,7 +164,7 @@ pub const VideoOnly = struct { dec: *VideoDecoder, rgba: []u8, w: u32, h: u32 };
 
 pub fn openVideoOnly(path: []const u8, gpa: std.mem.Allocator) !VideoOnly {
     if (comptime @import("build_options").video) {
-        const path_z = try gpa.dupeZ(u8, path);
+        const path_z = try gpa.dupeSentinel(u8, path, 0);
         defer gpa.free(path_z);
         const r = try VideoDecoder.start(path_z.ptr, gpa, video_max_dim);
         return .{ .dec = r.dec, .rgba = r.rgba, .w = r.w, .h = r.h };
@@ -179,9 +179,9 @@ pub fn openVideoOnly(path: []const u8, gpa: std.mem.Allocator) !VideoOnly {
 /// (`yt_search.openWorker`) su uno stato LOCALE, fuori dai lock.
 pub fn setupStream(vs: *VideoState, video_url: []const u8, audio_url: []const u8, gpa: std.mem.Allocator) !VideoFirst {
     if (comptime !@import("build_options").video) return error.NoVideo;
-    const vurl_z = try gpa.dupeZ(u8, video_url);
+    const vurl_z = try gpa.dupeSentinel(u8, video_url, 0);
     defer gpa.free(vurl_z);
-    const aurl_z = try gpa.dupeZ(u8, audio_url);
+    const aurl_z = try gpa.dupeSentinel(u8, audio_url, 0);
     defer gpa.free(aurl_z);
 
     const r = try VideoDecoder.start(vurl_z.ptr, gpa, video_max_dim);
@@ -207,7 +207,7 @@ pub fn setupAudio(vs: *VideoState, path: []const u8, gpa: std.mem.Allocator) !Vi
     if (comptime @import("build_options").video) {
         var clean: []const u8 = path;
         if (std.mem.indexOfScalar(u8, path, '#')) |h| clean = path[0..h];
-        const path_z = try gpa.dupeZ(u8, clean);
+        const path_z = try gpa.dupeSentinel(u8, clean, 0);
         defer gpa.free(path_z);
 
         const a = AudioPlayer.start(path_z.ptr, gpa) orelse return error.NoAudio;

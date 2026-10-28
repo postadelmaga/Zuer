@@ -68,7 +68,7 @@ pub const VideoDecoder = struct {
     frame_rate: f64,
 
     thread: ?std.Thread = null,
-    ring: [CAP]Slot = [_]Slot{.{}} ** CAP,
+    ring: [CAP]Slot = @splat(.{}),
     head: std.atomic.Value(u64) = .init(0), // consumatore: prossimo da leggere
     tail: std.atomic.Value(u64) = .init(0), // produttore: prossimo da scrivere
 
@@ -140,7 +140,7 @@ pub const VideoDecoder = struct {
         // thread chiamante, quindi deve essere lo STESSO thread che poi fa
         // `mpv_render_context_render`, non quello che chiama `start()`).
         if (comptime mpv_enabled) {
-            self.path_owned = gpa.dupeZ(u8, std.mem.span(path_z)) catch &[_:0]u8{};
+            self.path_owned = gpa.dupeSentinel(u8, std.mem.span(path_z), 0) catch &[_:0]u8{};
         }
         self.thread = std.Thread.spawn(.{}, threadEntry, .{self}) catch |e| {
             gpa.free(self.ring[0].pixels);

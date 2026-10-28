@@ -11,21 +11,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const c = @cImport({
-    @cInclude("libavformat/avformat.h");
-    @cInclude("libavcodec/avcodec.h");
-    @cInclude("libavutil/imgutils.h");
-    // Decodifica hardware VAAPI: device context (hwcontext) e descrittori dei
-    // pixel format (per riconoscere i formati hw nel callback get_format).
-    @cInclude("libavutil/hwcontext.h");
-    @cInclude("libavutil/pixdesc.h");
-    @cInclude("libswscale/swscale.h");
-    // Audio: resample → f32 interleaved e gestione dei channel layout (usati da
-    // src/audio_player.zig, che riusa questo @cImport per condividere i tipi).
-    @cInclude("libswresample/swresample.h");
-    @cInclude("libavutil/channel_layout.h");
-    @cInclude("libavutil/opt.h");
-});
+// src/c/av.h, tradotto dallo step translate-c di `LinkAv` in build.zig: Zig
+// 0.17 ha rimosso `@cImport`. src/audio_player.zig importa QUESTO stesso modulo
+// (`player.c`) per condividere i tipi del resampler.
+pub const c = @import("av_c");
 
 // Decoder VP9 su GPU compute (libcompute_vp9): Linux-only (la libreria non è portata su
 // Windows) e solo con il renderer Vulkan attivo. Altrove `cvp9` è uno struct vuoto e il
@@ -95,17 +84,19 @@ pub const AvApi = struct {
 // a comptime che ogni firma combaci con gli header, così restano allineate.
 comptime {
     if (builtin.zig_backend == .stage2_llvm) {
-        for (@typeInfo(AvApi).@"struct".fields) |f| {
-            const Expected = *const @TypeOf(@field(c, f.name));
-            if (f.type != Expected) @compileError("AvApi." ++ f.name ++ ": firma diversa dagli header, attesa " ++ @typeName(Expected));
+        // 0.17 ha sostituito `fields` con liste parallele (`field_names`/`field_types`).
+        const info = @typeInfo(AvApi).@"struct";
+        for (info.field_names, info.field_types) |fname, FieldType| {
+            const Expected = *const @TypeOf(@field(c, fname));
+            if (FieldType != Expected) @compileError("AvApi." ++ fname ++ ": firma diversa dagli header, attesa " ++ @typeName(Expected));
         }
     }
 }
 
 const av_static: AvApi = if (av_dynamic) undefined else blk: {
     var t: AvApi = undefined;
-    for (@typeInfo(AvApi).@"struct".fields) |f| {
-        @field(t, f.name) = &@field(c, f.name);
+    for (@typeInfo(AvApi).@"struct".field_names) |fname| {
+        @field(t, fname) = &@field(c, fname);
     }
     break :blk t;
 };
@@ -186,18 +177,18 @@ fn ensureAvRuntime() bool {
     }
     // Le librerie restano caricate per la vita del processo (mai chiuse): i
     // puntatori della tabella vivono dentro di loro.
-    inline for (@typeInfo(AvApi).@"struct".fields) |f| {
+    inline for (@typeInfo(AvApi).@"struct".field_names) |fname| {
         var found = false;
         for (libs) |l| {
-            const sym = if (is_win) win.GetProcAddress(l, f.name) else std.c.dlsym(l, f.name);
+            const sym = if (is_win) win.GetProcAddress(l, fname) else std.c.dlsym(l, fname);
             if (sym) |p| {
-                @field(av_runtime_table, f.name) = @ptrCast(@alignCast(p));
+                @field(av_runtime_table, fname) = @ptrCast(@alignCast(p));
                 found = true;
                 break;
             }
         }
         if (!found) {
-            std.debug.print("zuer: simbolo libav mancante: {s}\n", .{f.name});
+            std.debug.print("zuer: simbolo libav mancante: {s}\n", .{fname});
             return false;
         }
     }
@@ -289,7 +280,7 @@ fn listHwDevices(out: *[max_hw_devices][max_hw_device_path]u8) u8 {
         const entry = std.c.readdir(dir) orelse break;
         const name = std.mem.sliceTo(@as([*]const u8, &entry.name), 0);
         if (!std.mem.startsWith(u8, name, "renderD")) continue;
-        _ = std.fmt.bufPrintZ(&out[count], "/dev/dri/{s}", .{name}) catch continue;
+        _ = std.mem.printSentinel(&out[count], "/dev/dri/{s}", .{name}, 0) catch continue;
         count += 1;
     }
     std.mem.sort([max_hw_device_path]u8, out[0..count], {}, struct {

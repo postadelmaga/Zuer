@@ -14,7 +14,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("uso: mpv-video-test <file>\n", .{});
         return error.MissingArg;
     };
-    const path_z = try gpa.dupeZ(u8, path);
+    const path_z = try gpa.dupeSentinel(u8, path, 0);
     defer gpa.free(path_z);
 
     var mv = mpv_video.MpvVideo.init() catch |e| {

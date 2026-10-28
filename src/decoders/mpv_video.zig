@@ -11,20 +11,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const c = @cImport({
-    @cInclude("mpv/client.h");
-    @cInclude("mpv/render.h");
-    @cInclude("mpv/render_gl.h");
-    @cInclude("EGL/egl.h");
-    @cInclude("EGL/eglext.h");
-    // GL/gl.h da solo dichiara solo il core 1.1 (ABI storica) — le funzioni FBO
-    // (glGenFramebuffers e affini, core dal 3.0) sono comunque esportate da
-    // libGL.so di Mesa, ma servono i prototipi da glext.h per linkarle dirette.
-    @cDefine("GL_GLEXT_PROTOTYPES", "1");
-    @cInclude("GL/gl.h");
-    @cInclude("GL/glext.h");
-    @cInclude("wayland-client.h");
-});
+// src/c/mpv.h, tradotto dallo step translate-c di `addMpv` in build.zig.
+pub const c = @import("mpv_c");
 
 pub const InitError = error{
     MpvLibraryMissing,
@@ -73,17 +61,19 @@ pub const MpvApi = struct {
 // a comptime che ogni firma combaci con gli header, così restano allineate.
 comptime {
     if (builtin.zig_backend == .stage2_llvm) {
-        for (@typeInfo(MpvApi).@"struct".fields) |f| {
-            const Expected = *const @TypeOf(@field(c, f.name));
-            if (f.type != Expected) @compileError("MpvApi." ++ f.name ++ ": firma diversa dagli header, attesa " ++ @typeName(Expected));
+        // 0.17 ha sostituito `fields` con liste parallele (`field_names`/`field_types`).
+        const info = @typeInfo(MpvApi).@"struct";
+        for (info.field_names, info.field_types) |fname, FieldType| {
+            const Expected = *const @TypeOf(@field(c, fname));
+            if (FieldType != Expected) @compileError("MpvApi." ++ fname ++ ": firma diversa dagli header, attesa " ++ @typeName(Expected));
         }
     }
 }
 
 const mpv_static: MpvApi = if (mpv_dynamic) undefined else blk: {
     var t: MpvApi = undefined;
-    for (@typeInfo(MpvApi).@"struct".fields) |f| {
-        @field(t, f.name) = &@field(c, f.name);
+    for (@typeInfo(MpvApi).@"struct".field_names) |fname| {
+        @field(t, fname) = &@field(c, fname);
     }
     break :blk t;
 };
@@ -121,12 +111,12 @@ fn ensureMpvRuntime() bool {
     };
     // La libreria resta caricata per la vita del processo (mai dlclose): i
     // puntatori della tabella vivono dentro di lei.
-    inline for (@typeInfo(MpvApi).@"struct".fields) |f| {
-        const sym = std.c.dlsym(lib, f.name) orelse {
-            std.debug.print("zuer: simbolo libmpv mancante: {s}\n", .{f.name});
+    inline for (@typeInfo(MpvApi).@"struct".field_names) |fname| {
+        const sym = std.c.dlsym(lib, fname) orelse {
+            std.debug.print("zuer: simbolo libmpv mancante: {s}\n", .{fname});
             return false;
         };
-        @field(mpv_runtime_table, f.name) = @ptrCast(@alignCast(sym));
+        @field(mpv_runtime_table, fname) = @ptrCast(@alignCast(sym));
     }
     mpv_state = .ok;
     return true;
@@ -258,7 +248,7 @@ pub const MpvVideo = struct {
     /// al target — non serve il nostro skip lato produttore come per FFmpeg).
     pub fn seek(self: *MpvVideo, seconds: f64) void {
         var buf: [64]u8 = undefined;
-        const target = std.fmt.bufPrintZ(&buf, "{d:.3}", .{@max(0, seconds)}) catch return;
+        const target = std.mem.printSentinel(&buf, "{d:.3}", .{@max(0, seconds)}, 0) catch return;
         const args = [_:null]?[*:0]const u8{ "seek", target, "absolute", null };
         _ = api.mpv_command(self.mpv, @ptrCast(@constCast(&args)));
     }

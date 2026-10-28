@@ -9,6 +9,17 @@ const loader_mod = @import("loader.zig");
 const LoadedFile = loader_mod.LoadedFile;
 const gpu_mod = @import("gpu_renderer.zig");
 
+/// Zig 0.17 ha tolto `std.ascii.indexOfIgnoreCase`; al filtro serve solo sapere
+/// se la cella contiene l'ago, ignorando le maiuscole.
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i..][0..needle.len], needle)) return true;
+    }
+    return false;
+}
+
 pub const TuiSink = struct {
     gpa: std.mem.Allocator,
     receiver: zicro.media.LatestReceiver(LoadedFile),
@@ -421,7 +432,7 @@ pub const TuiSink = struct {
             if (filter.len > 0) {
                 var matches = false;
                 for (row) |cell| {
-                    if (std.ascii.indexOfIgnoreCase(cell, filter) != null) {
+                    if (containsIgnoreCase(cell, filter)) {
                         matches = true;
                         break;
                     }

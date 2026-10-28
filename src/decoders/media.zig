@@ -5,7 +5,9 @@ const Decoded = decoder.Decoded;
 
 // TinyMidiLoader (vendor/tsf, compilato nel plugin da tsf_impl.c): parsa il
 // .mid con la mappa tempi completa → durata reale nella scheda MIDI.
-const tml = @cImport(@cInclude("tml.h"));
+// src/c/midi.h, tradotto da `addTsf` in build.zig (tsf.h + tml.h nello stesso
+// modulo): qui serve solo la metà TinyMidiLoader.
+const tml = @import("tsf_c");
 
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
@@ -84,7 +86,7 @@ fn posterFrame(path: []const u8, filename: []const u8, allocator: std.mem.Alloca
         if (std.mem.eql(u8, std.mem.span(v), "1")) max_dim = 1280;
     }
     if (coarse) max_dim = @min(max_dim, coarse_max_dim);
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     const frame = try player.firstVideoFrame(path_z.ptr, max_dim, allocator);

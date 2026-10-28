@@ -249,7 +249,7 @@ fn cacheDir(gpa: std.mem.Allocator) ?[]u8 {
 /// collideva tra file diversi). Fallback al path così com'è se la risoluzione
 /// fallisce (file sparito, path troppo lungo…). Il chiamante libera.
 fn canonPath(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
-    const pz = gpa.dupeZ(u8, path) catch return null;
+    const pz = gpa.dupeSentinel(u8, path, 0) catch return null;
     defer gpa.free(pz);
     var buf: [4096]u8 = undefined; // PATH_MAX
     if (realpath(pz.ptr, &buf)) |res|
@@ -268,7 +268,7 @@ fn keyPath(gpa: std.mem.Allocator, dir: []const u8, path: []const u8) ?[:0]u8 {
 /// al mtime: due file diversi con lo stesso mtime — zip estratti, `cp -p` — non
 /// devono più collidere). null se il file non è apribile/misurabile.
 fn srcSize(gpa: std.mem.Allocator, path: []const u8) ?u64 {
-    const pz = gpa.dupeZ(u8, path) catch return null;
+    const pz = gpa.dupeSentinel(u8, path, 0) catch return null;
     defer gpa.free(pz);
     const fd = open(pz.ptr, O_RDONLY, 0);
     if (fd < 0) return null;
@@ -347,7 +347,7 @@ pub fn writeCoarse(gpa: std.mem.Allocator, path: []const u8, mtime_ns: i128, mes
         w.buf.deinit(pa);
         return;
     };
-    const kp_owned = pa.dupeZ(u8, kp) catch {
+    const kp_owned = pa.dupeSentinel(u8, kp, 0) catch {
         pa.free(blob);
         return;
     };
