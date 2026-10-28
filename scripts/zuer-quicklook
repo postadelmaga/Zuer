@@ -9,12 +9,20 @@
 #
 # Su Wayland un client può scrivere negli appunti solo se ha il focus: funziona
 # proprio perché una scorciatoia globale non toglie il focus a Dolphin.
+# Il log e il dirottamento di stderr vengono PRIMA di tutto il resto, `set -u`
+# compreso: lanciato da KDE questo script non ha un terminale, quindi un errore
+# di bash (una variabile non impostata, un binario assente) sparirebbe senza
+# lasciare traccia — ed è esattamente il modo in cui ha fallito in silenzio.
+LOG="${XDG_RUNTIME_DIR:-/tmp}/zuer-quicklook.log"
+exec 2>>"$LOG"
+printf '%s  --- avvio pid=%s home=%s xdg=%s shell=%s\n' \
+  "$(date '+%H:%M:%S')" "$$" "${HOME:-NON-IMPOSTATA}" "${XDG_RUNTIME_DIR:-NON-IMPOSTATA}" "${BASH_VERSION:-non-bash}" >> "$LOG"
+
 set -u
 
 ZUER="${ZUER_GUI:-$HOME/.local/bin/zuer-gui}"
 QDBUS=$(command -v qdbus6 || command -v qdbus) || exit 1
 command -v wl-paste >/dev/null || exit 1
-LOG="${XDG_RUNTIME_DIR:-/tmp}/zuer-quicklook.log"
 dbg() {
   printf '%s  %s\n' "$(date '+%H:%M:%S')" "$*" >> "$LOG"
   [ -n "${ZUER_QL_DEBUG:-}" ] && printf 'zuer-quicklook: %s\n' "$*" >&2

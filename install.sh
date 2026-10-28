@@ -167,15 +167,19 @@ if command -v kwriteconfig6 &> /dev/null; then
   echo "Registering global shortcut Meta+Space (Quick Look)..."
   kwriteconfig6 --file kglobalshortcutsrc --group services --group zuer-quicklook.desktop \
     --key _launch "Meta+Space,none,Zuer — Anteprima rapida (Quick Look)"
-  # Su Plasma 6 le scorciatoie le gestisce KWin: scrivere il file non basta,
-  # va registrata anche a runtime (Meta+Space = Qt::Key_Space|Qt::MetaModifier).
-  if command -v gdbus &> /dev/null; then
-    QL_ID="['zuer-quicklook.desktop','_launch','Zuer — Anteprima rapida (Quick Look)','Zuer — Anteprima rapida (Quick Look)']"
-    gdbus call --session --dest org.kde.kglobalaccel --object-path /kglobalaccel \
-      --method org.kde.KGlobalAccel.doRegister "$QL_ID" &> /dev/null
-    gdbus call --session --dest org.kde.kglobalaccel --object-path /kglobalaccel \
-      --method org.kde.KGlobalAccel.setForeignShortcutKeys "$QL_ID" "[([268435488],)]" &> /dev/null
-  fi
+  # NB: la scorciatoia diventa attiva al PROSSIMO LOGIN, non subito.
+  #
+  # Su Plasma 6 kglobalacceld non esiste più come processo separato (sta dentro
+  # KWin) e attiva i componenti di tipo "services" solo quando LI CARICA
+  # all'avvio, leggendo kglobalshortcutsrc. Una voce aggiunta dopo si può
+  # registrare via D-Bus (doRegister + setForeignShortcutKeys) e compare in
+  # getGlobalShortcutsByKey, ma il suo componente resta `isActive=false`: è
+  # invocabile esplicitamente via Component.invokeShortcut e NON riceve il
+  # tasto. Non c'è API per attivarlo — né activateGlobalShortcutContext né
+  # Component.cleanUp seguito da una nuova registrazione lo spostano (provati).
+  # Per questo qui si scrive solo il file: la registrazione a runtime darebbe
+  # l'illusione di una scorciatoia pronta che invece resta muta fino al logout.
+  SHORTCUT_PENDING=1
 fi
 
 # Rebuild KDE sycoca cache if applicable
@@ -187,6 +191,13 @@ fi
 echo "--------------------------------------------------------"
 echo "Success! zuer installed to: $INSTALL_DIR/zuer"
 echo "Success! zuer-gui installed to: $INSTALL_DIR/zuer-gui"
+if [ -n "${SHORTCUT_PENDING:-}" ]; then
+  echo "--------------------------------------------------------"
+  echo "NB: la scorciatoia Meta+Space (Quick Look) si attiva al prossimo login."
+  echo "    Per averla subito: Impostazioni di sistema > Scorciatoie, cerca"
+  echo "    \"Quick Look\" e riassegna Meta+Space (quel percorso attiva il"
+  echo "    componente, cosa che la registrazione via D-Bus non fa)."
+fi
 echo "--------------------------------------------------------"
 
 # Warn if target directory is not in PATH
