@@ -158,7 +158,7 @@ pub fn sanitizeToUtf8(bytes: []const u8, allocator: std.mem.Allocator) ![]u8 {
 pub fn decode(bytes: []const u8, allocator: std.mem.Allocator) Decoded {
     if (isBinary(bytes)) {
         allocator.free(bytes);
-        return .{ .err = "Formato non riconosciuto o file binario non UTF-8." };
+        return decoder.pluginError(allocator, "Formato non riconosciuto o file binario non UTF-8.", .{});
     }
 
     // Se è già pulito (senza ANSI, senza controlli non stampabili, UTF-8 valido), ritorna senza allocare
@@ -169,7 +169,7 @@ pub fn decode(bytes: []const u8, allocator: std.mem.Allocator) Decoded {
     // Altrimenti sanifica in UTF-8 (rimuove ANSI/controlli, converte ISO-8859-1/non-UTF8 in UTF-8)
     const sanitized = sanitizeToUtf8(bytes, allocator) catch {
         allocator.free(bytes);
-        return .{ .err = "Impossibile allocare memoria per la sanificazione del testo." };
+        return decoder.pluginError(allocator, "Impossibile allocare memoria per la sanificazione del testo.", .{});
     };
 
     allocator.free(bytes);
@@ -187,7 +187,7 @@ fn zuer_decode(
     const allocator = @as(*const std.mem.Allocator, @ptrCast(@alignCast(allocator_ptr))).*;
     const decoded = decode(content.toSlice(), allocator);
     return decoded.toDecodedC(allocator) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "error";
+        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "";
         return .{
             .tag = .err,
             .payload = .{ .err = decoder.SliceC.fromSlice(msg) },

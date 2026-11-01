@@ -16,7 +16,7 @@ la decodifica video per libav (FFmpeg).
 |-----------|-----------|------|
 | **Testo / codice / markdown** | `.txt`, sorgenti, `.md`, … | rasterizzazione nativa (stb_truetype), selezione + copia |
 | **Tabelle** | `.csv`, `.tsv`, `.xlsx`, `.xls`, `.ods`, `.zip`, `.jar`, `.cbz`, `.epub`, … | griglia con header fisso; workbook multi-foglio con linguette |
-| **Immagini** | `.png`, `.jpg`, `.gif`, `.bmp`, `.webp`, `.tif`, `.avif`, `.heic`, `.ico` | decodifica nativa (stb_image) |
+| **Immagini** | `.png`, `.jpg`, `.gif`, `.bmp`, `.webp`, `.tif`, `.avif`, `.heic`, `.ico` | decodifica nativa (stb_image; WebP con `libwebp` caricata a runtime su Linux), gli altri formati via ImageMagick |
 | **Mesh 3D** | `.obj`, `.stl`, `.glb`, `.gltf`, `.ply`, `.fbx`, `.dae`, `.3ds` | renderer Vulkan (PBR-ish, shadow pass), orbita col mouse |
 | **Video** | `.mp4`, `.mkv`, `.webm`, `.mov`, `.avi`, `.m4v`, … | player libav con timeline/scrubbing stile YouTube |
 | **Documenti** | `.pdf`, office | reso come immagine di pagina (via `pdftoppm`/`soffice`, solo Linux) |
@@ -214,8 +214,8 @@ benchmark). Aprendo una cartella:
 
 Limiti: 96 miniature in RAM (≈24 MB) e 96 decode per cartella; niente miniatura oltre
 256 MB; **un solo decode "pesante" alla volta** (PDF, video, formati che passano da
-rsvg/ImageMagick, file oltre 8 MiB: processi esterni già multi-thread o picchi di RAM
-da centinaia di MB); cache su disco in `~/.cache/zuer/thumbs` con tetto LRU di
+rsvg/ImageMagick — fuori da Linux anche il WebP —, file oltre 8 MiB: processi esterni
+già multi-thread o picchi di RAM da centinaia di MB); cache su disco in `~/.cache/zuer/thumbs` con tetto LRU di
 128 MB. Un decode fallito lascia in cache una voce negativa valida 24 ore, così la
 cartella non lo ritenta a ogni visita.
 
@@ -260,14 +260,18 @@ Miniature, 70 file reali (PNG, JPEG, WebP, GIF, BMP, SVG, PDF, video), cache fre
 
 | | seq | 1 job | 2 job | 3 job | 4 job |
 |---|---|---|---|---|---|
-| tempo | 9,7 s | 10,3 s | 8,1 s | 7,7 s | 8,1 s |
-| RSS massima | 446 MB | 444 MB | 489 MB | 497 MB | 510 MB |
+| tempo | 5,0 s | 4,5 s | **2,1 s** | 2,3 s | 2,3 s |
+| CPU | 4,8 s | 4,4 s | 4,1 s | 5,7 s | 5,8 s |
+| RSS massima | 447 MB | 445 MB | 489 MB | 498 MB | 517 MB |
 | apertura di un JPEG 2048² durante le miniature (da solo: 125 ms) | — | 124 ms | 186 ms | 170 ms | 261 ms |
 
-Le miniature sono identiche (stesso hash) in tutti gli scenari. Su cartelle di soli
-file "pesanti" (WebP, immagini oltre 8 MiB, PDF) il parallelo non accelera né rallenta:
-sono serializzati di proposito. Con la cache calda la cartella si riempie in 60–85 ms.
-Default 2 job: 3 sono equivalenti entro il rumore, 4 raddoppiano l'apertura di un file.
+Le miniature sono identiche (stesso hash) in tutti gli scenari. 16 WebP: 330 ms in
+sequenza, 167 ms con 2 job (prima, via ImageMagick: ~4,8 s e 2 file falliti). Su
+cartelle di soli file "pesanti" (immagini oltre 8 MiB, PDF) il parallelo non accelera
+né rallenta: sono serializzati di proposito. Con la cache calda la cartella si riempie
+in 60–85 ms. Default 2 job: oltre non si guadagna tempo, si spende il 40% di CPU in
+più e con 4 job l'apertura di un file raddoppia. (La riga dell'apertura file è stata
+misurata prima del WebP nativo.)
 
 Decode di un GLB in primo piano con altri 3 in sfondo, 8 round, rispetto alla
 versione senza scheduler: apertura **−44%** (644 → 362 ms, migliore in 8 round su 8),

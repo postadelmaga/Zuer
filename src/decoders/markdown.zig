@@ -120,7 +120,7 @@ pub fn decode(bytes: []const u8, allocator: std.mem.Allocator) Decoded {
 
     const sanitized = sanitizeToUtf8(bytes, allocator) catch {
         allocator.free(bytes);
-        return .{ .err = "Markdown non in formato UTF-8 valido." };
+        return decoder.pluginError(allocator, "Markdown non in formato UTF-8 valido.", .{});
     };
     allocator.free(bytes);
     return .{ .markdown = .{ .content = sanitized } };
@@ -137,7 +137,7 @@ fn zuer_decode(
     const allocator = @as(*const std.mem.Allocator, @ptrCast(@alignCast(allocator_ptr))).*;
     const decoded = decode(content.toSlice(), allocator);
     return decoded.toDecodedC(allocator) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "error";
+        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "";
         return .{
             .tag = .err,
             .payload = .{ .err = decoder.SliceC.fromSlice(msg) },

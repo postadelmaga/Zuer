@@ -959,7 +959,7 @@ export fn zuer_decode(
     const filename = std.fs.path.basename(clean_path);
     const decoded = decode(content.toSlice(), filename, want_sheet, allocator);
     return decoded.toDecodedC(allocator) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "error";
+        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "";
         return .{
             .tag = .err,
             .payload = .{ .err = decoder.SliceC.fromSlice(msg) },

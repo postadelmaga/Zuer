@@ -80,6 +80,14 @@ pub fn decodeWithMax(path: []const u8, file_bytes: []const u8, filename: []const
         } else |_| {}
     }
 
+    // WebP: libwebp a runtime, in processo. Senza (libreria assente, WebP
+    // animato, altro OS) si prosegue verso stb e poi ImageMagick come prima.
+    if (isWebp(file_bytes)) {
+        if (decodeWebp(file_bytes, filename, max_dim, allocator)) |img| {
+            return .{ .image = img };
+        } else |_| {}
+    }
+
     if (decodeNative(file_bytes, filename, max_dim, allocator)) |img| {
         return .{ .image = img };
     } else |native_err| {
@@ -96,7 +104,7 @@ pub fn decodeWithMax(path: []const u8, file_bytes: []const u8, filename: []const
                 allocator,
                 "Errore caricamento immagine: {s} (fallback ImageMagick: {s})",
                 .{ native_reason, @errorName(im_err) },
-            ) catch "Errore immagine";
+            ) catch "";
             return .{ .err = msg };
         }
     }
@@ -157,6 +165,74 @@ fn decodeNative(file_bytes: []const u8, filename: []const u8, max_dim: usize, al
         return error.UnsupportedImageFormat;
     defer stbi_image_free(data);
 
+    if (w <= 0 or h <= 0) return error.InvalidImageSize;
+    return resizeToFit(data, @intCast(w), @intCast(h), filename, max_dim, allocator);
+}
+
+fn isWebp(b: []const u8) bool {
+    return b.len >= 12 and std.mem.eql(u8, b[0..4], "RIFF") and std.mem.eql(u8, b[8..12], "WEBP");
+}
+
+/// `libwebp` caricata con dlopen al primo WebP: nessuna dipendenza di build e
+/// niente processo esterno. Prima i WebP passavano da ImageMagick (un processo
+/// per file, multi-thread, ~0,4 s l'uno; e il `magick` di molte distro non ha
+/// nemmeno il delegate WebP). Solo Linux: altrove `load` dà sempre null.
+const webp = struct {
+    const GetInfo = *const fn ([*]const u8, usize, *c_int, *c_int) callconv(.c) c_int;
+    const DecodeRGB = *const fn ([*]const u8, usize, *c_int, *c_int) callconv(.c) ?[*]u8;
+    const Free = *const fn (?*anyopaque) callconv(.c) void;
+    const Api = struct { get_info: GetInfo, decode_rgb: DecodeRGB, free: Free };
+
+    const dl = switch (@import("builtin").os.tag) {
+        .linux => struct {
+            extern "c" fn dlopen(path: [*:0]const u8, mode: c_int) ?*anyopaque;
+            extern "c" fn dlsym(handle: ?*anyopaque, symbol: [*:0]const u8) ?*anyopaque;
+        },
+        else => void,
+    };
+
+    // 0 = da provare, 1 = pronta, 2 = assente. Due decode concorrenti al
+    // primo WebP possono caricarla entrambi: dlopen conta i riferimenti e
+    // l'handle è lo stesso, quindi la corsa è innocua.
+    var state: std.atomic.Value(u8) = .init(0);
+    var api: Api = undefined;
+
+    fn load() ?*const Api {
+        switch (state.load(.acquire)) {
+            1 => return &api,
+            2 => return null,
+            else => {},
+        }
+        if (dl == void) {
+            state.store(2, .release);
+            return null;
+        }
+        const RTLD_NOW = 2;
+        const h = dl.dlopen("libwebp.so.7", RTLD_NOW) orelse dl.dlopen("libwebp.so", RTLD_NOW) orelse {
+            state.store(2, .release);
+            return null;
+        };
+        const gi = dl.dlsym(h, "WebPGetInfo");
+        const dr = dl.dlsym(h, "WebPDecodeRGB");
+        const fr = dl.dlsym(h, "WebPFree");
+        if (gi == null or dr == null or fr == null) {
+            state.store(2, .release);
+            return null;
+        }
+        api = .{ .get_info = @ptrCast(@alignCast(gi)), .decode_rgb = @ptrCast(@alignCast(dr)), .free = @ptrCast(@alignCast(fr)) };
+        state.store(1, .release);
+        return &api;
+    }
+};
+
+fn decodeWebp(file_bytes: []const u8, filename: []const u8, max_dim: usize, allocator: std.mem.Allocator) !ImageData {
+    const a = webp.load() orelse return error.WebpUnavailable;
+    var w: c_int = 0;
+    var h: c_int = 0;
+    if (a.get_info(file_bytes.ptr, file_bytes.len, &w, &h) == 0) return error.UnsupportedImageFormat;
+    // I WebP animati non passano dall'API semplice: NULL → ripiego.
+    const data = a.decode_rgb(file_bytes.ptr, file_bytes.len, &w, &h) orelse return error.UnsupportedImageFormat;
+    defer a.free(data);
     if (w <= 0 or h <= 0) return error.InvalidImageSize;
     return resizeToFit(data, @intCast(w), @intCast(h), filename, max_dim, allocator);
 }
@@ -290,7 +366,7 @@ fn decodeExport(path: decoder.SliceC, content: decoder.SliceC, allocator_ptr: *c
     // trapelano a ogni immagine.
     allocator.free(content_slice);
     return decoded.toDecodedC(allocator) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "error";
+        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "";
         return .{
             .tag = .err,
             .payload = .{ .err = decoder.SliceC.fromSlice(msg) },

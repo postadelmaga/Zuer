@@ -53,7 +53,7 @@ fn decodeTier(path: []const u8, bytes: []const u8, filename: []const u8, allocat
         }
     }
     const info: MediaInfo = info_opt orelse {
-        const msg = std.fmt.allocPrint(allocator, "Formato multimediale non riconosciuto: {s}", .{filename}) catch "Formato non riconosciuto";
+        const msg = std.fmt.allocPrint(allocator, "Formato multimediale non riconosciuto: {s}", .{filename}) catch "";
         return .{ .err = msg };
     };
 
@@ -514,7 +514,7 @@ fn decodeExport(
 
     const decoded = decodeTier(path.toSlice(), content.toSlice(), filename, allocator, coarse);
     return decoded.toDecodedC(allocator) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "error";
+        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "";
         return .{
             .tag = .err,
             .payload = .{ .err = decoder.SliceC.fromSlice(msg) },

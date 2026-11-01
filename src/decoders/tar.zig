@@ -19,7 +19,7 @@ pub fn decode(path: []const u8, io: std.Io, allocator: std.mem.Allocator) Decode
     var clean_path = path;
     if (std.mem.indexOfScalar(u8, path, '#')) |h| clean_path = path[0..h];
     return decodeTar(clean_path, io, allocator) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "Errore lettura archivio tar: {s}", .{@errorName(err)}) catch "Errore archivio";
+        const msg = std.fmt.allocPrint(allocator, "Errore lettura archivio tar: {s}", .{@errorName(err)}) catch "";
         return .{ .err = msg };
     };
 }
@@ -190,7 +190,7 @@ fn zuer_decode(
 
     const decoded = decode(path.toSlice(), io, allocator);
     return decoded.toDecodedC(allocator) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "error";
+        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "";
         return .{
             .tag = .err,
             .payload = .{ .err = decoder.SliceC.fromSlice(msg) },

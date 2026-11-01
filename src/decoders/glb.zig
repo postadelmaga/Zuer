@@ -552,36 +552,36 @@ fn readFloatAccessor(
 pub fn decode(bytes: []const u8, filename: []const u8, allocator: std.mem.Allocator, coarse: bool) Decoded {
     defer allocator.free(bytes);
 
-    if (bytes.len < 20) return .{ .err = "File GLB troppo piccolo" };
-    if (!std.mem.eql(u8, bytes[0..4], "glTF")) return .{ .err = "Formato GLB non valido (magic header errato)" };
+    if (bytes.len < 20) return decoder.pluginError(allocator, "File GLB troppo piccolo", .{});
+    if (!std.mem.eql(u8, bytes[0..4], "glTF")) return decoder.pluginError(allocator, "Formato GLB non valido (magic header errato)", .{});
 
     const version = std.mem.readInt(u32, bytes[4..8], .little);
-    if (version != 2) return .{ .err = "Versione glTF non supportata (solo v2)" };
+    if (version != 2) return decoder.pluginError(allocator, "Versione glTF non supportata (solo v2)", .{});
 
     // Chunk 0: JSON. Le lunghezze arrivano dal file (u32 ostili): tutta
     // l'aritmetica degli offset si fa in usize con controlli espliciti, così un
     // GLB corrotto produce un errore e mai un overflow/OOB.
     const chunk0_len: usize = std.mem.readInt(u32, bytes[12..16], .little);
     const chunk0_type = std.mem.readInt(u32, bytes[16..20], .little);
-    if (chunk0_type != 0x4E4F534A) return .{ .err = "Il primo chunk GLB deve essere JSON" };
-    const json_end = std.math.add(usize, 20, chunk0_len) catch return .{ .err = "JSON chunk fuori dai limiti del file" };
-    if (json_end > bytes.len) return .{ .err = "JSON chunk fuori dai limiti del file" };
+    if (chunk0_type != 0x4E4F534A) return decoder.pluginError(allocator, "Il primo chunk GLB deve essere JSON", .{});
+    const json_end = std.math.add(usize, 20, chunk0_len) catch return decoder.pluginError(allocator, "JSON chunk fuori dai limiti del file", .{});
+    if (json_end > bytes.len) return decoder.pluginError(allocator, "JSON chunk fuori dai limiti del file", .{});
     const json_str = bytes[20..json_end];
 
     // Chunk 1: BIN
     const chunk1_offset = json_end;
-    const chunk1_hdr_end = std.math.add(usize, chunk1_offset, 8) catch return .{ .err = "Nessun chunk BIN trovato" };
-    if (chunk1_hdr_end > bytes.len) return .{ .err = "Nessun chunk BIN trovato" };
+    const chunk1_hdr_end = std.math.add(usize, chunk1_offset, 8) catch return decoder.pluginError(allocator, "Nessun chunk BIN trovato", .{});
+    if (chunk1_hdr_end > bytes.len) return decoder.pluginError(allocator, "Nessun chunk BIN trovato", .{});
     const chunk1_len: usize = std.mem.readInt(u32, bytes[chunk1_offset..][0..4], .little);
     const chunk1_type = std.mem.readInt(u32, bytes[chunk1_offset + 4 ..][0..4], .little);
-    if (chunk1_type != 0x004E4942) return .{ .err = "Il secondo chunk GLB deve essere BIN" };
-    const bin_end = std.math.add(usize, chunk1_hdr_end, chunk1_len) catch return .{ .err = "BIN chunk fuori dai limiti del file" };
-    if (bin_end > bytes.len) return .{ .err = "BIN chunk fuori dai limiti del file" };
+    if (chunk1_type != 0x004E4942) return decoder.pluginError(allocator, "Il secondo chunk GLB deve essere BIN", .{});
+    const bin_end = std.math.add(usize, chunk1_hdr_end, chunk1_len) catch return decoder.pluginError(allocator, "BIN chunk fuori dai limiti del file", .{});
+    if (bin_end > bytes.len) return decoder.pluginError(allocator, "BIN chunk fuori dai limiti del file", .{});
     const bin_data = bytes[chunk1_hdr_end..bin_end];
 
     // Parse JSON
     var parsed = std.json.parseFromSlice(GltfStructure, allocator, json_str, .{ .ignore_unknown_fields = true }) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "Errore parsing JSON glTF: {s}", .{@errorName(err)}) catch "Errore JSON";
+        const msg = std.fmt.allocPrint(allocator, "Errore parsing JSON glTF: {s}", .{@errorName(err)}) catch "";
         return .{ .err = msg };
     };
     defer parsed.deinit();
@@ -589,7 +589,7 @@ pub fn decode(bytes: []const u8, filename: []const u8, allocator: std.mem.Alloca
 
     // Decode meshes to MeshData
     const mesh_data = decodeGltfScene(gltf, bin_data, filename, allocator, coarse) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "Errore decodifica modello 3D GLB: {s}", .{@errorName(err)}) catch "Errore GLB";
+        const msg = std.fmt.allocPrint(allocator, "Errore decodifica modello 3D GLB: {s}", .{@errorName(err)}) catch "";
         return .{ .err = msg };
     };
 
@@ -945,7 +945,7 @@ fn decodeExport(
     const filename = std.fs.path.basename(path.toSlice());
     const decoded = decode(content.toSlice(), filename, allocator, coarse);
     return decoded.toDecodedC(allocator) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "error";
+        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "";
         return .{
             .tag = .err,
             .payload = .{ .err = decoder.SliceC.fromSlice(msg) },

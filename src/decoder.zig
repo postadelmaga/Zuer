@@ -554,16 +554,21 @@ pub const DecodedC = extern struct {
                 };
             },
             .err => {
-                // I plugin possono restituire messaggi d'errore sia letterali statici
-                // sia heap: si duplica al confine ABI e non si libera mai l'originale
-                // (un messaggio heap del plugin trapela pochi byte, ma non si può
-                // distinguere e un free su un letterale corromperebbe l'allocator).
-                const e = self.payload.err;
-                return .{ .err = allocator.dupe(u8, e.toSlice()) catch "" };
+                // Contratto v6: il messaggio è allocato con `allocator` (o vuoto),
+                // l'host ne prende possesso e lo libera in `Decoded.deinit`.
+                return .{ .err = self.payload.err.toSlice() };
             },
         }
     }
 };
+
+/// Errore di un plugin secondo il contratto ABI v6: messaggio allocato con
+/// `allocator` (l'allocator dell'host passato a `zuer_decode`), di cui l'host
+/// prende possesso; vuoto se manca la memoria (liberare una slice vuota non fa
+/// nulla). MAI un letterale: l'host lo libererebbe.
+pub fn pluginError(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) Decoded {
+    return .{ .err = std.fmt.allocPrint(allocator, fmt, args) catch "" };
+}
 
 /// Versione dell'ABI plugin (layout di `DecodedC`, firma di `DecodeFn` E layout
 /// dei tipi std che attraversano il confine — `io_ptr` e `allocator_ptr` puntano
@@ -579,7 +584,12 @@ pub const DecodedC = extern struct {
 ///     `SafeAllocator.alloc` muore in `@alignCast` ("incorrect alignment"):
 ///     `DecodedC` era identico, quindi solo il bump lo fa scartare.
 /// v5: l'impronta qui sotto, calcolata a comptime, al posto del numero a mano.
-pub const abi_contract: u32 = 5;
+/// v6: il messaggio di `.err` è SEMPRE allocato con l'allocator dell'host (o
+///     vuoto) e l'host ne prende possesso. Prima poteva essere un letterale,
+///     quindi l'host lo duplicava e non liberava mai l'originale (un leak per
+///     ogni decode fallito). Un plugin v5 darebbe all'host un letterale da
+///     liberare: il bump lo fa scartare.
+pub const abi_contract: u32 = 6;
 
 /// Versione effettiva confrontata al caricamento: `abi_contract` + versione di
 /// Zig + layout dei tipi std che attraversano il confine (`io_ptr` e

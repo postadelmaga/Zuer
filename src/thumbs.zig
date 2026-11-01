@@ -494,14 +494,17 @@ const ClaimResult = union(enum) {
 pub const heavy_bytes: u64 = 8 * 1024 * 1024;
 
 /// Decode lenti o costosi in RAM: PDF (processo esterno), video (demuxer +
-/// decoder), immagini che stb non legge e che passano da rsvg/ImageMagick
-/// (processi esterni a loro volta multi-thread), file oltre `heavy_bytes`.
+/// decoder), immagini che passano da rsvg/ImageMagick (processi esterni a loro
+/// volta multi-thread), file oltre `heavy_bytes`.
 fn isHeavy(e: *const Entry) bool {
     if (e.size > heavy_bytes) return true;
     const ext = decoder_mod.getExtension(e.name);
-    inline for (.{ "pdf", "webp", "svg", "svgz", "tif", "tiff", "avif", "ico" }) |x| {
+    inline for (.{ "pdf", "svg", "svgz", "tif", "tiff", "avif", "ico" }) |x| {
         if (extEqCi(ext, x)) return true;
     }
+    // WebP: su Linux il plugin image lo decodifica in processo con libwebp;
+    // altrove passa ancora da ImageMagick.
+    if (builtin.os.tag != .linux and extEqCi(ext, "webp")) return true;
     return layout.winKindFromExt(e.name) == .video;
 }
 

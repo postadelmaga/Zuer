@@ -449,7 +449,9 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    b.installArtifact(bench_dbg);
+    // Strumenti solo Linux (getrusage, /proc, perf_event_open): installati
+    // solo lì, così la build Windows non li compila.
+    if (target.result.os.tag == .linux) b.installArtifact(bench_dbg);
     const bench_run = b.addRunArtifact(bench_dbg);
     bench_run.addPassthruArgs();
     b.step("bench-decode", "Latenza di un decode con altri decode in sfondo").dependOn(&bench_run.step);
@@ -465,7 +467,9 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    b.installArtifact(bench_th);
+    // Strumenti solo Linux (getrusage, /proc, perf_event_open): installati
+    // solo lì, così la build Windows non li compila.
+    if (target.result.os.tag == .linux) b.installArtifact(bench_th);
     const bench_th_run = b.addRunArtifact(bench_th);
     bench_th_run.addPassthruArgs();
     b.step("bench-thumbnails", "Pipeline miniature headless, uno scenario per processo").dependOn(&bench_th_run.step);

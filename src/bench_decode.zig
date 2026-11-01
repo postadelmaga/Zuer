@@ -72,7 +72,7 @@ pub fn main(init: std.process.Init) !void {
             }
         }
         var hb: [128]u8 = undefined;
-        var hw = std.Io.File.stdout().writer(io, &hb);
+        var hw = std.Io.File.stdout().writerStreaming(io, &hb);
         try hw.interface.print("tex_hash={x} tag={s}\n", .{ h.final(), @tagName(d) });
         try hw.interface.flush();
         return;
@@ -127,7 +127,7 @@ pub fn main(init: std.process.Init) !void {
     _ = getrusage(linux.rusage.SELF, &ru);
     {
         var pb: [512]u8 = undefined;
-        var pw = std.Io.File.stdout().writer(io, &pb);
+        var pw = std.Io.File.stdout().writerStreaming(io, &pb);
         try pw.interface.print("perf user_ms={d} sys_ms={d} vcsw={d} ivcsw={d} minflt={d}", .{
             @as(i64, ru.utime.sec) * 1000 + @divTrunc(ru.utime.usec, 1000),
             @as(i64, ru.stime.sec) * 1000 + @divTrunc(ru.stime.usec, 1000),
@@ -142,7 +142,7 @@ pub fn main(init: std.process.Init) !void {
     var bg_max: u64 = 0;
     for (bgs) |b| bg_max = @max(bg_max, b.elapsed_ns);
     var buf: [256]u8 = undefined;
-    var w = std.Io.File.stdout().writer(io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(io, &buf);
     try w.interface.print("solo_ms={d} fg_under_load_ms={d} bg_total_ms={d}\n", .{
         solo_ns / std.time.ns_per_ms, fg_ns / std.time.ns_per_ms, bg_max / std.time.ns_per_ms,
     });

@@ -101,21 +101,21 @@ pub fn decode(bytes: []u8, delimiter: u8, allocator: std.mem.Allocator) Decoded 
     var i: usize = 0;
     while (i < bytes.len) {
         const cell = scanCell(bytes, &i, delimiter);
-        current_row.append(allocator, cell.text) catch return .{ .err = "Out of memory" };
+        current_row.append(allocator, cell.text) catch return decoder.pluginError(allocator, "Out of memory", .{});
         switch (cell.term) {
             .delim => {}, // la riga continua
             .newline, .eof => {
-                const row = current_row.toOwnedSlice(allocator) catch return .{ .err = "Out of memory" };
+                const row = current_row.toOwnedSlice(allocator) catch return decoder.pluginError(allocator, "Out of memory", .{});
                 rows.append(allocator, row) catch {
                     allocator.free(row);
-                    return .{ .err = "Out of memory" };
+                    return decoder.pluginError(allocator, "Out of memory", .{});
                 };
             },
         }
     }
 
     if (rows.items.len == 0) {
-        const msg = allocator.dupe(u8, "Tabella CSV vuota.") catch "CSV vuoto";
+        const msg = allocator.dupe(u8, "Tabella CSV vuota.") catch "";
         return .{ .err = msg };
     }
 
@@ -123,7 +123,7 @@ pub fn decode(bytes: []u8, delimiter: u8, allocator: std.mem.Allocator) Decoded 
     const headers = rows.orderedRemove(0);
     const final_rows = rows.toOwnedSlice(allocator) catch {
         allocator.free(headers);
-        return .{ .err = "Out of memory" };
+        return decoder.pluginError(allocator, "Out of memory", .{});
     };
 
     handed_over = true;
@@ -162,7 +162,7 @@ fn zuer_decode(
     // compattandole al suo interno. Il `const` è solo del layout C `SliceC`.
     const decoded = decode(@constCast(content_slice), delimiter, allocator);
     return decoded.toDecodedC(allocator) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "error";
+        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "";
         return .{
             .tag = .err,
             .payload = .{ .err = decoder.SliceC.fromSlice(msg) },

@@ -275,8 +275,8 @@ pub fn main(init: std.process.Init) !void {
     const p95 = if (n > 0) times[@min(n - 1, (n * 95 + 99) / 100 - 1)] else 0;
     const thr_x100 = if (wall_ns > 0) made * 100 * std.time.ns_per_s / wall_ns else 0;
 
-    var buf: [1024]u8 = undefined;
-    var w = std.Io.File.stdout().writer(io, &buf);
+    var buf: [2048]u8 = undefined;
+    var w = std.Io.File.stdout().writerStreaming(io, &buf);
     try w.interface.print(
         "scenario={s} wall_ms={d} cpu_ms={d} sys_ms={d} minflt={d} child_cpu_ms={d} thumbs={d} failed={d} " ++
             "thr_per_s={d}.{d:0>2} mean_ms={d} median_ms={d} p95_ms={d} " ++
@@ -302,10 +302,10 @@ pub fn main(init: std.process.Init) !void {
         },
     );
     try w.interface.flush();
-    var buf2: [512]u8 = undefined;
-    var w2 = std.Io.File.stdout().writer(io, &buf2);
-    try w2.interface.print("perf scenario={s}", .{scenario});
-    try pc.print(&w2.interface);
-    try w2.interface.print("\n", .{});
-    try w2.interface.flush();
+    // Stesso writer: due writer su uno stdout rediretto a file scrivono
+    // entrambi dall'offset 0 (scrittura posizionale) e si sovrascrivono.
+    try w.interface.print("perf scenario={s}", .{scenario});
+    try pc.print(&w.interface);
+    try w.interface.print("\n", .{});
+    try w.interface.flush();
 }

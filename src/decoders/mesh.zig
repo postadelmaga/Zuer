@@ -199,7 +199,7 @@ fn decodeStl(bytes: []const u8, filename: []const u8, allocator: std.mem.Allocat
         if (vertices.items.len == 0) {
             vertices.deinit(allocator);
             faces.deinit(allocator);
-            const msg = allocator.dupe(u8, "STL non valido: nessun triangolo trovato.") catch "STL non valido";
+            const msg = allocator.dupe(u8, "STL non valido: nessun triangolo trovato.") catch "";
             return .{ .err = msg };
         }
     }
@@ -244,7 +244,7 @@ fn zuer_decode(
     const filename = std.fs.path.basename(path_slice);
     const decoded = decode(content_slice, filename, allocator);
     return decoded.toDecodedC(allocator) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "error";
+        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "";
         return .{
             .tag = .err,
             .payload = .{ .err = decoder.SliceC.fromSlice(msg) },

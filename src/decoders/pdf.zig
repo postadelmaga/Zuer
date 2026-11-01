@@ -121,7 +121,7 @@ fn decodeTier(path: []const u8, io: std.Io, filename: []const u8, allocator: std
             error.CommandNotFound => "pdftoppm/pdfinfo non trovati: installa poppler-utils",
             else => @errorName(err),
         };
-        const msg = std.fmt.allocPrint(allocator, "Errore rendering PDF: {s}", .{hint}) catch "Errore PDF";
+        const msg = std.fmt.allocPrint(allocator, "Errore rendering PDF: {s}", .{hint}) catch "";
         return .{ .err = msg };
     };
 }
@@ -636,7 +636,7 @@ fn decodeExport(
     allocator.free(content.toSlice());
     const decoded = decodeTier(path_slice, io, filename, allocator, coarse);
     return decoded.toDecodedC(allocator) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "error";
+        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "";
         return .{
             .tag = .err,
             .payload = .{ .err = decoder.SliceC.fromSlice(msg) },
