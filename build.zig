@@ -426,6 +426,17 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run zuer");
     run_step.dependOn(&run_cmd.step);
 
+    // Test unitari puri (nessuna dipendenza nativa): `zig build test`.
+    const test_step = b.step("test", "Esegue i test unitari");
+    for ([_][]const u8{"src/detect.zig"}) |src_path| {
+        const t = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path(src_path),
+            .target = target,
+            .optimize = optimize,
+        }) });
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
+
     // Tool di sviluppo: chiama decoder.decode() su un file e stampa il risultato.
     const decode_dbg = b.addExecutable(.{
         .name = "decode-test",

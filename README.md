@@ -21,6 +21,12 @@ la decodifica video per libav (FFmpeg).
 | **Video** | `.mp4`, `.mkv`, `.webm`, `.mov`, `.avi`, `.m4v`, … | player libav con timeline/scrubbing stile YouTube |
 | **Documenti** | `.pdf`, office | reso come immagine di pagina (via `pdftoppm`/`soffice`, solo Linux) |
 
+Il formato si riconosce anche **senza estensione o con quella sbagliata**:
+`src/detect.zig` legge i byte magici dai primi 8 KB (immagini, PDF, ZIP/tar/gzip,
+glb, MP4/MKV/WebM/AVI, MP3/FLAC/Ogg/WAV/MIDI) e carica solo il plugin che serve.
+I formati riconosciuti ma senza decoder (ELF, PE, 7z, RAR, SQLite, HEIC, …) e gli
+header troncati danno un errore esplicito. Test: `zig build test`.
+
 Aprendo una **cartella** si apre il primo file e si naviga tra gli altri con le
 frecce `← →`.
 

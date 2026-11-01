@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const dynlib = @import("dynlib.zig");
 const meshcache = @import("meshcache.zig");
+const detect = @import("detect.zig");
 
 pub const CsvData = struct {
     headers: [][]const u8,
@@ -576,7 +577,33 @@ pub const DecodedC = extern struct {
 ///     pre-0.17 passa un `Alignment` che l'host interpreta come spazzatura e
 ///     `SafeAllocator.alloc` muore in `@alignCast` ("incorrect alignment"):
 ///     `DecodedC` era identico, quindi solo il bump lo fa scartare.
-pub const abi_version: u32 = 4;
+/// v5: l'impronta qui sotto, calcolata a comptime, al posto del numero a mano.
+pub const abi_contract: u32 = 5;
+
+/// Versione effettiva confrontata al caricamento: `abi_contract` + versione di
+/// Zig + layout dei tipi std che attraversano il confine (`io_ptr` e
+/// `allocator_ptr` di `DecodeFn` puntano a `std.Io`/`std.mem.Allocator` dell'
+/// host, NON a tipi C). La v4 ha mostrato che un cambio di quei layout lascia
+/// identico `DecodedC` e passa il controllo: ora un plugin compilato con un
+/// altro Zig viene scartato da solo, senza ricordarsi di bumpare nulla.
+/// Host e plugin la calcolano dallo stesso sorgente, quindi coincidono
+/// esattamente quando coincidono compilatore e contratto.
+pub const abi_version: u32 = blk: {
+    @setEvalBranchQuota(10_000);
+    var h = std.hash.Fnv1a_32.init();
+    h.update(std.mem.asBytes(&abi_contract));
+    h.update(builtin.zig_version_string);
+    for ([_]usize{
+        @sizeOf(std.mem.Allocator),        @alignOf(std.mem.Allocator),
+        @sizeOf(std.mem.Allocator.VTable), @sizeOf(std.Io),
+        @alignOf(std.Io),                  @sizeOf(std.Io.VTable),
+        @sizeOf(DecodedC),                 @alignOf(DecodedC),
+    }) |n| {
+        const v: u64 = n;
+        h.update(std.mem.asBytes(&v));
+    }
+    break :blk h.final();
+};
 
 /// True quando i decoder sono compilati come **plugin** caricabili con `dlopen` — il caso
 /// del desktop. Su Android no: l'APK porta una libreria sola e i decoder ci finiscono
@@ -779,10 +806,10 @@ fn registerPluginFile(dir_path: []const u8, file_name: []const u8, type_name: []
     const abi_ok = if (lib.lookup(AbiVersionFn, "zuer_abi_version")) |abi_fn| blk: {
         const v = abi_fn();
         if (v != abi_version)
-            std.debug.print("zuer: plugin {s} ignorato: ABI v{d} != v{d}\n", .{ file_name, v, abi_version });
+            std.debug.print("zuer: plugin {s} ignorato: ABI {x:0>8} != {x:0>8} (compilato con un altro Zig o contratto)\n", .{ file_name, v, abi_version });
         break :blk v == abi_version;
     } else blk: {
-        std.debug.print("zuer: plugin {s} ignorato: manca zuer_abi_version (atteso ABI v{d})\n", .{ file_name, abi_version });
+        std.debug.print("zuer: plugin {s} ignorato: manca zuer_abi_version (atteso ABI {x:0>8})\n", .{ file_name, abi_version });
         break :blk false;
     };
     if (!abi_ok) {
@@ -1456,22 +1483,14 @@ fn computeDefaultMaxSize(io: std.Io, allocator: std.mem.Allocator) usize {
     return (kb * 1024) / 2;
 }
 
-/// Riconosce i formati immagine comuni dai byte magici, per instradare al plugin
-/// immagini i file con estensione errata o assente (quando nessun plugin è
-/// stato risolto per estensione nel registro).
-fn guessImageFormat(bytes: []const u8) bool {
-    if (bytes.len >= 4) {
-        if (std.mem.eql(u8, bytes[0..4], &.{ 0x89, 0x50, 0x4E, 0x47 })) return true; // PNG
-        if (std.mem.eql(u8, bytes[0..4], "GIF8")) return true; // GIF
-        if (bytes[0] == 'B' and bytes[1] == 'M') return true; // BMP
-    }
-    if (bytes.len >= 3) {
-        if (std.mem.eql(u8, bytes[0..3], &.{ 0xFF, 0xD8, 0xFF })) return true; // JPEG
-    }
-    if (bytes.len >= 12) {
-        if (std.mem.eql(u8, bytes[0..4], "RIFF") and std.mem.eql(u8, bytes[8..12], "WEBP")) return true; // WebP
-    }
-    return false;
+/// Legge i primi `buf.len` byte del file (meno se è più corto).
+fn probeFile(io: std.Io, path: []const u8, buf: []u8) ![]const u8 {
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var rbuf: [1024]u8 = undefined;
+    var reader = file.readerStreaming(io, &rbuf);
+    const n = reader.interface.readSliceShort(buf) catch 0;
+    return buf[0..n];
 }
 
 /// Stesso criterio di `isBinary` in decoders/text.zig, applicato dall'host al
@@ -1836,10 +1855,8 @@ fn decodeImpl(path: []const u8, io: std.Io, allocator: std.mem.Allocator, coarse
 
     var ext_fn: ?DecodeFn = null;
     var ext_found = false;
+    var ext_is_text = false;
     var ext_prefix: usize = std.math.maxInt(usize);
-    var image_fn: ?DecodeFn = null;
-    var image_found = false;
-    var image_prefix: usize = std.math.maxInt(usize);
     var text_fn: ?DecodeFn = null;
     {
         plugin_cache_mutex.lockUncancelable(io);
@@ -1849,59 +1866,72 @@ fn decodeImpl(path: []const u8, io: std.Io, allocator: std.mem.Allocator, coarse
         ensureForExtLocked(ext, io, allocator);
         if (findPluginByExtension(ext)) |p| {
             ext_found = true;
+            ext_is_text = std.mem.eql(u8, p.type_name, "text");
             ext_fn = if (coarse) p.decode_coarse_fn else p.decode_fn;
             ext_prefix = p.content_prefix;
         } else {
-            // Estensione sconosciuta anche dopo la risoluzione: servono solo i
-            // fallback (probe immagine per byte magici, poi testo).
-            loadPluginByNameLocked("image", io, allocator);
+            // Estensione sconosciuta anche dopo la risoluzione: il plugin
+            // giusto lo dirà il rilevamento per byte magici qui sotto; il
+            // testo serve come ultimo fallback. Il plugin immagine NON si
+            // carica più a scatola chiusa: solo se il probe lo indica.
             loadPluginByNameLocked("text", io, allocator);
-            if (findPluginByName("image")) |p| {
-                image_found = true;
-                image_fn = if (coarse) p.decode_coarse_fn else p.decode_fn;
-                image_prefix = p.content_prefix;
-            }
             if (findPluginByName("text")) |p| {
                 text_fn = if (coarse) p.decode_coarse_fn else p.decode_fn;
             }
         }
     }
 
-    // Fase coarse senza alcun candidato con `zuer_decode_coarse` → null subito,
-    // senza toccare il file: l'host farà solo il decode full.
-    if (coarse and ext_fn == null and image_fn == null and text_fn == null) return null;
+    // Fase coarse senza estensione nota → null subito, senza toccare il file:
+    // l'unico plugin con `zuer_decode_coarse` (glb) ha un'estensione, e l'host
+    // farà comunque il decode full.
+    if (coarse and !ext_found) return null;
 
     var decode_fn: ?DecodeFn = ext_fn;
     var content_prefix: usize = ext_prefix;
-    if (!ext_found) {
-        // Estensione ignota al registro: servono i primi byte per riconoscere
-        // un'immagine con nome sbagliato/assente. Prefisso, non l'intero file —
-        // ma 8 KB invece di 16 byte, così lo stesso campione basta anche per il
-        // verdetto "binario" qui sotto.
+    // Rilevamento per contenuto (detect.zig), indipendente dall'estensione:
+    // per le estensioni ignote, e per quelle che il manifest manda al plugin
+    // `text` (un PNG salvato come `.txt`, un tar.gz chiamato `.log`). Gli altri
+    // plugin per estensione sniffano già da soli (stb, libav, gzip in tar.zig).
+    // Costo: un solo read di 8 KB, che serve anche al verdetto "binario".
+    if (!ext_found or (ext_is_text and !coarse)) {
         var probe_buf: [binary_probe_bytes]u8 = undefined;
-        var probe_len: usize = 0;
-        {
-            var file = std.Io.Dir.cwd().openFile(io, clean_path, .{}) catch |err| {
-                const msg = std.fmt.allocPrint(allocator, "Impossibile aprire o leggere il file: {s} ({s})", .{ clean_path, @errorName(err) }) catch "";
-                return .{ .err = msg };
-            };
-            defer file.close(io);
-            var rbuf: [1024]u8 = undefined;
-            var reader = file.readerStreaming(io, &rbuf);
-            probe_len = reader.interface.readSliceShort(&probe_buf) catch 0;
+        const probe = probeFile(io, clean_path, &probe_buf) catch |err| {
+            const msg = std.fmt.allocPrint(allocator, "Impossibile aprire o leggere il file: {s} ({s})", .{ clean_path, @errorName(err) }) catch "";
+            return .{ .err = msg };
+        };
+        const det = detect.detect(probe, stat.size);
+        // Troncato: errore chiaro solo senza estensione. Con un'estensione di
+        // testo vince il testo (un `.txt` che contiene solo "GIF89a" è testo).
+        if (det.truncated and !ext_found) {
+            const msg = std.fmt.allocPrint(allocator, "File {s} incompleto o corrotto: header troncato ({d} byte).", .{ det.label, stat.size }) catch "";
+            return .{ .err = msg };
         }
-        if (image_found and guessImageFormat(probe_buf[0..probe_len])) {
-            decode_fn = image_fn;
-            content_prefix = image_prefix;
-        } else {
-            // Il fallback è il plugin `text`, che legge TUTTO il file solo per
-            // scoprire dai primi 8 KB che è binario e scartarlo: un .bin o un
-            // core dump senza estensione veniva caricato per intero in RAM per
-            // nulla. Il verdetto si dà QUI, sul probe già letto e con lo stesso
-            // criterio del plugin. I file di testo grandi ma legittimi (log da
-            // centinaia di MB) passano il probe e restano apribili esattamente
-            // come prima, sempre entro il tetto `max_size`.
-            if (!coarse and probeLooksBinary(probe_buf[0..probe_len])) {
+        var routed = false;
+        if (det.plugin) |name| {
+            if (!det.truncated and !std.mem.eql(u8, name, "text")) {
+                plugin_cache_mutex.lockUncancelable(io);
+                defer plugin_cache_mutex.unlock(io);
+                loadPluginByNameLocked(name, io, allocator);
+                if (findPluginByName(name)) |p| {
+                    decode_fn = if (coarse) p.decode_coarse_fn else p.decode_fn;
+                    content_prefix = p.content_prefix;
+                    routed = true;
+                }
+            }
+        }
+        if (!routed and !ext_found) {
+            if (det.plugin) |name| {
+                const msg = std.fmt.allocPrint(allocator, "Formato {s} riconosciuto, ma il plugin '{s}' non è disponibile.", .{ det.label, name }) catch "";
+                return .{ .err = msg };
+            }
+            if (det.known()) {
+                const msg = std.fmt.allocPrint(allocator, "Formato riconosciuto ma non supportato: {s} ({s}).", .{ det.label, det.mime }) catch "";
+                return .{ .err = msg };
+            }
+            // Il fallback è il plugin `text`, che leggerebbe TUTTO il file solo
+            // per scoprire dai primi 8 KB che è binario: il verdetto si dà QUI,
+            // sul probe già letto e con lo stesso criterio del plugin.
+            if (probeLooksBinary(probe)) {
                 const msg = allocator.dupe(u8, "Formato non riconosciuto o file binario non UTF-8.") catch "";
                 return .{ .err = msg };
             }
