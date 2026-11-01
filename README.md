@@ -119,6 +119,7 @@ in sync (office/pdf sono Linux-only → non associati su Windows).
 | Var | Effetto |
 |-----|---------|
 | `ZUER_GPU=<indice\|nome>` | forza la GPU (es. `ZUER_GPU=intel` o `ZUER_GPU=0`); zuer logga i device che vede. Off-Linux preferisce l'**integrata** (readback economico) |
+| `ZUER_WORKERS=<n>` | numero massimo di worker dello scheduler condiviso (default: core logici − 1) |
 | `ZUER_OPAQUE=1` | finestra **opaca** (BitBlt veloce) invece del vetro layered: utile per testare 3D/video fluidi **sotto Wine**, dove senza DWM il vetro va composto in software. Su Windows vero il DWM compone il vetro in GPU, quindi non serve |
 
 Due capacità native, ognuna con la sua import-lib, attivabili a parte:
@@ -164,6 +165,28 @@ Il **GUI** (`gui.zig`) è organizzato in moduli coesi:
 I **decoder** sono librerie dinamiche caricate a runtime (`decoder_<fmt>.so`/`.dll`):
 aggiungerne uno = un nuovo file in `src/decoders/` più una voce nella lista di `build.zig`.
 
+### Concorrenza
+
+Il lavoro CPU che si parallelizza passa da **uno scheduler condiviso**
+(`src/scheduler.zig`) invece che da `Thread.spawn` sparsi:
+
+- **worker pigri e limitati**: nessun thread finché non serve, al massimo
+  `ZUER_WORKERS` (default core logici − 1); un worker inattivo per 2 s esce e
+  libera stack e cache di malloc;
+- **quattro priorità** — `critical`, `interactive` (il file aperto dall'utente),
+  `normal` (miniature), `background` (prefetch) — con anti-starvation;
+- **`parallelFor`**: il thread chiamante drena gli indici, i worker liberi aiutano e
+  cedono il posto tra un indice e l'altro se arriva lavoro più urgente;
+- **plugin**: un `.so` non vede lo scheduler dell'host, quindi lo riceve come tabella
+  C (`HostServices`) dall'export opzionale `zuer_set_host`. Oggi lo usa `glb` per le
+  texture; senza la tabella (Android, host vecchi) il plugin ripiega sui propri thread.
+
+Restano **thread dedicati**, di proposito: finestra, render, loader e prefetch (cicli
+permanenti con la loro condition), audio/MIDI/video (tempo reale), le operazioni
+YouTube e appunti (aspettano processi esterni: nel pool bloccherebbero worker CPU)
+e la scrittura della cache mesh (I/O su disco, misurato: in un worker ritardava il
+decode in primo piano).
+
 Portabilità: zicro e zrame nascondono le differenze di OS (finestra, input, clipboard,
 dynamic loading) dietro API uniformi, così zuer resta in gran parte agnostico rispetto
 alla piattaforma. I punti che restano specifici sono isolati in file per-OS
@@ -177,5 +200,7 @@ alla piattaforma. I punti che restano specifici sono isolati in file per-OS
 zig build gpu-selftest    # render headless di un cubo per validare la pipeline mesh
 zig build raster-debug -- file      # rasterizza un file su PPM (stdout)
 zig build decode-test -- file       # decodifica un file e stampa il risultato
+zig build bench-decode -- fg bg...  # latenza di un decode con altri decode in sfondo
+zig build test                      # test unitari (detector, scheduler)
 zig build player-test -- video      # itera i frame video col motore libav
 ```

@@ -10,6 +10,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const decoder_mod = @import("decoder.zig");
+const scheduler = @import("scheduler.zig");
 const glyph = @import("glyph.zig");
 const layout = @import("layout.zig");
 const nav = @import("nav.zig");
@@ -278,9 +279,55 @@ fn enterDir(state: *GuiAppState, dir_path: []const u8) bool {
     state.shared.file_changed = true;
     state.shared.mutex.unlock(state.io);
 
-    const t = std.Thread.spawn(.{}, thumbWorker, .{ state, gen }) catch return true;
-    t.detach();
+    startThumbs(state, gen);
     return true;
+}
+
+/// Batch di miniature come task dello scheduler (priorità `normal`: sotto il
+/// file che l'utente apre, sopra il prefetch). Si libera da sé in `on_done`.
+///
+/// Cooperativo: tra una miniatura e l'altra cede il worker se in coda c'è
+/// lavoro più urgente (il decode che l'utente ha aperto), e si risottomette
+/// riprendendo da dove era. Il batch di una cartella dura secondi: senza
+/// cedere terrebbe un worker per tutto quel tempo.
+const ThumbJob = struct {
+    task: scheduler.Task,
+    state: *GuiAppState,
+    gen: u32,
+    batch: ThumbBatch = .{ .cooperative = true },
+    again: bool = false,
+
+    fn run(t: *scheduler.Task) void {
+        const j: *ThumbJob = @fieldParentPtr("task", t);
+        j.again = thumbBatch(j.state, j.gen, &j.batch);
+    }
+
+    fn done(t: *scheduler.Task) void {
+        const j: *ThumbJob = @fieldParentPtr("task", t);
+        if (t.state == .done and j.again) {
+            j.again = false;
+            if (scheduler.get()) |s| {
+                if (s.submit(&j.task)) |_| return else |err| if (err == error.QueueFull) {
+                    // Coda piena: si finisce qui, senza più cedere.
+                    j.batch.cooperative = false;
+                    _ = thumbBatch(j.state, j.gen, &j.batch);
+                }
+            }
+        }
+        j.state.gpa.destroy(j);
+    }
+};
+
+fn startThumbs(state: *GuiAppState, gen: u32) void {
+    if (scheduler.get()) |s| {
+        if (state.gpa.create(ThumbJob)) |j| {
+            j.* = .{ .task = .{ .run_fn = ThumbJob.run, .on_done = ThumbJob.done, .priority = .normal }, .state = state, .gen = gen };
+            if (s.submit(&j.task)) |_| return else |_| state.gpa.destroy(j);
+        } else |_| {}
+    }
+    // Ripiego: scheduler assente o coda piena → thread dedicato come prima.
+    const t = std.Thread.spawn(.{}, thumbWorker, .{ state, gen }) catch return;
+    t.detach();
 }
 
 /// Apre l'esploratore sulla cartella del file corrente, con fallback su $HOME
@@ -1008,9 +1055,17 @@ fn thumbPass(
     dir_copy: []const u8,
     real_dir: []const u8,
     cdir: ?std.Io.Dir,
-    writes: *usize,
+    batch: *ThumbBatch,
 ) void {
-    while (claimNext(state, gen, phase)) |claim| {
+    while (true) {
+        // Almeno una voce per esecuzione, così il batch avanza anche se lavoro
+        // più urgente arriva di continuo; poi cede appena ce n'è.
+        if (batch.cooperative and batch.done_this_run > 0 and scheduler.shouldYield(.normal)) {
+            batch.yielded = true;
+            return;
+        }
+        const claim = claimNext(state, gen, phase) orelse return;
+        batch.done_this_run += 1;
         defer state.gpa.free(claim.name);
 
         // Chiave di cache: hash(realpath cartella + nome) + mtime + size.
@@ -1038,7 +1093,7 @@ fn thumbPass(
                 if (cdir) |cd| {
                     if (key) |k| {
                         thumbCacheWrite(state, cd, k, th);
-                        writes.* += 1;
+                        batch.writes += 1;
                     }
                 }
                 break :blk th;
@@ -1061,15 +1116,37 @@ fn thumbPass(
 /// marcatura sotto lock e budget in `FxState` condivisi — quindi passare a 2-3
 /// thread è solo spawnare più `thumbWorker` con lo stesso `gen`.
 fn thumbWorker(state: *GuiAppState, gen: u32) void {
-    fillSizes(state, gen);
+    var batch: ThumbBatch = .{};
+    _ = thumbBatch(state, gen, &batch);
+}
+
+/// Stato di un batch di miniature che sopravvive alle interruzioni: le voci già
+/// tentate sono marcate in `FxState` (`claimNext`), qui resta solo il resto.
+const ThumbBatch = struct {
+    cooperative: bool = false,
+    sizes_done: bool = false,
+    writes: usize = 0,
+    yielded: bool = false,
+    done_this_run: usize = 0,
+};
+
+/// Esegue (o riprende) il batch. Ritorna true se ha ceduto il worker e va
+/// risottomesso; false a batch finito o superato da un `enterDir`.
+fn thumbBatch(state: *GuiAppState, gen: u32, batch: *ThumbBatch) bool {
+    batch.yielded = false;
+    batch.done_this_run = 0;
+    if (!batch.sizes_done) {
+        fillSizes(state, gen);
+        batch.sizes_done = true;
+    }
 
     // Snapshot della cartella: `fx.dir` non cambia entro la generazione.
     var dir_copy: []u8 = &.{};
     {
         state.shared.mutex.lockUncancelable(state.io);
         defer state.shared.mutex.unlock(state.io);
-        if (gen != state.shared.fx.gen) return;
-        dir_copy = state.gpa.dupe(u8, state.shared.fx.dir) catch return;
+        if (gen != state.shared.fx.gen) return false;
+        dir_copy = state.gpa.dupe(u8, state.shared.fx.dir) catch return false;
     }
     defer state.gpa.free(dir_copy);
 
@@ -1091,19 +1168,21 @@ fn thumbWorker(state: *GuiAppState, gen: u32) void {
         null;
     defer if (cdir) |d| d.close(state.io);
 
-    var writes: usize = 0;
-    if (cdir != null) thumbPass(state, gen, .cache, dir_copy, real_dir, cdir, &writes);
-    thumbPass(state, gen, .decode, dir_copy, real_dir, cdir, &writes);
+    if (cdir != null) thumbPass(state, gen, .cache, dir_copy, real_dir, cdir, batch);
+    if (batch.yielded) return true;
+    thumbPass(state, gen, .decode, dir_copy, real_dir, cdir, batch);
+    if (batch.yielded) return true;
 
     // Manutenzione best-effort UNA VOLTA PER BATCH (non a ogni scrittura: è una
     // scansione della directory): sweep dei tmp orfani + cap LRU. Vale anche se
     // il batch è stato interrotto a metà da un `enterDir`.
-    if (writes > 0) {
+    if (batch.writes > 0) {
         if (cdir_path) |p| {
             evict.sweepTmpOnce(&tmp_sweep_done, p);
             evict.evictLru(p, thumb_cache_cap_bytes);
         }
     }
+    return false;
 }
 
 // ── Disegno dell'overlay ─────────────────────────────────────────────────────

@@ -4,6 +4,7 @@ const state_mod = @import("state.zig");
 const AppState = state_mod.AppState;
 const AppAction = state_mod.AppAction;
 const decoder_mod = @import("decoder.zig");
+const scheduler = @import("scheduler.zig");
 const Decoded = decoder_mod.Decoded;
 const loader_mod = @import("loader.zig");
 const LoaderModule = loader_mod.LoaderModule;
@@ -20,7 +21,9 @@ pub fn main(init: std.process.Init) !void {
     const io = threaded.io();
 
     // Rilasciata per ultima (LIFO), dopo il join di tutti i moduli che decodificano.
+    scheduler.initGlobal(io, .{});
     defer decoder_mod.closePluginCache(gpa);
+    defer scheduler.deinitGlobal();
 
     // 1. Handle command line arguments
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);

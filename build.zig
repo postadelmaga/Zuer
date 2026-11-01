@@ -428,7 +428,7 @@ pub fn build(b: *std.Build) void {
 
     // Test unitari puri (nessuna dipendenza nativa): `zig build test`.
     const test_step = b.step("test", "Esegue i test unitari");
-    for ([_][]const u8{"src/detect.zig"}) |src_path| {
+    for ([_][]const u8{ "src/detect.zig", "src/scheduler.zig" }) |src_path| {
         const t = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path(src_path),
             .target = target,
@@ -436,6 +436,21 @@ pub fn build(b: *std.Build) void {
         }) });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
+
+    // Benchmark di contesa: decode in primo piano mentre altri thread
+    // decodificano in sfondo (`zig build bench-decode -- <fg> <bg...>`).
+    const bench_dbg = b.addExecutable(.{
+        .name = "bench-decode",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_decode.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const bench_run = b.addRunArtifact(bench_dbg);
+    bench_run.addPassthruArgs();
+    b.step("bench-decode", "Latenza di un decode con altri decode in sfondo").dependOn(&bench_run.step);
 
     // Tool di sviluppo: chiama decoder.decode() su un file e stampa il risultato.
     const decode_dbg = b.addExecutable(.{

@@ -9,6 +9,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const gpu = @import("gpu_renderer.zig");
 const decoder_mod = @import("decoder.zig");
+const scheduler = @import("scheduler.zig");
 const text_render = @import("text_render.zig");
 // The native video player (libav container/decoding + overlay controls) lives in its own
 // module, imported as `videomod` (the local name `vid` is taken by a VideoState pointer in
@@ -992,7 +993,13 @@ pub fn main(init: std.process.Init) !void {
     defer threaded.deinit();
     const io = threaded.io();
 
+    // Worker condivisi per il lavoro CPU (texture GLB, miniature, scritture di
+    // cache): partono pigri al primo task. Il deinit gira PRIMA della chiusura
+    // dei plugin (defer in ordine inverso), così nessun worker esegue codice
+    // di un .so già chiuso. In pratica l'uscita è `process.exit(0)`.
+    scheduler.initGlobal(io, .{});
     defer decoder_mod.closePluginCache(gpa);
+    defer scheduler.deinitGlobal();
 
     // Se l'avvio precedente è finito in panic, propone l'issue GitHub
     // precompilata aprendo il browser (vedi crash_report.zig). Su thread:

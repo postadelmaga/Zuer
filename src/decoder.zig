@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const dynlib = @import("dynlib.zig");
 const meshcache = @import("meshcache.zig");
 const detect = @import("detect.zig");
+const scheduler = @import("scheduler.zig");
 
 pub const CsvData = struct {
     headers: [][]const u8,
@@ -598,6 +599,7 @@ pub const abi_version: u32 = blk: {
         @sizeOf(std.mem.Allocator.VTable), @sizeOf(std.Io),
         @alignOf(std.Io),                  @sizeOf(std.Io.VTable),
         @sizeOf(DecodedC),                 @alignOf(DecodedC),
+        @sizeOf(HostServices),
     }) |n| {
         const v: u64 = n;
         h.update(std.mem.asBytes(&v));
@@ -610,6 +612,33 @@ pub const abi_version: u32 = blk: {
 /// dentro linkati, dove gli export dell'ABI plugin (`zuer_decode`, `zuer_extensions`…)
 /// colliderebbero l'uno con l'altro, uno per decoder, senza che nessuno li chiami.
 pub const plugin_abi = builtin.abi != .android;
+
+/// Servizi che l'host offre ai plugin, consegnati al caricamento tramite
+/// l'export OPZIONALE `zuer_set_host`. Un plugin non può raggiungere da solo lo
+/// scheduler dell'host (è un .so con le sue variabili statiche): senza questa
+/// tabella ogni plugin dovrebbe crearsi i propri thread, come faceva glb.
+/// Un plugin senza `zuer_set_host`, o un host che non lo chiama (Android, dove i
+/// decoder sono linkati e non caricati), resta sul proprio ripiego.
+pub const HostServices = extern struct {
+    /// `@sizeOf(HostServices)` dell'host: un campo aggiunto in coda si
+    /// riconosce senza rompere i plugin esistenti.
+    size: usize,
+    /// Esegue `body(ctx, i)` per `i` in `0..n` sui worker condivisi, con la
+    /// priorità del thread chiamante; ritorna quando tutti gli indici sono
+    /// stati eseguiti e nessun worker tocca più `ctx`.
+    parallel_for: *const fn (n: usize, ctx: ?*anyopaque, body: ParallelBody) callconv(.c) void,
+};
+pub const ParallelBody = *const fn (ctx: ?*anyopaque, index: usize) callconv(.c) void;
+pub const SetHostFn = *const fn (services: *const HostServices) callconv(.c) void;
+
+fn hostParallelFor(n: usize, ctx: ?*anyopaque, body: ParallelBody) callconv(.c) void {
+    scheduler.parallelForGlobal(n, ctx, body);
+}
+
+const host_services: HostServices = .{
+    .size = @sizeOf(HostServices),
+    .parallel_for = hostParallelFor,
+};
 
 /// Ogni plugin esporta `zuer_abi_version` (ritorna l'`abi_version` con cui è
 /// stato compilato); l'host la verifica al caricamento e scarta i mismatch.
@@ -821,6 +850,7 @@ fn registerPluginFile(dir_path: []const u8, file_name: []const u8, type_name: []
         return;
     };
     const decode_coarse_fn = lib.lookup(DecodeFn, "zuer_decode_coarse");
+    if (lib.lookup(SetHostFn, "zuer_set_host")) |set_host| set_host(&host_services);
     const content_prefix: usize = if (lib.lookup(ContentPrefixFn, "zuer_content_prefix")) |f| f() else std.math.maxInt(usize);
 
     // `zuer_extensions` è opzionale: un plugin senza estensioni dichiarate

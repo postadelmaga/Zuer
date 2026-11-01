@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const decoder_mod = @import("decoder.zig");
+const scheduler = @import("scheduler.zig");
 const compose = @import("compose.zig");
 const loader_mod = @import("loader.zig");
 const text_render = @import("text_render.zig");
@@ -995,6 +996,7 @@ pub fn resolveInitialFile(io: std.Io, gpa: std.mem.Allocator, arg: []const u8) !
 /// stato quando è pronto (azzerando lo spinner via `applyDecoded`). Sugli errori
 /// mostra il messaggio come testo nella finestra invece di terminare il processo.
 pub fn decodeInitial(state: *GuiAppState, path: []const u8) void {
+    scheduler.setThreadPriority(.interactive);
     // Latest-wins anche per il decode iniziale (come `loadWorker`): appena la
     // fase coarse spegne lo spinner l'utente può navigare, e il full del file
     // iniziale — ormai superato — non deve sovrascrivere quello navigato.
@@ -1050,6 +1052,9 @@ pub fn decodeInitial(state: *GuiAppState, path: []const u8) void {
 /// Latest-wins: se nel frattempo è arrivata una richiesta più recente (`ld_gen`
 /// cambiato) scarta il risultato — la nuova verrà processata al giro dopo.
 pub fn loadWorker(state: *GuiAppState) void {
+    // Decode chiesti dall'utente (navigazione): il loro lavoro parallelo passa
+    // davanti a prefetch e miniature.
+    scheduler.setThreadPriority(.interactive);
     const io = state.io;
     const gpa = state.gpa;
     while (true) {
@@ -1125,6 +1130,7 @@ pub fn loadWorker(state: *GuiAppState) void {
 /// quelli non più desiderati (cache limitata ai 2 vicini). Fa SOLO decode+stage
 /// (CPU/memfd): non tocca mai il renderer né lo stato condiviso della finestra.
 pub fn prefetchWorker(state: *GuiAppState) void {
+    scheduler.setThreadPriority(.background);
     const io = state.io;
     const gpa = state.gpa;
     // Soglia oltre cui NON precaricare (file enormi: lenti e pesanti in RAM;

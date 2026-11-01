@@ -353,7 +353,9 @@ pub fn writeCoarse(gpa: std.mem.Allocator, path: []const u8, mtime_ns: i128, mes
     };
 
     // Il thread prende possesso di kp_owned e blob e li libera lui. Se lo spawn
-    // fallisce, si scrive in linea (comportamento precedente).
+    // fallisce, si scrive in linea (comportamento precedente). NON è un task
+    // dello scheduler: è I/O su disco, e un worker CPU fermo su una scrittura
+    // ritardava il decode in primo piano (misurato con bench-decode).
     const t = std.Thread.spawn(.{}, writeBlob, .{ kp_owned, blob }) catch {
         writeBlob(kp_owned, blob);
         return;

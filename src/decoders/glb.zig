@@ -256,20 +256,41 @@ const TexJob = struct {
     missed: std.atomic.Value(bool), // coarse: una texture non era in cache 256²
 };
 
+fn decodeTex(job: *TexJob, i: usize) void {
+    var w: usize = 0;
+    var h: usize = 0;
+    if (decodeImageSource(job.gltf, job.bin, job.srcs[i], std.heap.page_allocator, &w, &h, job.coarse)) |px| {
+        job.results[i] = .{ .pixels = px, .w = w, .h = h };
+    } else if (job.coarse) {
+        // Cache coarse mancante per questa texture: la fase coarse non è
+        // completabile senza decodificare (ciò che vogliamo evitare) → segnala.
+        job.missed.store(true, .monotonic);
+    }
+}
+
 fn texWorker(job: *TexJob) void {
     while (true) {
         const i = job.next.fetchAdd(1, .monotonic);
         if (i >= job.srcs.len) break;
-        var w: usize = 0;
-        var h: usize = 0;
-        if (decodeImageSource(job.gltf, job.bin, job.srcs[i], std.heap.page_allocator, &w, &h, job.coarse)) |px| {
-            job.results[i] = .{ .pixels = px, .w = w, .h = h };
-        } else if (job.coarse) {
-            // Cache coarse mancante per questa texture: la fase coarse non è
-            // completabile senza decodificare (ciò che vogliamo evitare) → segnala.
-            job.missed.store(true, .monotonic);
-        }
+        decodeTex(job, i);
     }
+}
+
+/// Corpo per `HostServices.parallel_for`: ogni indice è una texture sorgente,
+/// ognuna scrive solo il proprio `results[i]`.
+fn texBody(ctx: ?*anyopaque, i: usize) callconv(.c) void {
+    decodeTex(@ptrCast(@alignCast(ctx.?)), i);
+}
+
+/// Servizi dell'host (scheduler condiviso), impostati da `zuer_set_host` al
+/// caricamento del plugin, sotto il mutex del registro: ogni decode successivo
+/// passa da quel mutex, quindi vede il valore già pubblicato. Null = host che
+/// non li offre (Android, tool vecchi): si ripiega sui thread propri qui sotto.
+var host_services: ?*const decoder.HostServices = null;
+
+fn zuer_set_host(services: *const decoder.HostServices) callconv(.c) void {
+    if (services.size < @sizeOf(decoder.HostServices)) return;
+    host_services = services;
 }
 
 /// Budget di worker thread per la decodifica texture, CONDIVISO tra tutte le
@@ -375,13 +396,20 @@ fn buildTexCache(gltf: GltfStructure, bin_data: []const u8, allocator: std.mem.A
     // finestra per minuti, percepito come "si impalla"). Il thread corrente
     // drena comunque la coda, così anche con 0 spawn (budget esaurito) tutte le
     // texture vengono decodificate, solo più lentamente.
-    var pool: [31]?std.Thread = @splat(null);
-    const want = @min(n -| 1, pool.len);
-    const spawn_n = reserveTexWorkers(want);
-    defer releaseTexWorkers(spawn_n);
-    for (0..spawn_n) |i| pool[i] = std.Thread.spawn(.{}, texWorker, .{&job}) catch null;
-    texWorker(&job);
-    for (0..spawn_n) |i| if (pool[i]) |t| t.join();
+    if (host_services) |hs| {
+        // Scheduler condiviso dell'host: worker già vivi, limitati per tutto il
+        // processo e ordinati per priorità (il decode che l'utente ha aperto
+        // passa davanti al prefetch). Ritorna a lavoro finito.
+        hs.parallel_for(n, &job, texBody);
+    } else {
+        var pool: [31]?std.Thread = @splat(null);
+        const want = @min(n -| 1, pool.len);
+        const spawn_n = reserveTexWorkers(want);
+        defer releaseTexWorkers(spawn_n);
+        for (0..spawn_n) |i| pool[i] = std.Thread.spawn(.{}, texWorker, .{&job}) catch null;
+        texWorker(&job);
+        for (0..spawn_n) |i| if (pool[i]) |t| t.join();
+    }
 
     // Fase coarse con cache 256² incompleta: aborta (il chiamante farà il full).
     // I risultati parziali (hit di cache) non sono ancora nella map → liberali qui.
@@ -968,5 +996,6 @@ comptime {
         @export(&zuer_decode_coarse, .{ .name = "zuer_decode_coarse", .linkage = .strong });
         @export(&zuer_extensions, .{ .name = "zuer_extensions", .linkage = .strong });
         @export(&zuer_abi_version, .{ .name = "zuer_abi_version", .linkage = .strong });
+        @export(&zuer_set_host, .{ .name = "zuer_set_host", .linkage = .strong });
     }
 }

@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const decoder = @import("decoder.zig");
+const scheduler = @import("scheduler.zig");
 
 extern "c" fn usleep(usec: c_uint) c_int;
 
@@ -25,6 +26,7 @@ pub fn main(init: std.process.Init) !void {
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
+    scheduler.initGlobal(io, .{});
 
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
     defer args.deinit();
@@ -79,5 +81,6 @@ pub fn main(init: std.process.Init) !void {
     }
     try w.flush();
     shared.result.deinit(gpa);
+    scheduler.deinitGlobal();
     decoder.closePluginCache(gpa);
 }
