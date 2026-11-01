@@ -27,8 +27,10 @@ glb, MP4/MKV/WebM/AVI, MP3/FLAC/Ogg/WAV/MIDI) e carica solo il plugin che serve.
 I formati riconosciuti ma senza decoder (ELF, PE, 7z, RAR, SQLite, HEIC, …) e gli
 header troncati danno un errore esplicito. Test: `zig build test`.
 
-Aprendo una **cartella** si apre il primo file e si naviga tra gli altri con le
-frecce `← →`.
+Aprendo una **cartella** si apre il primo file e si passa agli altri con le frecce
+`↑ ↓` (sempre, per ogni tipo di file). `← →` sfogliano le pagine nei PDF, fanno un
+seek di ±5 s nei video e altrove cambiano file anche loro; nel testo si scorre con
+PagSu/PagGiù o la rotellina.
 
 ---
 

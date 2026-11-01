@@ -687,19 +687,21 @@ pub fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) 
         } else if (key == KEY_0) {
             // Reset vista: torna al fit (1:1 sullo schermo) e ricentra.
             resetView(app_state);
-        } else if (is_text and (key == KEY_UP or key == KEY_DOWN)) {
-            // Nei documenti le frecce verticali scorrono; ← → restano
-            // la navigazione tra i file della cartella (parità con viewer).
-            scrollText(app_state, if (key == KEY_DOWN) scroll_step else -scroll_step);
+        } else if (key == KEY_DOWN or key == KEY_UP) {
+            // ↑/↓ cambiano SEMPRE file, per ogni tipo di contenuto (anche
+            // testo, PDF e video): un solo gesto per scorrere la cartella.
+            nav.navigate(app_state, if (key == KEY_DOWN) 1 else -1);
         } else if (is_text and (key == KEY_PGUP or key == KEY_PGDOWN)) {
+            // Nel testo lo scorrimento resta su PagSu/PagGiù (e rotellina).
             scrollText(app_state, if (key == KEY_PGDOWN) scroll_step * 10 else -scroll_step * 10);
-        } else if (is_pdf and (key == KEY_UP or key == KEY_DOWN or key == KEY_PGUP or key == KEY_PGDOWN)) {
-            const dir: i32 = if (key == KEY_DOWN or key == KEY_PGDOWN) 1 else -1;
+        } else if (is_pdf and (key == KEY_LEFT or key == KEY_RIGHT or key == KEY_PGUP or key == KEY_PGDOWN)) {
+            // PDF: ←/→ sfogliano le pagine (come il seek nei video).
+            const dir: i32 = if (key == KEY_RIGHT or key == KEY_PGDOWN) 1 else -1;
             changePdfPage(app_state, dir);
-        } else if (key == KEY_RIGHT or key == KEY_DOWN) {
-            nav.navigate(app_state, 1);
-        } else if (key == KEY_LEFT or key == KEY_UP) {
-            nav.navigate(app_state, -1);
+        } else if (key == KEY_RIGHT or key == KEY_LEFT) {
+            // Dove ←/→ non hanno un uso proprio (immagini, mesh, testo)
+            // continuano a cambiare file.
+            nav.navigate(app_state, if (key == KEY_RIGHT) 1 else -1);
         } else if (key == KEY_EQUAL) {
             const cpx = win.contentPx();
             applyZoomAt(app_state, 1.1, @as(f32, @floatFromInt(cpx.w)) / 2.0, @as(f32, @floatFromInt(cpx.h)) / 2.0, cpx.w, cpx.h);
