@@ -58,6 +58,53 @@ const evict_cap_bytes: u64 = 1024 * 1024 * 1024; // 1 GiB
 
 var tmp_seq: std.atomic.Value(u64) = .init(0);
 
+/// Chiavi la cui cache coarse è in serializzazione o in scrittura in questo
+/// processo. `existsFresh` non basta: il file compare solo dopo il `rename` del
+/// writer staccato, e un secondo decode dello stesso GLB finito nel frattempo
+/// (prefetch + loader, o due decode ravvicinati) rifaceva downscale e
+/// serializzazione per intero (misurato: +2% di istruzioni nel bench-decode).
+const Inflight = struct {
+    lock: std.atomic.Value(bool) = .init(false),
+    keys: [16]u64 = @splat(0),
+
+    const Claim = enum { claimed, busy, untracked };
+
+    fn hashKey(kp: []const u8) u64 {
+        const h = std.hash.Wyhash.hash(0x696e666c69676874, kp); // "inflight"
+        return if (h == 0) 1 else h; // 0 = posto libero
+    }
+
+    fn acquire(self: *Inflight) void {
+        while (self.lock.swap(true, .acquire)) std.atomic.spinLoopHint();
+    }
+
+    /// `claimed`: tocca a noi, poi `leave`. `busy`: un altro la sta già
+    /// scrivendo. `untracked`: tabella piena, si procede senza deduplicare.
+    fn enter(self: *Inflight, key: u64) Claim {
+        self.acquire();
+        defer self.lock.store(false, .release);
+        var free: ?usize = null;
+        for (&self.keys, 0..) |k, i| {
+            if (k == key) return .busy;
+            if (k == 0 and free == null) free = i;
+        }
+        const i = free orelse return .untracked;
+        self.keys[i] = key;
+        return .claimed;
+    }
+
+    fn leave(self: *Inflight, key: u64, claim: Claim) void {
+        if (claim != .claimed) return;
+        self.acquire();
+        defer self.lock.store(false, .release);
+        for (&self.keys) |*k| if (k.* == key) {
+            k.* = 0;
+            return;
+        };
+    }
+};
+var inflight: Inflight = .{};
+
 /// Sweep dei tmp orfani fatto al più una volta per processo (alla prima scrittura).
 var tmp_sweep_done: std.atomic.Value(bool) = .init(false);
 
@@ -330,6 +377,15 @@ pub fn writeCoarse(gpa: std.mem.Allocator, path: []const u8, mtime_ns: i128, mes
     // Senza la dimensione del sorgente non si può validare la cache: niente scrittura.
     const src_size = srcSize(gpa, path) orelse return;
 
+    // Un'altra serializzazione/scrittura della stessa chiave è già in corso.
+    const key = Inflight.hashKey(kp);
+    const claim = inflight.enter(key);
+    if (claim == .busy) return;
+    // Da qui ogni uscita rilascia la chiave, tranne il passaggio al writer
+    // (che la rilascia lui dopo il rename).
+    var handed_off = false;
+    defer if (!handed_off) inflight.leave(key, claim);
+
     // Già presente e aggiornata (stesso mtime e stessa dimensione)? evita di
     // ri-downscalare le texture e ri-serializzare i ~20MB ad ogni sharpen (la 2ª
     // fase di ogni apertura fa un decode full). Si scrive solo la prima volta.
@@ -356,8 +412,9 @@ pub fn writeCoarse(gpa: std.mem.Allocator, path: []const u8, mtime_ns: i128, mes
     // fallisce, si scrive in linea (comportamento precedente). NON è un task
     // dello scheduler: è I/O su disco, e un worker CPU fermo su una scrittura
     // ritardava il decode in primo piano (misurato con bench-decode).
-    const t = std.Thread.spawn(.{}, writeBlob, .{ kp_owned, blob }) catch {
-        writeBlob(kp_owned, blob);
+    handed_off = true;
+    const t = std.Thread.spawn(.{}, writeBlob, .{ kp_owned, blob, key, claim }) catch {
+        writeBlob(kp_owned, blob, key, claim);
         return;
     };
     t.detach();
@@ -365,7 +422,9 @@ pub fn writeCoarse(gpa: std.mem.Allocator, path: []const u8, mtime_ns: i128, mes
 
 /// Corpo della scrittura (thread detached): tmp + rename atomico, poi libera
 /// blob e percorso. Usa solo page_allocator: nessuna dipendenza dal gpa dell'app.
-fn writeBlob(kp: [:0]u8, blob: []u8) void {
+fn writeBlob(kp: [:0]u8, blob: []u8, key: u64, claim: Inflight.Claim) void {
+    // Ultimo: dopo il rename (o il fallimento) la chiave torna libera.
+    defer inflight.leave(key, claim);
     const pa = std.heap.page_allocator;
     defer pa.free(kp);
     defer pa.free(blob);
@@ -542,4 +601,45 @@ fn deserialize(c: *Cursor, gpa: std.mem.Allocator, expect_mtime: i128, expect_si
         }
     }
     return m;
+}
+
+test "Inflight: una chiave alla volta, tabella piena senza deduplica" {
+    var t: Inflight = .{};
+    const a = Inflight.hashKey("/cache/a");
+    const b = Inflight.hashKey("/cache/b");
+    try std.testing.expectEqual(Inflight.Claim.claimed, t.enter(a));
+    try std.testing.expectEqual(Inflight.Claim.busy, t.enter(a));
+    try std.testing.expectEqual(Inflight.Claim.claimed, t.enter(b));
+    t.leave(a, .claimed);
+    try std.testing.expectEqual(Inflight.Claim.claimed, t.enter(a));
+    // Riempita la tabella, le chiavi nuove passano senza registro (e il loro
+    // `leave` non tocca nulla).
+    var i: u64 = 0;
+    while (t.enter(100 + i) == .claimed) i += 1;
+    try std.testing.expectEqual(@as(u64, 14), i);
+    try std.testing.expectEqual(Inflight.Claim.untracked, t.enter(999));
+    t.leave(999, .untracked);
+    try std.testing.expectEqual(Inflight.Claim.busy, t.enter(a));
+}
+
+test "Inflight: niente doppio claim fra thread" {
+    var t: Inflight = .{};
+    var wins: std.atomic.Value(u32) = .init(0);
+    const W = struct {
+        fn run(tab: *Inflight, w: *std.atomic.Value(u32)) void {
+            for (0..1000) |_| {
+                if (tab.enter(42) == .claimed) {
+                    _ = w.fetchAdd(1, .monotonic);
+                    // Nessun altro può averla adesso.
+                    if (tab.enter(42) != .busy) @panic("doppio claim");
+                    tab.leave(42, .claimed);
+                }
+            }
+        }
+    };
+    var th: [4]std.Thread = undefined;
+    for (&th) |*x| x.* = try std.Thread.spawn(.{}, W.run, .{ &t, &wins });
+    for (th) |x| x.join();
+    try std.testing.expect(wins.load(.monotonic) > 0);
+    for (t.keys) |k| try std.testing.expectEqual(@as(u64, 0), k);
 }

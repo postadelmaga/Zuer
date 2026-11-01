@@ -271,5 +271,11 @@ Default 2 job: 3 sono equivalenti entro il rumore, 4 raddoppiano l'apertura di u
 
 Decode di un GLB in primo piano con altri 3 in sfondo, 8 round, rispetto alla
 versione senza scheduler: apertura **−44%** (644 → 362 ms, migliore in 8 round su 8),
-CPU **+4%** con 3 worker (istruzioni +2,7%, cache miss +7%, CPU di sistema +9%),
-−6% con 1 worker.
+CPU pari alla versione vecchia con 3 worker (cicli +0,0%), −3% con 1 worker
+(`perf stat`, 8 round). Lo scheduler non aggiunge istruzioni: a parità di lavoro il
+conteggio è identico entro lo 0,005%. Il +2–3% misurato in un primo tempo era
+lavoro duplicato della cache mesh coarse: `meshcache.writeCoarse` controllava se il
+file esisteva, ma lo scrive su un thread staccato, quindi due decode ravvicinati
+dello stesso GLB serializzavano entrambi. Ora un registro delle chiavi in scrittura
+lo impedisce: le istruzioni sono −1,3% rispetto alla versione vecchia e identiche
+in ogni esecuzione (prima variavano del 2% a seconda dei tempi).

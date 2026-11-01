@@ -971,6 +971,29 @@ fn setEnvVar(name: [*:0]const u8, value: [*:0]const u8) void {
     }
 }
 
+/// Finestra da chiudere su SIGTERM/SIGINT/SIGHUP (logout, `kill`, Ctrl+C dal
+/// terminale): stesso percorso di Esc (fine del loop, `process.exit(0)`)
+/// invece della morte per segnale con exit 143.
+var term_window: std.atomic.Value(?*zrame.Window) = .init(null);
+
+fn onTermSignal(_: std.posix.SIG) callconv(.c) void {
+    // `requestClose` = un flag e una `write` su eventfd: async-signal-safe.
+    if (term_window.load(.acquire)) |w| w.requestClose();
+}
+
+fn installTermHandlers(win: *zrame.Window) void {
+    if (comptime builtin.os.tag == .windows) return;
+    term_window.store(win, .release);
+    const act: std.posix.Sigaction = .{
+        .handler = .{ .handler = onTermSignal },
+        .mask = std.posix.sigemptyset(),
+        // Un secondo segnale torna al comportamento di default: se il loop non
+        // risponde, il processo muore comunque.
+        .flags = std.posix.SA.RESETHAND,
+    };
+    inline for (.{ .TERM, .INT, .HUP }) |sig| std.posix.sigaction(sig, &act, null);
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
 
@@ -1282,6 +1305,7 @@ pub fn main(init: std.process.Init) !void {
     // il contenuto, per non decodificare in parallelo al decode iniziale.)
     if (!yt_start and !gui_state.shared.loading) nav.schedulePrefetchAround(&gui_state);
 
+    installTermHandlers(win);
     win.run() catch {};
     // Esc/chiusura: esci SUBITO. NON aspettare il join dei thread di decode: possono
     // essere dentro una decodifica non interrompibile in un plugin .so, e attenderli
