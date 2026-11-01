@@ -120,6 +120,7 @@ in sync (office/pdf sono Linux-only → non associati su Windows).
 |-----|---------|
 | `ZUER_GPU=<indice\|nome>` | forza la GPU (es. `ZUER_GPU=intel` o `ZUER_GPU=0`); zuer logga i device che vede. Off-Linux preferisce l'**integrata** (readback economico) |
 | `ZUER_WORKERS=<n>` | numero massimo di worker dello scheduler condiviso (default: core logici − 1) |
+| `ZUER_THUMB_JOBS=<n>` | job paralleli delle miniature per cartella (default 2, mai oltre `ZUER_WORKERS`) |
 | `ZUER_OPAQUE=1` | finestra **opaca** (BitBlt veloce) invece del vetro layered: utile per testare 3D/video fluidi **sotto Wine**, dove senza DWM il vetro va composto in software. Su Windows vero il DWM compone il vetro in GPU, quindi non serve |
 
 Due capacità native, ognuna con la sua import-lib, attivabili a parte:
@@ -179,7 +180,44 @@ Il lavoro CPU che si parallelizza passa da **uno scheduler condiviso**
   cedono il posto tra un indice e l'altro se arriva lavoro più urgente;
 - **plugin**: un `.so` non vede lo scheduler dell'host, quindi lo riceve come tabella
   C (`HostServices`) dall'export opzionale `zuer_set_host`. Oggi lo usa `glb` per le
-  texture; senza la tabella (Android, host vecchi) il plugin ripiega sui propri thread.
+  texture; senza la tabella (Android, host vecchi) il plugin ripiega sui propri thread;
+- **cancellazione e shutdown**: un task in coda si toglie con `cancel` (il proprietario
+  lo riprende subito), uno in esecuzione vede `cancelRequested()`; allo shutdown i task
+  in coda sono cancellati (i fire-and-forget passano dal loro `on_done`), quelli in
+  corso finiscono, i worker sono tutti gioinati, anche quelli ritirati;
+- **segnale di primo piano**: il loader (thread suo, fuori dal pool) apre e chiude
+  `beginForeground`/`endForeground` attorno al decode chiesto dall'utente; i lavori
+  lunghi di background lo leggono per ridurre il proprio parallelismo.
+
+I test dello scheduler (`zig build test`) impongono l'ordine delle corse con hook e
+lock, non con sleep: shutdown con task in esecuzione/in coda/cancellati, ritiro di un
+worker mentre arriva un task, timeout di inattività contemporaneo a un submit, coda
+satura con più produttori, crescita e ritiro del pool. Quelli sulle corse corrette
+sono stati verificati reintroducendo il bug: falliscono.
+
+### Miniature dell'esploratore
+
+La pipeline sta in `src/thumbs.zig` (senza dipendenze dalla GUI: la usa anche il
+benchmark). Aprendo una cartella:
+
+1. la scansione legge solo i nomi (al più 512 voci) e incrementa la **generazione**:
+   il lavoro della cartella precedente da lì non installa più nulla;
+2. un job (task `normal`) riempie dimensioni e mtime, legge la cache su disco e poi
+   decodifica ciò che manca, partendo dalle card visibili;
+3. ogni job aggiunge job fratelli fino a `ZUER_THUMB_JOBS` (default **2**, mai oltre i
+   worker dello scheduler) se resta lavoro reclamabile; le voci si dividono con un
+   claim sotto lock;
+4. mentre l'utente apre un file i job in più si ritirano (ne resta uno, che cede
+   comunque il worker al lavoro più urgente) e ripartono dopo;
+5. i worker non toccano la GUI: installano la miniatura sotto il mutex condiviso, solo
+   se la generazione è ancora quella, e chiedono un ridisegno.
+
+Limiti: 96 miniature in RAM (≈24 MB) e 96 decode per cartella; niente miniatura oltre
+256 MB; **un solo decode "pesante" alla volta** (PDF, video, formati che passano da
+rsvg/ImageMagick, file oltre 8 MiB: processi esterni già multi-thread o picchi di RAM
+da centinaia di MB); cache su disco in `~/.cache/zuer/thumbs` con tetto LRU di
+128 MB. Un decode fallito lascia in cache una voce negativa valida 24 ore, così la
+cartella non lo ritenta a ogni visita.
 
 Restano **thread dedicati**, di proposito: finestra, render, loader e prefetch (cicli
 permanenti con la loro condition), audio/MIDI/video (tempo reale), le operazioni
@@ -201,6 +239,37 @@ zig build gpu-selftest    # render headless di un cubo per validare la pipeline 
 zig build raster-debug -- file      # rasterizza un file su PPM (stdout)
 zig build decode-test -- file       # decodifica un file e stampa il risultato
 zig build bench-decode -- fg bg...  # latenza di un decode con altri decode in sfondo
-zig build test                      # test unitari (detector, scheduler)
+zig build test                      # test unitari (detector, scheduler, miniature)
 zig build player-test -- video      # itera i frame video col motore libav
+scripts/bench-thumbnails.sh dir 5 none seq w1 w2 w3 w4   # pipeline miniature headless
 ```
+
+### Benchmark (riferimento)
+
+Macchina: i5-6200U (2 core fisici, 4 logici), 7,8 GB di RAM, Linux 7.3 (CachyOS),
+Zig 0.17.0, build **ReleaseSafe**. Ogni esecuzione è un processo a sé con `HOME`
+vuota (cache dei plugin fredde); gli scenari si alternano a ogni round; si riportano
+le mediane. CPU = `getrusage` e contatori `perf_event_open` letti dal processo stesso
+(`src/perfcount.zig`, solo user space: con `perf_event_paranoid=2` cambi di contesto
+del kernel e migrazioni dei thread non sono accessibili). La macchina è rumorosa (lo
+stesso scenario varia fino a 4× fra un round e l'altro con altri programmi aperti):
+contano i confronti dentro la stessa serie alternata.
+
+Miniature, 70 file reali (PNG, JPEG, WebP, GIF, BMP, SVG, PDF, video), cache fredda,
+5 round:
+
+| | seq | 1 job | 2 job | 3 job | 4 job |
+|---|---|---|---|---|---|
+| tempo | 9,7 s | 10,3 s | 8,1 s | 7,7 s | 8,1 s |
+| RSS massima | 446 MB | 444 MB | 489 MB | 497 MB | 510 MB |
+| apertura di un JPEG 2048² durante le miniature (da solo: 125 ms) | — | 124 ms | 186 ms | 170 ms | 261 ms |
+
+Le miniature sono identiche (stesso hash) in tutti gli scenari. Su cartelle di soli
+file "pesanti" (WebP, immagini oltre 8 MiB, PDF) il parallelo non accelera né rallenta:
+sono serializzati di proposito. Con la cache calda la cartella si riempie in 60–85 ms.
+Default 2 job: 3 sono equivalenti entro il rumore, 4 raddoppiano l'apertura di un file.
+
+Decode di un GLB in primo piano con altri 3 in sfondo, 8 round, rispetto alla
+versione senza scheduler: apertura **−44%** (644 → 362 ms, migliore in 8 round su 8),
+CPU **+4%** con 3 worker (istruzioni +2,7%, cache miss +7%, CPU di sistema +9%),
+−6% con 1 worker.

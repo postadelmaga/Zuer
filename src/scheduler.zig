@@ -22,6 +22,7 @@
 //!   "fire-and-forget", dentro il suo `on_done`, che il worker chiama per ultimo.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const Priority = enum(u8) {
     /// Serve alla visualizzazione immediata (il frame che l'utente sta guardando).
@@ -49,6 +50,9 @@ pub const Task = struct {
 
     next: ?*Task = null,
     state: State = .idle,
+    /// Istante dell'ultimo `submit` (orologio `awake`): per la statistica
+    /// dell'attesa in coda.
+    enqueued_ns: i96 = 0,
     cancel_flag: std.atomic.Value(bool) = .init(false),
 
     /// Il task in esecuzione può controllarlo per uscire prima.
@@ -83,6 +87,10 @@ pub const Stats = struct {
     tasks_run: usize,
     tasks_cancelled: usize,
     max_workers: usize,
+    /// Task tolti dalla coda da un worker, e tempo che ci hanno passato.
+    tasks_started: usize,
+    queue_wait_ns_total: u64,
+    queue_wait_ns_max: u64,
 };
 
 const max_threads = 64;
@@ -161,6 +169,27 @@ pub const Scheduler = struct {
     threads: [max_threads]std.Thread = undefined,
     tasks_run: usize = 0,
     tasks_cancelled: usize = 0,
+    tasks_started: usize = 0,
+    queue_wait_ns_total: u64 = 0,
+    queue_wait_ns_max: u64 = 0,
+    /// Lavoro interattivo in corso FUORI dal pool (il loader che decodifica il
+    /// file aperto dall'utente su un thread suo): il pool non lo vede in coda,
+    /// quindi i task lunghi e divisibili lo leggono per ridurre il proprio
+    /// parallelismo (vedi `beginForeground`).
+    foreground: std.atomic.Value(u32) = .init(0),
+    hooks: Hooks = .{},
+
+    /// Punti di aggancio per i test deterministici delle corse (vuoto fuori
+    /// dai test: nessun costo in produzione).
+    const Hooks = if (builtin.is_test) struct {
+        /// In `deinit`, dopo aver svuotato le code e rilasciato il lock, prima
+        /// di chiamare gli `on_done` dei task cancellati.
+        after_drain: ?*const fn (*Scheduler) void = null,
+        /// In un worker che si ritira, dopo l'ultimo unlock e prima di
+        /// decrementare `exiting`.
+        retire_exit: ?*const fn (*Scheduler) void = null,
+        ctx: ?*anyopaque = null,
+    } else struct {};
 
     pub fn init(io: std.Io, cfg: Config) Scheduler {
         const cores = std.Thread.getCpuCount() catch 2;
@@ -200,6 +229,7 @@ pub const Scheduler = struct {
             self.work_cond.broadcast(self.io);
             self.done_cond.broadcast(self.io);
         }
+        if (builtin.is_test) if (self.hooks.after_drain) |h| h(self);
         while (drained.pop()) |t| if (t.on_done) |f| f(t);
         // Dopo `stop` nessun worker si ritira più (vedi `workerMain`): gli slot
         // `live` sono stabili e sono esattamente i thread da gioinare.
@@ -215,12 +245,18 @@ pub const Scheduler = struct {
     pub fn submit(self: *Scheduler, task: *Task) SubmitError!void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        return self.submitLocked(task);
+    }
+
+    /// `submit` con `mutex` già acquisito.
+    fn submitLocked(self: *Scheduler, task: *Task) SubmitError!void {
         if (self.stop) return error.ShuttingDown;
         std.debug.assert(task.state != .queued and task.state != .running);
         const urgent = task.priority == .critical or task.priority == .interactive;
         if (!urgent and self.queued >= self.max_queued) return error.QueueFull;
         task.cancel_flag.store(false, .monotonic);
         task.state = .queued;
+        task.enqueued_ns = std.Io.Clock.awake.now(self.io).nanoseconds;
         self.queues[@backingInt(task.priority)].push(task);
         self.queued += 1;
         self.refreshMask();
@@ -304,6 +340,9 @@ pub const Scheduler = struct {
             .tasks_run = self.tasks_run,
             .tasks_cancelled = self.tasks_cancelled,
             .max_workers = self.max_workers,
+            .tasks_started = self.tasks_started,
+            .queue_wait_ns_total = self.queue_wait_ns_total,
+            .queue_wait_ns_max = self.queue_wait_ns_max,
         };
     }
 
@@ -341,6 +380,10 @@ pub const Scheduler = struct {
         while (true) {
             if (self.pick()) |t| {
                 t.state = .running;
+                const waited: u64 = @intCast(@max(0, std.Io.Clock.awake.now(self.io).nanoseconds - t.enqueued_ns));
+                self.tasks_started += 1;
+                self.queue_wait_ns_total +|= waited;
+                self.queue_wait_ns_max = @max(self.queue_wait_ns_max, waited);
                 self.mutex.unlock(self.io);
                 // I `parallelFor` annidati (es. un GLB dentro una miniatura)
                 // ereditano la priorità del task, non quella del worker.
@@ -394,7 +437,10 @@ pub const Scheduler = struct {
         }
         self.mutex.unlock(self.io);
         // Ultimo accesso allo scheduler di un worker ritirato.
-        if (retiring) _ = self.exiting.fetchSub(1, .release);
+        if (retiring) {
+            if (builtin.is_test) if (self.hooks.retire_exit) |h| h(self);
+            _ = self.exiting.fetchSub(1, .release);
+        }
     }
 
     /// Esegue `body(ctx, i)` per ogni `i` in `0..n`, distribuendo gli indici fra
@@ -520,6 +566,23 @@ pub fn threadPriority() Priority {
 pub fn shouldYield(p: Priority) bool {
     const s = global orelse return false;
     return s.stopping.load(.monotonic) or s.hasPendingAbove(p);
+}
+
+/// Segnala lavoro interattivo in corso fuori dal pool (decode del file aperto
+/// dall'utente sul thread loader). Va chiuso con `endForeground`. Annidabile.
+pub fn beginForeground() void {
+    if (global) |s| _ = s.foreground.fetchAdd(1, .monotonic);
+}
+
+pub fn endForeground() void {
+    if (global) |s| _ = s.foreground.fetchSub(1, .monotonic);
+}
+
+/// C'è un decode interattivo in corso (in coda o fuori dal pool)? I task lunghi
+/// di priorità `normal`/`background` riducono il loro parallelismo.
+pub fn foregroundActive() bool {
+    const s = global orelse return false;
+    return s.foreground.load(.monotonic) != 0 or s.hasPendingAbove(.normal);
 }
 
 /// `parallelFor` sullo scheduler globale con la priorità del thread corrente;
@@ -906,4 +969,410 @@ test "una raffica di submit fa crescere il pool anche con un worker inattivo" {
     for (&gates) |*g| g.open.store(true, .release);
     for (&gates) |*g| s.wait(&g.task);
     try testing.expect(all_started);
+}
+
+// ---------------------------------------------------------------------------
+// Test deterministici delle corse: l'ordine degli eventi è imposto da gate e
+// hook, non da sleep. Le attese con scadenza servono solo a FALLIRE invece di
+// restare appesi se il codice sotto test è sbagliato.
+
+fn waitUntil(io: std.Io, comptime cond: anytype, args: anytype, timeout_ms: u64) bool {
+    const t0 = std.Io.Clock.awake.now(io).nanoseconds;
+    while (!@call(.auto, cond, args)) {
+        if (std.Io.Clock.awake.now(io).nanoseconds - t0 > timeout_ms * std.time.ns_per_ms) return false;
+        std.Thread.yield() catch {};
+    }
+    return true;
+}
+
+fn taskIs(s: *Scheduler, t: *Task, st: State) bool {
+    s.mutex.lockUncancelable(s.io);
+    defer s.mutex.unlock(s.io);
+    return t.state == st;
+}
+
+fn idleIs(s: *Scheduler, n: usize) bool {
+    s.mutex.lockUncancelable(s.io);
+    defer s.mutex.unlock(s.io);
+    return s.idle == n;
+}
+
+fn liveIs(s: *Scheduler, n: usize) bool {
+    return s.stats().live_workers == n;
+}
+
+test "deinit: un task senza on_done ripreso dal proprietario non viene più toccato" {
+    // La corsa corretta in 9603564: deinit toglie dalla coda un task del
+    // chiamante (es. un helper di parallelFor sullo stack), rilascia il lock, e
+    // il proprietario lo ritrova `cancelled` e lo libera PRIMA che deinit abbia
+    // finito. L'hook impone esattamente quell'ordine e avvelena la memoria del
+    // task: se deinit lo rilegge (per `next` o `on_done`) il test va in crash.
+    var th = testIo();
+    defer th.deinit();
+    const io = th.io();
+    var s = Scheduler.init(io, .{ .workers = 1 });
+    var gate = Gate{};
+    try startGate(&s, &gate);
+
+    const Ctx = struct {
+        victim: *Task,
+        gate: *Gate,
+        reclaimed: bool = false,
+        fn afterDrain(sch: *Scheduler) void {
+            const c: *@This() = @ptrCast(@alignCast(sch.hooks.ctx.?));
+            // Il proprietario: cancel ritorna true (task suo), poi lo libera.
+            c.reclaimed = sch.cancel(c.victim);
+            const bytes: []u8 = std.mem.asBytes(c.victim);
+            @memset(bytes, 0xaa);
+            testing.allocator.destroy(c.victim);
+            c.gate.open.store(true, .release);
+        }
+    };
+    const victim = try testing.allocator.create(Task);
+    victim.* = .{ .run_fn = Recorder.run, .priority = .background };
+    try s.submit(victim);
+    var ctx = Ctx{ .victim = victim, .gate = &gate };
+    s.hooks = .{ .after_drain = Ctx.afterDrain, .ctx = &ctx };
+    s.deinit();
+    try testing.expect(ctx.reclaimed);
+}
+
+test "shutdown durante un task in esecuzione: il task finisce, i submit successivi falliscono" {
+    var th = testIo();
+    defer th.deinit();
+    const io = th.io();
+    var s = Scheduler.init(io, .{ .workers = 1 });
+    const Long = struct {
+        task: Task = .{ .run_fn = run },
+        started: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        finished: std.atomic.Value(bool) = .init(false),
+        resubmit: SubmitError!void = {},
+        child: Task = .{ .run_fn = Recorder.run },
+        s: *Scheduler,
+        fn run(t: *Task) void {
+            const l: *@This() = @fieldParentPtr("task", t);
+            l.started.store(true, .release);
+            while (!l.release.load(.acquire)) std.Thread.yield() catch {};
+            // Siamo dopo `stop`: un task che prova ad accodare altro lavoro
+            // riceve ShuttingDown invece di lasciare un task orfano.
+            l.resubmit = l.s.submit(&l.child);
+            l.finished.store(true, .release);
+        }
+    };
+    var long = Long{ .s = &s };
+    try s.submit(&long.task);
+    try testing.expect(waitUntil(io, struct {
+        fn f(l: *Long) bool {
+            return l.started.load(.acquire);
+        }
+    }.f, .{&long}, 2000));
+    const H = struct {
+        fn afterDrain(sch: *Scheduler) void {
+            const l: *Long = @ptrCast(@alignCast(sch.hooks.ctx.?));
+            l.release.store(true, .release);
+        }
+    };
+    s.hooks = .{ .after_drain = H.afterDrain, .ctx = &long };
+    s.deinit();
+    // deinit è ritornato: il task era già finito (join del worker).
+    try testing.expect(long.finished.load(.acquire));
+    try testing.expectError(error.ShuttingDown, long.resubmit);
+    try testing.expectEqual(State.done, long.task.state);
+}
+
+test "shutdown con task cancellati: deinit non li tocca e non chiama on_done" {
+    var th = testIo();
+    defer th.deinit();
+    const io = th.io();
+    var s = Scheduler.init(io, .{ .workers = 1 });
+    var gate = Gate{};
+    try startGate(&s, &gate);
+    var ran: std.atomic.Value(u32) = .init(0);
+    var freed: std.atomic.Value(u32) = .init(0);
+    var owned: [6]*Owned = undefined;
+    for (&owned) |*o| {
+        o.* = try testing.allocator.create(Owned);
+        o.*.* = .{ .task = .{ .run_fn = Owned.run, .on_done = Owned.done, .priority = .normal }, .gpa = testing.allocator, .ran = &ran, .freed = &freed };
+        try s.submit(&o.*.task);
+    }
+    // Il proprietario ritira i primi 3 (cancel = true → tornano suoi, on_done
+    // NON verrà chiamato) e li libera da sé, avvelenandoli prima.
+    for (owned[0..3]) |o| {
+        try testing.expect(s.cancel(&o.task));
+        @memset(std.mem.asBytes(o), 0xaa);
+        testing.allocator.destroy(o);
+    }
+    const H = struct {
+        fn afterDrain(sch: *Scheduler) void {
+            const g: *Gate = @ptrCast(@alignCast(sch.hooks.ctx.?));
+            g.open.store(true, .release);
+        }
+    };
+    s.hooks = .{ .after_drain = H.afterDrain, .ctx = &gate };
+    s.deinit();
+    // Solo i 3 rimasti in coda passano da on_done (cancellati dallo shutdown).
+    try testing.expectEqual(@as(u32, 3), freed.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), ran.load(.monotonic));
+    try testing.expectEqual(@as(usize, 6), s.tasks_cancelled);
+}
+
+test "worker che si ritira mentre arriva un task: il task gira su un worker nuovo" {
+    var th = testIo();
+    defer th.deinit();
+    const io = th.io();
+    var s = Scheduler.init(io, .{ .workers = 1, .idle_timeout_ms = 1 });
+    const Ctx = struct {
+        in_exit: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        fn retireExit(sch: *Scheduler) void {
+            const c: *@This() = @ptrCast(@alignCast(sch.hooks.ctx.?));
+            // Solo il primo ritiro si ferma qui; gli altri passano.
+            if (c.in_exit.swap(true, .acq_rel)) return;
+            while (!c.release.load(.acquire)) std.Thread.yield() catch {};
+        }
+    };
+    var ctx = Ctx{};
+    s.hooks = .{ .retire_exit = Ctx.retireExit, .ctx = &ctx };
+    var warm = Gate{};
+    warm.open.store(true, .release);
+    try s.submit(&warm.task);
+    s.wait(&warm.task);
+    // Il worker scade e si ferma DENTRO l'uscita: slot già libero, thread vivo.
+    try testing.expect(waitUntil(io, struct {
+        fn f(c: *Ctx) bool {
+            return c.in_exit.load(.acquire);
+        }
+    }.f, .{&ctx}, 2000));
+    try testing.expectEqual(@as(usize, 0), s.stats().live_workers);
+    // Un task adesso: non può contare sul worker in uscita, ne serve uno nuovo.
+    var log = Recorder.Log{ .io = io };
+    var r = Recorder{ .task = .{ .run_fn = Recorder.run }, .log = &log, .id = 1 };
+    try s.submit(&r.task);
+    const ok = waitUntil(io, taskIs, .{ &s, &r.task, .done }, 2000);
+    ctx.release.store(true, .release);
+    try testing.expect(ok);
+    try testing.expectEqual(@as(usize, 2), s.stats().threads_spawned);
+    // deinit aspetta anche il thread ritirato (contatore `exiting`).
+    s.deinit();
+    try testing.expectEqual(@as(u32, 0), s.exiting.load(.acquire));
+}
+
+test "timeout di inattività e submit nello stesso istante: il worker non si ritira" {
+    var th = testIo();
+    defer th.deinit();
+    const io = th.io();
+    var s = Scheduler.init(io, .{ .workers = 1, .idle_timeout_ms = 5 });
+    defer s.deinit();
+    var warm = Gate{};
+    warm.open.store(true, .release);
+    try s.submit(&warm.task);
+    var log = Recorder.Log{ .io = io };
+    var r = Recorder{ .task = .{ .run_fn = Recorder.run }, .log = &log, .id = 1 };
+    // Si aspetta la fine del task TENENDO il mutex all'uscita: il worker lo
+    // tiene senza interruzioni dal broadcast di `done_cond` fino a dentro
+    // `waitTimeout`, quindi qui è sicuramente inattivo e in attesa.
+    s.mutex.lockUncancelable(io);
+    while (warm.task.state != .done) s.done_cond.waitUncancelable(io, &s.mutex);
+    try testing.expectEqual(@as(usize, 1), s.idle);
+    // Teniamo noi il mutex oltre la scadenza: il worker si sveglia per
+    // timeout e resta fermo a riprendere il lock. Intanto accodiamo un task.
+    const t0 = std.Io.Clock.awake.now(io).nanoseconds;
+    while (std.Io.Clock.awake.now(io).nanoseconds - t0 < 50 * std.time.ns_per_ms) {}
+    s.submitLocked(&r.task) catch unreachable;
+    s.mutex.unlock(io);
+    // Il worker scaduto vede `queued > 0`: serve il task invece di ritirarsi.
+    // (Se si ritirasse, il segnale sarebbe perso e il task resterebbe in coda.)
+    try testing.expect(waitUntil(io, taskIs, .{ &s, &r.task, .done }, 2000));
+    try testing.expectEqual(@as(usize, 1), s.stats().threads_spawned);
+}
+
+test "errore dentro un task: resta al task, il worker continua" {
+    // I task non propagano errori allo scheduler (run_fn ritorna void): il
+    // task li registra nel proprio stato. Verifica che un task fallito non
+    // fermi il worker né salti il suo on_done.
+    var th = testIo();
+    defer th.deinit();
+    const io = th.io();
+    var s = Scheduler.init(io, .{ .workers = 1 });
+    defer s.deinit();
+    const Failing = struct {
+        task: Task = .{ .run_fn = run, .on_done = done },
+        result: anyerror!u32 = 0,
+        done_called: std.atomic.Value(bool) = .init(false),
+        fn work() !u32 {
+            return error.DecodeFailed;
+        }
+        fn run(t: *Task) void {
+            const f: *@This() = @fieldParentPtr("task", t);
+            f.result = work();
+        }
+        fn done(t: *Task) void {
+            const f: *@This() = @fieldParentPtr("task", t);
+            f.done_called.store(true, .release);
+        }
+    };
+    var f = Failing{};
+    try s.submit(&f.task);
+    try testing.expect(waitUntil(io, struct {
+        fn g(x: *Failing) bool {
+            return x.done_called.load(.acquire);
+        }
+    }.g, .{&f}, 2000));
+    try testing.expectError(error.DecodeFailed, f.result);
+    var log = Recorder.Log{ .io = io };
+    var r = Recorder{ .task = .{ .run_fn = Recorder.run }, .log = &log, .id = 7 };
+    try s.submit(&r.task);
+    s.wait(&r.task);
+    try testing.expectEqual(@as(usize, 1), log.len);
+}
+
+test "cancel di un task fire-and-forget in coda: on_done non viene chiamato" {
+    var th = testIo();
+    defer th.deinit();
+    const io = th.io();
+    var s = Scheduler.init(io, .{ .workers = 1 });
+    defer s.deinit();
+    var gate = Gate{};
+    try startGate(&s, &gate);
+    var ran: std.atomic.Value(u32) = .init(0);
+    var freed: std.atomic.Value(u32) = .init(0);
+    const o = try testing.allocator.create(Owned);
+    o.* = .{ .task = .{ .run_fn = Owned.run, .on_done = Owned.done }, .gpa = testing.allocator, .ran = &ran, .freed = &freed };
+    try s.submit(&o.task);
+    try testing.expect(s.cancel(&o.task));
+    testing.allocator.destroy(o);
+    gate.open.store(true, .release);
+    s.wait(&gate.task);
+    try testing.expectEqual(@as(u32, 0), freed.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), ran.load(.monotonic));
+}
+
+test "cancel di un task in esecuzione: il task vede la richiesta ed esce" {
+    var th = testIo();
+    defer th.deinit();
+    const io = th.io();
+    var s = Scheduler.init(io, .{ .workers = 1 });
+    defer s.deinit();
+    const Loop = struct {
+        task: Task = .{ .run_fn = run },
+        started: std.atomic.Value(bool) = .init(false),
+        iterations: usize = 0,
+        fn run(t: *Task) void {
+            const l: *@This() = @fieldParentPtr("task", t);
+            l.started.store(true, .release);
+            while (!t.cancelRequested()) l.iterations += 1;
+        }
+    };
+    var l = Loop{};
+    try s.submit(&l.task);
+    try testing.expect(waitUntil(io, struct {
+        fn f(x: *Loop) bool {
+            return x.started.load(.acquire);
+        }
+    }.f, .{&l}, 2000));
+    try testing.expect(!s.cancel(&l.task));
+    s.wait(&l.task);
+    try testing.expectEqual(State.done, l.task.state);
+}
+
+test "coda satura con più produttori: niente oltre il limite, ogni task accettato gira una volta" {
+    var th = testIo();
+    defer th.deinit();
+    const io = th.io();
+    var s = Scheduler.init(io, .{ .workers = 2, .max_queued = 16 });
+    defer s.deinit();
+    const Item = struct {
+        task: Task = .{ .run_fn = run, .priority = .background },
+        runs: std.atomic.Value(u32) = .init(0),
+        accepted: bool = false,
+        fn run(t: *Task) void {
+            const it: *@This() = @fieldParentPtr("task", t);
+            _ = it.runs.fetchAdd(1, .monotonic);
+            // Un po' di lavoro, così la coda si riempie davvero.
+            var x: u64 = 0;
+            for (0..20_000) |i| x +%= i *% i;
+            std.mem.doNotOptimizeAway(x);
+        }
+    };
+    var items: [4][200]Item = undefined;
+    for (&items) |*row| for (row) |*it| {
+        it.* = .{};
+    };
+    const Producer = struct {
+        fn run(sch: *Scheduler, row: *[200]Item, max_seen: *std.atomic.Value(usize)) void {
+            for (row) |*it| {
+                it.accepted = if (sch.submit(&it.task)) true else |_| false;
+                sch.mutex.lockUncancelable(sch.io);
+                const q = sch.queued;
+                sch.mutex.unlock(sch.io);
+                _ = max_seen.fetchMax(q, .monotonic);
+            }
+        }
+    };
+    var max_seen: std.atomic.Value(usize) = .init(0);
+    var producers: [4]std.Thread = undefined;
+    for (&producers, &items) |*p, *row| p.* = try std.Thread.spawn(.{}, Producer.run, .{ &s, row, &max_seen });
+    for (producers) |p| p.join();
+    var accepted: usize = 0;
+    var rejected: usize = 0;
+    for (&items) |*row| for (row) |*it| {
+        if (it.accepted) {
+            s.wait(&it.task);
+            try testing.expectEqual(@as(u32, 1), it.runs.load(.monotonic));
+            accepted += 1;
+        } else {
+            try testing.expectEqual(@as(u32, 0), it.runs.load(.monotonic));
+            rejected += 1;
+        }
+    };
+    try testing.expect(max_seen.load(.monotonic) <= 16);
+    try testing.expectEqual(@as(usize, 800), accepted + rejected);
+    try testing.expectEqual(accepted, s.stats().tasks_run);
+}
+
+test "il pool cresce sotto carico e torna a zero, due volte" {
+    var th = testIo();
+    defer th.deinit();
+    const io = th.io();
+    var s = Scheduler.init(io, .{ .workers = 3, .idle_timeout_ms = 20 });
+    defer s.deinit();
+    for (0..2) |round| {
+        var gates: [3]Gate = @splat(.{});
+        for (&gates) |*g| try s.submit(&g.task);
+        // Tre task bloccati insieme: girano solo se il pool è salito a 3.
+        const all = waitUntil(io, struct {
+            fn f(gs: *[3]Gate) bool {
+                for (gs) |*g| if (!g.started.load(.acquire)) return false;
+                return true;
+            }
+        }.f, .{&gates}, 2000);
+        try testing.expectEqual(@as(usize, 3), s.stats().live_workers);
+        for (&gates) |*g| g.open.store(true, .release);
+        for (&gates) |*g| s.wait(&g.task);
+        try testing.expect(all);
+        // Senza lavoro scendono tutti (attesa con scadenza, non sleep fisso).
+        try testing.expect(waitUntil(io, liveIs, .{ &s, 0 }, 5000));
+        try testing.expectEqual(3 * (round + 1), s.stats().threads_retired);
+    }
+}
+
+test "statistiche: l'attesa in coda è misurata" {
+    var th = testIo();
+    defer th.deinit();
+    const io = th.io();
+    var s = Scheduler.init(io, .{ .workers = 1 });
+    defer s.deinit();
+    var gate = Gate{};
+    try startGate(&s, &gate);
+    var log = Recorder.Log{ .io = io };
+    var r = Recorder{ .task = .{ .run_fn = Recorder.run }, .log = &log, .id = 1 };
+    try s.submit(&r.task);
+    const t0 = std.Io.Clock.awake.now(io).nanoseconds;
+    while (std.Io.Clock.awake.now(io).nanoseconds - t0 < 5 * std.time.ns_per_ms) {}
+    gate.open.store(true, .release);
+    s.wait(&r.task);
+    const st = s.stats();
+    try testing.expectEqual(@as(usize, 2), st.tasks_started);
+    try testing.expect(st.queue_wait_ns_max >= 5 * std.time.ns_per_ms);
 }

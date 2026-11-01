@@ -8,6 +8,9 @@
 const std = @import("std");
 const decoder = @import("decoder.zig");
 const scheduler = @import("scheduler.zig");
+const perfcount = @import("perfcount.zig");
+const linux = std.os.linux;
+extern "c" fn getrusage(who: c_int, usage: *linux.rusage) c_int;
 
 extern "c" fn usleep(usec: c_uint) c_int;
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
@@ -40,6 +43,9 @@ pub fn main(init: std.process.Init) !void {
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
+    // Prima di qualunque thread: worker e thread di sfondo li ereditano.
+    var pc = perfcount.Counters.open();
+    defer pc.close();
     scheduler.initGlobal(io, .{});
     defer decoder.closePluginCache(gpa);
     defer scheduler.deinitGlobal();
@@ -115,6 +121,24 @@ pub fn main(init: std.process.Init) !void {
     const fg_ns: u64 = @intCast(now(io) - fg_t0);
     for (threads) |t| t.join();
 
+    // Join dei worker, poi i contatori (vedi perfcount.zig).
+    scheduler.deinitGlobal();
+    var ru: linux.rusage = undefined;
+    _ = getrusage(linux.rusage.SELF, &ru);
+    {
+        var pb: [512]u8 = undefined;
+        var pw = std.Io.File.stdout().writer(io, &pb);
+        try pw.interface.print("perf user_ms={d} sys_ms={d} vcsw={d} ivcsw={d} minflt={d}", .{
+            @as(i64, ru.utime.sec) * 1000 + @divTrunc(ru.utime.usec, 1000),
+            @as(i64, ru.stime.sec) * 1000 + @divTrunc(ru.stime.usec, 1000),
+            ru.nvcsw,
+            ru.nivcsw,
+            ru.minflt,
+        });
+        try pc.print(&pw.interface);
+        try pw.interface.print("\n", .{});
+        try pw.interface.flush();
+    }
     var bg_max: u64 = 0;
     for (bgs) |b| bg_max = @max(bg_max, b.elapsed_ns);
     var buf: [256]u8 = undefined;

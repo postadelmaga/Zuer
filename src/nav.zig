@@ -997,6 +997,9 @@ pub fn resolveInitialFile(io: std.Io, gpa: std.mem.Allocator, arg: []const u8) !
 /// mostra il messaggio come testo nella finestra invece di terminare il processo.
 pub fn decodeInitial(state: *GuiAppState, path: []const u8) void {
     scheduler.setThreadPriority(.interactive);
+    // Decode interattivo fuori dal pool: le miniature riducono il parallelismo.
+    scheduler.beginForeground();
+    defer scheduler.endForeground();
     // Latest-wins anche per il decode iniziale (come `loadWorker`): appena la
     // fase coarse spegne lo spinner l'utente può navigare, e il full del file
     // iniziale — ormai superato — non deve sovrascrivere quello navigato.
@@ -1070,6 +1073,9 @@ pub fn loadWorker(state: *GuiAppState) void {
         const gen = state.nav.gen;
         state.nav.mutex.unlock(io);
         defer gpa.free(path);
+        // Per tutta la richiesta (anche `continue`): le miniature cedono CPU.
+        scheduler.beginForeground();
+        defer scheduler.endForeground();
 
         // Spam di frecce: se è GIÀ arrivata una navigazione più recente, salta
         // questa per intero (niente decode né upload) → la più recente verrà presa

@@ -428,11 +428,12 @@ pub fn build(b: *std.Build) void {
 
     // Test unitari puri (nessuna dipendenza nativa): `zig build test`.
     const test_step = b.step("test", "Esegue i test unitari");
-    for ([_][]const u8{ "src/detect.zig", "src/scheduler.zig" }) |src_path| {
+    for ([_][]const u8{ "src/detect.zig", "src/scheduler.zig", "src/thumbs.zig" }) |src_path| {
         const t = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path(src_path),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         }) });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
@@ -448,9 +449,26 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
+    b.installArtifact(bench_dbg);
     const bench_run = b.addRunArtifact(bench_dbg);
     bench_run.addPassthruArgs();
     b.step("bench-decode", "Latenza di un decode con altri decode in sfondo").dependOn(&bench_run.step);
+
+    // Benchmark headless della pipeline miniature (stesso codice della GUI):
+    // `zig build bench-thumbnails -- <cartella> <seq|w1..w4|auto> [none|<cache>]`.
+    const bench_th = b.addExecutable(.{
+        .name = "bench-thumbnails",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_thumbnails.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    b.installArtifact(bench_th);
+    const bench_th_run = b.addRunArtifact(bench_th);
+    bench_th_run.addPassthruArgs();
+    b.step("bench-thumbnails", "Pipeline miniature headless, uno scenario per processo").dependOn(&bench_th_run.step);
 
     // Tool di sviluppo: chiama decoder.decode() su un file e stampa il risultato.
     const decode_dbg = b.addExecutable(.{
