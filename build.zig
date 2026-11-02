@@ -1,4 +1,7 @@
 const std = @import("std");
+// Zicro's build.zig, for `addTextC` (the C half of its text module): a dependency's
+// build.zig is importable, so the step is Zicro's own and cannot drift from it.
+const zicro_build = @import("zicro");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -553,8 +556,11 @@ pub fn build(b: *std.Build) void {
     // scripts/build-android-apk.sh; senza NDK lo step fallisce con un messaggio chiaro.
     {
         const android_step = b.step("android", "Compila libzuer.so per Android (aarch64)");
-        const ndk = b.option([]const u8, "ndk", "Percorso dell'Android NDK (default: $ANDROID_NDK_HOME)") orelse
-            b.graph.environ_map.get("ANDROID_NDK_HOME") orelse "";
+        // Solo esplicito (-Dndk): la cache di configurazione di Zig 0.17 non vede le
+        // variabili d'ambiente — un ANDROID_NDK_HOME cambiato o tolto dopo un build ne
+        // riusava la configurazione vecchia (riprodotto). scripts/build-android-apk.sh
+        // lo passa come -Dndk.
+        const ndk = b.option([]const u8, "ndk", "Percorso dell'Android NDK (richiesto)") orelse "";
         // API 24 (Android 7): la più bassa con tutte le AMotionEvent/ANativeWindow usate.
         const android_target = b.resolveTargetQuery(.{
             .cpu_arch = .aarch64,
@@ -563,7 +569,7 @@ pub fn build(b: *std.Build) void {
             .android_api_level = 24,
         });
         if (ndk.len == 0) {
-            android_step.dependOn(&b.addFail("Android NDK non trovato: passa -Dndk=<path> o esporta ANDROID_NDK_HOME").step);
+            android_step.dependOn(&b.addFail("Android NDK non indicato: passa -Dndk=<path>").step);
         } else {
             const glue_dir = b.pathJoin(&.{ ndk, "sources", "android", "native_app_glue" });
             const sysroot = b.pathJoin(&.{ ndk, "toolchains", "llvm", "prebuilt", "linux-x86_64", "sysroot" });
@@ -622,27 +628,14 @@ pub fn build(b: *std.Build) void {
 
             const zicro_android = dep_zicro.module("zicro_android");
             zicro_android.addIncludePath(arch_inc);
-            // Zig 0.17 ha rimosso `@cImport`: il modulo translate-c di text.zig va
-            // creato DAL LATO NOSTRO, perché il target di `zicro_android` lo decide
-            // il consumatore (qui) — Zicro non lo conosce. Lo step si crea sul
-            // builder della dipendenza, così `vendor/stb` e `src/c/text.h` si
-            // risolvono rispetto alla sua radice e non alla nostra.
+            // Zig 0.17 ha rimosso `@cImport`: il modulo C di text.zig (header tradotti
+            // + stb_truetype + HarfBuzz dove c'è) lo attacca `addTextC` di Zicro, sul
+            // builder della dipendenza, perché il target di `zicro_android` lo decide
+            // il consumatore (qui). Noi aggiungiamo solo ciò che è nostro: il NDK.
+            // Include bionic, per-architettura e API level: la stessa funzione di Zicro
+            // che usano Zrame e ZenFlow2, non una copia.
             if (!zicro_android.import_table.contains("text_c")) {
-                const zb = dep_zicro.builder;
-                const text_c = zb.addTranslateC(.{
-                    .root_source_file = zb.path("src/c/text.h"),
-                    .target = android_target,
-                    .optimize = .ReleaseFast,
-                    .link_libc = true,
-                });
-                text_c.addIncludePath(zb.path("vendor/stb"));
-                text_c.addIncludePath(arch_inc); // header per-architettura del NDK
-                // Il sysroot del NDK pretende l'API level come macro: agli step di
-                // compilazione arriva dal file libc, che translate-c non riceve
-                // ("Unversioned target triples are not supported" da cdefs.h).
-                text_c.defineCMacro("__ANDROID_API__", "24");
-                text_c.defineCMacro("__ANDROID_MIN_SDK_VERSION__", "24");
-                zicro_android.addImport("text_c", text_c.createModule());
+                _ = zicro_build.addTextCAndroid(dep_zicro.builder, zicro_android, android_target, .fast, ndk, 24);
             }
             lib.root_module.addImport("zicro", zicro_android);
             lib.root_module.addIncludePath(arch_inc);

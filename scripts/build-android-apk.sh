@@ -52,7 +52,7 @@ MIN_SDK=24  # deve combaciare con l'android_api_level dello step `android` in bu
 
 if [[ $DO_BUILD -eq 1 ]]; then
   echo "→ [1/5] zig build android (libzuer.so, aarch64)"
-  ANDROID_NDK_HOME="$NDK" zig build android
+  zig build android -Dndk="$NDK"  # esplicito: Zig 0.17 non traccia le variabili d'ambiente
 fi
 SO="$ROOT/zig-out/android/lib/arm64-v8a/libzuer.so"
 [[ -f "$SO" ]] || { echo "✗ $SO assente: esegui senza --no-build"; exit 1; }
