@@ -7,9 +7,6 @@
         .zicro = .{
             .path = "../Zicro",
         },
-        .zrame = .{
-            .path = "../Zrame",
-        },
     },
     .paths = .{
         "build.zig",

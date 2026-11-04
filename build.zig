@@ -98,10 +98,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const dep_zrame = b.dependency("zrame", .{
-        .target = target,
-        .optimize = optimize,
-    });
 
     // I quattro eseguibili con pipeline Vulkan importano lo stesso set di shader
     // SPIR-V: raccolti in una struct con un helper, per non ripetere gli import.
@@ -220,19 +216,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // IMPORTANTE: `zuer-gui` importa zicro sia direttamente sia (transitivamente)
-    // via zrame. Se prendessimo l'istanza da `dep_zicro` (builder di zuer) sarebbe
-    // un modulo DISTINTO da quello che linka zrame (builder di zrame): il
-    // `protocol.c` xdg-shell generato da zicro verrebbe compilato DUE volte →
-    // `duplicate symbol xdg_wm_base_interface`. Prendiamo perciò l'unica istanza
-    // di zicro dal builder di zrame, così protocol.c si compila una volta sola
-    // (e i tipi zicro sono identici tra zuer e zrame).
-    const gui_zicro = dep_zrame.builder.dependency("zicro", .{
-        .target = target,
-        .optimize = optimize,
-    }).module("zicro");
-    gui_exe.root_module.addImport("zicro", gui_zicro);
-    gui_exe.root_module.addImport("zrame", dep_zrame.module("zrame"));
+    // `zuer-gui` importa zicro sia direttamente sia (transitivamente) via zrame: zrame
+    // è un modulo dello STESSO pacchetto zicro e importa la sua zicro, quindi c'è
+    // un'istanza sola (protocol.c di xdg-shell compilato una volta, tipi identici).
+    gui_exe.root_module.addImport("zicro", dep_zicro.module("zicro"));
+    gui_exe.root_module.addImport("zrame", dep_zicro.module("zrame"));
     gui_exe.root_module.addOptions("build_options", build_opts);
     shaders.addTo(gui_exe.root_module);
     // Vulkan mesh/text renderer: Linux + Windows (vendored import lib). On Windows this

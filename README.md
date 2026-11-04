@@ -3,7 +3,7 @@
 Un **viewer di file** veloce e GPU-accelerato, scritto in Zig. Apre in un lampo
 documenti, tabelle, immagini, mesh 3D e video — sia nel **terminale** (`zuer`) sia
 in una **finestra** (`zuer-gui`) — costruito sui framework [zicro](../Zicro) (UI/paint
-in stile egui) e [zrame](../Zrame) (finestra + input cross-platform).
+in stile egui) e [zrame](../Zicro/zrame) (finestra + input cross-platform).
 
 Gira su **Linux** (Wayland) e **Windows** (GDI); il rendering 3D passa per Vulkan e
 la decodifica video per libav (FFmpeg).
@@ -38,7 +38,7 @@ PagSu/PagGiù o la rotellina.
 
 - **Zig 0.17** (vedi `minimum_zig_version` in `build.zig.zon`)
 - **glslc** (shaderc) — compila gli shader GLSL → SPIR-V durante la build
-- I framework **zicro** e **zrame** come repository fratelli in `../Zicro` e `../Zrame`
+- Il framework **zicro** (con dentro **zrame**, il livello finestra) come repository fratello in `../Zicro`
 - **Linux**: loader Vulkan di sistema, FFmpeg (pkg-config), `wayland-client`;
   opzionali per pdf/office: `poppler` (`pdftoppm`) e LibreOffice (`soffice`)
 
