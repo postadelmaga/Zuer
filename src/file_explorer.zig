@@ -500,7 +500,7 @@ fn rowOffFromY(lay: Layout, sb: [4]i32, my: f32) i32 {
 // ── Input mouse ──────────────────────────────────────────────────────────────
 
 /// Rotella a overlay attivo: scorre la griglia di una riga per scatto.
-pub fn handleWheel(state: *GuiAppState, win: *zrame.Window, axis: u32, value: i32) bool {
+pub fn handleWheel(state: *GuiAppState, win: *zrame.Window, axis: u32, value: f32) bool {
     state.shared.mutex.lockUncancelable(state.io);
     defer state.shared.mutex.unlock(state.io);
     const fx = &state.shared.fx;
@@ -535,13 +535,13 @@ pub fn handleMouse(state: *GuiAppState, win: *zrame.Window, event: zrame.MouseEv
         const lay = layoutFor(dims[0], dims[1], fx.entries.len, fx.err != null);
         const sb = scrollbarGeom(lay);
 
-        switch (event) {
-            .motion => |mot| {
-                state.last_x = mot.x;
-                state.last_y = mot.y;
+        switch (event.kind) {
+            .motion => {
+                state.last_x = event.x;
+                state.last_y = event.y;
                 if (fx.sb_drag) {
                     if (sb) |bar| {
-                        const off = rowOffFromY(lay, bar, mot.y);
+                        const off = rowOffFromY(lay, bar, event.y);
                         if (off != fx.row_off) {
                             fx.row_off = off;
                             state.shared.file_changed = true;
@@ -549,8 +549,8 @@ pub fn handleMouse(state: *GuiAppState, win: *zrame.Window, event: zrame.MouseEv
                     }
                 } else for (fx.entries, 0..) |_, i| {
                     const rc = cardRect(lay, fx.row_off, i) orelse continue;
-                    if (mot.x >= @as(f32, @floatFromInt(rc[0])) and mot.x < @as(f32, @floatFromInt(rc[0] + rc[2])) and
-                        mot.y >= @as(f32, @floatFromInt(rc[1])) and mot.y < @as(f32, @floatFromInt(rc[1] + rc[3])))
+                    if (event.x >= @as(f32, @floatFromInt(rc[0])) and event.x < @as(f32, @floatFromInt(rc[0] + rc[2])) and
+                        event.y >= @as(f32, @floatFromInt(rc[1])) and event.y < @as(f32, @floatFromInt(rc[1] + rc[3])))
                     {
                         if (fx.sel != @as(i32, @intCast(i))) {
                             fx.sel = @intCast(i);
@@ -560,15 +560,15 @@ pub fn handleMouse(state: *GuiAppState, win: *zrame.Window, event: zrame.MouseEv
                     }
                 }
             },
-            .button => |btn| {
+            .press, .release => {
                 // 0x110/0x111/0x112 = sinistro/destro/centrale.
-                const known = btn.button == 0x110 or btn.button == 0x111 or btn.button == 0x112;
-                if (btn.state != 1) {
+                const known = event.button == 0x110 or event.button == 0x111 or event.button == 0x112;
+                if (event.kind != .press) {
                     fx.sb_drag = false;
                 } else if (known) hit: {
                     const mx = state.last_x;
                     const my = state.last_y;
-                    if (btn.button == 0x110) {
+                    if (event.button == 0x110) {
                         if (sb) |bar| {
                             if (mx >= @as(f32, @floatFromInt(bar[0] - 4)) and mx < @as(f32, @floatFromInt(bar[0] + bar[2] + 4)) and
                                 my >= @as(f32, @floatFromInt(bar[1])) and my < @as(f32, @floatFromInt(bar[1] + bar[3])))
@@ -589,7 +589,7 @@ pub fn handleMouse(state: *GuiAppState, win: *zrame.Window, event: zrame.MouseEv
                             state.shared.file_changed = true;
                             act = if (!e.is_dir)
                                 .open_file
-                            else if (btn.button == 0x111)
+                            else if (event.button == 0x111)
                                 .preview_folder
                             else
                                 .enter_dir;
@@ -604,6 +604,7 @@ pub fn handleMouse(state: *GuiAppState, win: *zrame.Window, event: zrame.MouseEv
                 }
             },
             .leave => consumed = false,
+            .scroll => consumed = false, // la rotella passa da `handleWheel`
         }
     }
     if (act_path) |p| runAction(state, act, p);

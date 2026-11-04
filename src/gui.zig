@@ -1248,7 +1248,6 @@ pub fn main(init: std.process.Init) !void {
         .height = win_size.h,
         .on_key = input.keyCallback,
         .on_text = input.textCallback,
-        .on_scroll = input.scrollCallback,
         .on_mouse = input.mouseCallback,
         .user = &gui_state,
         .style = gui_state_mod.minimalFrame(zrame.Style.fluent()),

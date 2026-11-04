@@ -1122,7 +1122,7 @@ fn rowOffFromY(lay: Layout, sb: [4]i32, my: f32) i32 {
 
 /// Rotella col pannello aperto: scorre la griglia di una riga per scatto.
 /// Ritorna true se l'evento è consumato (sempre, a overlay attivo).
-pub fn handleWheel(state: *GuiAppState, win: *zrame.Window, axis: u32, value: i32) bool {
+pub fn handleWheel(state: *GuiAppState, win: *zrame.Window, axis: u32, value: f32) bool {
     state.shared.mutex.lockUncancelable(state.io);
     defer state.shared.mutex.unlock(state.io);
     const yt = &state.shared.yt;
@@ -1154,13 +1154,13 @@ pub fn handleMouse(state: *GuiAppState, win: *zrame.Window, event: zrame.MouseEv
     const lay = layoutFor(dims[0], dims[1], yt.results.len, status);
     const sb = scrollbarGeom(lay);
 
-    switch (event) {
-        .motion => |mot| {
-            state.last_x = mot.x;
-            state.last_y = mot.y;
+    switch (event.kind) {
+        .motion => {
+            state.last_x = event.x;
+            state.last_y = event.y;
             if (yt.sb_drag) {
                 if (sb) |bar| {
-                    const off = rowOffFromY(lay, bar, mot.y);
+                    const off = rowOffFromY(lay, bar, event.y);
                     if (off != yt.row_off) {
                         yt.row_off = off;
                         state.shared.file_changed = true;
@@ -1170,8 +1170,8 @@ pub fn handleMouse(state: *GuiAppState, win: *zrame.Window, event: zrame.MouseEv
             }
             for (yt.results, 0..) |_, i| {
                 const rc = cardRect(lay, yt.row_off, i) orelse continue;
-                if (mot.x >= @as(f32, @floatFromInt(rc[0])) and mot.x < @as(f32, @floatFromInt(rc[0] + rc[2])) and
-                    mot.y >= @as(f32, @floatFromInt(rc[1])) and mot.y < @as(f32, @floatFromInt(rc[1] + rc[3])))
+                if (event.x >= @as(f32, @floatFromInt(rc[0])) and event.x < @as(f32, @floatFromInt(rc[0] + rc[2])) and
+                    event.y >= @as(f32, @floatFromInt(rc[1])) and event.y < @as(f32, @floatFromInt(rc[1] + rc[3])))
                 {
                     if (yt.sel != @as(i32, @intCast(i))) {
                         yt.sel = @intCast(i);
@@ -1182,9 +1182,9 @@ pub fn handleMouse(state: *GuiAppState, win: *zrame.Window, event: zrame.MouseEv
             }
             return true;
         },
-        .button => |btn| {
-            if (btn.button != 0x110) return true;
-            if (btn.state != 1) {
+        .press, .release => {
+            if (event.button != 0x110) return true;
+            if (event.kind != .press) {
                 yt.sb_drag = false; // rilascio: fine del drag della scrollbar
                 return true;
             }
@@ -1233,6 +1233,7 @@ pub fn handleMouse(state: *GuiAppState, win: *zrame.Window, event: zrame.MouseEv
             return true;
         },
         .leave => return false,
+        .scroll => return false, // la rotella passa da `handleWheel`
     }
 }
 

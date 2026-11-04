@@ -728,8 +728,9 @@ pub fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) 
     }
 }
 
-pub fn scrollCallback(win: *zrame.Window, axis: u32, value: i32, user: ?*anyopaque) void {
-    const app_state: *GuiAppState = @ptrCast(@alignCast(user orelse return));
+/// La rotella (`.scroll` di `on_mouse`): `value` in unità d'asse Wayland, positivo =
+/// scorri in giù / a destra.
+fn handleScroll(app_state: *GuiAppState, win: *zrame.Window, axis: u32, value: f32) void {
     // Overlay YouTube aperto: la rotella sfoglia la griglia dei risultati.
     if (yt_search.handleWheel(app_state, win, axis, value)) return;
     // Esploratore file aperto: la rotella sfoglia la griglia delle voci.
@@ -742,13 +743,13 @@ pub fn scrollCallback(win: *zrame.Window, axis: u32, value: i32, user: ?*anyopaq
     if (axis == 1) {
         // Asse orizzontale (trackpad/tilt-wheel): scorre le tabelle larghe.
         if (is_text) {
-            const val = @as(f32, @floatFromInt(value)) / 256.0;
+            const val = value;
             scrollTextX(app_state, val * 5.0);
         }
         return;
     }
     if (axis == 0) {
-        const val = @as(f32, @floatFromInt(value)) / 256.0;
+        const val = value;
         if (is_text) {
             // Shift+rotella = scroll orizzontale (per chi non ha rotella orizzontale).
             if (app_state.shift_down) {
@@ -774,6 +775,10 @@ pub fn scrollCallback(win: *zrame.Window, axis: u32, value: i32, user: ?*anyopaq
 /// Così un click sulla scrollbar afferra il thumb invece di spostare la finestra.
 pub fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopaque) bool {
     const app_state: *GuiAppState = @ptrCast(@alignCast(user orelse return false));
+    if (event.kind == .scroll) {
+        if (event.scroll_dx != 0) handleScroll(app_state, win, 1, event.scroll_dx) else handleScroll(app_state, win, 0, event.scroll_dy);
+        return true;
+    }
     // Overlay di ricerca YouTube aperto: il mouse è suo (hover seleziona la
     // card, click apre, click fuori dal pannello chiude). `handleMouse` ritorna
     // false solo a overlay chiuso o sul leave → si prosegue col flusso normale.
@@ -785,11 +790,11 @@ pub fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopa
     // (vedi `zrame.MouseEvent`): lo stesso spazio in cui zuer disegna, quindi tutti gli
     // hit-test qui sotto (scrollbar, selezione testo, tab bar, controlli video) usano
     // le coordinate così come sono.
-    switch (event) {
-        .button => |btn| {
+    switch (event.kind) {
+        .press, .release => {
             // 0x110 = BTN_LEFT (click sinistro), 0x111 = BTN_RIGHT (click destro)
-            if (btn.button != 0x110 and btn.button != 0x111) return false;
-            const down = (btn.state == 1);
+            if (event.button != 0x110 and event.button != 0x111) return false;
+            const down = (event.kind == .press);
             // Snapshot dei flag di tipo sotto lock (pattern `is_pdf` del key
             // handler): sono riscritti da `applyDecoded` sui thread loader.
             app_state.shared.mutex.lockUncancelable(app_state.io);
@@ -800,7 +805,7 @@ pub fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopa
             // Doppio-click sinistro: video → fullscreen; immagine → fit ↔ 100% (verso
             // il cursore). Standard e comodo. Rilevato a orologio (gli eventi button
             // di zrame non portano timestamp).
-            if (down and btn.button == 0x110) {
+            if (down and event.button == 0x110) {
                 const now = nowMs();
                 const cxp = app_state.last_x;
                 const cyp = app_state.last_y;
@@ -823,7 +828,7 @@ pub fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopa
             // Video: controlli overlay. Click sinistro su play/pausa o timeline;
             // il rilascio termina lo scrubbing. Click sul corpo → non consumato
             // (zrame muove/ridimensiona la finestra come al solito).
-            if (app_state.video.isActive() and btn.button == 0x110) {
+            if (app_state.video.isActive() and event.button == 0x110) {
                 const vid = &app_state.video;
                 // Tutto nella STESSA sezione critica: static_w/h (per il fit-rect)
                 // sono riscritti dal worker (`advanceVideo`) e dai thread loader,
@@ -875,7 +880,7 @@ pub fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopa
                 return true;
             }
             // Click sinistro sulla barra delle linguette (in fondo): cambia foglio.
-            if (btn.button == 0x110 and is_table) {
+            if (event.button == 0x110 and is_table) {
                 const H = win.contentPx().h;
                 // `tab_bar` (count/h/bounds) è riscritta per intero da `rasterizeText`
                 // sul worker sotto `mutex`: va letta sotto lock, non a nudo.
@@ -931,7 +936,7 @@ pub fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopa
             }
             // Click sinistro: prima offri la pressione alla scrollbar (afferra il
             // thumb o salta sotto il cursore); se la consuma, niente selezione/drag.
-            if (btn.button == 0x110) {
+            if (event.button == 0x110) {
                 app_state.shared.mutex.lockUncancelable(app_state.io);
                 const grabbed = app_state.shared.sc.onButtonDown(app_state.last_x, app_state.last_y);
                 if (grabbed) app_state.shared.file_changed = true;
@@ -942,7 +947,7 @@ pub fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopa
             // bordo, dove (se il thumb non ha già afferrato sopra) lasciamo a zrame il
             // ridimensionamento della finestra. Senza questo, ogni click sul contenuto
             // consuma l'evento e la finestra risulta "fissa".
-            if (btn.button == 0x110 and is_text) {
+            if (event.button == 0x110 and is_text) {
                 const cpx = win.contentPx();
                 const W = cpx.w;
                 const H = cpx.h;
@@ -974,7 +979,7 @@ pub fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopa
             // zrame l'eventuale move/resize dal bordo (comportamento di default).
             return false;
         },
-        .motion => |mot| {
+        .motion => {
             // Video: ogni movimento rivela i controlli (azzera l'idle); durante lo
             // scrubbing il movimento cerca sulla timeline. Consuma solo mentre
             // scrubba, così sul corpo la finestra resta trascinabile/ridimensionabile.
@@ -987,11 +992,11 @@ pub fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopa
                 if (scrub) {
                     const cpx = win.contentPx();
                     const fr = videomod.videoFitRect(cpx.w, cpx.h, app_state.shared.static_w, app_state.shared.static_h);
-                    vid.seek_to = videomod.videoTimelineFrac(fr.w, fr.h, mot.x) * (if (vid.dur_s > 0) vid.dur_s else 0);
+                    vid.seek_to = videomod.videoTimelineFrac(fr.w, fr.h, event.x) * (if (vid.dur_s > 0) vid.dur_s else 0);
                 }
                 app_state.shared.mutex.unlock(app_state.io);
-                app_state.last_x = mot.x;
-                app_state.last_y = mot.y;
+                app_state.last_x = event.x;
+                app_state.last_y = event.y;
                 return scrub;
             }
             // La scrollbar vede sempre il movimento: aggiorna hover/thumb e, se sta
@@ -999,23 +1004,23 @@ pub fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopa
             // in drag), non facciamo selezione/pan.
             app_state.shared.mutex.lockUncancelable(app_state.io);
             app_state.shared.ui_idle_s = 0; // mostra l'etichetta nome file
-            const sc_consumed = app_state.shared.sc.onMotion(mot.x, mot.y);
+            const sc_consumed = app_state.shared.sc.onMotion(event.x, event.y);
             if (sc_consumed) app_state.shared.file_changed = true;
             app_state.shared.mutex.unlock(app_state.io);
             if (sc_consumed) {
-                app_state.last_x = mot.x;
-                app_state.last_y = mot.y;
+                app_state.last_x = event.x;
+                app_state.last_y = event.y;
                 return true;
             }
             if (app_state.shared.sel_selecting) {
                 const cpx = win.contentPx();
                 app_state.shared.mutex.lockUncancelable(app_state.io);
-                app_state.shared.sel_b = textHit(app_state, cpx.w, cpx.h, mot.x, mot.y);
+                app_state.shared.sel_b = textHit(app_state, cpx.w, cpx.h, event.x, event.y);
                 app_state.shared.file_changed = true;
                 app_state.shared.mutex.unlock(app_state.io);
             } else if (app_state.dragging) {
-                const dx = mot.x - app_state.last_x;
-                const dy = mot.y - app_state.last_y;
+                const dx = event.x - app_state.last_x;
+                const dy = event.y - app_state.last_y;
                 // Flag di tipo e camera sotto lo stesso mutex del pan: yaw/pitch
                 // sono letti dal renderWorker e AZZERATI da `applyDecoded` sotto
                 // `mutex` — incrementi a nudo potrebbero far perdere il reset.
@@ -1038,12 +1043,13 @@ pub fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopa
                     app_state.shared.mutex.unlock(app_state.io);
                 }
             }
-            app_state.last_x = mot.x;
-            app_state.last_y = mot.y;
+            app_state.last_x = event.x;
+            app_state.last_y = event.y;
             // Consuma il movimento mentre selezioni/trascini, così zrame non mostra il
             // cursore di resize sul bordo durante l'interazione.
             return app_state.shared.sel_selecting or app_state.dragging;
         },
+        .scroll => return true, // gestito in cima
         .leave => {
             // Puntatore fuori dalla finestra: spegni l'hover della scrollbar (fade)
             // e dimentica l'ultima posizione così un click successivo non parte da
