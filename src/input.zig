@@ -730,6 +730,9 @@ pub fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) 
 
 /// La rotella (`.scroll` di `on_mouse`): `value` in unità d'asse Wayland, positivo =
 /// scorri in giù / a destra.
+/// Pixel per unità d'asse: il passo della rotella di zicro, uguale in tutto lo stack.
+const wheel_px = zrame.scroll.wheel_gain;
+
 fn handleScroll(app_state: *GuiAppState, win: *zrame.Window, axis: u32, value: f32) void {
     // Overlay YouTube aperto: la rotella sfoglia la griglia dei risultati.
     if (yt_search.handleWheel(app_state, win, axis, value)) return;
@@ -744,7 +747,7 @@ fn handleScroll(app_state: *GuiAppState, win: *zrame.Window, axis: u32, value: f
         // Asse orizzontale (trackpad/tilt-wheel): scorre le tabelle larghe.
         if (is_text) {
             const val = value;
-            scrollTextX(app_state, val * 5.0);
+            scrollTextX(app_state, val * wheel_px);
         }
         return;
     }
@@ -753,11 +756,11 @@ fn handleScroll(app_state: *GuiAppState, win: *zrame.Window, axis: u32, value: f
         if (is_text) {
             // Shift+rotella = scroll orizzontale (per chi non ha rotella orizzontale).
             if (app_state.shift_down) {
-                scrollTextX(app_state, val * 5.0);
+                scrollTextX(app_state, val * wheel_px);
                 return;
             }
             // Documento: la rotella scorre (lo zoom testo resta su +/-)
-            scrollText(app_state, val * 5.0);
+            scrollText(app_state, val * wheel_px);
             return;
         }
         // Rotella = zoom immagini/mesh VERSO IL CURSORE (ultima posizione nota).
