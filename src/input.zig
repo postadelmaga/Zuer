@@ -456,7 +456,7 @@ fn handleYtKey(app_state: *GuiAppState, key: u32) bool {
             yt.swallow_text = true;
             yt.sel_all = false;
             yt.bs_held = false;
-            yt.sb_drag = false;
+            _ = yt.scroll.onRelease();
             app_state.shared.file_changed = true;
             return true;
         }
@@ -486,7 +486,7 @@ fn handleYtKey(app_state: *GuiAppState, key: u32) bool {
         KEY_ESC => {
             yt.active = false;
             yt.bs_held = false;
-            yt.sb_drag = false;
+            _ = yt.scroll.onRelease();
             app_state.shared.file_changed = true;
         },
         KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT => {

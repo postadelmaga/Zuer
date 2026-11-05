@@ -16,7 +16,7 @@ const layout = @import("layout.zig");
 const nav = @import("nav.zig");
 const videomod = @import("video.zig");
 const yt_search = @import("yt_search.zig");
-const grid_scroll = @import("grid_scroll.zig");
+const card_grid = @import("card_grid.zig");
 const gui_state_mod = @import("gui_state.zig");
 const vtcache = @import("vtcache.zig");
 const GuiAppState = gui_state_mod.GuiAppState;
@@ -93,7 +93,7 @@ fn setErr(state: *GuiAppState, msg: []const u8) void {
 fn closeOverlay(state: *GuiAppState) void {
     const fx = &state.shared.fx;
     fx.active = false;
-    fx.sb_drag = false;
+    _ = fx.scroll.onRelease();
     _ = fx.bumpGeneration();
     fx.sel = -1;
     fx.scroll.reset();
@@ -235,7 +235,7 @@ fn enterDir(state: *GuiAppState, dir_path: []const u8) bool {
     fx.scroll.reset();
     fx.top_row = 0;
     fx.active = true;
-    fx.sb_drag = false;
+    _ = fx.scroll.onRelease();
     if (fx.err) |e| {
         state.gpa.free(e);
         fx.err = null;
@@ -457,8 +457,16 @@ fn layoutFor(W: u32, H: u32, n: usize, status: bool) Layout {
 }
 
 /// Geometria verticale della griglia, per lo scroll.
-fn geom(lay: Layout) grid_scroll.Geom {
-    return .{ .grid_y = lay.grid_y, .card_h = lay.card_h, .gap = gap, .total_rows = lay.total_rows, .vis_rows = lay.vis_rows };
+fn geom(lay: Layout) card_grid.Geom {
+    return .{
+        .grid_x = lay.grid_x,
+        .grid_y = lay.grid_y,
+        .right = lay.xp + lay.wp - 3, // la scrollbar flottante sta nel margine del pannello
+        .card_h = lay.card_h,
+        .gap = gap,
+        .total_rows = lay.total_rows,
+        .vis_rows = lay.vis_rows,
+    };
 }
 
 /// Rettangolo intero della card `i` spostato dallo scroll in pixel, o null se
@@ -490,11 +498,6 @@ fn overlayDims(state: *GuiAppState, win: *zrame.Window) [2]u32 {
     return .{ cpx.w, cpx.h };
 }
 
-fn scrollbarGeom(lay: Layout) ?[4]i32 {
-    if (lay.total_rows <= lay.vis_rows) return null;
-    return .{ lay.xp + lay.wp - 11, lay.grid_y, 7, geom(lay).bandH() };
-}
-
 // ── Input mouse ──────────────────────────────────────────────────────────────
 
 /// Rotella a overlay attivo: scorre la griglia col passo di zicro, con l'easing
@@ -505,9 +508,9 @@ pub fn handleWheel(state: *GuiAppState, win: *zrame.Window, axis: u32, value: f3
     const fx = &state.shared.fx;
     if (!fx.active) return false;
     if (axis != 0 or value == 0) return true;
-    const dims = overlayDims(state, win);
-    const lay = layoutFor(dims[0], dims[1], fx.entries.len, fx.err != null);
-    if (fx.scroll.wheel(geom(lay), value)) state.shared.file_changed = true;
+    _ = win; // la geometria la allinea il prossimo disegno (`GridScroll.tick`)
+    fx.scroll.sc.wheel(.vertical, value);
+    state.shared.file_changed = true;
     return true;
 }
 
@@ -526,24 +529,23 @@ pub fn handleMouse(state: *GuiAppState, win: *zrame.Window, event: zrame.MouseEv
 
         const dims = overlayDims(state, win);
         const lay = layoutFor(dims[0], dims[1], fx.entries.len, fx.err != null);
-        const sb = scrollbarGeom(lay);
 
         switch (event.kind) {
             .motion => {
                 state.last_x = event.x;
                 state.last_y = event.y;
-                if (fx.sb_drag) {
-                    if (sb) |bar| {
-                        // Drag 1:1, senza easing.
-                        if (fx.scroll.jump(geom(lay).scrollFromY(bar[1], bar[3], event.y))) state.shared.file_changed = true;
-                    }
-                } else for (fx.entries, 0..) |_, i| {
-                    if (cardHit(lay, fx.scroll.pos, i, event.x, event.y)) {
-                        if (fx.sel != @as(i32, @intCast(i))) {
-                            fx.sel = @intCast(i);
-                            state.shared.file_changed = true;
+                const m = fx.scroll.onMotion(geom(lay), event.x, event.y);
+                if (m.redraw) state.shared.file_changed = true;
+                // Sulla scrollbar o in drag: niente hover sulle card.
+                if (!m.consumed) {
+                    for (fx.entries, 0..) |_, i| {
+                        if (cardHit(lay, fx.scroll.pos(), i, event.x, event.y)) {
+                            if (fx.sel != @as(i32, @intCast(i))) {
+                                fx.sel = @intCast(i);
+                                state.shared.file_changed = true;
+                            }
+                            break;
                         }
-                        break;
                     }
                 }
             },
@@ -551,24 +553,17 @@ pub fn handleMouse(state: *GuiAppState, win: *zrame.Window, event: zrame.MouseEv
                 // 0x110/0x111/0x112 = sinistro/destro/centrale.
                 const known = event.button == 0x110 or event.button == 0x111 or event.button == 0x112;
                 if (event.kind != .press) {
-                    fx.sb_drag = false;
+                    if (fx.scroll.onRelease()) state.shared.file_changed = true; // fine del drag
                 } else if (known) hit: {
                     const mx = state.last_x;
                     const my = state.last_y;
-                    if (event.button == 0x110) {
-                        if (sb) |bar| {
-                            if (mx >= @as(f32, @floatFromInt(bar[0] - 4)) and mx < @as(f32, @floatFromInt(bar[0] + bar[2] + 4)) and
-                                my >= @as(f32, @floatFromInt(bar[1])) and my < @as(f32, @floatFromInt(bar[1] + bar[3])))
-                            {
-                                fx.sb_drag = true;
-                                _ = fx.scroll.jump(geom(lay).scrollFromY(bar[1], bar[3], my));
-                                state.shared.file_changed = true;
-                                break :hit;
-                            }
-                        }
+                    // Sinistro sulla scrollbar: prende il thumb (o lo porta lì) e inizia il drag.
+                    if (event.button == 0x110 and fx.scroll.onPress(geom(lay), mx, my)) {
+                        state.shared.file_changed = true;
+                        break :hit;
                     }
                     for (fx.entries, 0..) |e, i| {
-                        if (cardHit(lay, fx.scroll.pos, i, mx, my)) {
+                        if (cardHit(lay, fx.scroll.pos(), i, mx, my)) {
                             fx.sel = @intCast(i);
                             state.shared.file_changed = true;
                             act = if (!e.is_dir)
@@ -587,7 +582,11 @@ pub fn handleMouse(state: *GuiAppState, win: *zrame.Window, event: zrame.MouseEv
                     if (!inside) closeOverlay(state);
                 }
             },
-            .leave => consumed = false,
+            .leave => {
+                fx.scroll.sc.onLeave(); // la scrollbar torna a riposo
+                state.shared.file_changed = true;
+                consumed = false;
+            },
             .scroll => consumed = false, // la rotella passa da `handleWheel`
         }
     }
@@ -652,9 +651,9 @@ pub fn drawOverlay(buf: []u8, W: u32, H: u32, state: *GuiAppState, raster: *glyp
 
     // Scroll a inseguimento della selezione (solo da tastiera, come YouTube):
     // la card selezionata entra intera nella banda.
-    if (fx.follow_sel and fx.sel >= 0) fx.scroll.follow(geom(lay), @divTrunc(fx.sel, grid_cols));
+    if (fx.follow_sel and fx.sel >= 0) fx.scroll.revealRow(geom(lay), @divTrunc(fx.sel, grid_cols));
     fx.follow_sel = false;
-    if (fx.scroll.step(geom(lay), zrame.widget.nowMs())) state.shared.file_changed = true; // easing in corso: un altro frame
+    if (fx.scroll.tick(geom(lay), zrame.widget.nowMs())) state.shared.file_changed = true; // easing o dissolvenza in corso: un altro frame
     fx.top_row = fx.scroll.topRow(geom(lay));
 
     const u32px: [*]u32 = @ptrCast(@alignCast(buf.ptr));
@@ -715,7 +714,7 @@ pub fn drawOverlay(buf: []u8, W: u32, H: u32, state: *GuiAppState, raster: *glyp
     const saved_clip = canvas.setClip(0, @intCast(@max(clip_y0, 0)), W, @intCast(@max(clip_y1 - @max(clip_y0, 0), 0)));
     defer canvas.clip = saved_clip;
     for (fx.entries, 0..) |e, i| {
-        const rc = cardRect(lay, fx.scroll.pos, i) orelse continue;
+        const rc = cardRect(lay, fx.scroll.pos(), i) orelse continue;
         const x = rc[0];
         const y = rc[1];
 
@@ -777,11 +776,7 @@ pub fn drawOverlay(buf: []u8, W: u32, H: u32, state: *GuiAppState, raster: *glyp
         _ = yt_search.drawTextClip(buf, W, H, raster, x + 8, tbase, e.name, text_fg, lay.card_w - 16, clip_y0, clip_y1);
     }
 
-    // Scrollbar della griglia (solo se c'è altro da sfogliare).
+    // Scrollbar flottante di zicro, come quella del testo.
     canvas.clip = saved_clip;
-    if (scrollbarGeom(lay)) |sb| {
-        canvas.fillRoundedRect(@floatFromInt(sb[0]), @floatFromInt(sb[1]), @floatFromInt(sb[2]), @floatFromInt(sb[3]), 3.5, paint.Color.rgba(255, 255, 255, 0.10));
-        const th = geom(lay).thumb(sb[1], sb[3], fx.scroll.pos);
-        canvas.fillRoundedRect(@floatFromInt(sb[0]), @floatFromInt(th[0]), @floatFromInt(sb[2]), @floatFromInt(th[1]), 3.5, paint.Color.rgba(255, 255, 255, if (fx.sb_drag) 0.65 else 0.38));
-    }
+    fx.scroll.sc.draw(&canvas);
 }

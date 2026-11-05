@@ -426,13 +426,13 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
         }) });
-        t.root_module.addImport("zicro", dep_zicro.module("zicro")); // via grid_scroll
+        t.root_module.addImport("zicro", dep_zicro.module("zicro")); // via card_grid
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
     {
         // Lo scroll delle griglie usa il passo e l'easing di zicro.
         const t = b.addTest(.{ .root_module = b.createModule(.{
-            .root_source_file = b.path("src/grid_scroll.zig"),
+            .root_source_file = b.path("src/card_grid.zig"),
             .target = target,
             .optimize = optimize,
         }) });
@@ -469,6 +469,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
+    bench_th.root_module.addImport("zicro", dep_zicro.module("zicro")); // thumbs → card_grid
     // Strumenti solo Linux (getrusage, /proc, perf_event_open): installati
     // solo lì, così la build Windows non li compila.
     if (target.result.os.tag == .linux) b.installArtifact(bench_th);

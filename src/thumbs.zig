@@ -31,7 +31,7 @@ const layout = @import("layout.zig");
 const vtcache = @import("vtcache.zig");
 // Copia host dell'helper di manutenzione cache (LRU per mtime + sweep dei tmp).
 const evict = @import("cache_evict.zig");
-const grid_scroll = @import("grid_scroll.zig");
+const card_grid = @import("card_grid.zig");
 
 /// Colonne della griglia: `claimNext` parte dalla prima card visibile.
 pub const grid_cols: i32 = 4;
@@ -84,8 +84,8 @@ pub const FxState = struct {
     entries: []Entry = &.{},
     /// Card selezionata (-1 = nessuna).
     sel: i32 = -1,
-    /// Scroll della griglia in pixel, col passo e l'easing di zicro.
-    scroll: grid_scroll.GridScroll = .{},
+    /// Scroll della griglia: lo `Scroll` di zicro.
+    scroll: card_grid.GridScroll = .{},
     /// Prima riga di card visibile, aggiornata dal disegno: i job delle
     /// miniature partono da lì.
     top_row: i32 = 0,
@@ -102,8 +102,6 @@ pub const FxState = struct {
     heavy_inflight: u32 = 0,
     /// La selezione è appena cambiata da tastiera: lo scroll la insegue.
     follow_sel: bool = false,
-    /// Trascinamento del thumb della scrollbar in corso.
-    sb_drag: bool = false,
     /// Messaggio di stato (posseduto), sotto l'header. null = nessuno.
     err: ?[]u8 = null,
 
