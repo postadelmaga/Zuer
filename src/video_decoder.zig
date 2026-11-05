@@ -148,6 +148,9 @@ pub const VideoDecoder = struct {
         }
         self.thread = std.Thread.spawn(.{}, threadEntry, .{self}) catch |e| {
             gpa.free(self.ring[0].pixels);
+            if (comptime mpv_enabled) {
+                if (self.path_owned.len > 0) gpa.free(self.path_owned);
+            }
             return e;
         };
         return .{ .dec = self, .rgba = poster, .w = w, .h = h, .pts_s = frame.pts_s };
@@ -159,7 +162,8 @@ pub const VideoDecoder = struct {
         if (self.thread) |t| t.join();
         for (&self.ring) |*s| if (s.cap > 0) self.gpa.free(s.pixels);
         if (comptime mpv_enabled) {
-            if (self.mpv) |*mv| mv.deinit();
+            // mpv è già stato smontato dal suo thread (`threadEntry`), dopo il join.
+            std.debug.assert(self.mpv == null);
             if (self.path_owned.len > 0) self.gpa.free(self.path_owned);
         }
         self.player.deinit();
@@ -281,6 +285,9 @@ pub const VideoDecoder = struct {
                     self.mpv = mv;
                     self.mpv.?.loadFile(self.path_owned);
                     threadMainMpvLoop(self);
+                    // Teardown sullo stesso thread di init: il contesto EGL è corrente qui.
+                    self.mpv.?.deinit();
+                    self.mpv = null;
                     return;
                 } else |e| {
                     std.log.warn("zuer video: init mpv fallita ({}), uso il decoder FFmpeg esistente", .{e});

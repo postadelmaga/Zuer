@@ -155,6 +155,7 @@ pub const MpvVideo = struct {
         var egl_major: c.EGLint = 0;
         var egl_minor: c.EGLint = 0;
         if (c.eglInitialize(egl_display, &egl_major, &egl_minor) == c.EGL_FALSE) return error.EglInitializeFailed;
+        errdefer _ = c.eglTerminate(egl_display);
         if (c.eglBindAPI(c.EGL_OPENGL_API) == c.EGL_FALSE) return error.EglBindApiFailed;
 
         const config_attribs = [_]c.EGLint{
@@ -228,13 +229,19 @@ pub const MpvVideo = struct {
         return @ptrCast(@constCast(c.eglGetProcAddress(name)));
     }
 
+    /// Da chiamare sul thread che ha fatto `init` (il contesto EGL è corrente lì):
+    /// la pulizia GL e quella del render context di mpv lo richiedono. Rilascia
+    /// anche il display EGL (e con lui il fd DRM) prima di chiudere la connessione.
     pub fn deinit(self: *MpvVideo) void {
         if (self.fbo != 0) c.glDeleteFramebuffers(1, &self.fbo);
         if (self.fbo_tex != 0) c.glDeleteTextures(1, &self.fbo_tex);
         api.mpv_render_context_free(self.render_ctx);
         api.mpv_terminate_destroy(self.mpv);
+        _ = c.eglMakeCurrent(self.egl_display, c.EGL_NO_SURFACE, c.EGL_NO_SURFACE, c.EGL_NO_CONTEXT);
         _ = c.eglDestroyContext(self.egl_display, self.egl_context);
         _ = c.eglDestroySurface(self.egl_display, self.egl_surface);
+        _ = c.eglTerminate(self.egl_display);
+        _ = c.eglReleaseThread();
         c.wl_display_disconnect(self.wl_display);
         self.* = undefined;
     }
