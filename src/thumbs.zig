@@ -31,6 +31,7 @@ const layout = @import("layout.zig");
 const vtcache = @import("vtcache.zig");
 // Copia host dell'helper di manutenzione cache (LRU per mtime + sweep dei tmp).
 const evict = @import("cache_evict.zig");
+const grid_scroll = @import("grid_scroll.zig");
 
 /// Colonne della griglia: `claimNext` parte dalla prima card visibile.
 pub const grid_cols: i32 = 4;
@@ -83,8 +84,11 @@ pub const FxState = struct {
     entries: []Entry = &.{},
     /// Card selezionata (-1 = nessuna).
     sel: i32 = -1,
-    /// Prima riga di card visibile.
-    row_off: i32 = 0,
+    /// Scroll della griglia in pixel, col passo e l'easing di zicro.
+    scroll: grid_scroll.GridScroll = .{},
+    /// Prima riga di card visibile, aggiornata dal disegno: i job delle
+    /// miniature partono da lì.
+    top_row: i32 = 0,
     /// Generazione delle voci: i job installano solo se è ancora la loro.
     gen: u32 = 0,
     /// Miniature installate nella generazione corrente e decode già tentati:
@@ -527,8 +531,8 @@ fn leaveLocked(h: *const Host, batch: *Batch) void {
 }
 
 /// Reclama sotto lock la prossima voce da lavorare, PARTENDO DALLA PRIMA CARD
-/// VISIBILE (`row_off * grid_cols`) e proseguendo circolarmente fino a chiudere
-/// il giro: `row_off` è riletto ad OGNI chiamata, quindi lo scroll dell'utente
+/// VISIBILE (`top_row * grid_cols`) e proseguendo circolarmente fino a chiudere
+/// il giro: `top_row` è riletto ad OGNI chiamata, quindi lo scroll dell'utente
 /// ridirige subito i job sulle card che sta guardando.
 /// La marcatura (`cache_tried`/`thumb_tried`) fa da claim: più job sulla stessa
 /// generazione non si pestano i piedi.
@@ -544,7 +548,7 @@ fn claimNext(h: *const Host, gen: u32, phase: Phase, batch: *Batch) ClaimResult 
         if (phase == .decode and @as(usize, fx.thumb_attempts) >= max_thumb_files) break :blk null; // tetto CPU
         const n = fx.entries.len;
         if (n == 0) break :blk null;
-        const off: usize = @intCast(@max(fx.row_off, 0));
+        const off: usize = @intCast(@max(fx.top_row, 0));
         const first = @min(off *| @as(usize, @intCast(grid_cols)), n - 1);
         for (0..n) |k| {
             const i = (first + k) % n;

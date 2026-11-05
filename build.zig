@@ -426,6 +426,17 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
         }) });
+        t.root_module.addImport("zicro", dep_zicro.module("zicro")); // via grid_scroll
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
+    {
+        // Lo scroll delle griglie usa il passo e l'easing di zicro.
+        const t = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("src/grid_scroll.zig"),
+            .target = target,
+            .optimize = optimize,
+        }) });
+        t.root_module.addImport("zicro", dep_zicro.module("zicro"));
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
 
