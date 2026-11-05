@@ -54,8 +54,13 @@ pub const YtState = struct {
     results: []Result = &.{},
     /// Card selezionata nella griglia (-1 = nessuna).
     sel: i32 = -1,
-    /// Prima riga di card visibile (la griglia scorre seguendo la selezione).
-    row_off: i32 = 0,
+    /// Scroll della griglia in pixel: `scroll` è quello disegnato, `scroll_target`
+    /// quello voluto (rotella, tastiera); il primo insegue il secondo con l'easing
+    /// di zicro (`zrame.scroll.wheelBlend`). Il drag della scrollbar li muove insieme.
+    scroll: f32 = 0,
+    scroll_target: f32 = 0,
+    /// Istante (ms) dell'ultimo passo dell'easing; 0 = fermo.
+    scroll_ms: i64 = 0,
     /// Ricerca yt-dlp in corso (spinner nel campo).
     searching: bool = false,
     /// Risoluzione/apertura dello stream in corso.
@@ -138,13 +143,19 @@ pub fn clearCurrentStream(state: *GuiAppState) void {
 /// Svuota risultati/errore correnti (dopo una modifica alla query i vecchi
 /// risultati non corrispondono più) e brucia la generazione così i worker in
 /// volo (search/thumb) buttano ciò che portano. Con `shared.mutex` acquisito.
+fn resetScroll(yt: *YtState) void {
+    yt.scroll = 0;
+    yt.scroll_target = 0;
+    yt.scroll_ms = 0;
+}
+
 pub fn invalidateResults(state: *GuiAppState) void {
     const yt = &state.shared.yt;
     yt.gen +%= 1;
     freeResults(state.gpa, yt.results);
     yt.results = &.{};
     yt.sel = -1;
-    yt.row_off = 0;
+    resetScroll(yt);
     if (yt.err) |e| state.gpa.free(e);
     yt.err = null;
 }
@@ -365,7 +376,7 @@ fn searchWorker(state: *GuiAppState, query: []u8, gen: u32) void {
         freeResults(state.gpa, yt.results);
         yt.results = owned;
         yt.sel = if (owned.len > 0) 0 else -1;
-        yt.row_off = 0;
+        resetScroll(yt);
         yt.searching = false;
         if (owned.len == 0) setErr(state, "nessun risultato");
         state.shared.file_changed = true;
@@ -1030,7 +1041,8 @@ pub const Layout = struct {
 };
 
 /// Geometria del pannello per la finestra `W`×`H` con `n` risultati e una riga
-/// di stato opzionale (errore/apertura). Le card scorrono per righe (`row_off`).
+/// di stato opzionale (errore/apertura). Le card scorrono in pixel (`YtState.scroll`)
+/// dentro una banda alta `vis_rows` righe.
 fn layoutFor(W: u32, H: u32, n: usize, status: bool) Layout {
     const wi: i32 = @intCast(W);
     const hi: i32 = @intCast(H);
@@ -1068,16 +1080,46 @@ fn chipRect(lay: Layout, i: usize) [4]i32 {
     return .{ x, y, chip_w, chip_h };
 }
 
-/// Rettangolo della card `i` (indice assoluto) con lo scroll `row_off`, o null
-/// se fuori dalla banda visibile.
-fn cardRect(lay: Layout, row_off: i32, i: usize) ?[4]i32 {
+/// Passo verticale tra due righe di card.
+fn rowPitch(lay: Layout) i32 {
+    return lay.card_h + gap;
+}
+
+/// Altezza della banda visibile della griglia (le card fuori sono tagliate).
+fn bandH(lay: Layout) i32 {
+    return lay.vis_rows * rowPitch(lay) - gap;
+}
+
+/// Altezza di tutte le righe di card.
+fn contentH(lay: Layout) i32 {
+    return @max(0, lay.total_rows * rowPitch(lay) - gap);
+}
+
+/// Scroll massimo: l'ultima riga a filo del fondo della banda.
+fn maxScroll(lay: Layout) f32 {
+    return @floatFromInt(@max(0, contentH(lay) - bandH(lay)));
+}
+
+/// Rettangolo intero della card `i` (indice assoluto) spostato dallo scroll in
+/// pixel, o null se nemmeno un pixel cade nella banda visibile. Può sporgere dalla
+/// banda: chi disegna taglia alla banda, chi fa hit-test usa `cardHit`.
+fn cardRect(lay: Layout, scroll: f32, i: usize) ?[4]i32 {
     const idx: i32 = @intCast(i);
     const row = @divTrunc(idx, grid_cols);
     const col = @mod(idx, grid_cols);
-    if (row < row_off or row >= row_off + lay.vis_rows) return null;
     const x = lay.grid_x + col * (lay.card_w + gap);
-    const y = lay.grid_y + (row - row_off) * (lay.card_h + gap);
+    const y = lay.grid_y + row * rowPitch(lay) - @as(i32, @intFromFloat(@round(scroll)));
+    if (y + lay.card_h <= lay.grid_y or y >= lay.grid_y + bandH(lay)) return null;
     return .{ x, y, lay.card_w, lay.card_h };
+}
+
+/// Il punto (x,y) cade sulla parte VISIBILE della card `i`?
+fn cardHit(lay: Layout, scroll: f32, i: usize, x: f32, y: f32) bool {
+    const rc = cardRect(lay, scroll, i) orelse return false;
+    const y0 = @max(rc[1], lay.grid_y);
+    const y1 = @min(rc[1] + rc[3], lay.grid_y + bandH(lay));
+    return x >= @as(f32, @floatFromInt(rc[0])) and x < @as(f32, @floatFromInt(rc[0] + rc[2])) and
+        y >= @as(f32, @floatFromInt(y0)) and y < @as(f32, @floatFromInt(y1));
 }
 
 // ── Input mouse ──────────────────────────────────────────────────────────────
@@ -1097,30 +1139,29 @@ fn overlayDims(state: *GuiAppState, win: *zrame.Window) [2]u32 {
 /// del pannello): `{x, y, w, h}` del binario, o null se non serve (tutto visibile).
 fn scrollbarGeom(lay: Layout) ?[4]i32 {
     if (lay.total_rows <= lay.vis_rows) return null;
-    const h = lay.vis_rows * (lay.card_h + gap) - gap;
-    return .{ lay.xp + lay.wp - 11, lay.grid_y, 7, h };
+    return .{ lay.xp + lay.wp - 11, lay.grid_y, 7, bandH(lay) };
 }
 
-/// Posizione/altezza del thumb per lo scroll corrente.
-fn scrollbarThumb(lay: Layout, sb: [4]i32, row_off: i32) [2]i32 {
+/// Posizione/altezza del thumb per lo scroll corrente (in pixel).
+fn scrollbarThumb(lay: Layout, sb: [4]i32, scroll: f32) [2]i32 {
     const track_h = sb[3];
-    const th = @max(@as(i32, 24), @divTrunc(track_h * lay.vis_rows, lay.total_rows));
-    const max_off = @max(lay.total_rows - lay.vis_rows, 1);
-    const ty = sb[1] + @divTrunc((track_h - th) * std.math.clamp(row_off, 0, max_off), max_off);
+    const th = @max(@as(i32, 24), @divTrunc(track_h * bandH(lay), @max(contentH(lay), 1)));
+    const max_s = @max(maxScroll(lay), 1.0);
+    const frac = std.math.clamp(scroll / max_s, 0.0, 1.0);
+    const ty = sb[1] + @as(i32, @intFromFloat(@round(@as(f32, @floatFromInt(track_h - th)) * frac)));
     return .{ ty, th };
 }
 
-/// `row_off` dalla coordinata Y del mouse sul binario (drag/click del thumb).
-fn rowOffFromY(lay: Layout, sb: [4]i32, my: f32) i32 {
+/// Scroll (pixel) dalla coordinata Y del mouse sul binario (drag/click del thumb).
+fn scrollFromY(lay: Layout, sb: [4]i32, my: f32) f32 {
     const th = scrollbarThumb(lay, sb, 0)[1];
     const span: f32 = @floatFromInt(@max(sb[3] - th, 1));
     const rel = (my - @as(f32, @floatFromInt(sb[1]))) - @as(f32, @floatFromInt(th)) / 2.0;
-    const max_off: f32 = @floatFromInt(@max(lay.total_rows - lay.vis_rows, 0));
-    const off: i32 = @intFromFloat(@round(std.math.clamp(rel / span, 0.0, 1.0) * max_off));
-    return off;
+    return std.math.clamp(rel / span, 0.0, 1.0) * maxScroll(lay);
 }
 
-/// Rotella col pannello aperto: scorre la griglia di una riga per scatto.
+/// Rotella col pannello aperto: scorre la griglia col passo di zicro
+/// (`zrame.scroll.wheel_gain`), con l'easing applicato al disegno.
 /// Ritorna true se l'evento è consumato (sempre, a overlay attivo).
 pub fn handleWheel(state: *GuiAppState, win: *zrame.Window, axis: u32, value: f32) bool {
     state.shared.mutex.lockUncancelable(state.io);
@@ -1130,11 +1171,9 @@ pub fn handleWheel(state: *GuiAppState, win: *zrame.Window, axis: u32, value: f3
     if (axis != 0 or value == 0) return true;
     const dims = overlayDims(state, win);
     const lay = layoutFor(dims[0], dims[1], yt.results.len, yt.err != null or yt.opening);
-    const step: i32 = if (value > 0) 1 else -1;
-    const max_off = @max(lay.total_rows - lay.vis_rows, 0);
-    const new_off = std.math.clamp(yt.row_off + step, 0, max_off);
-    if (new_off != yt.row_off) {
-        yt.row_off = new_off;
+    const target = std.math.clamp(yt.scroll_target + value * zrame.scroll.wheel_gain, 0, maxScroll(lay));
+    if (target != yt.scroll_target) {
+        yt.scroll_target = target;
         state.shared.file_changed = true;
     }
     return true;
@@ -1160,19 +1199,17 @@ pub fn handleMouse(state: *GuiAppState, win: *zrame.Window, event: zrame.MouseEv
             state.last_y = event.y;
             if (yt.sb_drag) {
                 if (sb) |bar| {
-                    const off = rowOffFromY(lay, bar, event.y);
-                    if (off != yt.row_off) {
-                        yt.row_off = off;
+                    const off = scrollFromY(lay, bar, event.y);
+                    if (off != yt.scroll) {
+                        yt.scroll = off; // drag 1:1, senza easing
+                        yt.scroll_target = off;
                         state.shared.file_changed = true;
                     }
                 }
                 return true;
             }
             for (yt.results, 0..) |_, i| {
-                const rc = cardRect(lay, yt.row_off, i) orelse continue;
-                if (event.x >= @as(f32, @floatFromInt(rc[0])) and event.x < @as(f32, @floatFromInt(rc[0] + rc[2])) and
-                    event.y >= @as(f32, @floatFromInt(rc[1])) and event.y < @as(f32, @floatFromInt(rc[1] + rc[3])))
-                {
+                if (cardHit(lay, yt.scroll, i, event.x, event.y)) {
                     if (yt.sel != @as(i32, @intCast(i))) {
                         yt.sel = @intCast(i);
                         state.shared.file_changed = true;
@@ -1196,7 +1233,8 @@ pub fn handleMouse(state: *GuiAppState, win: *zrame.Window, event: zrame.MouseEv
                     my >= @as(f32, @floatFromInt(bar[1])) and my < @as(f32, @floatFromInt(bar[1] + bar[3])))
                 {
                     yt.sb_drag = true;
-                    yt.row_off = rowOffFromY(lay, bar, my);
+                    yt.scroll = scrollFromY(lay, bar, my);
+                    yt.scroll_target = yt.scroll;
                     state.shared.file_changed = true;
                     return true;
                 }
@@ -1213,10 +1251,7 @@ pub fn handleMouse(state: *GuiAppState, win: *zrame.Window, event: zrame.MouseEv
                 }
             }
             for (yt.results, 0..) |_, i| {
-                const rc = cardRect(lay, yt.row_off, i) orelse continue;
-                if (mx >= @as(f32, @floatFromInt(rc[0])) and mx < @as(f32, @floatFromInt(rc[0] + rc[2])) and
-                    my >= @as(f32, @floatFromInt(rc[1])) and my < @as(f32, @floatFromInt(rc[1] + rc[3])))
-                {
+                if (cardHit(lay, yt.scroll, i, mx, my)) {
                     yt.sel = @intCast(i);
                     openSelected(state);
                     return true;
@@ -1251,8 +1286,15 @@ const text_err = [3]u8{ 240, 120, 110 };
 /// Testo monospazio troncato a `max_w` px; ritorna la larghezza usata.
 /// Pubblica: riusata dall'esploratore file (stesso stile di overlay).
 pub fn drawText(buf: []u8, W: u32, H: u32, raster: *glyph.Raster, x: i32, baseline: i32, text: []const u8, rgb: [3]u8, max_w: i32) i32 {
+    return drawTextClip(buf, W, H, raster, x, baseline, text, rgb, max_w, 0, @intCast(H));
+}
+
+/// Come `drawText`, ma disegna solo le righe di pixel in `[clip_y0, clip_y1)`.
+fn drawTextClip(buf: []u8, W: u32, H: u32, raster: *glyph.Raster, x: i32, baseline: i32, text: []const u8, rgb: [3]u8, max_w: i32, clip_y0: i32, clip_y1: i32) i32 {
     const wi: i32 = @intCast(W);
     const hi: i32 = @intCast(H);
+    const y_lo = @max(clip_y0, 0);
+    const y_hi = @min(clip_y1, hi);
     const cell = raster.advance;
     if (cell <= 0 or max_w <= 0) return 0;
     var pen_x = x;
@@ -1270,7 +1312,7 @@ pub fn drawText(buf: []u8, W: u32, H: u32, raster: *glyph.Raster, x: i32, baseli
             var gy: i32 = 0;
             while (gy < gph.h) : (gy += 1) {
                 const py = gy0 + gy;
-                if (py < 0 or py >= hi) continue;
+                if (py < y_lo or py >= y_hi) continue;
                 var gx: i32 = 0;
                 while (gx < gph.w) : (gx += 1) {
                     const px = gx0 + gx;
@@ -1299,12 +1341,17 @@ fn blendPx(buf: []u8, idx: usize, rgb: [3]u8, a: u8) void {
 /// ai bordi del frame. Sorgente e destinazione sono RGBA opache: copia di parole.
 /// Pubblica: riusata dall'esploratore file.
 pub fn blitThumb(buf: []u8, W: u32, H: u32, dx: i32, dy: i32, dw: i32, dh: i32, src: []const u8, sw: u32, sh: u32) void {
+    blitThumbClip(buf, W, H, dx, dy, dw, dh, src, sw, sh, 0, @intCast(H));
+}
+
+/// Come `blitThumb`, ma copia solo le righe in `[clip_y0, clip_y1)`.
+fn blitThumbClip(buf: []u8, W: u32, H: u32, dx: i32, dy: i32, dw: i32, dh: i32, src: []const u8, sw: u32, sh: u32, clip_y0: i32, clip_y1: i32) void {
     if (dw <= 0 or dh <= 0 or sw == 0 or sh == 0) return;
     const wi: i32 = @intCast(W);
-    const hi: i32 = @intCast(H);
+    const hi: i32 = @intCast(@min(@as(i32, @intCast(H)), clip_y1));
     const dst_words: []u32 = @alignCast(std.mem.bytesAsSlice(u32, buf[0 .. @as(usize, W) * H * 4]));
     const src_words: []const u32 = @alignCast(std.mem.bytesAsSlice(u32, src[0 .. @as(usize, sw) * sh * 4]));
-    var y: i32 = @max(dy, 0);
+    var y: i32 = @max(dy, @max(clip_y0, 0));
     const y1 = @min(dy + dh, hi);
     while (y < y1) : (y += 1) {
         const sy: u32 = @intCast(@divTrunc((y - dy) * @as(i32, @intCast(sh)), dh));
@@ -1322,6 +1369,23 @@ pub fn blitThumb(buf: []u8, W: u32, H: u32, dx: i32, dy: i32, dw: i32, dh: i32, 
 /// Disegna l'overlay di ricerca sul frame corrente (`W`×`H`). Da chiamare con
 /// `shared.mutex` acquisito e solo se `yt.active`. `spin_phase` in secondi
 /// anima lo spinner mentre ricerca/apertura sono in corso.
+/// Un passo dell'easing dello scroll verso il target, a tempo (90% in 0.1 s, come
+/// ogni scroll dello stack). `scroll_ms` resta != 0 finché c'è ancora strada.
+fn stepScroll(yt: *YtState, lay: Layout) void {
+    const max_s = maxScroll(lay);
+    yt.scroll_target = std.math.clamp(yt.scroll_target, 0, max_s);
+    const diff = yt.scroll_target - yt.scroll;
+    if (@abs(diff) < 0.5) {
+        yt.scroll = yt.scroll_target;
+        yt.scroll_ms = 0;
+        return;
+    }
+    const now = zrame.widget.nowMs();
+    const dt: f32 = if (yt.scroll_ms == 0) 1.0 / 60.0 else std.math.clamp(@as(f32, @floatFromInt(now - yt.scroll_ms)) / 1000.0, 0, 0.1);
+    yt.scroll_ms = if (now == 0) 1 else now;
+    yt.scroll = std.math.clamp(yt.scroll + diff * zrame.scroll.wheelBlend(dt), 0, max_s);
+}
+
 pub fn drawOverlay(buf: []u8, W: u32, H: u32, state: *GuiAppState, raster: *glyph.Raster, spin_phase: f32) void {
     if (W < 160 or H < 160) return;
     const yt = &state.shared.yt;
@@ -1331,14 +1395,17 @@ pub fn drawOverlay(buf: []u8, W: u32, H: u32, state: *GuiAppState, raster: *glyp
 
     // Scroll a inseguimento della selezione SOLO quando è cambiata da tastiera:
     // rotella e drag della scrollbar sfogliano liberamente (l'hover non c'entra,
-    // il mouse è già su una card visibile).
+    // il mouse è già su una card visibile). La card selezionata entra intera.
     if (yt.follow_sel and yt.sel >= 0) {
-        const sel_row = @divTrunc(yt.sel, grid_cols);
-        if (sel_row < yt.row_off) yt.row_off = sel_row;
-        if (sel_row >= yt.row_off + lay.vis_rows) yt.row_off = sel_row - lay.vis_rows + 1;
+        const top: f32 = @floatFromInt(@divTrunc(yt.sel, grid_cols) * rowPitch(lay));
+        const bottom = top + @as(f32, @floatFromInt(lay.card_h));
+        const band: f32 = @floatFromInt(bandH(lay));
+        if (top < yt.scroll_target) yt.scroll_target = top;
+        if (bottom > yt.scroll_target + band) yt.scroll_target = bottom - band;
     }
     yt.follow_sel = false;
-    yt.row_off = std.math.clamp(yt.row_off, 0, @max(lay.total_rows - lay.vis_rows, 0));
+    stepScroll(yt, lay);
+    if (yt.scroll_ms != 0) state.shared.file_changed = true; // easing in corso: un altro frame
 
     const u32px: [*]u32 = @ptrCast(@alignCast(buf.ptr));
     var canvas = paint.Canvas.initRgba8(u32px[0 .. @as(usize, W) * H], W, H);
@@ -1415,8 +1482,14 @@ pub fn drawOverlay(buf: []u8, W: u32, H: u32, state: *GuiAppState, raster: *glyp
     }
 
     // Griglia di card stile Netflix: miniatura 16:9, striscia titolo, badge durata.
+    // Tutto tagliato alla banda (più i 3 px del bordo di selezione): le card a metà
+    // dello scroll escono dal bordo alto e basso.
+    const clip_y0 = lay.grid_y - 3;
+    const clip_y1 = lay.grid_y + bandH(lay) + 3;
+    const saved_clip = canvas.setClip(0, @intCast(@max(clip_y0, 0)), W, @intCast(@max(clip_y1 - @max(clip_y0, 0), 0)));
+    defer canvas.clip = saved_clip;
     for (yt.results, 0..) |r, i| {
-        const rc = cardRect(lay, yt.row_off, i) orelse continue;
+        const rc = cardRect(lay, yt.scroll, i) orelse continue;
         const x = rc[0];
         const y = rc[1];
 
@@ -1426,7 +1499,7 @@ pub fn drawOverlay(buf: []u8, W: u32, H: u32, state: *GuiAppState, raster: *glyp
         canvas.fillRoundedRect(@floatFromInt(x), @floatFromInt(y), @floatFromInt(lay.card_w), @floatFromInt(lay.card_h), 8.0, card_bg);
 
         if (r.thumb_w != 0) {
-            blitThumb(buf, W, H, x + 1, y + 1, lay.card_w - 2, lay.thumb_h - 1, r.thumb_rgba, r.thumb_w, r.thumb_h);
+            blitThumbClip(buf, W, H, x + 1, y + 1, lay.card_w - 2, lay.thumb_h - 1, r.thumb_rgba, r.thumb_w, r.thumb_h, clip_y0, clip_y1);
         } else {
             // Miniatura non ancora arrivata: placeholder scuro.
             canvas.fillRoundedRect(@floatFromInt(x + 1), @floatFromInt(y + 1), @floatFromInt(lay.card_w - 2), @floatFromInt(lay.thumb_h - 1), 8.0, paint.Color.rgba(16, 19, 27, 1.0));
@@ -1445,19 +1518,20 @@ pub fn drawOverlay(buf: []u8, W: u32, H: u32, state: *GuiAppState, raster: *glyp
             const bx = x + lay.card_w - bw - 6;
             const by = y + lay.thumb_h - bh - 6;
             canvas.fillRoundedRect(@floatFromInt(bx), @floatFromInt(by), @floatFromInt(bw), @floatFromInt(bh), 4.0, badge_bg);
-            _ = drawText(buf, W, H, raster, bx + 5, by + 2 + raster.ascent, r.duration, text_fg, bw);
+            _ = drawTextClip(buf, W, H, raster, bx + 5, by + 2 + raster.ascent, r.duration, text_fg, bw, clip_y0, clip_y1);
         }
 
         // Striscia titolo sotto la miniatura.
         const tbase = y + lay.thumb_h + @divTrunc(title_strip_h - line_h, 2) + raster.ascent;
-        _ = drawText(buf, W, H, raster, x + 8, tbase, r.title, text_fg, lay.card_w - 16);
+        _ = drawTextClip(buf, W, H, raster, x + 8, tbase, r.title, text_fg, lay.card_w - 16, clip_y0, clip_y1);
     }
 
     // Scrollbar della griglia (solo se c'è altro da sfogliare): binario fioco
     // sul bordo destro del pannello + thumb proporzionale, trascinabile.
+    canvas.clip = saved_clip;
     if (scrollbarGeom(lay)) |sb| {
         canvas.fillRoundedRect(@floatFromInt(sb[0]), @floatFromInt(sb[1]), @floatFromInt(sb[2]), @floatFromInt(sb[3]), 3.5, paint.Color.rgba(255, 255, 255, 0.10));
-        const th = scrollbarThumb(lay, sb, yt.row_off);
+        const th = scrollbarThumb(lay, sb, yt.scroll);
         canvas.fillRoundedRect(@floatFromInt(sb[0]), @floatFromInt(th[0]), @floatFromInt(sb[2]), @floatFromInt(th[1]), 3.5, paint.Color.rgba(255, 255, 255, if (yt.sb_drag) 0.65 else 0.38));
     }
 }

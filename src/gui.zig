@@ -1310,5 +1310,10 @@ pub fn main(init: std.process.Init) !void {
     // essere dentro una decodifica non interrompibile in un plugin .so, e attenderli
     // renderebbe Esc lento. Un viewer non ha stato da salvare; il SO libera
     // memoria/GPU/fd e la disconnessione Wayland fa sparire la finestra all'istante.
+    // `_exit`, non `exit`: `exit` esegue i distruttori delle librerie (mesa, libmpv)
+    // mentre i loro thread stanno ancora lavorando, e chiudendo con un video in
+    // riproduzione uno di quei thread andava in segfault. Non c'è nulla da salvare,
+    // quindi niente distruttori.
+    if (comptime builtin.link_libc and builtin.os.tag != .windows) std.c._exit(0);
     std.process.exit(0);
 }
