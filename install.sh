@@ -49,16 +49,26 @@ mkdir -p "$APP_DIR"
 
 # Create/Overwrite desktop entry for zuer-gui
 echo "Creating desktop entry for zuer-gui..."
+# UN solo lanciatore per Zuer. Lo "Sfoglia" (home nel file explorer) è
+# un'azione di questo stesso entry, non un secondo .desktop: nel menu delle
+# applicazioni compare come voce del tasto destro su "Zuer", non come un'app
+# in più accanto.
 cat <<EOF > "$APP_DIR/zuer-gui.desktop"
 [Desktop Entry]
 Type=Application
-Name=Zuer GUI
-Comment=Visualizzatore universale zuer: immagini, modelli 3D, testo, archivi e media
+Name=Zuer
+GenericName=Visualizzatore universale
+Comment=Immagini, modelli 3D, testo, archivi e media
 Exec=$INSTALL_DIR/zuer-gui %f
 Icon=utilities-terminal
 Terminal=false
 Categories=Graphics;Viewer;
+Actions=browse;
 MimeType=image/png;image/jpeg;image/gif;image/bmp;image/svg+xml;model/obj;model/gltf-binary;application/zip;text/plain;text/csv;text/markdown;audio/mpeg;audio/flac;audio/ogg;audio/x-wav;video/mp4;video/x-matroska;video/webm;video/x-msvideo;video/quicktime;
+
+[Desktop Action browse]
+Name=Sfoglia la home
+Exec=$INSTALL_DIR/zuer-gui $HOME
 EOF
 
 # Clean up previous mime associations to zuer-gui
@@ -99,18 +109,10 @@ xdg-mime default zuer-gui.desktop image/png image/jpeg image/gif image/bmp image
 echo "Updating desktop database..."
 update-desktop-database "$APP_DIR"
 
-# Desktop entry "sfoglia" per la scorciatoia globale: apre la home in zuer
-# (con le frecce si naviga tutta la cartella → file manager visuale).
-cat <<EOF > "$APP_DIR/zuer-browse.desktop"
-[Desktop Entry]
-Type=Application
-Name=Zuer (Sfoglia)
-Comment=Apre la home in Zuer e naviga i file con le frecce
-Exec=$INSTALL_DIR/zuer-gui $HOME
-Icon=utilities-terminal
-Terminal=false
-Categories=Graphics;Viewer;
-EOF
+# Lanciatori di un tempo, ora doppioni: "Zuer (Sfoglia)" è diventato l'azione
+# `browse` di zuer-gui.desktop; viewer è il visualizzatore Rust sostituito da
+# Zuer.
+rm -f "$APP_DIR/zuer-browse.desktop" "$APP_DIR/viewer-app.desktop"
 
 # KDE: una sola voce "Anteprima rapida (Quick Look)" nel menu contestuale di
 # Dolphin (service menu). Niente doppioni: le vecchie voci ("Apri con Zuer",
@@ -140,26 +142,31 @@ Exec=$INSTALL_DIR/zuer-gui %f
 EOF
 chmod +x "$SVCMENU_DIR/zuer-quicklook.desktop" # Dolphin recente esige il bit eseguibile
 
-# …e scorciatoia globale Meta+Z → Zuer (Sfoglia). Solo la registrazione nel
-# config: su Plasma 6 diventa attiva al prossimo login (kglobalaccel attiva i
-# componenti "services" quando li carica all'avvio). NON Ctrl+Z (è l'Annulla di
-# sistema); Meta+Z è libera.
+# …e scorciatoia globale Meta+Z → azione "Sfoglia la home" di zuer-gui.desktop
+# (kglobalaccel registra ogni Desktop Action col suo nome come chiave). Solo la
+# registrazione nel config: su Plasma 6 diventa attiva al prossimo login
+# (kglobalaccel attiva i componenti "services" quando li carica all'avvio).
+# NON Ctrl+Z (è l'Annulla di sistema); Meta+Z è libera.
 #
-# Il doppione va tolto: Meta+Z era finita anche su zuer-gui.desktop, cioè sul
-# LANCIATORE dell'app (`Exec=zuer-gui %f`), mentre deve stare su
-# zuer-browse.desktop (`Exec=zuer-gui $HOME`, "Sfoglia"). Due componenti sullo
-# stesso tasto: quale dei due parta non è definito.
+# Un solo proprietario per Meta+Z: né `_launch` di zuer-gui.desktop (aprirebbe
+# la ricerca YouTube, non la home) né il vecchio zuer-browse.desktop.
 if command -v kwriteconfig6 &> /dev/null; then
   echo "Registering global shortcut Meta+Z (KDE)..."
-  kwriteconfig6 --file kglobalshortcutsrc --group services --group zuer-browse.desktop --key _launch "Meta+Z"
+  kwriteconfig6 --file kglobalshortcutsrc --group services \
+    --group zuer-gui.desktop --key browse "Meta+Z"
   kwriteconfig6 --file kglobalshortcutsrc --group services \
     --group zuer-gui.desktop --key _launch --delete &> /dev/null || true
-  # …e a runtime, perché quel componente è attivo e il grab sopravvive al
+  kwriteconfig6 --file kglobalshortcutsrc --group services \
+    --group zuer-browse.desktop --key _launch --delete &> /dev/null || true
+  # …e a runtime, perché quei componenti sono attivi e il grab sopravvive al
   # file finché non si rifà il login (lista di tasti vuota = nessun tasto).
   if command -v gdbus &> /dev/null; then
-    gdbus call --session --dest org.kde.kglobalaccel --object-path /kglobalaccel \
-      --method org.kde.KGlobalAccel.setForeignShortcutKeys \
-      "['zuer-gui.desktop','_launch','Zuer GUI','Zuer GUI']" "@a(ai) []" &> /dev/null || true
+    for comp in "zuer-gui.desktop','_launch','Zuer GUI','Zuer GUI" \
+                "zuer-browse.desktop','_launch','Zuer (Sfoglia)','Zuer (Sfoglia)"; do
+      gdbus call --session --dest org.kde.kglobalaccel --object-path /kglobalaccel \
+        --method org.kde.KGlobalAccel.setForeignShortcutKeys \
+        "['$comp']" "@a(ai) []" &> /dev/null || true
+    done
   fi
 fi
 
