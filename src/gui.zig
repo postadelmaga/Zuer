@@ -401,6 +401,10 @@ fn renderWorker(
     var vid_prev_gpu = false;
     var vid_ovl_acc: f32 = 0;
     var vid_ovl_key: u64 = 0;
+    // Taglia del buffer all'ultimo present INTERO: un present della sola fascia dei
+    // controlli vale solo se il resto del buffer è ancora quello.
+    var vid_full_w: u32 = 0;
+    var vid_full_h: u32 = 0;
     // Dopo un cambio contenuto (navigazione) ripresenta per qualche frame: il
     // frame staged viene committato dal thread finestra solo su un suo "wake", e
     // se il primo redraw è differito (entrambi gli slot buffer occupati) resterebbe
@@ -575,6 +579,13 @@ fn renderWorker(
             const ovl_key: u64 = if (vs.dur_s > 0) @as(u64, @intFromFloat(@max(0, vs.pos_s))) << 32 | @as(u64, @intFromFloat(@max(0, vs.pos_s / vs.dur_s) * @as(f64, @floatFromInt(cur_w)))) else 0;
             const ovl_tick = gpu_video and vs.controls > 0.01 and vid_ovl_acc >= 1.0 / 8.0 and ovl_key != vid_ovl_key;
             const do_present = new_frame or size_ch or ctrl_ch or vs.scrubbing or yt_ch or yt_anim or label_ch or gpu_ch or ovl_tick;
+            // Sul piano dmabuf, quando avanza SOLO la timeline (nessun altro overlay):
+            // si ridisegna e si consegna solo la fascia dei controlli — prima ogni tick
+            // ricomponeva l'intera finestra trasparente (~30% di un core a controlli
+            // visibili, misurato).
+            const only_tick = ovl_tick and !(new_frame or size_ch or ctrl_ch or vs.scrubbing or yt_ch or yt_anim or label_ch or gpu_ch);
+            const band_only = only_tick and !yt_active and !state.shared.yt.subs_on and !state.shared.fx.active;
+            var pres_dirty: ?zrame.Rect = null;
             if (do_present) last_label_alpha = label_alpha;
             var pres_w: u32 = 0;
             var pres_h: u32 = 0;
@@ -587,6 +598,10 @@ fn renderWorker(
                     // Oscilloscopio disegnato a piena finestra (fr = cur_w×cur_h):
                     // niente static_rgba/composeFrame, si dipinge diretto nel buffer.
                     videomod.drawOscilloscope(composited_rgba.*, fr.w, fr.h, vs);
+                } else if (gpu_video and band_only and fr.w == vid_full_w and fr.h == vid_full_h) {
+                    const rows = videomod.controlsBandRows(fr.h);
+                    @memset(composited_rgba.*[@as(usize, fr.w) * (fr.h - rows) * 4 .. @as(usize, fr.w) * fr.h * 4], 0);
+                    pres_dirty = .{ .x = 0, .y = fr.h - rows, .w = fr.w, .h = rows };
                 } else if (gpu_video) {
                     // Il frame è già a schermo (subsurface dmabuf, sotto la finestra):
                     // qui solo trasparenza, su cui vanno controlli e overlay.
@@ -605,7 +620,12 @@ fn renderWorker(
                     }
                 }
                 videomod.drawVideoControls(composited_rgba.*, fr.w, fr.h, vs, raster);
-                if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, fr.w, fr.h, r, std.fs.path.basename(state.shared.current_file_path), label_alpha);
+                // Fuori dalla fascia dei controlli il buffer è già quello buono.
+                if (pres_dirty == null) {
+                    if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, fr.w, fr.h, r, std.fs.path.basename(state.shared.current_file_path), label_alpha);
+                    vid_full_w = fr.w;
+                    vid_full_h = fr.h;
+                }
                 if (state.shared.fx.active) {
                     if (name_raster) |*r| file_explorer.drawOverlay(composited_rgba.*, fr.w, fr.h, state, r);
                 }
@@ -630,7 +650,7 @@ fn renderWorker(
             // Present FUORI dal lock: `presentRgba` copia subito il buffer (di cui
             // il worker è unico proprietario) nel mailbox di zrame → i callback
             // input non aspettano la copia del frame.
-            if (do_present) win.presentRgba(pres_w, pres_h, composited_rgba.*);
+            if (do_present) win.presentRgbaRegion(pres_w, pres_h, composited_rgba.*, pres_dirty);
             // Vsync: dopo un present in riproduzione, attendi il frame callback
             // del compositor (zrame.waitFrame) così la fase del loop si aggancia
             // al repaint reale — il frame appena committato viene mostrato al

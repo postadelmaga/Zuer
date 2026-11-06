@@ -685,6 +685,12 @@ const Ctrl = struct {
     scrim_h: f32,
 };
 
+/// Righe in fondo a un frame alto `vh` che i controlli occupano, scrim compreso:
+/// `drawVideoControls` non scrive fuori da lì.
+pub fn controlsBandRows(vh: u32) u32 {
+    return @intFromFloat(ctrlLayout(1, vh).scrim_h);
+}
+
 fn ctrlLayout(vw: u32, vh: u32) Ctrl {
     const w: f32 = @floatFromInt(vw);
     const h: f32 = @floatFromInt(vh);
@@ -763,13 +769,19 @@ pub fn drawVideoControls(buf: []u8, W: u32, H: u32, vs: *VideoState, raster: ?*g
     // senza sovrapposizioni. Sul piano video dmabuf il buffer sotto è trasparente:
     // una riga coperta due volte (le vecchie bande si accavallavano di 1 px) vi
     // diventava una striscia più scura.
+    // Ogni riga col clip a sé stessa: senza, `fillRoundedRect` visita anche le due
+    // righe di antialiasing sopra e sotto (copertura zero, ma una SDF per pixel —
+    // era più di metà del costo dei controlli). Stesso risultato, pixel per pixel.
     const rows: u32 = @intFromFloat(L.scrim_h);
     const y_top = H - rows;
+    const saved_clip = canvas.clip;
     var i: u32 = 0;
     while (i < rows) : (i += 1) {
         const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(rows));
+        _ = canvas.setClip(0, y_top + i, W, 1);
         canvas.fillRoundedRect(0, @floatFromInt(y_top + i), vwf, 1, 0, paint.Color.rgba(0, 0, 0, 0.55 * t * t * a));
     }
+    canvas.clip = saved_clip;
 
     // Timeline + knob.
     const bar_h: f32 = 4.0;
