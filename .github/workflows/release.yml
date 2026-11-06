@@ -83,7 +83,7 @@ jobs:
   linux:
     name: Gate Linux (test unitari)
     needs: meta
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04 # wayland-scanner recente: gli XML vendored usano deprecated-since
     permissions:
       contents: read
     steps:
@@ -110,7 +110,8 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends glslc pkg-config \
             libwayland-dev libxkbcommon-dev libpipewire-0.3-dev libasound2-dev \
-            libharfbuzz-dev libfreetype-dev libvulkan-dev libegl-dev libgl-dev libgbm-dev
+            libharfbuzz-dev libfreetype-dev libvulkan-dev libegl-dev libgl-dev libgbm-dev \
+            libsystemd-dev wayland-protocols
       - name: Test Zicro
         working-directory: Zicro
         run: zig build test --summary all
@@ -155,7 +156,8 @@ jobs:
         run: |
           set -euo pipefail
           zig version
-          scripts/build-macos-bundle.sh --arch arm64 --build --out "$RUNNER_TEMP/macos"
+          ZUER_ICON_FONT="/System/Library/Fonts/Supplemental/Arial Bold.ttf" \
+            scripts/build-macos-bundle.sh --arch arm64 --build --out "$RUNNER_TEMP/macos"
           mkdir -p "$RUNNER_TEMP/dist"
           mv "$RUNNER_TEMP/macos/Zuer-macos-arm64.tar.gz" "$RUNNER_TEMP/dist/zuer-$VERSION-macos-arm64.tar.gz"
       - name: Verifica del pacchetto (copia pulita)
@@ -195,8 +197,9 @@ jobs:
             echo "$k = $(/usr/libexec/PlistBuddy -c "Print :$k" "$APP/Contents/Info.plist" 2>/dev/null || echo '(assente)')"
           done
           # Firma: solo ad-hoc (nessun certificato). Su arm64 macOS esige almeno questa.
-          codesign -dv "$EXE" 2>&1 | grep -E 'Signature|Identifier|flags' || true
-          codesign --verify --verbose "$EXE"
+          codesign -dv "$APP" 2>&1 | grep -E 'Signature|Identifier|flags|Sealed' || true
+          codesign --verify --strict --verbose=2 "$APP"
+          [[ -f "$APP/Contents/Resources/zuer.icns" ]] || { echo "::error::icona assente"; exit 1; }
       - name: Smoke test
         run: |
           set -euo pipefail
@@ -250,13 +253,21 @@ jobs:
           echo "$(cygpath -w "$RUNNER_TEMP/zig-x86_64-windows-$ZIG_VERSION")" >> "$GITHUB_PATH"
           # glslc (shader), objdump (verifica import) e ImageMagick (icona) da MSYS2.
           /c/msys64/usr/bin/pacman.exe -S --noconfirm --needed --noprogressbar \
-            mingw-w64-ucrt-x86_64-shaderc mingw-w64-ucrt-x86_64-binutils mingw-w64-ucrt-x86_64-imagemagick
+            mingw-w64-ucrt-x86_64-shaderc mingw-w64-ucrt-x86_64-binutils mingw-w64-ucrt-x86_64-imagemagick \
+            mingw-w64-ucrt-x86_64-pkgconf
       - name: Build e installer (scripts/build-windows-installer.sh)
         working-directory: Zuer
         run: |
           set -euo pipefail
           # MSYS2 e NSIS in coda al PATH: non devono coprire gli strumenti di Git Bash.
           export PATH="$PATH:/c/msys64/ucrt64/bin:/c/Program Files (x86)/NSIS"
+          # zig interroga pkg-config per le librerie di sistema; sul runner il primo nel
+          # PATH è un .BAT rotto di Strawberry Perl. Uno funzionante e SENZA pacchetti:
+          # FFmpeg viene dalle import-lib vendored, come nel cross-build da Linux.
+          mkdir -p "$RUNNER_TEMP/no-pc"
+          export PKG_CONFIG="$(cygpath -w /c/msys64/ucrt64/bin/pkg-config.exe)"
+          export PKG_CONFIG_LIBDIR="$(cygpath -w "$RUNNER_TEMP/no-pc")" PKG_CONFIG_PATH=
+          export ZUER_ICON_FONT='C:\Windows\Fonts\arialbd.ttf' 
           zig version; glslc --version | head -1; makensis -VERSION
           mkdir -p "$RUNNER_TEMP/dist"
           scripts/build-windows-installer.sh --out "$(cygpath -w "$RUNNER_TEMP/dist/zuer-$VERSION-windows-x64-setup.exe")"

@@ -66,7 +66,7 @@ if command -v magick >/dev/null && command -v python3 >/dev/null; then
   for s in 16 32 128 256 512; do
     magick -size ${s}x${s} xc:none \
       -fill '#2563eb' -draw "roundrectangle $((s/32)),$((s/32)) $((s-1-s/32)),$((s-1-s/32)) $((s*3/16)),$((s*3/16))" \
-      -fill white -font DejaVu-Sans-Bold -pointsize $((s*3/4)) -gravity center -annotate +0-$((s/42)) 'Z' \
+      -fill white -font "${ZUER_ICON_FONT:-DejaVu-Sans-Bold}" -pointsize $((s*3/4)) -gravity center -annotate +0-$((s/42)) 'Z' \
       "$TMPI/icon_$s.png" 2>/dev/null || break
   done
   if [[ -f "$TMPI/icon_512.png" ]] && python3 - "$TMPI" "$APP/Contents/Resources/zuer.icns" <<'PY'
@@ -151,6 +151,19 @@ PL
 PL
 } > "$PLIST"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
+
+# Firma ad-hoc dell'intero bundle (prima le dylib, poi l'app), dove c'è codesign:
+# il linker firma ad-hoc il solo eseguibile, e un bundle con risorse non sigillate
+# non passa `codesign --verify` (e può non avviarsi). Ad-hoc NON identifica
+# l'autore: niente certificato Developer ID, niente notarizzazione.
+if command -v codesign >/dev/null; then
+  codesign --force --sign - "$APP"/Contents/MacOS/decoders/*.dylib
+  codesign --force --sign - "$APP"
+  codesign --verify --strict --verbose=1 "$APP"
+  echo "  ✓ firma ad-hoc del bundle"
+else
+  echo "  · codesign assente (build fuori da macOS): bundle con la sola firma ad-hoc del linker"
+fi
 
 N_EXT=$(echo "$EXTS" | wc -w)
 echo "  ✓ Info.plist ($N_EXT estensioni in \"Apri con\")"

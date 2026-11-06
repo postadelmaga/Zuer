@@ -67,7 +67,7 @@ if command -v magick >/dev/null || command -v convert >/dev/null; then
   # "Z" bianca su tondo blu, multi-risoluzione.
   "$IM" -size 256x256 xc:none \
     -fill '#2563eb' -draw 'roundrectangle 8,8 248,248 48,48' \
-    -fill white -font DejaVu-Sans-Bold -pointsize 190 -gravity center -annotate +0-6 'Z' \
+    -fill white -font "${ZUER_ICON_FONT:-DejaVu-Sans-Bold}" -pointsize 190 -gravity center -annotate +0-6 'Z' \
     -define icon:auto-resize=256,128,64,48,32,16 "$BIN/zuer.ico" 2>/dev/null \
     && NSIS_DEFS+=(-DHAVE_ICON=1) && echo "  ✓ zuer.ico" \
     || echo "  · icona non generata (uso l'icona dell'exe)"
