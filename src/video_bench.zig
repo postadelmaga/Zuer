@@ -15,6 +15,8 @@
 //!                (chiusura con seek in volo: il motore deve scaricarlo e restare sano).
 //! * `detach`   — spegne il video come il tasto `v` (l'audio passa all'AudioPlayer).
 //! * `wait S`   — aspetta S secondi senza presentare (con `detach`: suona solo l'audio).
+//! * `open-at S` — apre una seconda sessione da S secondi (come la riaccensione del
+//!                video col tasto `v`) e la chiude: tempo ed esito.
 //!
 //! Serve una connessione Wayland (mpv crea il suo contesto EGL su di essa): lanciarlo
 //! dentro una sessione, anche headless. Righe di risultato con prefisso `bench:`.
@@ -189,6 +191,16 @@ pub fn main(init: std.process.Init) !void {
             const t0 = nowNs();
             const ok = video.detachVideo(&s.vs, gpa);
             std.debug.print("bench: detach ok={} ms={d:.1} audio_player={}\n", .{ ok, @as(f64, @floatFromInt(nowNs() - t0)) / 1e6, s.vs.audio != null });
+        } else if (std.mem.eql(u8, cmd, "open-at")) {
+            // Una seconda sessione sulla stessa sorgente da S secondi, in pausa: è
+            // la riaccensione del video col tasto `v` (`openVideoOnly`).
+            const at = try std.fmt.parseFloat(f64, args.next() orelse "1");
+            const t0 = nowNs();
+            if (video.openVideoOnly(path, path, at, gpa)) |vo| { // audio dentro, come `videoReopenWorker`
+                std.debug.print("bench: open-at s={d:.1} ms={d:.1} ok=true\n", .{ at, @as(f64, @floatFromInt(nowNs() - t0)) / 1e6 });
+                vo.dec.stopAndDestroy();
+                gpa.free(vo.rgba);
+            } else |e| std.debug.print("bench: open-at s={d:.1} ms={d:.1} ok=false err={s}\n", .{ at, @as(f64, @floatFromInt(nowNs() - t0)) / 1e6, @errorName(e) });
         } else if (std.mem.eql(u8, cmd, "wait")) {
             const secs = try std.fmt.parseFloat(f64, args.next() orelse "1");
             sleepNs(@intFromFloat(secs * 1e9));

@@ -64,6 +64,11 @@ for clip in trunc.ts tiny.ts; do
     check "$clip si apre in meno di 3 s" "awk '/bench: open ms=/{split(\$0,a,\"ms=\"); f=(a[2]+0 < 3000)} END{exit !f}' <<<\"\$out\""
     check "$clip in riproduzione sotto 60% CPU" "awk '/bench: play/{split(\$0,a,\"cpu=\"); exit !(a[2]+0 < 60)}' <<<\"\$out\""
 done
+# Riaccensione del video (tasto v) da 1 s sul TS troncato: mpv non vi si posiziona;
+# deve dirlo subito (ripiego) invece di aspettare 20 s il primo frame.
+out=$(run "$WORK/trunc.ts" open-at 1)
+echo "$out" | grep open-at | sed "s|^|  [trunc.ts] |"
+check "trunc.ts riaperto da 1 s in meno di 3 s" "awk '/bench: open-at/{split(\$0,a,\" ms=\"); f=(a[2]+0 < 3000 && /ok=true/)} END{exit !f}' <<<\"\$out\""
 for clip in garbage.ts empty.ts; do
     out=$(ZUER_TRACE=1 "$BENCH" "$WORK/$clip" 2>&1 || true)
     check "$clip rifiutato senza crash" "grep -q 'bench: open fallita' <<<\"\$out\" && grep -q 'bench: end fds=4 threads=1' <<<\"\$out\""
