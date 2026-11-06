@@ -239,8 +239,9 @@ pub fn prepareFor(state: *GuiAppState, d: *decoder_mod.Decoded, path: []const u8
         },
         else => {},
     }
-    if (has_video and av and layout.winKindFromExt(path) == .video) pre.video = openVideo(state.gpa, path);
-    if (av and isMidiPath(path)) pre.midi = midi_player.MidiPlayer.start(path, state.gpa);
+    const playable = av and openableMedia(state.io, path);
+    if (has_video and playable and layout.winKindFromExt(path) == .video) pre.video = openVideo(state.gpa, path);
+    if (playable and isMidiPath(path)) pre.midi = midi_player.MidiPlayer.start(path, state.gpa);
     return pre;
 }
 
@@ -628,7 +629,20 @@ fn stripFragment(path: []const u8) []const u8 {
     return if (std.mem.indexOfScalar(u8, path, '#')) |h| path[0..h] else path;
 }
 
+/// Una sorgente che i player possono aprire senza restare appesi: un URL, o un
+/// file regolare. Una FIFO col nome di un video bloccava l'apertura di mpv (e
+/// con lei la chiusura dell'app); il decoder dei file la rifiuta già da sé.
+fn openableMedia(io: std.Io, path: []const u8) bool {
+    if (std.mem.indexOf(u8, path, "://") != null) return true;
+    const st = std.Io.Dir.cwd().statFile(io, stripFragment(path), .{}) catch return true; // l'errore lo dirà il player
+    return st.kind == .file;
+}
+
 pub fn startVideo(state: *GuiAppState, path: []const u8) bool {
+    if (!openableMedia(state.io, path)) {
+        std.debug.print("Media non apribile: non è un file regolare ({s})\n", .{path});
+        return false;
+    }
     const first = videomod.setupVideo(&state.video, path, state.gpa) catch |e| {
         // Nessuno stream video (mp3, wav, flac…): apri come audio-only →
         // oscilloscopio stile Winamp, riusando la stessa finestra/controlli.
@@ -1329,10 +1343,9 @@ fn wantContains(want: *const [2]?[]u8, path: []const u8) bool {
     return false;
 }
 
-/// Dimensione del file in byte, o `null` se non stat-abile.
+/// Dimensione del file in byte, o `null` se non stat-abile. Senza aprirlo: su una
+/// FIFO l'apertura bloccherebbe il thread di prefetch.
 fn fileSizeBytes(io: std.Io, path: []const u8) ?u64 {
-    var f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
-    defer f.close(io);
-    const st = f.stat(io) catch return null;
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return null;
     return st.size;
 }

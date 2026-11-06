@@ -905,23 +905,32 @@ fn registerPluginFile(dir_path: []const u8, file_name: []const u8, type_name: []
     registered = true;
 }
 
+/// Cartelle dei plugin, in ordine, tutte relative all'ESEGUIBILE: `<exe>/decoders`
+/// (installazione: install.sh, installer Windows), `<exe>` (DLL accanto all'exe) e
+/// `<exe>/../lib` (`zig build` e `--prefix`: bin/ + lib/). Mai relative alla
+/// cartella corrente: lanciato da una cartella scaricata, zuer farebbe dlopen dei
+/// `.so` che ci trova.
+fn pluginDirsLocked(io: std.Io, allocator: std.mem.Allocator, out: *[3][]u8) [][]u8 {
+    const exe_dir = executableDirCachedLocked(io, allocator) orelse return out[0..0];
+    var n: usize = 0;
+    for ([_][]const []const u8{ &.{ exe_dir, "decoders" }, &.{exe_dir}, &.{ exe_dir, "..", "lib" } }) |parts| {
+        out[n] = std.fs.path.join(allocator, parts) catch continue;
+        n += 1;
+    }
+    return out[0..n];
+}
+
 /// Registra (una sola volta) i plugin di TERZE PARTI — quelli fuori manifest —
-/// scandendo, nell'ordine, `<exe_dir>/decoders`, `<exe_dir>`, `zig-out/lib` e
-/// `decoders`. È un readdir + dlopen dei soli file sconosciuti: nel caso comune
-/// (nessun plugin extra) non apre nulla. Con `plugin_cache_mutex` acquisito.
+/// scandendo le cartelle di `pluginDirsLocked`. È un readdir + dlopen dei soli
+/// file sconosciuti: nel caso comune (nessun plugin extra) non apre nulla. Con
+/// `plugin_cache_mutex` acquisito.
 fn ensureThirdPartyLocked(io: std.Io, allocator: std.mem.Allocator) void {
     if (third_party_scanned) return;
     third_party_scanned = true;
-
-    if (executableDirCachedLocked(io, allocator)) |exe_dir| {
-        if (std.fs.path.join(allocator, &.{ exe_dir, "decoders" })) |p| {
-            defer allocator.free(p);
-            scanPluginDir(p, io, allocator, true);
-        } else |_| {}
-        scanPluginDir(exe_dir, io, allocator, true);
-    }
-    scanPluginDir("zig-out/lib", io, allocator, true);
-    scanPluginDir("decoders", io, allocator, true);
+    var buf: [3][]u8 = undefined;
+    const dirs = pluginDirsLocked(io, allocator, &buf);
+    defer for (dirs) |d| allocator.free(d);
+    for (dirs) |d| scanPluginDir(d, io, allocator, true);
 }
 
 /// Carica il SOLO plugin `name` cercandolo nelle stesse directory (e ordine)
@@ -931,19 +940,13 @@ fn loadPluginByNameLocked(name: []const u8, io: std.Io, allocator: std.mem.Alloc
     if (findPluginByName(name) != null) return;
     var fname_buf: [160]u8 = undefined;
     const fname = std.fmt.bufPrint(&fname_buf, "{s}{s}{s}", .{ plugin_prefix, name, plugin_suffix }) catch return;
-
-    if (executableDirCachedLocked(io, allocator)) |exe_dir| {
-        if (std.fs.path.join(allocator, &.{ exe_dir, "decoders" })) |p| {
-            defer allocator.free(p);
-            registerPluginFile(p, fname, name, io, allocator);
-        } else |_| {}
-        if (findPluginByName(name) != null) return;
-        registerPluginFile(exe_dir, fname, name, io, allocator);
+    var buf: [3][]u8 = undefined;
+    const dirs = pluginDirsLocked(io, allocator, &buf);
+    defer for (dirs) |d| allocator.free(d);
+    for (dirs) |d| {
+        registerPluginFile(d, fname, name, io, allocator);
         if (findPluginByName(name) != null) return;
     }
-    registerPluginFile("zig-out/lib", fname, name, io, allocator);
-    if (findPluginByName(name) != null) return;
-    registerPluginFile("decoders", fname, name, io, allocator);
 }
 
 /// Risoluzione LAZY per estensione: carica solo il plugin che (da manifest)
@@ -1868,6 +1871,13 @@ fn decodeImpl(path: []const u8, io: std.Io, allocator: std.mem.Allocator, coarse
         const msg = std.fmt.allocPrint(allocator, "Impossibile ottenere informazioni sul file: {s} ({s})", .{ clean_path, @errorName(err) }) catch "";
         return .{ .err = msg };
     };
+    // Solo file regolari: aprire una FIFO blocca finché qualcuno non ci scrive (il
+    // thread che decodifica resterebbe appeso per sempre, e con lui la chiusura);
+    // un device a caratteri non ha una dimensione da leggere.
+    if (stat.kind != .file) {
+        const msg = std.fmt.allocPrint(allocator, "Non è un file regolare ({s}): {s}", .{ @tagName(stat.kind), clean_path }) catch "";
+        return .{ .err = msg };
+    }
     // Il limite di dimensione NON viene applicato qui su `stat.size`: un plugin
     // path-based (`zuer_content_prefix = 0`, es. archivi grandi) non carica il
     // file in RAM e deve poter aprire anche archivi da molti GB. Il tetto viene
