@@ -664,9 +664,27 @@ pub fn toggleVideoTrack(state: *GuiAppState) void {
         return;
     }
     if (!vs.audio_only) {
-        // Video → solo audio (vedi `detachVideo`).
-        if (videomod.detachVideo(vs, state.gpa)) state.shared.file_changed = true;
+        // Video → solo audio (vedi `detachVideo`). Con l'audio nel motore va
+        // riaperto in un `AudioPlayer`: apertura (rete inclusa) su un thread, fuori
+        // dal mutex — sotto, uno stream lento fermava la GUI per tutta l'apertura.
+        const dec = vs.decoder.?;
+        if (!dec.audio_inside) {
+            if (videomod.installDetached(vs, null)) state.shared.file_changed = true;
+            state.shared.mutex.unlock(state.io);
+            return;
+        }
+        const asrc = state.gpa.dupe(u8, dec.audio_url_owned orelse dec.path_owned) catch {
+            state.shared.mutex.unlock(state.io);
+            return;
+        };
+        const vsrc: ?[]u8 = if (state.shared.av_src_video) |v| (state.gpa.dupe(u8, v) catch null) else null;
         state.shared.mutex.unlock(state.io);
+        const t = std.Thread.spawn(.{}, audioDetachWorker, .{ state, asrc, vsrc }) catch {
+            state.gpa.free(asrc);
+            if (vsrc) |v| state.gpa.free(v);
+            return;
+        };
+        t.detach();
         return;
     }
     const src_ref = state.shared.av_src_video orelse {
@@ -686,6 +704,25 @@ pub fn toggleVideoTrack(state: *GuiAppState) void {
         return;
     };
     t.detach();
+}
+
+/// Thread dello spegnimento del video (toggle 'v') con l'audio nel motore: apre
+/// l'audio in un `AudioPlayer` fuori dal lock, poi lo installa sotto `mutex` se
+/// nel frattempo il video è ancora acceso sulla stessa sorgente (altrimenti lo
+/// chiude). Il player si allinea alla posizione del motore al momento dell'install.
+fn audioDetachWorker(state: *GuiAppState, asrc: []u8, vsrc: ?[]u8) void {
+    defer state.gpa.free(asrc);
+    defer if (vsrc) |v| state.gpa.free(v);
+    if (comptime !has_video) return;
+    const opened = videomod.openDetachedAudio(asrc, state.gpa) orelse return;
+    state.shared.mutex.lockUncancelable(state.io);
+    const vs = &state.video;
+    const same_src = if (state.shared.av_src_video) |cur| (if (vsrc) |v| std.mem.eql(u8, cur, v) else false) else vsrc == null;
+    const still = vs.decoder != null and !vs.audio_only and same_src and vs.decoder.?.audio_inside;
+    if (still and videomod.installDetached(vs, opened)) state.shared.file_changed = true;
+    state.shared.mutex.unlock(state.io);
+    // Superato (navigato altrove, riacceso, già spento): si chiude fuori dal lock.
+    if (!still) opened.deinit();
 }
 
 /// Thread di riaccensione del video (toggle 'v'): apre il container fuori dal

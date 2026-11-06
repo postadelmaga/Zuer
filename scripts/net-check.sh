@@ -30,6 +30,9 @@ export ZUER_MPV_OPTS="${ZUER_MPV_OPTS:-ao=null}"
 gen() { [ -f "$WORK/$1" ] && [ "$WORK/$1" -nt "$0" ] || ffmpeg -loglevel error -y "${@:2}" "$WORK/$1"; }
 gen net_v.mp4 -f lavfi -i testsrc2=size=1920x1080:rate=30 -t 40 -c:v libx264 -preset veryfast -g 30 -b:v 6M -maxrate 6M -bufsize 6M -pix_fmt yuv420p -movflags +faststart
 gen net_a.m4a -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 -t 40 -c:a aac -movflags +faststart
+# Video + audio muto nello stesso file: col video spento (`v`) l'AudioPlayer lo
+# legge tutto (anche i pacchetti video), quindi consuma rete come uno stream vero.
+gen net_va.mp4 -f lavfi -i testsrc2=size=1280x720:rate=30 -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 -t 40 -c:v libx264 -preset veryfast -b:v 4M -c:a aac -shortest -movflags +faststart
 
 python3 "$ROOT/scripts/slow_http.py" "$WORK" "$PORT" 2> "$WORK/server.log" &
 SP=$!
@@ -77,6 +80,14 @@ check "stallo: fd e thread come all'inizio" end_ok
 run caduta "$U/drop/3000000/net_v.mp4" "$U/ok/net_a.m4a" play 6
 check "caduta: chiusura entro ${CLOSE_MAX_MS} ms" close_ok
 check "caduta: fd e thread come all'inizio" end_ok
+
+# 4b. Video spento (`v`, l'audio passa all'AudioPlayer FFmpeg) e la rete si ferma
+# mentre l'AudioPlayer legge: la chiusura non aspetta una lettura che non torna
+# (prima di `player.Interrupt` il join restava appeso per sempre).
+run audio-stallo "$U/ok/net_v.mp4" "$U/stall/1500000/net_va.mp4" play 2 detach wait 6
+check "audio-stallo: il video si spegne e l'audio si riapre" "grep -q 'bench: detach ok=true .*audio_player=true' <<<\"\$out\""
+check "audio-stallo: chiusura con la rete ferma entro ${CLOSE_MAX_MS} ms" close_ok
+check "audio-stallo: fd e thread come all'inizio" end_ok
 
 # 5. Server che accetta e non risponde: l'apertura fallisce entro il timeout.
 run muto "$U/hang/net_v.mp4" "$U/ok/net_a.m4a"

@@ -191,21 +191,63 @@ pub fn wrongThreadCalls() u32 {
 /// che torna a fare auto-loop da sé (oscilloscopio, come per gli mp3). Se l'audio
 /// era dentro il motore (mpv), prima lo si riapre in un `AudioPlayer` alla
 /// stessa posizione. false se l'audio non si riapre: il video resta com'è.
+///
+/// In un colpo solo (banco, test). La GUI apre l'audio FUORI dal lock
+/// (`openDetachedAudio`, rete inclusa) e installa sotto (`installDetached`).
 pub fn detachVideo(vs: *VideoState, gpa: std.mem.Allocator) bool {
     if (comptime !@import("build_options").video) return false;
     const dec = vs.decoder orelse return false;
+    var opened: ?DetachedAudio = null;
     if (dec.audio_inside) {
-        const src = dec.audio_url_owned orelse dec.path_owned;
-        const keep = std.heap.smp_allocator.dupeSentinel(u8, src, 0) catch return false;
-        const a = AudioPlayer.start(src.ptr, gpa) orelse {
-            std.heap.smp_allocator.free(keep);
-            return false;
-        };
-        a.seek(dec.clockSeconds());
-        a.setPlaying(vs.playing);
-        vs.audio = a;
-        if (vs.detached_audio_src) |s| std.heap.smp_allocator.free(s);
-        vs.detached_audio_src = keep;
+        opened = openDetachedAudio(dec.audio_url_owned orelse dec.path_owned, gpa) orelse return false;
+    }
+    return installDetached(vs, opened);
+}
+
+/// L'audio riaperto per il toggle 'v': il player e la sua sorgente (per riaprire
+/// il video dopo). Di proprietà del chiamante finché `installDetached` non lo prende.
+pub const DetachedAudio = struct {
+    player: *AudioPlayer,
+    src: [:0]u8,
+
+    pub fn deinit(d: DetachedAudio) void {
+        if (comptime @import("build_options").video) {
+            d.player.stopAndDestroy();
+            std.heap.smp_allocator.free(d.src);
+        }
+    }
+};
+
+/// Apre `src` in un `AudioPlayer`, in pausa: può toccare la rete, va chiamata
+/// senza tenere il mutex della GUI. null se l'audio non si apre.
+pub fn openDetachedAudio(src: []const u8, gpa: std.mem.Allocator) ?DetachedAudio {
+    if (comptime !@import("build_options").video) return null;
+    const keep = std.heap.smp_allocator.dupeSentinel(u8, src, 0) catch return null;
+    const a = AudioPlayer.start(keep.ptr, gpa) orelse {
+        std.heap.smp_allocator.free(keep);
+        return null;
+    };
+    a.setPlaying(false); // parte quando `installDetached` lo allinea al video
+    return .{ .player = a, .src = keep };
+}
+
+/// Sotto il mutex: l'audio (se riaperto) prende il posto del motore, alla sua
+/// posizione di ADESSO (non a quella di quando l'apertura è partita), e il
+/// decoder video si chiude. Con `opened` null l'audio è già separato (ripiego
+/// FFmpeg: `vs.audio`). false se non c'è più un video da staccare: allora
+/// `opened` è chiuso qui.
+pub fn installDetached(vs: *VideoState, opened: ?DetachedAudio) bool {
+    if (comptime !@import("build_options").video) return false;
+    const dec = vs.decoder orelse {
+        if (opened) |d| d.deinit();
+        return false;
+    };
+    if (opened) |d| {
+        d.player.seek(dec.clockSeconds());
+        d.player.setPlaying(vs.playing);
+        vs.audio = d.player;
+        if (vs.detached_audio_src) |old| std.heap.smp_allocator.free(old);
+        vs.detached_audio_src = d.src;
     }
     dec.stopAndDestroy();
     vs.decoder = null;

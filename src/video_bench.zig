@@ -13,6 +13,8 @@
 //!                (tutto ricreato e smontato: verifica il teardown completo).
 //! * `cycles-seek N` — come `cycles`, ma chiudendo subito dopo aver chiesto un seek
 //!                (chiusura con seek in volo: il motore deve scaricarlo e restare sano).
+//! * `detach`   — spegne il video come il tasto `v` (l'audio passa all'AudioPlayer).
+//! * `wait S`   — aspetta S secondi senza presentare (con `detach`: suona solo l'audio).
 //!
 //! Serve una connessione Wayland (mpv crea il suo contesto EGL su di essa): lanciarlo
 //! dentro una sessione, anche headless. Righe di risultato con prefisso `bench:`.
@@ -181,6 +183,15 @@ pub fn main(init: std.process.Init) !void {
             const ua = usage();
             const frames = s.run(secs);
             report(cmd, secs, ua, usage(), frames);
+        } else if (std.mem.eql(u8, cmd, "detach")) {
+            // Come il tasto `v`: il video si spegne, l'audio passa all'AudioPlayer
+            // (FFmpeg, uscita audio di Zicro) sulla stessa sorgente.
+            const t0 = nowNs();
+            const ok = video.detachVideo(&s.vs, gpa);
+            std.debug.print("bench: detach ok={} ms={d:.1} audio_player={}\n", .{ ok, @as(f64, @floatFromInt(nowNs() - t0)) / 1e6, s.vs.audio != null });
+        } else if (std.mem.eql(u8, cmd, "wait")) {
+            const secs = try std.fmt.parseFloat(f64, args.next() orelse "1");
+            sleepNs(@intFromFloat(secs * 1e9));
         } else if (std.mem.eql(u8, cmd, "seek")) {
             s.vs.playing = true;
             const dur = if (s.vs.dur_s > 0) s.vs.dur_s else 10.0;
