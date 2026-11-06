@@ -915,6 +915,8 @@ const MpvEngine = if (mpv_enabled) struct {
         trace("motore mpv: pronto", .{});
 
         var idle_since = monotonicNs();
+        // Dopo una sessione, alla prima pausa senza sessioni in attesa: `trimHeap`.
+        var trim_pending = false;
         while (true) {
             const snap = eng.wake.prepare();
             if (eng.quit.load(.acquire)) break;
@@ -925,7 +927,15 @@ const MpvEngine = if (mpv_enabled) struct {
             if (cur) |s| {
                 eng.serve(&mv, s, seq, &scratch);
                 idle_since = monotonicNs();
+                trim_pending = true;
                 continue;
+            }
+            if (trim_pending) {
+                // Qui nessuno aspetta il motore (3–20 ms misurati): chi apre un
+                // video subito dopo non paga il trim.
+                trim_pending = false;
+                trimHeap();
+                continue; // una sessione può essere arrivata nel frattempo
             }
             // Inattivo: niente da fare finché non arriva una sessione o il ritiro.
             _ = mv.pollEvents();
@@ -990,6 +1000,21 @@ const MpvEngine = if (mpv_enabled) struct {
         pool_lock.unlock();
     }
 } else void;
+
+/// Restituisce al sistema la memoria già liberata che glibc tiene nelle arene.
+/// Una sessione video alloca e libera parecchio da molti thread (demuxer, decoder,
+/// cache di mpv): glibc conserva quelle pagine e l'RSS si assestava ~120 MB sopra
+/// la memoria in uso (misurato con malloc_stats su 1000 cambi di file). Gira sul
+/// thread del motore quando resta senza sessioni, fuori dal percorso della GUI e
+/// dell'apertura successiva.
+fn trimHeap() void {
+    if (comptime builtin.os.tag != .linux or builtin.abi.isMusl() or !builtin.link_libc) return;
+    const t0 = monotonicNs();
+    _ = malloc_trim(0);
+    trace("malloc_trim in {d:.1} ms", .{@as(f64, @floatFromInt(monotonicNs() - t0)) / 1e6});
+}
+
+extern "c" fn malloc_trim(pad: usize) c_int;
 
 /// Chiude il motore mpv inattivo (e quelli già ritirati), sul loro thread: per
 /// l'uscita ordinata dell'app e per i test che contano fd e thread.
