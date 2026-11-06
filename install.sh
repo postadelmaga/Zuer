@@ -8,72 +8,29 @@ set -e
 # NB: mold/altri linker esterni NON aiutano — Zig 0.16 linka in-process (LLD o
 # self-hosted), non invoca mai un linker di sistema, quindi non c'è nulla da
 # accelerare sul link: il tempo è tutto in LLVM (codegen ReleaseSafe).
+#   --uninstall : rimuove ciò che questo script installa (binari, plugin, voci
+#                 di menu, service menu, associazioni e scorciatoia di Zuer).
 OPTIMIZE="ReleaseSafe"
+UNINSTALL=0
 for arg in "$@"; do
   case "$arg" in
     --fast|-f) OPTIMIZE="Debug" ;;
+    --uninstall) UNINSTALL=1 ;;
   esac
 done
 
-echo "Building zuer and zuer-gui in ${OPTIMIZE} mode..."
-if [ "$OPTIMIZE" = "Debug" ]; then
-  echo "  (build veloce senza LLVM: binari non ottimizzati, per sviluppo)"
-fi
-zig build -Doptimize="$OPTIMIZE"
-
-# Set target directory
-# ~/.local/bin is the standard user-level binary directory.
-# If run as root, we install to /usr/local/bin.
 INSTALL_DIR="$HOME/.local/bin"
-if [ "$EUID" -eq 0 ]; then
-  INSTALL_DIR="/usr/local/bin"
-fi
-
-# Ensure target directory exists
-mkdir -p "$INSTALL_DIR"
-
-# Copy binaries to installation directory
-cp zig-out/bin/zuer "$INSTALL_DIR/zuer"
-cp zig-out/bin/zuer-gui "$INSTALL_DIR/zuer-gui"
-
-# Copy decoders as shared library plugins
-mkdir -p "$INSTALL_DIR/decoders"
-cp zig-out/lib/libdecoder_*.so "$INSTALL_DIR/decoders/"
-
-# Determine application directory path
 APP_DIR="$HOME/.local/share/applications"
 if [ "$EUID" -eq 0 ]; then
+  INSTALL_DIR="/usr/local/bin"
   APP_DIR="/usr/share/applications"
 fi
-mkdir -p "$APP_DIR"
+SVCMENU_DIR="$HOME/.local/share/kio/servicemenus"
 
-# Create/Overwrite desktop entry for zuer-gui
-echo "Creating desktop entry for zuer-gui..."
-# UN solo lanciatore per Zuer. Lo "Sfoglia" (home nel file explorer) è
-# un'azione di questo stesso entry, non un secondo .desktop: nel menu delle
-# applicazioni compare come voce del tasto destro su "Zuer", non come un'app
-# in più accanto.
-cat <<EOF > "$APP_DIR/zuer-gui.desktop"
-[Desktop Entry]
-Type=Application
-Name=Zuer
-GenericName=Visualizzatore universale
-Comment=Immagini, modelli 3D, testo, archivi e media
-Exec=$INSTALL_DIR/zuer-gui %f
-Icon=utilities-terminal
-Terminal=false
-Categories=Graphics;Viewer;
-Actions=browse;
-MimeType=image/png;image/jpeg;image/gif;image/bmp;image/svg+xml;model/obj;model/gltf-binary;application/zip;text/plain;text/csv;text/markdown;audio/mpeg;audio/flac;audio/ogg;audio/x-wav;video/mp4;video/x-matroska;video/webm;video/x-msvideo;video/quicktime;
-
-[Desktop Action browse]
-Name=Sfoglia la home
-Exec=$INSTALL_DIR/zuer-gui $HOME
-EOF
-
-# Clean up previous mime associations to zuer-gui
-echo "Cleaning previous associations for zuer-gui..."
-python3 - <<'EOF'
+# Toglie zuer-gui.desktop da ogni associazione in mimeapps.list (prima di
+# registrarne di nuove, e alla disinstallazione).
+clean_mime_associations() {
+python3 - <<'PYEOF'
 import os
 mime_files = [
     os.path.expanduser("~/.config/mimeapps.list"),
@@ -99,7 +56,72 @@ for filepath in mime_files:
             f.write("\n".join(new_lines) + "\n")
     except Exception as e:
         print(f"Error cleaning {filepath}: {e}")
+PYEOF
+}
+
+if [ "$UNINSTALL" = 1 ]; then
+  echo "Uninstalling zuer from $INSTALL_DIR..."
+  rm -f "$INSTALL_DIR/zuer" "$INSTALL_DIR/zuer-gui"
+  rm -rf "$INSTALL_DIR/decoders"
+  rm -f "$APP_DIR/zuer-gui.desktop" "$SVCMENU_DIR/zuer-quicklook.desktop"
+  clean_mime_associations
+  if command -v kwriteconfig6 &> /dev/null; then
+    kwriteconfig6 --file kglobalshortcutsrc --group services \
+      --group zuer-gui.desktop --key browse --delete &> /dev/null || true
+  fi
+  command -v update-desktop-database &> /dev/null && update-desktop-database "$APP_DIR" || true
+  command -v kbuildsycoca6 &> /dev/null && kbuildsycoca6 --noincremental &> /dev/null || true
+  echo "zuer rimosso. (Cache e log restano in ~/.cache/zuer, se presenti.)"
+  exit 0
+fi
+
+echo "Building zuer and zuer-gui in ${OPTIMIZE} mode..."
+if [ "$OPTIMIZE" = "Debug" ]; then
+  echo "  (build veloce senza LLVM: binari non ottimizzati, per sviluppo)"
+fi
+zig build -Doptimize="$OPTIMIZE"
+
+# Ensure target directory exists
+mkdir -p "$INSTALL_DIR"
+
+# Copy binaries to installation directory
+cp zig-out/bin/zuer "$INSTALL_DIR/zuer"
+cp zig-out/bin/zuer-gui "$INSTALL_DIR/zuer-gui"
+
+# Copy decoders as shared library plugins
+mkdir -p "$INSTALL_DIR/decoders"
+cp zig-out/lib/libdecoder_*.so "$INSTALL_DIR/decoders/"
+
+mkdir -p "$APP_DIR"
+
+# Create/Overwrite desktop entry for zuer-gui
+echo "Creating desktop entry for zuer-gui..."
+# UN solo lanciatore per Zuer. Lo "Sfoglia" (home nel file explorer) è
+# un'azione di questo stesso entry, non un secondo .desktop: nel menu delle
+# applicazioni compare come voce del tasto destro su "Zuer", non come un'app
+# in più accanto.
+cat <<EOF > "$APP_DIR/zuer-gui.desktop"
+[Desktop Entry]
+Type=Application
+Name=Zuer
+GenericName=Visualizzatore universale
+Comment=Immagini, modelli 3D, testo, archivi e media
+Exec=$INSTALL_DIR/zuer-gui %f
+Icon=utilities-terminal
+Terminal=false
+StartupWMClass=it.zuer.gui
+Categories=Graphics;Viewer;
+Actions=browse;
+MimeType=image/png;image/jpeg;image/gif;image/bmp;image/svg+xml;model/obj;model/gltf-binary;application/zip;text/plain;text/csv;text/markdown;audio/mpeg;audio/flac;audio/ogg;audio/x-wav;video/mp4;video/x-matroska;video/webm;video/x-msvideo;video/quicktime;
+
+[Desktop Action browse]
+Name=Sfoglia la home
+Exec=$INSTALL_DIR/zuer-gui $HOME
 EOF
+
+# Clean up previous mime associations to zuer-gui
+echo "Cleaning previous associations for zuer-gui..."
+clean_mime_associations
 
 # Set new associations to zuer-gui
 echo "Setting new file associations..."
@@ -118,7 +140,6 @@ rm -f "$APP_DIR/zuer-browse.desktop" "$APP_DIR/viewer-app.desktop"
 # Dolphin (service menu). Niente doppioni: le vecchie voci ("Apri con Zuer",
 # "Anteprima con zuer", "Apri con viewer") vengono rimosse qui sotto — in
 # passato erano file separati e si accavallavano tutte nello stesso menu.
-SVCMENU_DIR="$HOME/.local/share/kio/servicemenus"
 mkdir -p "$SVCMENU_DIR"
 rm -f "$SVCMENU_DIR/zuer.desktop" \
       "$SVCMENU_DIR/zuer-preview.desktop" \
