@@ -209,11 +209,16 @@ jobs:
           # Avvio vero con un file di testo: deve restare vivo (finestra aperta) per 8 s.
           printf 'Zuer %s smoke test\n' "$VERSION" > "$RUNNER_TEMP/smoke.txt"
           cd "$RUNNER_TEMP"
-          "$EXE" "$RUNNER_TEMP/smoke.txt" > smoke.log 2>&1 & P=$!
+          ZUER_NO_CRASH_REPORT=1 ZUER_TRACE=1 "$EXE" "$RUNNER_TEMP/smoke.txt" > smoke.log 2>&1 & P=$!
           sleep 8
-          if kill -0 $P 2>/dev/null; then echo "vivo dopo 8 s"; kill $P; wait $P 2>/dev/null || true
-          else wait $P; RC=$?; cat smoke.log; echo "::error::zuer-gui uscito (rc=$RC) prima di 8 s"; exit 1; fi
-          cat smoke.log
+          if kill -0 $P 2>/dev/null; then echo "vivo dopo 8 s"; kill $P; wait $P 2>/dev/null || true; cat smoke.log
+          else
+            RC=0; wait $P || RC=$?
+            echo "--- smoke.log"; cat smoke.log
+            echo "--- crash report"; ls -t ~/Library/Logs/DiagnosticReports/ 2>/dev/null | head -3
+            R="$(ls -t ~/Library/Logs/DiagnosticReports/zuer-gui* 2>/dev/null | head -1)"; [[ -n "$R" ]] && head -120 "$R"
+            echo "::error::zuer-gui uscito (rc=$RC) prima di 8 s"; exit 1
+          fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos-arm64

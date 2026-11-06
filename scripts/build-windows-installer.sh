@@ -46,7 +46,12 @@ BIN="$STAGE/bin"
 [[ -f "$BIN/zuer-gui.exe" ]] || { echo "✗ zuer-gui.exe non prodotto"; exit 1; }
 cp "$ROOT/LICENSE" "$BIN/LICENSE.txt" # AGPL-3.0-or-later, installata accanto all'exe
 
-NSIS_DEFS=(-DSTAGE="$BIN" -DVERSION="$VERSION" -DOUTFILE="$OUT")
+# makensis è un programma Windows: sotto Git Bash/MSYS gli servono percorsi Windows.
+NSIS_STAGE="$BIN"; NSIS_SCRIPT="$ROOT/installer/zuer.nsi"
+if command -v cygpath >/dev/null; then
+  NSIS_STAGE="$(cygpath -w "$BIN")"; NSIS_SCRIPT="$(cygpath -w "$NSIS_SCRIPT")"
+fi
+NSIS_DEFS=(-DSTAGE="$NSIS_STAGE" -DVERSION="$VERSION" -DOUTFILE="$OUT")
 
 case "$FFMPEG" in
   full)
@@ -123,7 +128,7 @@ NSH="$ROOT/installer/associations.nsh"
 echo "  ✓ $(echo "$EXTS" | wc -w) estensioni"
 
 echo "→ [5/5] makensis"
-makensis -V2 "${NSIS_DEFS[@]}" "$ROOT/installer/zuer.nsi"
+makensis -V2 "${NSIS_DEFS[@]}" "$NSIS_SCRIPT"
 
 echo
 echo "✓ Installer pronto: $OUT ($(du -h "$OUT" | cut -f1))"
