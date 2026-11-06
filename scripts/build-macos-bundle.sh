@@ -36,8 +36,10 @@ esac
 
 if [[ $DO_BUILD -eq 1 ]]; then
   echo "→ build $ZIG_TARGET"
-  if [[ "$ARCH" == arm64 ]]; then zig build -Dtarget=$ZIG_TARGET
-  else zig build -Dtarget=$ZIG_TARGET --prefix "$ROOT/zig-out/macos-x64"; fi
+  # ReleaseFast come ogni build distribuita (il default Debug compone in CPU 3–4×
+  # più lento); target esplicito = CPU baseline, non quella della macchina che compila.
+  if [[ "$ARCH" == arm64 ]]; then zig build -Dtarget=$ZIG_TARGET -Doptimize=ReleaseFast
+  else zig build -Dtarget=$ZIG_TARGET -Doptimize=ReleaseFast --prefix "$ROOT/zig-out/macos-x64"; fi
 fi
 [[ -f "$BIN/zuer-gui" ]] || { echo "✗ $BIN/zuer-gui assente: compila prima con zig build -Dtarget=$ZIG_TARGET"; exit 1; }
 
@@ -50,6 +52,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS/decoders" "$APP/Contents/Resources"
 
 cp "$BIN/zuer-gui" "$APP/Contents/MacOS/"
+cp "$ROOT/LICENSE" "$APP/Contents/Resources/LICENSE" # AGPL-3.0-or-later
 # I plugin accanto all'exe: il registro li scansiona in <exe_dir>/decoders.
 cp "$LIB"/libdecoder_*.dylib "$APP/Contents/MacOS/decoders/"
 

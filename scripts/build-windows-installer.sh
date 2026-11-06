@@ -32,8 +32,9 @@ done
 
 command -v makensis >/dev/null || { echo "✗ makensis non trovato (installa NSIS)"; exit 1; }
 
-VERSION="$(grep -oE '\.version = "[^"]+"' build.zig.zon | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
-VERSION="${VERSION:-0.1.0}"
+# Versione completa (anche il suffisso -rc.N): è quella in "App installate".
+VERSION="$(sed -nE 's/^[[:space:]]*\.version = "([^"]+)".*/\1/p' build.zig.zon | head -1)"
+[[ -n "$VERSION" ]] || { echo "✗ versione non trovata in build.zig.zon"; exit 1; }
 STAGE="$ROOT/zig-out/win-installer"
 
 echo "→ [1/5] build Windows ReleaseFast → $STAGE"
@@ -43,12 +44,13 @@ zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast --prefix "$STAGE"
 find "$STAGE/bin" -name '*.pdb' -delete
 BIN="$STAGE/bin"
 [[ -f "$BIN/zuer-gui.exe" ]] || { echo "✗ zuer-gui.exe non prodotto"; exit 1; }
+cp "$ROOT/LICENSE" "$BIN/LICENSE.txt" # AGPL-3.0-or-later, installata accanto all'exe
 
 NSIS_DEFS=(-DSTAGE="$BIN" -DVERSION="$VERSION" -DOUTFILE="$OUT")
 
 case "$FFMPEG" in
   full)
-    echo "→ [2/5] FFmpeg full: scarico le DLL gpl-shared di BtbN (~131 MB)"
+    echo "→ [2/5] FFmpeg: scarico le DLL LGPL di BtbN (~76 MB)"
     "$ROOT/scripts/fetch-ffmpeg-dlls.sh" "$BIN"
     NSIS_DEFS+=(-DHAVE_FFMPEG=1) ;;
   trimmed)

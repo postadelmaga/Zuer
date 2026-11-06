@@ -67,6 +67,7 @@ Section "Install"
 
   File "${STAGE}/zuer-gui.exe"
   File "${STAGE}/decoder_*.dll"
+  File "${STAGE}/LICENSE.txt"
 !ifdef HAVE_FFMPEG
   ; DLL runtime FFmpeg (player video); versionate → wildcard.
   File "${STAGE}/avformat-*.dll"
@@ -74,6 +75,8 @@ Section "Install"
   File "${STAGE}/avutil-*.dll"
   File "${STAGE}/swscale-*.dll"
   File "${STAGE}/swresample-*.dll"
+  File "${STAGE}/FFmpeg-LICENSE.txt"
+  File "${STAGE}/FFmpeg-SOURCE.txt"
 !endif
 !ifdef HAVE_ICON
   File "${STAGE}/zuer.ico"
@@ -144,6 +147,9 @@ Section "Uninstall"
   Delete "$INSTDIR\swscale-*.dll"
   Delete "$INSTDIR\swresample-*.dll"
   Delete "$INSTDIR\zuer.ico"
+  Delete "$INSTDIR\LICENSE.txt"
+  Delete "$INSTDIR\FFmpeg-LICENSE.txt"
+  Delete "$INSTDIR\FFmpeg-SOURCE.txt"
   Delete "$INSTDIR\uninstall.exe"
   RMDir  "$INSTDIR"
 
