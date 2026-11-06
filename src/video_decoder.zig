@@ -688,7 +688,7 @@ pub const VideoDecoder = struct {
         };
         const frame: GpuFrame = .{ .slot = g.slot, .fd = g.fd, .width = g.width, .height = g.height, .stride = g.stride, .fourcc = g.fourcc, .modifier = g.modifier };
         if (!p.present(p.ctx, &frame)) {
-            std.log.warn("zuer video: il compositor non accetta il piano dmabuf (formato non annunciato o niente linux-dmabuf), readback CPU", .{});
+            std.log.warn("zuer video: il compositor non accetta il piano dmabuf (formato non annunciato, import rifiutato o niente linux-dmabuf), readback CPU", .{});
             m.disableGpu();
             if (self.gpu_active.swap(false, .acq_rel)) p.hide(p.ctx);
             return .unavailable;
