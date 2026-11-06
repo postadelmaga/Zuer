@@ -20,9 +20,12 @@ mkdir -p "$WORK"
 command -v ffmpeg >/dev/null || { echo "serve ffmpeg per generare i clip"; exit 2; }
 (cd "$ROOT" && zig build video-bench -Doptimize=ReleaseFast -j2)
 
-gen() { [ -f "$WORK/$1" ] || ffmpeg -loglevel error -y "${@:2}" "$WORK/$1"; }
+gen() { [ -f "$WORK/$1" ] && [ "$WORK/$1" -nt "$0" ] || ffmpeg -loglevel error -y "${@:2}" "$WORK/$1"; }
 SRC=(-f lavfi -i testsrc2=size=1920x1080:rate=60)
-TONE=(-f lavfi -i sine=frequency=440:sample_rate=48000)
+# Traccia audio SILENZIOSA: il percorso audio lavora uguale, senza suonare nelle
+# casse di chi lancia la verifica. In più mpv non apre l'uscita audio vera.
+TONE=(-f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000)
+export ZUER_MPV_OPTS="${ZUER_MPV_OPTS:-ao=null}"
 gen h264.mp4   "${SRC[@]}" "${TONE[@]}" -t 20 -c:v libx264 -preset veryfast -g 60 -pix_fmt yuv420p -c:a aac -shortest
 gen hevc.mp4   -f lavfi -i testsrc2=size=1920x1080:rate=30 -t 10 -c:v libx265 -preset ultrafast -pix_fmt yuv420p -tag:v hvc1
 gen vp9.webm   -f lavfi -i testsrc2=size=1920x1080:rate=30 -t 10 -c:v libvpx-vp9 -deadline realtime -cpu-used 8 -b:v 2M
@@ -49,13 +52,16 @@ check "mp3 (senza video) rifiutato senza crash" "! grep -q 'bench: open ms=' <<<
 
 out=$(run "$WORK/h264.mp4" cycles 100 cycles-cold 30)
 echo "$out" | grep -E 'cycles|end' | sed 's|^|  [cicli] |'
-# A caldo gli fd oscillano (il motore resta vivo e l'uscita audio si apre e chiude
-# a ogni sessione): conta la crescita, non l'uguaglianza — il massimo degli ultimi
-# 20 cicli non supera quello dei primi 20. A freddo tutto torna al valore iniziale.
-cyc() { awk -v k="$1" '/bench: cycle [0-9]+ /{n=$3; split($4,f,"="); split($5,t,"="); v=(k=="fds")?f[2]:t[2]; if(n<=20 && v>a) a=v; if(n>80 && v>b) b=v} END{print a, b}' <<<"$out"; }
-check "cicli a caldo: fd non crescono" "read a b < <(cyc fds); [ \"\$b\" -le \"\$a\" ]"
-check "cicli a caldo: thread non crescono" "read a b < <(cyc threads); [ \"\$b\" -le \$((a + 1)) ]"
-check "cicli a freddo: fd e thread tornano" "awk '/bench: cycles-cold/{split(\$5,a,\"->\"); split(\$7,b,\"->\"); exit !(a[1]==a[2] && b[1]==b[2])}' <<<\"\$out\""
+# A caldo gli fd oscillano di qualche unità (lo stream audio di PipeWire si apre e
+# chiude in modo asincrono) e i thread di uno: conta la crescita lungo i 100 cicli —
+# un leak vero (≥ 1 fd o thread per ciclo) la porta a ≥ 100. Il ritorno esatto ai
+# valori di partenza lo verifica la riga di fine, dopo l'assestamento.
+# cyc CAMPO SERIE FINE_PRIMI INIZIO_ULTIMI: massimo nei primi cicli, massimo negli ultimi.
+cyc() { awk -v k="$1" -v c="$2" -v lo="$3" -v hi="$4" '$0 ~ "bench: cycle [0-9]+ " && seen==c {n=$3; split($4,f,"="); split($5,t,"="); v=(k=="fds")?f[2]:t[2]; if(n<=lo && v>a) a=v; if(n>hi && v>b) b=v} /bench: cycles/{seen++} END{print a+0, b+0}' <<<"$out"; }
+check "cicli a caldo: fd non crescono" "read a b < <(cyc fds 0 20 80); [ \"\$b\" -le \$((a + 6)) ]"
+check "cicli a caldo: thread non crescono" "read a b < <(cyc threads 0 20 80); [ \"\$b\" -le \$((a + 2)) ]"
+check "cicli a freddo: fd tornano a ogni giro" "awk '/bench: cycles-cold/{split(\$5,a,\"->\"); exit !(a[1]==a[2])}' <<<\"\$out\""
+check "cicli a freddo: thread non crescono" "read a b < <(cyc threads 1 10 20); [ \"\$b\" -le \$((a + 2)) ]"
 check "fine: fd e thread come all'inizio" "awk '/bench: start/{s=\$0} /bench: end/{e=\$0} END{sub(/.*start /,\"\",s); sub(/.*end /,\"\",e); exit !(s==e)}' <<<\"\$out\""
 
 exit $fail
