@@ -24,7 +24,7 @@ pub fn main(init: std.process.Init) !void {
     defer mv.deinit();
     std.debug.print("mpv_video: init ok\n", .{});
 
-    mv.loadFile(path_z, false);
+    mv.loadFile(path_z, false, 0);
     mv.setPaused(false);
 
     var out: std.ArrayList(u8) = .empty;

@@ -84,13 +84,46 @@ pub const Backend = enum { ffmpeg, mpv };
 pub const GpuFrame = struct { slot: u8, fd: i32, width: u32, height: u32, stride: u32, fourcc: u32, modifier: u64 };
 
 /// Chi mette a schermo i frame GPU: la finestra (`presentDmabuf` su un subsurface,
-/// da qualunque thread). `present` false = il compositor non lo supporta: si
-/// ripiega sul readback. `hide` toglie il piano a fine sessione.
+/// da qualunque thread). `present` false = il compositor non lo supporta (formato
+/// non annunciato, niente linux-dmabuf): si ripiega sul readback. `slot_free`:
+/// il compositor ha rilasciato lo slot e non è in coda — solo lì si rende.
+/// `hide` toglie il piano a fine sessione.
 pub const Presenter = struct {
     ctx: *anyopaque,
     present: *const fn (ctx: *anyopaque, frame: *const GpuFrame) bool,
+    slot_free: *const fn (ctx: *anyopaque, slot: u8) bool,
     hide: *const fn (ctx: *anyopaque) void,
 };
+
+/// Contatori di una sessione GPU, stampati a fine sessione (`logSession`):
+/// frame a schermo, frame persi perché ogni slot era ancora del compositor,
+/// intervallo tra present (media e deviazione: il pacing).
+const GpuStats = struct {
+    frames: u64 = 0,
+    busy_drops: u64 = 0,
+    last_ns: i64 = 0,
+    n: u64 = 0,
+    sum_ms: f64 = 0,
+    sumsq_ms: f64 = 0,
+    max_ms: f64 = 0,
+
+    fn tick(s: *GpuStats, now: i64) void {
+        s.frames += 1;
+        if (s.last_ns != 0) {
+            const d = @as(f64, @floatFromInt(now - s.last_ns)) / 1e6;
+            // Le pause (play fermo, seek) non sono pacing: fuori dal conto.
+            if (d < 250) {
+                s.n += 1;
+                s.sum_ms += d;
+                s.sumsq_ms += d * d;
+                s.max_ms = @max(s.max_ms, d);
+            }
+        }
+        s.last_ns = now;
+    }
+};
+
+const GpuPresent = enum { presented, busy, unavailable };
 
 /// Il presenter del processo (uno per finestra; Zuer ne ha una): registrato una
 /// volta all'avvio, vale per ogni sessione mpv aperta dopo.
@@ -158,6 +191,8 @@ pub const VideoDecoder = struct {
     /// Epoca (`gen`) dell'ultimo frame messo a schermo o in coda: uguale a `gen`
     /// = il seek è chiuso e si vede la posizione nuova.
     shown_gen: std.atomic.Value(u32) = .init(0),
+    gpu_stats: GpuStats = .{},
+    start_s: f64 = 0,
 
     /// Poster (primo frame) + decoder avviato. Il chiamante prende possesso di
     /// `.rgba` (→ `static_rgba`) e del decoder (chiuso da `stopAndDestroy`).
@@ -169,6 +204,8 @@ pub const VideoDecoder = struct {
         audio_url: ?[]const u8 = null,
         /// false: video muto (l'audio della sorgente suona già altrove).
         audio: bool = true,
+        /// Posizione di partenza (s): la sessione apre lì, senza un seek dopo.
+        start_s: f64 = 0,
     };
 
     /// Apre la sessione su `path_z` e ne restituisce il poster. mpv se c'è;
@@ -239,6 +276,7 @@ pub const VideoDecoder = struct {
             .duration_s = 0,
             .frame_rate = 0,
             .want_audio = opts.audio,
+            .start_s = opts.start_s,
             .presenter = presenter_global,
         };
         var attached = false;
@@ -532,6 +570,7 @@ pub const VideoDecoder = struct {
         var dirty = false;
         var last_w: u32 = 0;
         var last_h: u32 = 0;
+        var slot_wait = false;
         while (true) {
             const snap = ew.prepare();
             if (self.stop.load(.monotonic)) break;
@@ -566,10 +605,19 @@ pub const VideoDecoder = struct {
                 if (due) dirty = true;
                 if (sz[0] != last_w or sz[1] != last_h) dirty = true; // resize: anche in pausa
                 const room = self.tail.load(.monotonic) - self.head.load(.acquire) < CAP;
-                if (dirty and !awaiting_restart and self.presentGpu(m, sz, prod_gen)) {
+                const gp: GpuPresent = if (dirty and !awaiting_restart) self.presentGpu(m, sz, prod_gen) else .unavailable;
+                if (gp == .presented) {
                     dirty = false;
                     last_w = sz[0];
                     last_h = sz[1];
+                } else if (gp == .busy) {
+                    // Ogni slot è ancora del compositor: il frame dovuto si scarta
+                    // (mpv non va fermato) e `dirty` resta — quello corrente va a
+                    // schermo appena uno slot si libera. Il rilascio arriva sul thread
+                    // della finestra, che non ci sveglia: attesa breve, solo qui.
+                    if (due) m.renderDiscard(if (last_w > 0) last_w else sz[0], if (last_h > 0) last_h else sz[1]);
+                    if (due) self.gpu_stats.busy_drops += 1;
+                    slot_wait = true;
                 } else if (dirty and !awaiting_restart and room) {
                     if (m.renderReadback(scratch, self.gpa, sz[0], sz[1]) catch null) |fr| {
                         const t = self.tail.load(.monotonic);
@@ -589,26 +637,32 @@ pub const VideoDecoder = struct {
                     if (!awaiting_restart) dirty = false;
                 }
             }
-            ew.wait(snap, null);
+            ew.wait(snap, if (slot_wait) 2 * std.time.ns_per_ms else null);
+            slot_wait = false;
         }
     }
 
-    /// Percorso GPU: rende nel prossimo dmabuf e lo passa al presenter. false se
-    /// non c'è presenter o il percorso non va (da lì in poi readback).
-    fn presentGpu(self: *VideoDecoder, m: *mpv_video.MpvVideo, sz: [2]u32, prod_gen: u32) bool {
-        const p = self.presenter orelse return false;
-        if (m.gpuDisabled()) return false;
-        const g = m.renderGpu(sz[0], sz[1]) orelse return false;
+    /// Percorso GPU: rende nel primo dmabuf libero e lo passa al presenter.
+    /// `unavailable` se non c'è presenter o il percorso non va (da lì readback).
+    fn presentGpu(self: *VideoDecoder, m: *mpv_video.MpvVideo, sz: [2]u32, prod_gen: u32) GpuPresent {
+        const p = self.presenter orelse return .unavailable;
+        if (m.gpuDisabled()) return .unavailable;
+        const g = switch (m.renderGpu(sz[0], sz[1], p.ctx, p.slot_free)) {
+            .frame => |f| f,
+            .busy => return .busy,
+            .unavailable => return .unavailable,
+        };
         const frame: GpuFrame = .{ .slot = g.slot, .fd = g.fd, .width = g.width, .height = g.height, .stride = g.stride, .fourcc = g.fourcc, .modifier = g.modifier };
         if (!p.present(p.ctx, &frame)) {
-            std.log.warn("zuer video: il compositor non accetta il piano dmabuf, readback CPU", .{});
+            std.log.warn("zuer video: il compositor non accetta il piano dmabuf (formato non annunciato o niente linux-dmabuf), readback CPU", .{});
             m.disableGpu();
             if (self.gpu_active.swap(false, .acq_rel)) p.hide(p.ctx);
-            return false;
+            return .unavailable;
         }
         if (!self.gpu_active.swap(true, .acq_rel)) logGpu(m);
+        self.gpu_stats.tick(monotonicNs());
         self.shown_gen.store(prod_gen, .release);
-        return true;
+        return .presented;
     }
 
     /// Copia `pixels` nello slot di indice assoluto `t` (riallocandolo se serve).
@@ -842,8 +896,9 @@ const MpvEngine = if (mpv_enabled) struct {
     /// Una sessione dall'apertura alla fine; poi scarica la sorgente e la lascia.
     fn serve(eng: *MpvEngine, m: *mpv_video.MpvVideo, s: *VideoDecoder, scratch: *std.ArrayList(u8)) void {
         m.audio_url = s.audio_url_owned;
-        m.loadFile(s.path_owned, s.want_audio);
+        m.loadFile(s.path_owned, s.want_audio, s.start_s);
         if (s.mpvFirstFrame(m, &eng.wake, scratch)) s.mpvLoop(m, &eng.wake, scratch);
+        logEnd(s, m);
         // Scarica e aspetta la fine della sorgente: gli eventi di questo file non
         // devono arrivare alla sessione dopo.
         m.stopPlayback();
@@ -857,6 +912,7 @@ const MpvEngine = if (mpv_enabled) struct {
             if (el >= std.time.ns_per_s) break;
             eng.wake.wait(snap, std.time.ns_per_s - el);
         }
+        trace("mpv stop in {d:.1} ms", .{@as(f64, @floatFromInt(monotonicNs() - t0)) / 1e6});
         m.audio_url = null;
         eng.session.store(null, .release);
         s.engine_done.store(true, .release);
@@ -874,6 +930,16 @@ pub fn shutdownEngines() void {
     MpvEngine.idle = null;
     MpvEngine.pool_lock.unlock();
     if (e) |eng| eng.shutdown();
+}
+
+/// Fine sessione: frame a schermo e persi, pacing dei present, scarto A/V.
+fn logEnd(s: *const VideoDecoder, m: anytype) void {
+    const g = s.gpu_stats;
+    const mean = if (g.n > 0) g.sum_ms / @as(f64, @floatFromInt(g.n)) else 0;
+    const sd = if (g.n > 1) @sqrt(@max(0, g.sumsq_ms / @as(f64, @floatFromInt(g.n)) - mean * mean)) else 0;
+    std.log.info("zuer video: fine sessione: dmabuf frame={d} persi_slot_occupati={d} intervallo_ms media={d:.2} dev={d:.2} max={d:.1}; mpv drop={d} vo_ritardati={d} avsync_max_ms={d:.1}", .{
+        g.frames, g.busy_drops, mean, sd, g.max_ms, m.drops, m.delayed, m.avsync_max * 1000,
+    });
 }
 
 fn logGpu(m: anytype) void {

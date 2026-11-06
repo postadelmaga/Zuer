@@ -677,10 +677,12 @@ pub fn toggleVideoTrack(state: *GuiAppState) void {
         state.shared.mutex.unlock(state.io);
         return;
     };
-    const pos = vs.pos_s;
+    const pos = if (vs.audio) |a| a.clockSeconds() else vs.pos_s;
+    const audio_src: ?[]u8 = if (vs.detached_audio_src) |a| (state.gpa.dupe(u8, a) catch null) else null;
     state.shared.mutex.unlock(state.io);
-    const t = std.Thread.spawn(.{}, videoReopenWorker, .{ state, src, pos }) catch {
+    const t = std.Thread.spawn(.{}, videoReopenWorker, .{ state, src, audio_src, pos }) catch {
         state.gpa.free(src);
+        if (audio_src) |a| state.gpa.free(a);
         return;
     };
     t.detach();
@@ -689,10 +691,11 @@ pub fn toggleVideoTrack(state: *GuiAppState) void {
 /// Thread di riaccensione del video (toggle 'v'): apre il container fuori dal
 /// lock, poi installa player e poster sotto `mutex` se lo stato è ancora
 /// audio-only. `seek_to` riallinea video e audio alla posizione corrente.
-fn videoReopenWorker(state: *GuiAppState, src: []u8, pos: f64) void {
+fn videoReopenWorker(state: *GuiAppState, src: []u8, audio_src: ?[]u8, pos: f64) void {
     defer state.gpa.free(src);
+    defer if (audio_src) |a| state.gpa.free(a);
     if (comptime !has_video) return;
-    const vo = videomod.openVideoOnly(src, state.gpa) catch |e| {
+    const vo = videomod.openVideoOnly(src, audio_src, @max(pos, 0), state.gpa) catch |e| {
         std.debug.print("[video] riaccensione video fallita: {s}\n", .{@errorName(e)});
         return;
     };
@@ -711,12 +714,24 @@ fn videoReopenWorker(state: *GuiAppState, src: []u8, pos: f64) void {
     }
     vs.decoder = vo.dec;
     vs.audio_only = false;
-    // Il video torna clock-driven: loop coordinato dal present, non auto-loop.
-    if (vs.audio) |a| a.loop.store(false, .monotonic);
     vs.scope_head = 0;
     // Riaggancio alla posizione VERA: il clock audio ha continuato ad avanzare
     // durante l'apertura del container; `pos` è solo il fallback senza audio.
-    vs.seek_to = if (vs.audio) |a| a.clockSeconds() else @max(pos, 0);
+    const now_s = if (vs.audio) |a| a.clockSeconds() else @max(pos, 0);
+    if (vo.dec.audio_inside) {
+        // L'audio è tornato nel motore (stessa sessione, stesso clock): l'audio
+        // del toggle si chiude. Il motore è partito da `pos`; un seek solo se
+        // l'apertura ha lasciato indietro più di un quarto di secondo.
+        if (vs.audio) |a| a.stopAndDestroy();
+        vs.audio = null;
+        if (vs.detached_audio_src) |a| std.heap.smp_allocator.free(a);
+        vs.detached_audio_src = null;
+        if (@abs(now_s - pos) > 0.25) vs.seek_to = now_s;
+    } else {
+        // Ripiego FFmpeg: il video è muto, l'audio del toggle resta il clock.
+        if (vs.audio) |a| a.loop.store(false, .monotonic);
+        vs.seek_to = now_s;
+    }
     state.gpa.free(state.shared.static_rgba);
     state.shared.static_rgba = vo.rgba;
     state.shared.static_w = vo.w;

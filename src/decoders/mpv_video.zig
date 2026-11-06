@@ -356,6 +356,11 @@ pub const MpvVideo = struct {
     hwdec_len: usize = 0,
     video_id: ?i64 = null,
     audio_id: ?i64 = null,
+    /// Contatori mpv della sessione (vedi `observeAll`); `avsync_max` = |scarto
+    /// audio−video| massimo visto, in secondi.
+    drops: i64 = 0,
+    delayed: i64 = 0,
+    avsync_max: f64 = 0,
 
     /// Come la sessione usa mpv. `audio`: false solo per chi vuole il video muto
     /// (la riaccensione del video col 'v' mentre l'audio gira altrove).
@@ -529,9 +534,10 @@ pub const MpvVideo = struct {
 
     /// Carica `path` in pausa (il primo frame diventa il poster; si riparte con
     /// `setPaused(false)`), con l'audio acceso o spento per questa sorgente.
-    pub fn loadFile(self: *MpvVideo, path: [:0]const u8, audio: bool) void {
+    pub fn loadFile(self: *MpvVideo, path: [:0]const u8, audio: bool, start_s: f64) void {
         self.resetObserved();
-        const opts: [*:0]const u8 = if (audio) "pause=yes,aid=auto" else "pause=yes,aid=no";
+        var buf: [64]u8 = undefined;
+        const opts = std.mem.printSentinel(&buf, "pause=yes,aid={s},start={d:.3}", .{ if (audio) "auto" else "no", @max(0, start_s) }, 0) catch unreachable;
         self.commandAsync(&.{ "loadfile", path, "replace", "-1", opts, null });
     }
 
@@ -559,6 +565,9 @@ pub const MpvVideo = struct {
     pub const prop_hwdec: u64 = 7;
     pub const prop_video_id: u64 = 8;
     pub const prop_audio_id: u64 = 9;
+    pub const prop_drops: u64 = 10;
+    pub const prop_delayed: u64 = 11;
+    pub const prop_avsync: u64 = 12;
 
     fn observeAll(mpv: *c.mpv_handle) void {
         _ = api.mpv_observe_property(mpv, prop_time_pos, "time-pos", c.MPV_FORMAT_DOUBLE);
@@ -570,6 +579,11 @@ pub const MpvVideo = struct {
         _ = api.mpv_observe_property(mpv, prop_hwdec, "hwdec-current", c.MPV_FORMAT_STRING);
         _ = api.mpv_observe_property(mpv, prop_video_id, "current-tracks/video/id", c.MPV_FORMAT_INT64);
         _ = api.mpv_observe_property(mpv, prop_audio_id, "current-tracks/audio/id", c.MPV_FORMAT_INT64);
+        // Diagnostica di fine sessione: frame persi dal decoder, frame resi in
+        // ritardo dal VO, scarto audio−video (s) secondo mpv.
+        _ = api.mpv_observe_property(mpv, prop_drops, "frame-drop-count", c.MPV_FORMAT_INT64);
+        _ = api.mpv_observe_property(mpv, prop_delayed, "vo-delayed-frame-count", c.MPV_FORMAT_INT64);
+        _ = api.mpv_observe_property(mpv, prop_avsync, "avsync", c.MPV_FORMAT_DOUBLE);
     }
 
     fn resetObserved(self: *MpvVideo) void {
@@ -580,6 +594,9 @@ pub const MpvVideo = struct {
         self.hwdec_len = 0;
         self.video_id = null;
         self.audio_id = null;
+        self.drops = 0;
+        self.delayed = 0;
+        self.avsync_max = 0;
     }
 
     /// Ciò che è successo dall'ultima chiamata (eventi svuotati senza attendere).
@@ -622,6 +639,9 @@ pub const MpvVideo = struct {
                         prop_dwidth => self.disp_w = @as(*const i64, @ptrCast(@alignCast(p.data))).*,
                         prop_dheight => self.disp_h = @as(*const i64, @ptrCast(@alignCast(p.data))).*,
                         prop_fps => self.fps = @as(*const f64, @ptrCast(@alignCast(p.data))).*,
+                        prop_drops => self.drops = @as(*const i64, @ptrCast(@alignCast(p.data))).*,
+                        prop_delayed => self.delayed = @as(*const i64, @ptrCast(@alignCast(p.data))).*,
+                        prop_avsync => self.avsync_max = @max(self.avsync_max, @abs(@as(*const f64, @ptrCast(@alignCast(p.data))).*)),
                         prop_hwdec => {
                             const str = std.mem.span(@as(*const [*:0]const u8, @ptrCast(@alignCast(p.data))).*);
                             const n = @min(str.len, self.hwdec_buf.len);
@@ -742,37 +762,48 @@ pub const MpvVideo = struct {
         return api.mpv_render_context_render(self.render_ctx, &render_params) >= 0;
     }
 
-    /// Rende il frame corrente a w×h nel prossimo slot dmabuf e lo restituisce,
-    /// pronto per il compositor. null se il percorso GPU non va (si ripiega sul
-    /// readback per il resto della vita del motore, con il motivo nel log).
-    pub fn renderGpu(self: *MpvVideo, w: u32, h: u32) ?GpuFrame {
-        if (self.gpu_off) return null;
+    pub const GpuResult = union(enum) {
+        frame: GpuFrame,
+        /// Tutti gli slot sono ancora del compositor (o in coda): niente render.
+        busy,
+        /// Il percorso GPU non va: readback per il resto della vita del motore.
+        unavailable,
+    };
+
+    /// Rende il frame corrente a w×h nel primo slot dmabuf libero (`slot_free`:
+    /// il compositor l'ha rilasciato e non è in coda) e lo restituisce, pronto per
+    /// il compositor. Mai in uno slot che il compositor può ancora leggere.
+    pub fn renderGpu(self: *MpvVideo, w: u32, h: u32, ctx: *anyopaque, slot_free: *const fn (*anyopaque, u8) bool) GpuResult {
+        if (self.gpu_off) return .unavailable;
         if (self.gpu == null) {
             self.gpu = GpuTargets.init(self.egl_display) catch |e| {
                 std.log.warn("zuer video: percorso dmabuf non disponibile ({s}), readback CPU", .{@errorName(e)});
                 self.gpu_off = true;
-                return null;
+                return .unavailable;
             };
         }
         const t = &self.gpu.?;
         if (t.w != w or t.h != h) t.resize(self.egl_display, w, h);
-        const i = t.next;
+        const i: u8 = for (0..gpu_slots) |k| {
+            const s: u8 = @intCast((t.next + k) % gpu_slots);
+            if (slot_free(ctx, s)) break s;
+        } else return .busy;
         if (t.slots[i].bo == null) {
             t.slots[i] = t.createSlot(self.egl_display, w, h) catch |e| {
                 std.log.warn("zuer video: buffer dmabuf {d}x{d} non creato ({s}), readback CPU", .{ w, h, @errorName(e) });
                 self.gpu_off = true;
-                return null;
+                return .unavailable;
             };
         }
         const sl = &t.slots[i];
-        if (!self.renderTo(sl.fbo, w, h)) return null;
+        if (!self.renderTo(sl.fbo, w, h)) return .busy;
         // Sincronia implicita del dmabuf: il compositor attende il lavoro GPU
         // sottomesso qui; basta che sia sottomesso.
         c.glFlush();
         t.next = @intCast((i + 1) % gpu_slots);
         t.presents += 1;
         t.reap(self.egl_display, false);
-        return .{ .slot = i, .fd = sl.fd, .width = w, .height = h, .stride = sl.stride, .fourcc = drm_xbgr8888, .modifier = drm_mod_linear };
+        return .{ .frame = .{ .slot = i, .fd = sl.fd, .width = w, .height = h, .stride = sl.stride, .fourcc = drm_xbgr8888, .modifier = drm_mod_linear } };
     }
 
     /// Il percorso GPU ha fallito e non verrà ritentato.

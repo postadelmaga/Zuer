@@ -11,6 +11,8 @@
 //! * `cycles N` — N aperture+chiusure: fd e thread prima/dopo (non devono crescere).
 //! * `cycles-cold N` — come `cycles`, ma chiudendo anche il motore a ogni giro
 //!                (tutto ricreato e smontato: verifica il teardown completo).
+//! * `cycles-seek N` — come `cycles`, ma chiudendo subito dopo aver chiesto un seek
+//!                (chiusura con seek in volo: il motore deve scaricarlo e restare sano).
 //!
 //! Serve una connessione Wayland (mpv crea il suo contesto EGL su di essa): lanciarlo
 //! dentro una sessione, anche headless. Righe di risultato con prefisso `bench:`.
@@ -177,8 +179,9 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("bench: seek to={d:.2} ms={d:.1} pos={d:.2} ok={}\n", .{ target, @as(f64, @floatFromInt(nowNs() - t0)) / 1e6, s.vs.pos_s, got });
                 _ = s.run(0.4);
             }
-        } else if (std.mem.eql(u8, cmd, "cycles") or std.mem.eql(u8, cmd, "cycles-cold")) {
+        } else if (std.mem.eql(u8, cmd, "cycles") or std.mem.eql(u8, cmd, "cycles-cold") or std.mem.eql(u8, cmd, "cycles-seek")) {
             const cold = std.mem.eql(u8, cmd, "cycles-cold");
+            const seek_close = std.mem.eql(u8, cmd, "cycles-seek");
             const n = try std.fmt.parseInt(u32, args.next() orelse "20", 10);
             s.close();
             if (cold) if (@hasDecl(video, "shutdownEngines")) video.shutdownEngines();
@@ -190,7 +193,11 @@ pub fn main(init: std.process.Init) !void {
                 const t0 = nowNs();
                 s = try Session.open(gpa, path);
                 open_ns += nowNs() - t0;
-                _ = s.run(0.15);
+                if (seek_close) {
+                    _ = s.run(0.05);
+                    s.vs.seek_to = if (s.vs.dur_s > 0) s.vs.dur_s * (0.2 + 0.6 * @as(f64, @floatFromInt(i % 7)) / 7.0) else 1.0;
+                    _ = s.run(0.02); // il seek parte, la chiusura lo trova in volo
+                } else _ = s.run(0.15);
                 s.close();
                 if (cold) if (@hasDecl(video, "shutdownEngines")) video.shutdownEngines();
                 if (i % 10 == 9 or i + 1 == n) std.debug.print("bench: cycle {d} fds={d} threads={d}\n", .{ i + 1, countDir("/proc/self/fd"), countDir("/proc/self/task") });

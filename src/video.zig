@@ -69,6 +69,9 @@ pub const VideoState = struct {
     // il clock master; `audio_clk_prev` traccia il valore precedente per capire se
     // sta davvero drenando (device muto → clock fermo → NON congelare il video).
     audio: ?*AudioPlayer = null,
+    /// Toggle 'v' da una sessione mpv: la sorgente audio (file o URL DASH) che
+    /// `AudioPlayer` ha riaperto, per rimetterla nel motore quando il video torna.
+    detached_audio_src: ?[:0]u8 = null,
     audio_clk_prev: f64 = -1,
     // Modalità audio-only (mp3, wav, flac…): nessun `player` video, il frame è un
     // oscilloscopio disegnato dai campioni live (`drawOscilloscope`). La stessa
@@ -91,6 +94,8 @@ pub const VideoState = struct {
         if (@import("build_options").video) {
             if (self.audio) |a| a.stopAndDestroy();
             self.audio = null;
+            if (self.detached_audio_src) |s| std.heap.smp_allocator.free(s);
+            self.detached_audio_src = null;
             // Ferma e joina il thread di decodifica PRIMA di tornare: dopo questo
             // nessuno tocca più il Player (chiuso da stopAndDestroy).
             if (self.decoder) |d| d.stopAndDestroy();
@@ -191,10 +196,16 @@ pub fn detachVideo(vs: *VideoState, gpa: std.mem.Allocator) bool {
     const dec = vs.decoder orelse return false;
     if (dec.audio_inside) {
         const src = dec.audio_url_owned orelse dec.path_owned;
-        const a = AudioPlayer.start(src.ptr, gpa) orelse return false;
+        const keep = std.heap.smp_allocator.dupeSentinel(u8, src, 0) catch return false;
+        const a = AudioPlayer.start(src.ptr, gpa) orelse {
+            std.heap.smp_allocator.free(keep);
+            return false;
+        };
         a.seek(dec.clockSeconds());
         a.setPlaying(vs.playing);
         vs.audio = a;
+        if (vs.detached_audio_src) |s| std.heap.smp_allocator.free(s);
+        vs.detached_audio_src = keep;
     }
     dec.stopAndDestroy();
     vs.decoder = null;
@@ -203,17 +214,23 @@ pub fn detachVideo(vs: *VideoState, gpa: std.mem.Allocator) bool {
     return true;
 }
 
-/// Decoder + poster per la RIACCENSIONE del solo video (toggle 'v'): apre il
-/// container su `path` (file o URL) e avvia il thread; l'audio in corso non
-/// viene toccato. Il chiamante installa `dec` in `VideoState` sotto `mutex`.
+/// Decoder + poster per la RIACCENSIONE del video (toggle 'v'): apre `path`
+/// (file o URL) da `start_s`. Con `audio_src` (l'audio era nel motore prima del
+/// toggle) la sessione riprende ANCHE l'audio — un'apertura, un clock — e
+/// `dec.audio_inside` dice al chiamante di chiudere l'`AudioPlayer` del toggle.
+/// Senza (ripiego FFmpeg) il video è muto e l'audio in corso resta il clock.
+/// Il chiamante installa `dec` in `VideoState` sotto `mutex`.
 pub const VideoOnly = struct { dec: *VideoDecoder, rgba: []align(4) u8, w: u32, h: u32 };
 
-pub fn openVideoOnly(path: []const u8, gpa: std.mem.Allocator) !VideoOnly {
+pub fn openVideoOnly(path: []const u8, audio_src: ?[]const u8, start_s: f64, gpa: std.mem.Allocator) !VideoOnly {
     if (comptime @import("build_options").video) {
         const path_z = try gpa.dupeSentinel(u8, path, 0);
         defer gpa.free(path_z);
-        // Muto: l'audio della sorgente suona già (AudioPlayer del toggle).
-        const r = try VideoDecoder.start(path_z.ptr, gpa, video_max_dim, .{ .audio = false });
+        const r = try VideoDecoder.start(path_z.ptr, gpa, video_max_dim, .{
+            .audio = audio_src != null,
+            .audio_url = audio_src,
+            .start_s = start_s,
+        });
         return .{ .dec = r.dec, .rgba = r.rgba, .w = r.w, .h = r.h };
     }
     return error.NoVideo;

@@ -981,6 +981,11 @@ fn presentGpuFrame(ctx: *anyopaque, f: *const videomod.GpuFrame) bool {
     return w.presentDmabuf(4 + f.slot, f.fd, f.width, f.height, f.stride, f.fourcc, f.modifier);
 }
 
+fn gpuSlotFree(ctx: *anyopaque, slot: u8) bool {
+    const w: *zrame.Window = @ptrCast(@alignCast(ctx));
+    return w.videoSlotFree(4 + slot);
+}
+
 fn hideGpuVideo(ctx: *anyopaque) void {
     const w: *zrame.Window = @ptrCast(@alignCast(ctx));
     w.hideVideo();
@@ -1294,7 +1299,7 @@ pub fn main(init: std.process.Init) !void {
     // (diagnostica, o un compositor che lo accetta ma lo mostra male).
     if (comptime has_video) {
         const off = if (getenv("ZUER_VIDEO_PLANE")) |v| v[0] == '0' else false;
-        if (!off) videomod.setPresenter(.{ .ctx = win, .present = presentGpuFrame, .hide = hideGpuVideo });
+        if (!off) videomod.setPresenter(.{ .ctx = win, .present = presentGpuFrame, .slot_free = gpuSlotFree, .hide = hideGpuVideo });
     }
     // La navigazione con le frecce usa la finestra per animare il resize sul
     // contenuto. Impostata prima di `win.run()` (dove partono le callback).
