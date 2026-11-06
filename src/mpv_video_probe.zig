@@ -17,14 +17,15 @@ pub fn main(init: std.process.Init) !void {
     const path_z = try gpa.dupeSentinel(u8, path, 0);
     defer gpa.free(path_z);
 
-    var mv = mpv_video.MpvVideo.init() catch |e| {
+    var mv = mpv_video.MpvVideo.init(.{ .audio = false }) catch |e| {
         std.debug.print("init fallita: {}\n", .{e});
         return e;
     };
     defer mv.deinit();
     std.debug.print("mpv_video: init ok\n", .{});
 
-    mv.loadFile(path_z);
+    mv.loadFile(path_z, false);
+    mv.setPaused(false);
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
@@ -32,14 +33,14 @@ pub fn main(init: std.process.Init) !void {
     var got: u32 = 0;
     var tries: u32 = 0;
     while (got < 10 and tries < 2000) : (tries += 1) {
-        // 0,0 = nessun box di presentazione: mpv consegna la taglia nativa
-        // (dwidth/dheight). È quello che un probe deve misurare — l'output del
-        // decoder, non un ridimensionamento scelto qui. Il consumatore vero
-        // (video_decoder.zig) passa invece la taglia della finestra.
-        const fr = mv.pollFrame(&out, gpa, 0, 0) catch |e| {
-            std.debug.print("pollFrame errore: {}\n", .{e});
+        // Taglia nativa (dwidth/dheight): è quello che un probe deve misurare —
+        // l'output del decoder, non un ridimensionamento scelto qui.
+        _ = mv.pollEvents();
+        const disp = mv.displaySize();
+        const fr = if (disp != null and mv.frameDue()) mv.renderReadback(&out, gpa, disp.?[0], disp.?[1]) catch |e| {
+            std.debug.print("renderReadback errore: {}\n", .{e});
             continue;
-        };
+        } else null;
         if (fr) |f| {
             got += 1;
             // media RGBA grezza, giusto per verificare che non sia tutto nero/spazzatura

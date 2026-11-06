@@ -664,13 +664,8 @@ pub fn toggleVideoTrack(state: *GuiAppState) void {
         return;
     }
     if (!vs.audio_only) {
-        // Video → solo audio: ferma il thread di decodifica (che chiude il
-        // container), l'audio continua e torna a fare auto-loop da sé.
-        if (vs.decoder) |d| d.stopAndDestroy();
-        vs.decoder = null;
-        vs.audio_only = true;
-        if (vs.audio) |a| a.loop.store(true, .monotonic);
-        state.shared.file_changed = true;
+        // Video → solo audio (vedi `detachVideo`).
+        if (videomod.detachVideo(vs, state.gpa)) state.shared.file_changed = true;
         state.shared.mutex.unlock(state.io);
         return;
     }

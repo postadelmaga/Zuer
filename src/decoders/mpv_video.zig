@@ -5,8 +5,13 @@
 //! fuori dal nostro controllo). mpv fa hwdec+color management internamente,
 //! già maturo su questo stesso hardware/compositor (verificato più volte).
 //!
-//! Muto per design: l'audio resta interamente a Zuer (src/audio_player.zig),
-//! che continua a essere il clock master a cui il video si sincronizza.
+//! mpv è l'UNICO motore della sessione: apre la sorgente una volta sola e fa
+//! demux, decodifica (hw quando c'è), audio, sincronia A/V, seek, loop e rete
+//! (riconnessione, cache, tracce DASH separate via `audio-add`). Il suo clock è
+//! l'autorità temporale: Zuer lo legge (`time-pos`), non ne tiene un secondo.
+//! Niente polling: mpv sveglia il thread di decodifica coi suoi callback
+//! (`mpv_set_wakeup_callback` per gli eventi, `..._set_update_callback` per i
+//! frame) sulla `Wake` del chiamante.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -51,6 +56,12 @@ pub const MpvApi = struct {
     mpv_command: *const fn (?*c.struct_mpv_handle, [*c][*c]const u8) callconv(.c) c_int,
     mpv_get_property: *const fn (?*c.struct_mpv_handle, [*c]const u8, c_uint, ?*anyopaque) callconv(.c) c_int,
     mpv_set_property: *const fn (?*c.struct_mpv_handle, [*c]const u8, c_uint, ?*anyopaque) callconv(.c) c_int,
+    mpv_command_async: *const fn (?*c.struct_mpv_handle, u64, [*c][*c]const u8) callconv(.c) c_int,
+    mpv_set_property_async: *const fn (?*c.struct_mpv_handle, u64, [*c]const u8, c_uint, ?*anyopaque) callconv(.c) c_int,
+    mpv_wait_event: *const fn (?*c.struct_mpv_handle, f64) callconv(.c) [*c]c.struct_mpv_event,
+    mpv_observe_property: *const fn (?*c.struct_mpv_handle, u64, [*c]const u8, c_uint) callconv(.c) c_int,
+    mpv_set_wakeup_callback: *const fn (?*c.struct_mpv_handle, ?*const fn (?*anyopaque) callconv(.c) void, ?*anyopaque) callconv(.c) void,
+    mpv_render_context_set_update_callback: *const fn (?*c.struct_mpv_render_context, ?*const fn (?*anyopaque) callconv(.c) void, ?*anyopaque) callconv(.c) void,
 };
 
 // Le firme qui sopra sono scritte a mano invece di `*const @TypeOf(c.x)`: il
@@ -122,6 +133,39 @@ fn ensureMpvRuntime() bool {
     return true;
 }
 
+/// `ZUER_MPV_OPTS="chiave=valore,chiave=valore"`: opzioni mpv in più, applicate
+/// dopo le nostre (diagnostica e messa a punto senza ricompilare).
+fn applyUserOptions(mpv: *c.mpv_handle) void {
+    const raw = std.c.getenv("ZUER_MPV_OPTS") orelse return;
+    var it = std.mem.tokenizeScalar(u8, std.mem.span(raw), ',');
+    while (it.next()) |kv| {
+        const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
+        var kb: [64]u8 = undefined;
+        var vb: [256]u8 = undefined;
+        const k = std.fmt.bufPrintSentinel(&kb, "{s}", .{kv[0..eq]}, 0) catch continue;
+        const v = std.fmt.bufPrintSentinel(&vb, "{s}", .{kv[eq + 1 ..]}, 0) catch continue;
+        if (api.mpv_set_option_string(mpv, k.ptr, v.ptr) < 0) std.log.warn("zuer video: opzione mpv rifiutata: {s}", .{kv});
+    }
+}
+
+fn trace(comptime what: []const u8) void {
+    if (std.c.getenv("ZUER_TRACE") == null) return;
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    const ms = @as(f64, @floatFromInt(@mod(@as(i64, ts.sec), 100))) * 1000.0 + @as(f64, @floatFromInt(ts.nsec)) / 1e6;
+    std.debug.print("[trace {d:.1}] " ++ what ++ "\n", .{ms});
+}
+
+/// Chiamate GL/EGL/mpv-render fatte da un thread diverso da quello che ha creato
+/// il contesto (dovrebbe restare 0: lo legge il banco video).
+pub var wrong_thread_calls: std.atomic.Value(u32) = .init(0);
+
+fn checkThread(owner: std.Thread.Id, comptime what: []const u8) void {
+    if (std.Thread.getCurrentId() == owner) return;
+    _ = wrong_thread_calls.fetchAdd(1, .monotonic);
+    std.log.err("zuer video: " ++ what ++ " fuori dal thread del contesto EGL", .{});
+}
+
 /// Frame RGBA appena letto dall'FBO — di proprietà del chiamante (slice in un
 /// buffer passato da lui), valido solo fino alla prossima `renderFrame`.
 pub const Frame = struct {
@@ -142,11 +186,36 @@ pub const MpvVideo = struct {
     fbo_tex: c.GLuint = 0,
     fbo_w: c_int = 0,
     fbo_h: c_int = 0,
+    audio_url: ?[:0]const u8 = null,
+    /// Il thread che ha creato il contesto EGL: l'unico che può usarlo e smontarlo.
+    owner: std.Thread.Id,
+    // Stato osservato (aggiornato da `pollEvents`, mai letto con chiamate sincrone).
+    disp_w: i64 = 0,
+    disp_h: i64 = 0,
+    fps: f64 = 0,
+    pos: f64 = 0,
+    hwdec_buf: [32]u8 = undefined,
+    hwdec_len: usize = 0,
+    video_id: ?i64 = null,
+    audio_id: ?i64 = null,
 
-    pub fn init() InitError!MpvVideo {
+    /// Come la sessione usa mpv. `audio`: false solo per chi vuole il video muto
+    /// (la riaccensione del video col 'v' mentre l'audio gira altrove).
+    pub const Options = struct {
+        audio: bool = true,
+        /// Traccia audio in un URL separato (DASH di YouTube): aggiunta a file
+        /// caricato con `audio-add`, così mpv la sincronizza come una traccia sua.
+        audio_url: ?[:0]const u8 = null,
+        /// Notificata (da thread di mpv) a ogni evento e a ogni nuovo frame.
+        wake_ctx: ?*anyopaque = null,
+        wake_fn: ?*const fn (?*anyopaque) callconv(.c) void = null,
+    };
+
+    pub fn init(opts: Options) InitError!MpvVideo {
         if (comptime builtin.os.tag != .linux) @compileError("MpvVideo è Linux-only");
         if (!ensureMpv()) return error.MpvLibraryMissing;
 
+        trace("mpv libreria");
         const wl_display = c.wl_display_connect(null) orelse return error.WaylandConnectFailed;
         errdefer c.wl_display_disconnect(wl_display);
 
@@ -191,14 +260,44 @@ pub const MpvVideo = struct {
             return error.EglMakeCurrentFailed;
         }
 
+        trace("EGL pronto");
         const mpv = api.mpv_create() orelse return error.MpvCreateFailed;
         errdefer api.mpv_terminate_destroy(mpv);
-        _ = api.mpv_set_option_string(mpv, "hwdec", "auto");
-        _ = api.mpv_set_option_string(mpv, "aid", "no"); // niente audio: lo fa Zuer
+        // auto-safe: solo gli hwdec che mpv considera affidabili, con ripiego
+        // software automatico (anche a metà file, se il driver sbaglia un frame).
+        _ = api.mpv_set_option_string(mpv, "hwdec", "auto-safe");
+        _ = api.mpv_set_option_string(mpv, "aid", if (opts.audio) "auto" else "no");
+        // Gli script Lua integrati (console, stats, menu…) partirebbero a ogni
+        // istanza: in un'anteprima embedded non servono.
+        _ = api.mpv_set_option_string(mpv, "load-scripts", "no");
+        _ = api.mpv_set_option_string(mpv, "load-stats-overlay", "no");
+        _ = api.mpv_set_option_string(mpv, "load-console", "no");
+        _ = api.mpv_set_option_string(mpv, "load-select", "no");
+        _ = api.mpv_set_option_string(mpv, "load-context-menu", "no");
+        _ = api.mpv_set_option_string(mpv, "load-positioning", "no");
+        _ = api.mpv_set_option_string(mpv, "load-commands", "no");
+        _ = api.mpv_set_option_string(mpv, "load-auto-profiles", "no");
+        _ = api.mpv_set_option_string(mpv, "osc", "no");
+        _ = api.mpv_set_option_string(mpv, "ao", "pipewire,pulse,alsa");
+        _ = api.mpv_set_option_string(mpv, "audio-client-name", "zuer");
+        // La copertina di un mp3 non è un video: niente traccia video → il
+        // chiamante ripiega sul visualizzatore audio di Zuer.
+        _ = api.mpv_set_option_string(mpv, "audio-display", "no");
+        // Il loop lo fa mpv (demuxer riavvolto, niente riapertura né seek esterni).
+        _ = api.mpv_set_option_string(mpv, "loop-file", "inf");
+        _ = api.mpv_set_option_string(mpv, "idle", "yes");
+        _ = api.mpv_set_option_string(mpv, "ytdl", "no"); // gli URL arrivano già risolti
+        _ = api.mpv_set_option_string(mpv, "network-timeout", "15");
+        _ = api.mpv_set_option_string(mpv, "input-default-bindings", "no");
         _ = api.mpv_set_option_string(mpv, "terminal", "no");
         _ = api.mpv_set_option_string(mpv, "msg-level", "all=warn");
         _ = api.mpv_set_option_string(mpv, "vo", "libmpv");
+        applyUserOptions(mpv);
+        trace("mpv opzioni");
         if (api.mpv_initialize(mpv) < 0) return error.MpvInitializeFailed;
+        trace("mpv_initialize");
+        observeAll(mpv);
+        if (opts.wake_fn) |f| api.mpv_set_wakeup_callback(mpv, f, opts.wake_ctx);
 
         var init_params = c.mpv_opengl_init_params{
             .get_proc_address = getProcAddress,
@@ -212,6 +311,8 @@ pub const MpvVideo = struct {
         };
         var render_ctx: ?*c.mpv_render_context = null;
         if (api.mpv_render_context_create(&render_ctx, mpv, &params) < 0) return error.MpvRenderContextFailed;
+        trace("mpv_render_context_create");
+        if (opts.wake_fn) |f| api.mpv_render_context_set_update_callback(render_ctx.?, f, opts.wake_ctx);
 
         return .{
             .wl_display = wl_display,
@@ -221,6 +322,8 @@ pub const MpvVideo = struct {
             .egl_config = egl_config,
             .mpv = mpv,
             .render_ctx = render_ctx.?,
+            .audio_url = opts.audio_url,
+            .owner = std.Thread.getCurrentId(),
         };
     }
 
@@ -233,9 +336,12 @@ pub const MpvVideo = struct {
     /// la pulizia GL e quella del render context di mpv lo richiedono. Rilascia
     /// anche il display EGL (e con lui il fd DRM) prima di chiudere la connessione.
     pub fn deinit(self: *MpvVideo) void {
+        checkThread(self.owner, "deinit");
         if (self.fbo != 0) c.glDeleteFramebuffers(1, &self.fbo);
         if (self.fbo_tex != 0) c.glDeleteTextures(1, &self.fbo_tex);
+        api.mpv_render_context_set_update_callback(self.render_ctx, null, null);
         api.mpv_render_context_free(self.render_ctx);
+        api.mpv_set_wakeup_callback(self.mpv, null, null);
         api.mpv_terminate_destroy(self.mpv);
         _ = c.eglMakeCurrent(self.egl_display, c.EGL_NO_SURFACE, c.EGL_NO_SURFACE, c.EGL_NO_CONTEXT);
         _ = c.eglDestroyContext(self.egl_display, self.egl_context);
@@ -246,34 +352,174 @@ pub const MpvVideo = struct {
         self.* = undefined;
     }
 
-    pub fn loadFile(self: *MpvVideo, path: [:0]const u8) void {
-        const args = [_:null]?[*:0]const u8{ "loadfile", path, null };
-        _ = api.mpv_command(self.mpv, @ptrCast(@constCast(&args)));
+    // Dal thread di render NIENTE chiamate sincrone verso il core di mpv
+    // (`mpv_command`, `mpv_get/set_property`): il core può star aspettando il VO,
+    // che aspetta il nostro render — stallo sciolto solo dal timeout di 200 ms del
+    // VO (log: "mpv_render_context_render() not being called or stuck"). Comandi
+    // e scritture vanno asincroni, le letture arrivano come proprietà osservate.
+
+    fn commandAsync(self: *MpvVideo, args: []const ?[*:0]const u8) void {
+        _ = api.mpv_command_async(self.mpv, 0, @ptrCast(@constCast(args.ptr)));
     }
 
-    /// Seek assoluto (mpv fa la propria ricerca del keyframe/decodifica fino
-    /// al target — non serve il nostro skip lato produttore come per FFmpeg).
+    /// Scarica la sorgente corrente: mpv torna inattivo (istanza, contesto e
+    /// shader restano pronti per la prossima `loadFile`).
+    pub fn stopPlayback(self: *MpvVideo) void {
+        self.commandAsync(&.{ "stop", null });
+    }
+
+    /// Carica `path` in pausa (il primo frame diventa il poster; si riparte con
+    /// `setPaused(false)`), con l'audio acceso o spento per questa sorgente.
+    pub fn loadFile(self: *MpvVideo, path: [:0]const u8, audio: bool) void {
+        self.resetObserved();
+        const opts: [*:0]const u8 = if (audio) "pause=yes,aid=auto" else "pause=yes,aid=no";
+        self.commandAsync(&.{ "loadfile", path, "replace", "-1", opts, null });
+    }
+
+    /// Seek assoluto ed esatto (mpv decodifica dal keyframe fino al target).
+    /// Finito quando arriva `playback_restart` da `pollEvents`: i frame resi
+    /// prima appartengono ancora alla posizione vecchia.
     pub fn seek(self: *MpvVideo, seconds: f64) void {
         var buf: [64]u8 = undefined;
         const target = std.mem.printSentinel(&buf, "{d:.3}", .{@max(0, seconds)}, 0) catch return;
-        const args = [_:null]?[*:0]const u8{ "seek", target, "absolute", null };
-        _ = api.mpv_command(self.mpv, @ptrCast(@constCast(&args)));
+        self.commandAsync(&.{ "seek", target, "absolute+exact", null });
     }
 
-    /// Pausa/riprende la riproduzione INTERNA di mpv (il suo clock di pacing,
-    /// indipendente dal nostro). Senza questo, mettere in pausa lato Zuer
-    /// (smettere di drenare il ring) non ferma mpv: continua a decodificare e
-    /// a considerare "pronti" nuovi frame finché il ring non si riempie, e la
-    /// sua posizione interna avanza comunque nel frattempo.
+    /// Pausa/riprende la riproduzione di mpv (audio, clock e video insieme).
     pub fn setPaused(self: *MpvVideo, paused: bool) void {
         var flag: c_int = if (paused) 1 else 0;
-        _ = api.mpv_set_property(self.mpv, "pause", c.MPV_FORMAT_FLAG, &flag);
+        _ = api.mpv_set_property_async(self.mpv, 0, "pause", c.MPV_FORMAT_FLAG, &flag);
     }
 
-    pub fn eofReached(self: *MpvVideo) bool {
-        var flag: c_int = 0;
-        _ = api.mpv_get_property(self.mpv, "eof-reached", c.MPV_FORMAT_FLAG, &flag);
-        return flag != 0;
+    pub const prop_time_pos: u64 = 1;
+    pub const prop_duration: u64 = 2;
+    pub const prop_buffering: u64 = 3;
+    pub const prop_dwidth: u64 = 4;
+    pub const prop_dheight: u64 = 5;
+    pub const prop_fps: u64 = 6;
+    pub const prop_hwdec: u64 = 7;
+    pub const prop_video_id: u64 = 8;
+    pub const prop_audio_id: u64 = 9;
+
+    fn observeAll(mpv: *c.mpv_handle) void {
+        _ = api.mpv_observe_property(mpv, prop_time_pos, "time-pos", c.MPV_FORMAT_DOUBLE);
+        _ = api.mpv_observe_property(mpv, prop_duration, "duration", c.MPV_FORMAT_DOUBLE);
+        _ = api.mpv_observe_property(mpv, prop_buffering, "paused-for-cache", c.MPV_FORMAT_FLAG);
+        _ = api.mpv_observe_property(mpv, prop_dwidth, "dwidth", c.MPV_FORMAT_INT64);
+        _ = api.mpv_observe_property(mpv, prop_dheight, "dheight", c.MPV_FORMAT_INT64);
+        _ = api.mpv_observe_property(mpv, prop_fps, "container-fps", c.MPV_FORMAT_DOUBLE);
+        _ = api.mpv_observe_property(mpv, prop_hwdec, "hwdec-current", c.MPV_FORMAT_STRING);
+        _ = api.mpv_observe_property(mpv, prop_video_id, "current-tracks/video/id", c.MPV_FORMAT_INT64);
+        _ = api.mpv_observe_property(mpv, prop_audio_id, "current-tracks/audio/id", c.MPV_FORMAT_INT64);
+    }
+
+    fn resetObserved(self: *MpvVideo) void {
+        self.disp_w = 0;
+        self.disp_h = 0;
+        self.fps = 0;
+        self.pos = 0;
+        self.hwdec_len = 0;
+        self.video_id = null;
+        self.audio_id = null;
+    }
+
+    /// Ciò che è successo dall'ultima chiamata (eventi svuotati senza attendere).
+    /// Lo stato osservato (taglia, fps, tracce, hwdec) resta nei campi.
+    pub const Events = struct {
+        pos_s: ?f64 = null,
+        duration_s: ?f64 = null,
+        buffering: ?bool = null,
+        file_loaded: bool = false,
+        /// Seek (o avvio) completato: da qui i frame sono della posizione nuova.
+        playback_restart: bool = false,
+        /// Il file non si apre / lo stream è caduto senza ripresa.
+        failed: bool = false,
+        /// La sorgente è stata scaricata (fine, errore o `stopPlayback`).
+        ended: bool = false,
+    };
+
+    pub fn pollEvents(self: *MpvVideo) Events {
+        var ev: Events = .{};
+        while (true) {
+            const e = api.mpv_wait_event(self.mpv, 0);
+            switch (e.*.event_id) {
+                c.MPV_EVENT_NONE => break,
+                c.MPV_EVENT_PROPERTY_CHANGE => {
+                    const p: *c.mpv_event_property = @ptrCast(@alignCast(e.*.data));
+                    const none = p.format == c.MPV_FORMAT_NONE or p.data == null;
+                    switch (e.*.reply_userdata) {
+                        prop_video_id => self.video_id = if (none) null else @as(*const i64, @ptrCast(@alignCast(p.data))).*,
+                        prop_audio_id => self.audio_id = if (none) null else @as(*const i64, @ptrCast(@alignCast(p.data))).*,
+                        else => {},
+                    }
+                    if (none) continue;
+                    switch (e.*.reply_userdata) {
+                        prop_time_pos => {
+                            self.pos = @as(*const f64, @ptrCast(@alignCast(p.data))).*;
+                            ev.pos_s = self.pos;
+                        },
+                        prop_duration => ev.duration_s = @as(*const f64, @ptrCast(@alignCast(p.data))).*,
+                        prop_buffering => ev.buffering = @as(*const c_int, @ptrCast(@alignCast(p.data))).* != 0,
+                        prop_dwidth => self.disp_w = @as(*const i64, @ptrCast(@alignCast(p.data))).*,
+                        prop_dheight => self.disp_h = @as(*const i64, @ptrCast(@alignCast(p.data))).*,
+                        prop_fps => self.fps = @as(*const f64, @ptrCast(@alignCast(p.data))).*,
+                        prop_hwdec => {
+                            const str = std.mem.span(@as(*const [*:0]const u8, @ptrCast(@alignCast(p.data))).*);
+                            const n = @min(str.len, self.hwdec_buf.len);
+                            @memcpy(self.hwdec_buf[0..n], str[0..n]);
+                            self.hwdec_len = n;
+                        },
+                        else => {},
+                    }
+                },
+                c.MPV_EVENT_FILE_LOADED => {
+                    ev.file_loaded = true;
+                    if (self.audio_url) |u| self.commandAsync(&.{ "audio-add", u, "select", null });
+                },
+                c.MPV_EVENT_PLAYBACK_RESTART => ev.playback_restart = true,
+                c.MPV_EVENT_END_FILE => {
+                    const ef: *c.mpv_event_end_file = @ptrCast(@alignCast(e.*.data));
+                    if (ef.reason == c.MPV_END_FILE_REASON_ERROR) ev.failed = true;
+                    ev.ended = true;
+                },
+                c.MPV_EVENT_SHUTDOWN => {
+                    ev.failed = true;
+                    break;
+                },
+                else => {},
+            }
+        }
+        return ev;
+    }
+
+    /// True se mpv ha un nuovo frame da rendere (azzera il flag in mpv).
+    pub fn frameDue(self: *MpvVideo) bool {
+        return api.mpv_render_context_update(self.render_ctx) & c.MPV_RENDER_UPDATE_FRAME != 0;
+    }
+
+    /// La sorgente ha una traccia video vera (non la copertina di un audio).
+    pub fn hasVideo(self: *const MpvVideo) bool {
+        return self.video_id != null;
+    }
+
+    pub fn hasAudio(self: *const MpvVideo) bool {
+        return self.audio_id != null;
+    }
+
+    /// Dimensione di visualizzazione (aspect applicato), null finché ignota.
+    pub fn displaySize(self: *const MpvVideo) ?[2]u32 {
+        if (self.disp_w <= 0 or self.disp_h <= 0) return null;
+        return .{ @intCast(self.disp_w), @intCast(self.disp_h) };
+    }
+
+    /// Fotogrammi al secondo del contenitore (0 se ignoti).
+    pub fn frameRate(self: *const MpvVideo) f64 {
+        return self.fps;
+    }
+
+    /// Decodifica hardware in uso ("" o "no" se software).
+    pub fn hwdec(self: *const MpvVideo) []const u8 {
+        return self.hwdec_buf[0..self.hwdec_len];
     }
 
     fn ensureFbo(self: *MpvVideo, w: c_int, h: c_int) void {
@@ -304,42 +550,56 @@ pub const MpvVideo = struct {
     /// dal chiamante). Ritorna `null` se non c'era nulla di nuovo da mostrare
     /// (nessun nuovo frame dall'ultima chiamata) — il chiamante tiene l'ultimo
     /// frame presentato, stesso contratto di `VideoDecoder.pickInto` di oggi.
-    pub fn pollFrame(self: *MpvVideo, out: *std.ArrayList(u8), allocator: std.mem.Allocator, target_w: u32, target_h: u32) !?Frame {
-        const flags = api.mpv_render_context_update(self.render_ctx);
-        if (flags & c.MPV_RENDER_UPDATE_FRAME == 0) return null;
-
-        var w: i64 = 0;
-        var h: i64 = 0;
-        _ = api.mpv_get_property(self.mpv, "dwidth", c.MPV_FORMAT_INT64, &w);
-        _ = api.mpv_get_property(self.mpv, "dheight", c.MPV_FORMAT_INT64, &h);
-        if (w <= 0 or h <= 0) return null;
-        var gw: c_int = @intCast(w);
-        var gh: c_int = @intCast(h);
-        // Taglia di presentazione nota: mpv scala (bene, su GPU) direttamente a
-        // quella, così il compositore non ricampiona nearest. Aspect-fit del
-        // frame nel box richiesto, ingrandimento ammesso fino a 2×.
+    /// Taglia a cui rendere il frame: aspect-fit della taglia di visualizzazione
+    /// nel box di presentazione (ingrandimento fino a 2×), o la nativa limitata a
+    /// `max_dim` sul lato lungo se il box è ignoto.
+    pub fn fitSize(disp: [2]u32, target_w: u32, target_h: u32, max_dim: u32) [2]u32 {
+        const sw: f64 = @floatFromInt(disp[0]);
+        const sh: f64 = @floatFromInt(disp[1]);
+        var scale: f64 = 1.0;
         if (target_w > 0 and target_h > 0) {
-            const sw: f64 = @floatFromInt(w);
-            const sh: f64 = @floatFromInt(h);
-            var scale = @min(@as(f64, @floatFromInt(target_w)) / sw, @as(f64, @floatFromInt(target_h)) / sh);
-            scale = @min(scale, 2.0);
-            gw = @max(1, @as(c_int, @intFromFloat(@round(sw * scale))));
-            gh = @max(1, @as(c_int, @intFromFloat(@round(sh * scale))));
+            scale = @min(@min(@as(f64, @floatFromInt(target_w)) / sw, @as(f64, @floatFromInt(target_h)) / sh), 2.0);
+        } else if (max_dim > 0) {
+            scale = @min(1.0, @as(f64, @floatFromInt(max_dim)) / @max(sw, sh));
         }
+        return .{ @max(1, @as(u32, @intFromFloat(@round(sw * scale)))), @max(1, @as(u32, @intFromFloat(@round(sh * scale)))) };
+    }
 
-        self.ensureFbo(gw, gh);
-        c.glBindFramebuffer(c.GL_FRAMEBUFFER, self.fbo);
-        var fbo_param = c.mpv_opengl_fbo{ .fbo = @intCast(self.fbo), .w = gw, .h = gh, .internal_format = c.GL_RGBA8 };
+    /// Rende il frame corrente di mpv nel framebuffer `fbo` (w×h). false se mpv rifiuta.
+    pub fn renderTo(self: *MpvVideo, fbo: c.GLuint, w: u32, h: u32) bool {
+        checkThread(self.owner, "render");
+        c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
+        var fbo_param = c.mpv_opengl_fbo{ .fbo = @intCast(fbo), .w = @intCast(w), .h = @intCast(h), .internal_format = c.GL_RGBA8 };
         var flip: c_int = 0; // FBO nostro (non il default framebuffer): niente flip
-        var block: c_int = 0; // non bloccare sul target time: il pacing lo facciamo noi (Fase 3)
+        // Non bloccare sul target time: mpv sveglia il thread quando il frame è
+        // dovuto (update callback), il pacing è già il suo.
+        var block: c_int = 0;
         var render_params = [_]c.mpv_render_param{
             .{ .type = c.MPV_RENDER_PARAM_OPENGL_FBO, .data = &fbo_param },
             .{ .type = c.MPV_RENDER_PARAM_FLIP_Y, .data = &flip },
             .{ .type = c.MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, .data = &block },
             .{ .type = c.MPV_RENDER_PARAM_INVALID, .data = null },
         };
-        const render_rc = api.mpv_render_context_render(self.render_ctx, &render_params);
-        if (render_rc < 0) return null;
+        return api.mpv_render_context_render(self.render_ctx, &render_params) >= 0;
+    }
+
+    /// Rende il frame dovuto e lo butta: tiene vivo il ciclo di mpv (che attende
+    /// il disegno per chiudere un seek) senza readback. Alla taglia corrente: una
+    /// taglia diversa cambierebbe gli scaler e costerebbe una compilazione di
+    /// shader proprio durante il seek.
+    pub fn renderDiscard(self: *MpvVideo, w: u32, h: u32) void {
+        self.ensureFbo(@intCast(w), @intCast(h));
+        _ = self.renderTo(self.fbo, w, h);
+    }
+
+    /// Rende il frame corrente a w×h nel FBO interno e lo scarica in `out` (RGBA
+    /// stretto). Percorso CPU: il poster, e quando il compositor non accetta il
+    /// piano dmabuf.
+    pub fn renderReadback(self: *MpvVideo, out: *std.ArrayList(u8), allocator: std.mem.Allocator, w: u32, h: u32) !?Frame {
+        const gw: c_int = @intCast(w);
+        const gh: c_int = @intCast(h);
+        self.ensureFbo(gw, gh);
+        if (!self.renderTo(self.fbo, w, h)) return null;
 
         // mpv non promette di lasciare il FRAMEBUFFER BINDING invariato dopo il
         // render (solo viewport/scissor/blend/clear-color sono garantiti come
@@ -352,9 +612,6 @@ pub const MpvVideo = struct {
         c.glPixelStorei(c.GL_PACK_ALIGNMENT, 1);
         c.glReadPixels(0, 0, gw, gh, c.GL_RGBA, c.GL_UNSIGNED_BYTE, out.items.ptr);
 
-        var pos: f64 = 0;
-        _ = api.mpv_get_property(self.mpv, "time-pos", c.MPV_FORMAT_DOUBLE, &pos);
-
-        return .{ .width = @intCast(gw), .height = @intCast(gh), .pts_s = pos };
+        return .{ .width = w, .height = h, .pts_s = self.pos };
     }
 };

@@ -288,6 +288,37 @@ pub fn build(b: *std.Build) void {
     const gui_step = b.step("gui", "Compila solo la GUI Linux (zuer-gui), salta TUI e plugin");
     gui_step.dependOn(&b.addInstallArtifact(gui_exe, .{}).step);
 
+    // Banco della pipeline video (src/video_bench.zig): lo stesso codice della GUI
+    // (setupVideo/advanceVideo/deinit) senza finestra — CPU in play e in pausa,
+    // latenza dei seek, fd e thread su N aperture/chiusure. Dipendenze come zuer-gui.
+    if (ffmpeg_enabled and os_tag == .linux) {
+        const vbench = b.addExecutable(.{
+            .name = "zuer-video-bench",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/video_bench.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        vbench.root_module.addImport("zicro", dep_zicro.module("zicro"));
+        vbench.root_module.addImport("zrame", dep_zicro.module("zrame"));
+        vbench.root_module.addOptions("build_options", build_opts);
+        LinkAv.headersOnly(b, vbench.root_module, target);
+        vbench.root_module.linkSystemLibrary("compute_vp9", .{});
+        addCvp9C(b, vbench.root_module);
+        vbench.root_module.linkSystemLibrary("wayland-client", .{});
+        vbench.root_module.linkSystemLibrary("asound", .{});
+        if (vulkan_enabled) LinkVk.link(b, vbench.root_module, target);
+        if (mpv_enabled) {
+            vbench.root_module.linkSystemLibrary("EGL", .{});
+            vbench.root_module.linkSystemLibrary("GL", .{});
+            addMpvC(b, vbench.root_module);
+        }
+        addStbTruetypeHeaders(b, vbench.root_module);
+        b.step("video-bench", "Banco della pipeline video (zuer-video-bench)").dependOn(&b.addInstallArtifact(vbench, .{}).step);
+    }
+
     // Tool di sviluppo: rasterizza un file col percorso reale di text_render e
     // ne scrive il PPM, per verificare la resa headless (zig build raster-debug).
     const raster_dbg = b.addExecutable(.{
@@ -419,7 +450,7 @@ pub fn build(b: *std.Build) void {
 
     // Test unitari puri (nessuna dipendenza nativa): `zig build test`.
     const test_step = b.step("test", "Esegue i test unitari");
-    for ([_][]const u8{ "src/detect.zig", "src/scheduler.zig", "src/thumbs.zig", "src/meshcache.zig" }) |src_path| {
+    for ([_][]const u8{ "src/detect.zig", "src/scheduler.zig", "src/thumbs.zig", "src/meshcache.zig", "src/wake.zig" }) |src_path| {
         const t = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path(src_path),
             .target = target,

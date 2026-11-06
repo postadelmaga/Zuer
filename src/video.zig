@@ -142,19 +142,57 @@ pub fn setupVideo(vs: *VideoState, path: []const u8, gpa: std.mem.Allocator) !Vi
     const path_z = try gpa.dupeSentinel(u8, clean, 0);
     defer gpa.free(path_z);
 
-    const r = try VideoDecoder.start(path_z.ptr, gpa, video_max_dim);
+    const r = try VideoDecoder.start(path_z.ptr, gpa, video_max_dim, .{});
     errdefer r.dec.stopAndDestroy();
 
-    vs.dur_s = r.dec.duration_s;
+    vs.dur_s = r.dec.durationSeconds();
     vs.pos_s = r.pts_s;
     vs.playing = true;
     vs.decoder = r.dec;
-    // Avvia l'audio (handle libav separato + thread). null se il file è muto.
-    vs.audio = AudioPlayer.start(path_z.ptr, gpa);
-    // Audio come clock master del video: il loop lo coordina il present, non
-    // l'auto-loop del thread audio (vedi campo `loop` in AudioPlayer).
-    if (vs.audio) |a| a.loop.store(false, .monotonic);
+    // Col motore mpv l'audio è già suo (stessa apertura, stesso clock). Col
+    // ripiego FFmpeg serve un `AudioPlayer` (handle libav separato + thread),
+    // null se il file è muto.
+    if (!r.dec.audio_inside) {
+        vs.audio = AudioPlayer.start(path_z.ptr, gpa);
+        // Audio come clock master del video: il loop lo coordina il present, non
+        // l'auto-loop del thread audio (vedi campo `loop` in AudioPlayer).
+        if (vs.audio) |a| a.loop.store(false, .monotonic);
+    }
     return .{ .rgba = r.rgba, .w = r.w, .h = r.h };
+}
+
+/// Chiude i motori video inattivi (mpv) sul loro thread: uscita ordinata e test.
+pub fn shutdownEngines() void {
+    if (comptime @import("build_options").video) @import("video_decoder.zig").shutdownEngines();
+}
+
+/// Chiamate al contesto EGL di mpv fuori dal suo thread (diagnostica: deve essere 0).
+pub fn wrongThreadCalls() u32 {
+    if (comptime @import("build_options").video and @import("builtin").os.tag == .linux and @import("build_options").mpv) {
+        return @import("decoders/mpv_video.zig").wrong_thread_calls.load(.monotonic);
+    }
+    return 0;
+}
+
+/// Toggle 'v', video → solo audio: ferma il decoder e lascia suonare l'audio,
+/// che torna a fare auto-loop da sé (oscilloscopio, come per gli mp3). Se l'audio
+/// era dentro il motore (mpv), prima lo si riapre in un `AudioPlayer` alla
+/// stessa posizione. false se l'audio non si riapre: il video resta com'è.
+pub fn detachVideo(vs: *VideoState, gpa: std.mem.Allocator) bool {
+    if (comptime !@import("build_options").video) return false;
+    const dec = vs.decoder orelse return false;
+    if (dec.audio_inside) {
+        const src = dec.audio_url_owned orelse dec.path_owned;
+        const a = AudioPlayer.start(src.ptr, gpa) orelse return false;
+        a.seek(dec.clockSeconds());
+        a.setPlaying(vs.playing);
+        vs.audio = a;
+    }
+    dec.stopAndDestroy();
+    vs.decoder = null;
+    vs.audio_only = true;
+    if (vs.audio) |a| a.loop.store(true, .monotonic);
+    return true;
 }
 
 /// Decoder + poster per la RIACCENSIONE del solo video (toggle 'v'): apre il
@@ -166,7 +204,8 @@ pub fn openVideoOnly(path: []const u8, gpa: std.mem.Allocator) !VideoOnly {
     if (comptime @import("build_options").video) {
         const path_z = try gpa.dupeSentinel(u8, path, 0);
         defer gpa.free(path_z);
-        const r = try VideoDecoder.start(path_z.ptr, gpa, video_max_dim);
+        // Muto: l'audio della sorgente suona già (AudioPlayer del toggle).
+        const r = try VideoDecoder.start(path_z.ptr, gpa, video_max_dim, .{ .audio = false });
         return .{ .dec = r.dec, .rgba = r.rgba, .w = r.w, .h = r.h };
     }
     return error.NoVideo;
@@ -184,17 +223,21 @@ pub fn setupStream(vs: *VideoState, video_url: []const u8, audio_url: []const u8
     const aurl_z = try gpa.dupeSentinel(u8, audio_url, 0);
     defer gpa.free(aurl_z);
 
-    const r = try VideoDecoder.start(vurl_z.ptr, gpa, video_max_dim);
+    // mpv apre entrambe le tracce in una sessione sola (l'audio con
+    // `audio-add`): due connessioni, il minimo per un DASH, un solo clock.
+    const r = try VideoDecoder.start(vurl_z.ptr, gpa, video_max_dim, .{ .audio_url = audio_url });
     errdefer r.dec.stopAndDestroy();
 
-    vs.dur_s = r.dec.duration_s;
+    vs.dur_s = r.dec.durationSeconds();
     vs.pos_s = r.pts_s;
     vs.playing = true;
     vs.decoder = r.dec;
-    // Audio dal SUO URL (stream DASH separato). null se non si apre: video muto.
-    vs.audio = AudioPlayer.start(aurl_z.ptr, gpa);
-    // Loop coordinato dal present (vedi `loop` in AudioPlayer).
-    if (vs.audio) |a| a.loop.store(false, .monotonic);
+    if (!r.dec.audio_inside) {
+        // Ripiego FFmpeg: audio dal SUO URL con `AudioPlayer`. null se non si
+        // apre: video muto. Loop coordinato dal present (vedi `loop`).
+        vs.audio = AudioPlayer.start(aurl_z.ptr, gpa);
+        if (vs.audio) |a| a.loop.store(false, .monotonic);
+    }
     return .{ .rgba = r.rgba, .w = r.w, .h = r.h };
 }
 
@@ -231,6 +274,31 @@ pub fn setupAudio(vs: *VideoState, path: []const u8, gpa: std.mem.Allocator) !Vi
     return error.NoAudio;
 }
 
+/// Il motore (mpv) possiede audio, clock, seek e loop: qui si inoltrano solo i
+/// comandi e si legge la sua posizione. mpv consegna i frame quando sono dovuti,
+/// quindi si presenta sempre l'ultimo arrivato; dopo un seek il primo della
+/// posizione nuova (anche in pausa).
+fn advanceEngineClock(sink: FrameSink, vs: *VideoState, dec: *VideoDecoder) bool {
+    if (vs.seek_to >= 0) {
+        dec.seekAndFlush(vs.seek_to);
+        vs.pos_s = vs.seek_to;
+        vs.settle_seek = true;
+        vs.seek_to = -1;
+    }
+    dec.setPlaying(vs.playing);
+    const d = dec.durationSeconds();
+    if (d > 0) vs.dur_s = d;
+    // Durante il settle la testina resta sul target (il clock di mpv salta lì
+    // solo a seek finito): niente salto all'indietro sulla timeline.
+    if (!vs.settle_seek) vs.pos_s = dec.clockSeconds();
+    const picked = dec.pickInto(std.math.inf(f64), vs.settle_seek, sink.gpa, sink.rgba, sink.w, sink.h);
+    if (picked.presented and vs.settle_seek) {
+        vs.settle_seek = false;
+        vs.pos_s = dec.clockSeconds();
+    }
+    return picked.presented;
+}
+
 /// Avanza la riproduzione di `dt` secondi: applica un seek pendente, fa avanzare
 /// `pos_s` agganciandolo al clock audio master, gestisce il loop a fine video e
 /// SCEGLIE dalla coda del decoder il frame all'altezza di `pos_s` (scartando i
@@ -240,6 +308,9 @@ pub fn setupAudio(vs: *VideoState, path: []const u8, gpa: std.mem.Allocator) !Vi
 /// di accumularlo. Ritorna `true` se ha aggiornato il frame in `sink.rgba`.
 pub fn advanceVideo(sink: FrameSink, vs: *VideoState, dt: f32) bool {
     const dec = vs.decoder orelse return false;
+    if (comptime @import("build_options").video) {
+        if (dec.audio_inside) return advanceEngineClock(sink, vs, dec);
+    }
 
     // 1. Seek richiesto dall'input: svuota la coda del decoder e riposiziona
     // decoder e audio. `audio_clk_prev` a sentinella così la drift riparte pulita.
