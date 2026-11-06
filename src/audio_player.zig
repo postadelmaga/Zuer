@@ -47,6 +47,8 @@ const scope_len: usize = 8192;
 
 pub const AudioPlayer = struct {
     fmt_ctx: [*c]c.AVFormatContext,
+    /// Interruzione dell'I/O (vedi `player.Interrupt`): scattata da `stopAndDestroy`.
+    intr: *player.Interrupt,
     codec_ctx: [*c]c.AVCodecContext,
     frame: [*c]c.AVFrame,
     packet: [*c]c.AVPacket,
@@ -105,10 +107,12 @@ pub const AudioPlayer = struct {
     /// format ctx (e il suo fd!), codec ctx, swr, frame, packet e device — un
     /// `return null` li salterebbe, leakando risorse per ogni video muto aperto.
     fn startInner(path_z: [*:0]const u8, gpa: std.mem.Allocator) anyerror!*AudioPlayer {
-        var fmt_ctx: [*c]c.AVFormatContext = null;
-        if (av.avformat_open_input(&fmt_ctx, path_z, null, null) != 0) return error.OpenFailed;
+        // Apertura e letture interrompibili: con la rete ferma `stopAndDestroy` non
+        // deve aspettare un `av_read_frame` che non torna (vedi `player.Interrupt`).
+        const intr = player.Interrupt.create() orelse return error.AllocFailed;
+        errdefer intr.destroy();
+        var fmt_ctx: [*c]c.AVFormatContext = player.openInput(path_z, intr) orelse return error.OpenFailed;
         errdefer av.avformat_close_input(&fmt_ctx);
-        if (av.avformat_find_stream_info(fmt_ctx, null) < 0) return error.NoStreamInfo;
 
         var codec: [*c]const c.AVCodec = null;
         const idx = av.av_find_best_stream(fmt_ctx, c.AVMEDIA_TYPE_AUDIO, -1, -1, &codec, 0);
@@ -166,6 +170,7 @@ pub const AudioPlayer = struct {
         errdefer gpa.destroy(self); // spawn fallito → gli errdefer sopra liberano libav+dev
         self.* = .{
             .fmt_ctx = fmt_ctx,
+            .intr = intr,
             .codec_ctx = codec_ctx,
             .frame = frame,
             .packet = packet,
@@ -225,6 +230,7 @@ pub const AudioPlayer = struct {
     /// lo chiama una volta e azzera il puntatore).
     pub fn stopAndDestroy(self: *AudioPlayer) void {
         self.stop.store(true, .monotonic);
+        self.intr.trigger(); // una lettura ferma sulla rete torna subito
         if (self.thread) |t| t.join();
         self.thread = null;
         self.teardown();
@@ -238,6 +244,7 @@ pub const AudioPlayer = struct {
         av.av_frame_free(&self.frame);
         av.avcodec_free_context(&self.codec_ctx);
         av.avformat_close_input(&self.fmt_ctx);
+        self.intr.destroy();
     }
 
     fn threadMain(self: *AudioPlayer) void {

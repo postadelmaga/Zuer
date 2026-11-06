@@ -53,6 +53,7 @@ pub const AvApi = struct {
     avcodec_receive_frame: *const fn ([*c]c.struct_AVCodecContext, [*c]c.struct_AVFrame) callconv(.c) c_int,
     avcodec_send_packet: *const fn ([*c]c.struct_AVCodecContext, [*c]const c.struct_AVPacket) callconv(.c) c_int,
     av_find_best_stream: *const fn ([*c]c.struct_AVFormatContext, c_int, c_int, c_int, [*c][*c]const c.struct_AVCodec, c_int) callconv(.c) c_int,
+    avformat_alloc_context: *const fn () callconv(.c) [*c]c.struct_AVFormatContext,
     avformat_close_input: *const fn ([*c][*c]c.struct_AVFormatContext) callconv(.c) void,
     avformat_find_stream_info: *const fn ([*c]c.struct_AVFormatContext, [*c]?*c.struct_AVDictionary) callconv(.c) c_int,
     avformat_open_input: *const fn ([*c][*c]c.struct_AVFormatContext, [*c]const u8, [*c]const c.struct_AVInputFormat, [*c]?*c.struct_AVDictionary) callconv(.c) c_int,
@@ -409,8 +410,75 @@ fn probeHwDevice(
     return null;
 }
 
+/// Interruzione di aperture e letture di libav. Senza, `avformat_open_input` e
+/// `av_read_frame` su una rete ferma (server muto, connessione appesa) non tornano
+/// mai: il thread che le chiama non esce e chi lo chiude (join) resta bloccato con
+/// lui. libav chiama `check` durante ogni attesa di I/O: `stop` interrompe subito
+/// (chiusura), `deadline_ns` limita l'apertura (`open_timeout_ns`, come il
+/// `network-timeout` di mpv). Vive sullo heap: il contesto ne tiene l'indirizzo
+/// e `Player` si sposta per valore.
+pub const Interrupt = struct {
+    stop: std.atomic.Value(bool) = .init(false),
+    /// Istante (`nowNs`) oltre il quale l'operazione in corso si arrende; 0 = mai.
+    deadline_ns: std.atomic.Value(i64) = .init(0),
+
+    fn check(p: ?*anyopaque) callconv(.c) c_int {
+        const self: *const Interrupt = @ptrCast(@alignCast(p orelse return 0));
+        if (self.stop.load(.acquire)) return 1;
+        const d = self.deadline_ns.load(.monotonic);
+        return @intFromBool(d != 0 and nowNs() >= d);
+    }
+
+    pub fn create() ?*Interrupt {
+        const i = std.heap.smp_allocator.create(Interrupt) catch return null;
+        i.* = .{};
+        return i;
+    }
+
+    pub fn destroy(self: *Interrupt) void {
+        std.heap.smp_allocator.destroy(self);
+    }
+
+    /// Fa tornare l'I/O in corso (e ogni successivo) con errore: per la chiusura.
+    pub fn trigger(self: *Interrupt) void {
+        self.stop.store(true, .release);
+    }
+};
+
+/// Quanto può durare l'apertura di una sorgente (connessione, header, analisi).
+pub const open_timeout_ns: i64 = 15 * std.time.ns_per_s;
+
+/// `avformat_open_input` + `avformat_find_stream_info` interrompibili con `intr`
+/// (che deve vivere quanto il contesto restituito). null se la sorgente non si
+/// apre, non si analizza, o ci mette più di `open_timeout_ns`.
+pub fn openInput(path: [*:0]const u8, intr: *Interrupt) ?[*c]c.AVFormatContext {
+    var fmt_ctx: [*c]c.AVFormatContext = av.avformat_alloc_context();
+    if (fmt_ctx == null) return null;
+    fmt_ctx.*.interrupt_callback = .{ .callback = Interrupt.check, .@"opaque" = intr };
+    intr.deadline_ns.store(nowNs() + open_timeout_ns, .monotonic);
+    defer intr.deadline_ns.store(0, .monotonic);
+    // Se fallisce, libav libera il contesto e lo azzera.
+    if (av.avformat_open_input(&fmt_ctx, path, null, null) != 0) return null;
+    if (av.avformat_find_stream_info(fmt_ctx, null) < 0) {
+        av.avformat_close_input(&fmt_ctx);
+        return null;
+    }
+    return fmt_ctx;
+}
+
+extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+
+fn nowNs() i64 {
+    if (comptime builtin.os.tag == .windows) return @intCast(GetTickCount64() * std.time.ns_per_ms);
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * std.time.ns_per_s + ts.nsec;
+}
+
 pub const Player = struct {
     fmt_ctx: [*c]c.AVFormatContext,
+    /// Interruzione dell'I/O del contesto (vedi `Interrupt`): `interrupt()` la scatta.
+    intr: *Interrupt,
     codec_ctx: [*c]c.AVCodecContext,
     frame: [*c]c.AVFrame,
     packet: [*c]c.AVPacket,
@@ -502,11 +570,10 @@ pub const Player = struct {
     /// hardware concorrenti sulla stessa GPU.
     pub fn openEx(path: [*:0]const u8, allow_cvp9: bool) Error!Player {
         if (!ensureAv()) return Error.OpenFailed; // libav assente o soname disallineato
-        var fmt_ctx: [*c]c.AVFormatContext = null;
-        if (av.avformat_open_input(&fmt_ctx, path, null, null) != 0) return Error.OpenFailed;
+        const intr = Interrupt.create() orelse return Error.OpenFailed;
+        errdefer intr.destroy();
+        var fmt_ctx: [*c]c.AVFormatContext = openInput(path, intr) orelse return Error.OpenFailed;
         errdefer av.avformat_close_input(&fmt_ctx);
-
-        if (av.avformat_find_stream_info(fmt_ctx, null) < 0) return Error.NoStreamInfo;
 
         var codec: [*c]const c.AVCodec = null;
         const stream_idx = av.av_find_best_stream(fmt_ctx, c.AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0);
@@ -663,6 +730,7 @@ pub const Player = struct {
 
         return .{
             .fmt_ctx = fmt_ctx,
+            .intr = intr,
             .codec_ctx = codec_ctx,
             .frame = frame,
             .packet = packet,
@@ -679,6 +747,12 @@ pub const Player = struct {
             .hw_device_count = hw_device_count,
             .hw_device_idx = hw_device_idx,
         };
+    }
+
+    /// Interrompe l'I/O in corso e ogni successivo (rete ferma): il thread che
+    /// decodifica torna da `nextFrame` e può essere joinato. Da qualunque thread.
+    pub fn interrupt(self: *Player) void {
+        self.intr.trigger();
     }
 
     pub fn deinit(self: *Player) void {
@@ -699,6 +773,7 @@ pub const Player = struct {
         var cc: [*c]c.AVCodecContext = self.codec_ctx;
         av.avcodec_free_context(&cc);
         av.avformat_close_input(&self.fmt_ctx);
+        self.intr.destroy();
     }
 
     fn ptsSeconds(self: *Player) f64 {

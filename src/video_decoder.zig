@@ -30,6 +30,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const player_mod = @import("decoders/player.zig");
 const Wake = @import("wake.zig").Wake;
+const Once = @import("wake.zig").Once;
 
 // Backend video hardware-accelerato via libmpv (render API): Linux-only, gate
 // a livello di TIPO (non solo runtime) perché mpv_video.zig fa @cImport di
@@ -177,8 +178,9 @@ pub const VideoDecoder = struct {
 
     // --- solo mpv ---
     engine: if (mpv_enabled) ?*MpvEngine else void = if (mpv_enabled) null else {},
-    /// Il motore ha lasciato la sessione: da qui la sua memoria si può liberare.
-    engine_done: std.atomic.Value(bool) = .init(false),
+    /// Il motore ha lasciato la sessione: da qui la sua memoria si può liberare
+    /// (`Once`: il motore non la tocca più dopo averlo segnalato).
+    engine_done: Once = .{},
     path_owned: [:0]const u8 = &[_:0]u8{},
     audio_url_owned: ?[:0]const u8 = null,
     want_audio: bool = true,
@@ -332,15 +334,16 @@ pub const VideoDecoder = struct {
     pub fn stopAndDestroy(self: *VideoDecoder) void {
         self.stop.store(true, .monotonic);
         self.cmd_wake.notify();
+        // FFmpeg: una lettura ferma sulla rete torna subito invece di bloccare il join.
+        if (self.player) |*p| p.interrupt();
         if (self.thread) |t| t.join();
         self.thread = null;
         if (comptime mpv_enabled) {
             if (self.engine) |eng| {
-                while (true) {
-                    const snap = self.wake.prepare();
-                    if (self.engine_done.load(.acquire)) break;
-                    self.wake.wait(snap, null);
-                }
+                // Il motore lascia la sessione appena smette di presentare: qui non
+                // si aspetta lo scaricamento della sorgente (con la rete ferma dura
+                // quanto libavformat impiega ad annullare la lettura).
+                self.engine_done.wait();
                 MpvEngine.release(eng);
                 self.engine = null;
                 // Il piano video resta col suo ultimo frame finché non lo si toglie.
@@ -568,7 +571,7 @@ pub const VideoDecoder = struct {
     /// Regime: dorme su `ew`; a ogni risveglio applica i comandi, svuota gli
     /// eventi di mpv e, se mpv ha un frame dovuto, lo rende. In pausa mpv non
     /// produce frame né eventi: il thread resta fermo finché non arriva un comando.
-    fn mpvLoop(self: *VideoDecoder, m: *mpv_video.MpvVideo, ew: *Wake, scratch: *std.ArrayList(u8)) void {
+    fn mpvLoop(self: *VideoDecoder, m: *mpv_video.MpvVideo, ew: *Wake) void {
         var prod_gen: u32 = self.gen.load(.monotonic);
         // La sorgente parte in pausa (poster): il primo giro applica lo stato voluto.
         var applied_pause = true;
@@ -636,13 +639,20 @@ pub const VideoDecoder = struct {
                     if (due) self.gpu_stats.busy_drops += 1;
                     slot_wait = true;
                 } else if (dirty and !awaiting_restart and room) {
-                    if (m.renderReadback(scratch, self.gpa, sz[0], sz[1]) catch null) |fr| {
-                        const t = self.tail.load(.monotonic);
-                        if (self.storeSlot(t, scratch.items, fr.width, fr.height, fr.pts_s, prod_gen)) {
+                    // Lo slot `tail` è del produttore finché non lo pubblica: mpv ci
+                    // legge dentro direttamente (una copia CPU in meno per frame).
+                    const t = self.tail.load(.monotonic);
+                    if (self.slotFor(t, sz[0], sz[1])) |dst| {
+                        if (m.renderReadbackTo(dst, sz[0], sz[1])) |fr| {
+                            const slot = &self.ring[t % CAP];
+                            slot.w = fr.width;
+                            slot.h = fr.height;
+                            slot.pts_s = fr.pts_s;
+                            slot.gen = prod_gen;
                             self.tail.store(t + 1, .release);
                             self.shown_gen.store(prod_gen, .release);
                         }
-                    }
+                    } else if (due) m.renderDiscard(sz[0], sz[1]);
                     dirty = false;
                     last_w = sz[0];
                     last_h = sz[1];
@@ -681,6 +691,19 @@ pub const VideoDecoder = struct {
         self.gpu_stats.tick(monotonicNs());
         self.shown_gen.store(prod_gen, .release);
         return .presented;
+    }
+
+    /// Il buffer dello slot di indice assoluto `t`, grande almeno w×h×4 (riallocato
+    /// solo se cresce: a taglia costante nessuna allocazione per frame).
+    fn slotFor(self: *VideoDecoder, t: u64, w: u32, h: u32) ?[]u8 {
+        const need = @as(usize, w) * h * 4;
+        const slot = &self.ring[t % CAP];
+        if (slot.cap < need) {
+            const nb = self.gpa.realloc(slot.pixels, need) catch return null;
+            slot.pixels = nb;
+            slot.cap = need;
+        }
+        return slot.pixels[0..need];
     }
 
     /// Copia `pixels` nello slot di indice assoluto `t` (riallocandolo se serve).
@@ -769,6 +792,10 @@ const MpvEngine = if (mpv_enabled) struct {
     /// Sveglia del thread: callback di mpv (eventi, frame) e comandi della sessione.
     wake: Wake = .{},
     session: std.atomic.Value(?*VideoDecoder) = .init(null),
+    /// Quante sessioni sono state attaccate (sotto `pool_lock`): a fine servizio il
+    /// motore toglie la sessione solo se nessuna è arrivata nel frattempo. Il
+    /// puntatore non basta: la sessione liberata può tornare allo stesso indirizzo.
+    attach_seq: u64 = 0,
     quit: std.atomic.Value(bool) = .init(false),
     /// Il thread è uscito (init fallita o ritiro): va solo joinato.
     dead: std.atomic.Value(bool) = .init(false),
@@ -804,16 +831,30 @@ const MpvEngine = if (mpv_enabled) struct {
         return eng;
     }
 
-    /// Restituisce il motore: nel pool se è vivo e il posto è libero, altrimenti
-    /// lo chiude (join).
+    /// Restituisce il motore: nel pool se è vivo e il posto è libero. Altrimenti
+    /// si ritira da solo (come per inattività) e lo joina chi acquisisce dopo o
+    /// `shutdownEngines`: chi chiude una sessione non aspetta lo scaricamento della
+    /// sorgente né la distruzione di mpv. Solo se la lista dei ritirati è piena, join.
     fn release(eng: *MpvEngine) void {
         if (!eng.dead.load(.acquire)) {
             lockPool();
+            var retired = false;
             const keep = idle == null;
-            if (keep) idle = eng;
+            if (keep) {
+                idle = eng;
+            } else for (&exited) |*x| if (x.* == null) {
+                x.* = eng;
+                retired = true;
+                break;
+            };
             pool_lock.unlock();
             if (keep) {
                 eng.wake.notify(); // riparte il conto dell'inattività
+                return;
+            }
+            if (retired) {
+                eng.quit.store(true, .release);
+                eng.wake.notify();
                 return;
             }
         }
@@ -840,7 +881,10 @@ const MpvEngine = if (mpv_enabled) struct {
     }
 
     fn attach(eng: *MpvEngine, s: *VideoDecoder) void {
+        lockPool();
+        eng.attach_seq +%= 1;
         eng.session.store(s, .release);
+        pool_lock.unlock();
         eng.wake.notify();
     }
 
@@ -858,8 +902,7 @@ const MpvEngine = if (mpv_enabled) struct {
                 const snap = eng.wake.prepare();
                 if (eng.session.swap(null, .acq_rel)) |s| {
                     s.finishStart(.failed);
-                    s.engine_done.store(true, .release);
-                    s.wake.notify();
+                    s.engine_done.set();
                 }
                 eng.wake.wait(snap, null);
             }
@@ -875,8 +918,12 @@ const MpvEngine = if (mpv_enabled) struct {
         while (true) {
             const snap = eng.wake.prepare();
             if (eng.quit.load(.acquire)) break;
-            if (eng.session.load(.acquire)) |s| {
-                eng.serve(&mv, s, &scratch);
+            lockPool();
+            const cur = eng.session.load(.acquire);
+            const seq = eng.attach_seq;
+            pool_lock.unlock();
+            if (cur) |s| {
+                eng.serve(&mv, s, seq, &scratch);
                 idle_since = monotonicNs();
                 continue;
             }
@@ -911,15 +958,21 @@ const MpvEngine = if (mpv_enabled) struct {
         }
     }
 
-    /// Una sessione dall'apertura alla fine; poi scarica la sorgente e la lascia.
-    fn serve(eng: *MpvEngine, m: *mpv_video.MpvVideo, s: *VideoDecoder, scratch: *std.ArrayList(u8)) void {
+    /// Una sessione dall'apertura alla fine; poi la lascia e scarica la sorgente.
+    fn serve(eng: *MpvEngine, m: *mpv_video.MpvVideo, s: *VideoDecoder, seq: u64, scratch: *std.ArrayList(u8)) void {
         m.audio_url = s.audio_url_owned;
         m.loadFile(s.path_owned, s.want_audio, s.start_s);
-        if (s.mpvFirstFrame(m, &eng.wake, scratch)) s.mpvLoop(m, &eng.wake, scratch);
+        if (s.mpvFirstFrame(m, &eng.wake, scratch)) s.mpvLoop(m, &eng.wake);
         logEnd(s, m);
-        // Scarica e aspetta la fine della sorgente: gli eventi di questo file non
-        // devono arrivare alla sessione dopo.
         m.stopPlayback();
+        m.audio_url = null;
+        // La sessione è libera da qui: il ciclo è finito, il motore non presenta
+        // più frame e non tocca più `s` (chi chiude la libera appena lo vede). Lo
+        // scaricamento sotto resta del motore: gli eventi di questo file finiscono
+        // prima che serva la sessione successiva, e dal pool il motore va a chi lo
+        // chiede solo dopo (chi apre aspetta, chi chiude no).
+        const done = &s.engine_done;
+        done.set();
         const t0 = monotonicNs();
         while (true) {
             const snap = eng.wake.prepare();
@@ -931,10 +984,10 @@ const MpvEngine = if (mpv_enabled) struct {
             eng.wake.wait(snap, std.time.ns_per_s - el);
         }
         trace("mpv stop in {d:.1} ms", .{@as(f64, @floatFromInt(monotonicNs() - t0)) / 1e6});
-        m.audio_url = null;
-        eng.session.store(null, .release);
-        s.engine_done.store(true, .release);
-        s.wake.notify();
+        // Solo se è ancora lei: dal pool il motore può già avere una sessione nuova.
+        lockPool();
+        if (eng.attach_seq == seq) eng.session.store(null, .release);
+        pool_lock.unlock();
     }
 } else void;
 

@@ -365,6 +365,9 @@ pub const MpvVideo = struct {
     fbo: c.GLuint = 0,
     fbo_tex: c.GLuint = 0,
     fbo_w: c_int = 0,
+    /// Pixel buffer object della lettura (vedi `readInto`) e la sua taglia in byte.
+    pbo: c.GLuint = 0,
+    pbo_size: usize = 0,
     fbo_h: c_int = 0,
     audio_url: ?[:0]const u8 = null,
     /// Il thread che ha creato il contesto EGL: l'unico che può usarlo e smontarlo.
@@ -530,6 +533,7 @@ pub const MpvVideo = struct {
         if (self.gpu) |*g| g.deinit(self.egl_display);
         if (self.fbo != 0) c.glDeleteFramebuffers(1, &self.fbo);
         if (self.fbo_tex != 0) c.glDeleteTextures(1, &self.fbo_tex);
+        if (self.pbo != 0) c.glDeleteBuffers(1, &self.pbo);
         api.mpv_render_context_set_update_callback(self.render_ctx, null, null);
         api.mpv_render_context_free(self.render_ctx);
         api.mpv_set_wakeup_callback(self.mpv, null, null);
@@ -873,9 +877,45 @@ pub const MpvVideo = struct {
         c.glBindFramebuffer(c.GL_FRAMEBUFFER, self.fbo);
         const need: usize = @as(usize, @intCast(gw)) * @as(usize, @intCast(gh)) * 4;
         if (out.items.len < need) try out.resize(allocator, need);
-        c.glPixelStorei(c.GL_PACK_ALIGNMENT, 1);
-        c.glReadPixels(0, 0, gw, gh, c.GL_RGBA, c.GL_UNSIGNED_BYTE, out.items.ptr);
-
+        self.readInto(out.items[0..need], w, h);
         return .{ .width = w, .height = h, .pts_s = self.pos };
+    }
+
+    /// Come `renderReadback`, ma legge direttamente in `dst` (w×h×4 byte): il
+    /// chiamante ci passa lo slot della coda, senza un buffer intermedio da copiare.
+    pub fn renderReadbackTo(self: *MpvVideo, dst: []u8, w: u32, h: u32) ?Frame {
+        std.debug.assert(dst.len >= @as(usize, w) * h * 4);
+        self.ensureFbo(@intCast(w), @intCast(h));
+        if (!self.renderTo(self.fbo, w, h)) return null;
+        c.glBindFramebuffer(c.GL_FRAMEBUFFER, self.fbo); // vedi `renderReadback`
+        self.readInto(dst, w, h);
+        return .{ .width = w, .height = h, .pts_s = self.pos };
+    }
+
+    /// Legge l'FBO in `dst` passando da un pixel buffer object: la GPU copia il
+    /// frame in un buffer lineare, la CPU lo mappa (attesa della GPU, il thread
+    /// dorme) e lo copia una volta. `glReadPixels` diretto in memoria del processo
+    /// costava ~20 ms per 1280×720 su Intel HD 520 — oltre il budget di un frame a
+    /// 60 fps, con mpv che scartava un frame su tre; col PBO ~10 ms, di cui 0,9 di
+    /// copia. Se la mappa fallisce: lettura diretta.
+    fn readInto(self: *MpvVideo, dst: []u8, w: u32, h: u32) void {
+        const need: usize = @as(usize, w) * h * 4;
+        c.glPixelStorei(c.GL_PACK_ALIGNMENT, 1);
+        if (self.pbo == 0) c.glGenBuffers(1, &self.pbo);
+        c.glBindBuffer(c.GL_PIXEL_PACK_BUFFER, self.pbo);
+        defer c.glBindBuffer(c.GL_PIXEL_PACK_BUFFER, 0);
+        if (self.pbo_size != need) {
+            c.glBufferData(c.GL_PIXEL_PACK_BUFFER, @intCast(need), null, c.GL_STREAM_READ);
+            self.pbo_size = need;
+        }
+        c.glReadPixels(0, 0, @intCast(w), @intCast(h), c.GL_RGBA, c.GL_UNSIGNED_BYTE, null);
+        if (c.glMapBufferRange(c.GL_PIXEL_PACK_BUFFER, 0, @intCast(need), c.GL_MAP_READ_BIT)) |p| {
+            const src: [*]const u8 = @ptrCast(p);
+            @memcpy(dst[0..need], src[0..need]);
+            _ = c.glUnmapBuffer(c.GL_PIXEL_PACK_BUFFER);
+            return;
+        }
+        c.glBindBuffer(c.GL_PIXEL_PACK_BUFFER, 0);
+        c.glReadPixels(0, 0, @intCast(w), @intCast(h), c.GL_RGBA, c.GL_UNSIGNED_BYTE, dst.ptr);
     }
 };

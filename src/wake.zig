@@ -55,6 +55,39 @@ pub const Wake = struct {
     }
 };
 
+/// Un evento a scatto unico, segnalabile anche quando chi aspetta libererà la
+/// struttura appena lo vede (fine sessione: chi chiude libera la sessione). `set`
+/// scrive il flag e poi sveglia col futex sull'INDIRIZZO, senza più scrivere nella
+/// memoria (la WAKE del kernel non la tocca); con `store` + `Wake.notify` la notify
+/// incrementerebbe un contatore forse già liberato.
+pub const Once = struct {
+    v: std.atomic.Value(u32) = .init(0),
+
+    pub fn set(o: *Once) void {
+        const addr = &o.v.raw;
+        o.v.store(1, .release);
+        // Da qui `o` può essere già liberata: solo l'indirizzo, mai il contenuto.
+        if (comptime builtin.os.tag == .linux) {
+            const linux = std.os.linux;
+            _ = linux.futex_3arg(addr, .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
+        }
+    }
+
+    pub fn isSet(o: *const Once) bool {
+        return o.v.load(.acquire) != 0;
+    }
+
+    /// Dorme finché qualcuno non chiama `set`.
+    pub fn wait(o: *Once) void {
+        while (o.v.load(.acquire) == 0) {
+            if (comptime builtin.os.tag == .linux) {
+                const linux = std.os.linux;
+                _ = linux.futex_4arg(&o.v.raw, .{ .cmd = .WAIT, .private = true }, 0, null);
+            } else sleepMs(fallback_ms);
+        }
+    }
+};
+
 extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
 
 fn sleepMs(ms: u64) void {
@@ -79,4 +112,12 @@ test "wait con timeout torna senza notify" {
     const s = w.prepare();
     w.wait(s, 2 * std.time.ns_per_ms);
     try std.testing.expectEqual(s, w.prepare());
+}
+
+test "Once: set da un altro thread sveglia chi aspetta" {
+    var o: Once = .{};
+    const t = try std.Thread.spawn(.{}, Once.set, .{&o});
+    o.wait();
+    t.join();
+    try std.testing.expect(o.isSet());
 }
