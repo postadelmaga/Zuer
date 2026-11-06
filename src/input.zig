@@ -61,13 +61,13 @@ var last_click_y: f32 = 0;
 extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
 
 /// Orologio monotono in millisecondi (per intervalli, es. doppio-click).
-/// Linux: `clock_gettime(MONOTONIC)`; Windows: `GetTickCount64`.
+/// POSIX (Linux, macOS): `clock_gettime(MONOTONIC)` di libc; Windows: `GetTickCount64`.
 fn nowMs() i64 {
     if (comptime builtin.os.tag == .windows) {
         return @intCast(GetTickCount64());
     } else {
-        var ts: std.os.linux.timespec = undefined;
-        _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.MONOTONIC, &ts);
         return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
     }
 }
