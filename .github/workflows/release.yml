@@ -1,0 +1,406 @@
+# Release di Zuer: pacchetti macOS arm64 e Windows x64, pubblicati nella GitHub
+# Release del tag. Parte da sola al push di un tag `v*`; a mano (workflow_dispatch)
+# su un tag già esistente, o in prova (`dry_run`) su qualsiasi ref senza pubblicare.
+#
+# Riproducibilità: Zuer al commit del tag, Zicro al commit scritto in
+# .github/zicro.ref (dentro il tag stesso), Zig scaricato da ziglang.org con sha256
+# verificato, FFmpeg per Windows pinnato con sha256 in scripts/fetch-ffmpeg-dlls.sh.
+# Pacchetti NON firmati (nessun certificato Apple/Windows configurato): vedi RELEASE.md.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag da costruire (es. v1.0.0-rc.1). Con dry_run anche un ramo o un commit."
+        required: true
+        type: string
+      dry_run:
+        description: "Solo build e verifiche, nessuna pubblicazione"
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  ZIG_VERSION: "0.17.0"
+
+jobs:
+  meta:
+    name: Tag, commit e versione
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.m.outputs.tag }}
+      commit: ${{ steps.m.outputs.commit }}
+      version: ${{ steps.m.outputs.version }}
+      zicro: ${{ steps.m.outputs.zicro }}
+      prerelease: ${{ steps.m.outputs.prerelease }}
+      publish: ${{ steps.m.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+      - id: m
+        name: Verifica tag ↔ commit ↔ versione
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          REF="${INPUT_TAG:-$GITHUB_REF_NAME}"
+          COMMIT="$(git rev-parse HEAD)"
+          VERSION="$(sed -nE 's/^[[:space:]]*\.version = "([^"]+)".*/\1/p' build.zig.zon | head -1)"
+          [[ -n "$VERSION" ]] || { echo "::error::versione non trovata in build.zig.zon"; exit 1; }
+          ZICRO="$(tr -d '[:space:]' < .github/zicro.ref)"
+          [[ "$ZICRO" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::.github/zicro.ref non è uno SHA completo"; exit 1; }
+          PUBLISH=true
+          if [[ "${DRY_RUN:-false}" == true ]]; then
+            PUBLISH=false
+          else
+            # Il tag deve esistere sul remoto, puntare a questo commit e chiamarsi v<versione>.
+            TAGGED="$(git ls-remote "https://github.com/$GITHUB_REPOSITORY" "refs/tags/$REF^{}" "refs/tags/$REF" | awk '{print $1}' | head -1)"
+            PEELED="$(git ls-remote "https://github.com/$GITHUB_REPOSITORY" "refs/tags/$REF^{}" | awk '{print $1}')"
+            [[ -n "$PEELED" ]] && TAGGED="$PEELED"
+            [[ -n "$TAGGED" ]] || { echo "::error::$REF non è un tag del repository"; exit 1; }
+            [[ "$TAGGED" == "$COMMIT" ]] || { echo "::error::il tag $REF punta a $TAGGED, il checkout è $COMMIT"; exit 1; }
+            [[ "$REF" == "v$VERSION" ]] || { echo "::error::tag $REF ma build.zig.zon dice $VERSION"; exit 1; }
+          fi
+          PRE=false; [[ "$VERSION" == *-* ]] && PRE=true
+          {
+            echo "tag=$REF"; echo "commit=$COMMIT"; echo "version=$VERSION"
+            echo "zicro=$ZICRO"; echo "prerelease=$PRE"; echo "publish=$PUBLISH"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  linux:
+    name: Gate Linux (test unitari)
+    needs: meta
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.meta.outputs.commit }}
+          path: Zuer
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: postadelmaga/zicro
+          ref: ${{ needs.meta.outputs.zicro }}
+          path: Zicro
+          persist-credentials: false
+      - name: Zig
+        run: |
+          set -euo pipefail
+          curl -fsSL -o zig.tar.xz "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz"
+          echo "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026  zig.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/zig" && tar -xJf zig.tar.xz -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+      - name: Dipendenze
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends glslc pkg-config \
+            libwayland-dev libxkbcommon-dev libpipewire-0.3-dev libasound2-dev \
+            libharfbuzz-dev libfreetype-dev libvulkan-dev libegl-dev libgl-dev libgbm-dev
+      - name: Test Zicro
+        working-directory: Zicro
+        run: zig build test --summary all
+      - name: Test Zuer
+        working-directory: Zuer
+        run: zig build test --summary all
+
+  macos:
+    name: macOS arm64
+    needs: meta
+    runs-on: macos-15 # Apple Silicon (arm64)
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.meta.outputs.commit }}
+          path: Zuer
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: postadelmaga/zicro
+          ref: ${{ needs.meta.outputs.zicro }}
+          path: Zicro
+          persist-credentials: false
+      - name: Runner arm64
+        run: |
+          uname -m; sw_vers
+          [[ "$(uname -m)" == arm64 ]] || { echo "::error::runner non arm64"; exit 1; }
+      - name: Zig e strumenti
+        run: |
+          set -euo pipefail
+          curl -fsSL -o zig.tar.xz "https://ziglang.org/download/$ZIG_VERSION/zig-aarch64-macos-$ZIG_VERSION.tar.xz"
+          echo "b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a  zig.tar.xz" | shasum -a 256 -c -
+          mkdir -p "$RUNNER_TEMP/zig" && tar -xJf zig.tar.xz -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+          brew install --quiet shaderc imagemagick
+      - name: Build e bundle (scripts/build-macos-bundle.sh)
+        working-directory: Zuer
+        run: |
+          set -euo pipefail
+          zig version
+          scripts/build-macos-bundle.sh --arch arm64 --build --out "$RUNNER_TEMP/macos"
+          mkdir -p "$RUNNER_TEMP/dist"
+          mv "$RUNNER_TEMP/macos/Zuer-macos-arm64.tar.gz" "$RUNNER_TEMP/dist/zuer-$VERSION-macos-arm64.tar.gz"
+      - name: Verifica del pacchetto (copia pulita)
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/clean"; rm -rf "$C"; mkdir -p "$C"
+          tar -xzf "$RUNNER_TEMP/dist/zuer-$VERSION-macos-arm64.tar.gz" -C "$C"
+          APP="$C/Zuer.app"; EXE="$APP/Contents/MacOS/zuer-gui"
+          find "$APP" -type f | sed "s|$C/||" | sort
+          # Niente file di sviluppo nel pacchetto.
+          if find "$APP" -type f \( -name '*.patch' -o -name '*.log' -o -name '*.pdb' -o -name '*.dSYM' -o -name '*.o' \) | grep -q .; then
+            echo "::error::file di sviluppo nel bundle"; exit 1; fi
+          [[ -f "$APP/Contents/Resources/LICENSE" ]] || { echo "::error::LICENSE assente"; exit 1; }
+          ls "$APP/Contents/MacOS/decoders/"libdecoder_*.dylib
+          # Architettura: solo arm64, ovunque.
+          for f in "$EXE" "$APP"/Contents/MacOS/decoders/*.dylib; do
+            a="$(lipo -archs "$f")"; echo "$f: $a"
+            [[ "$a" == arm64 ]] || { echo "::error::$f non è solo arm64 ($a)"; exit 1; }
+          done
+          # Dipendenze dinamiche: solo librerie e framework di sistema, nessun percorso di build.
+          for f in "$EXE" "$APP"/Contents/MacOS/decoders/*.dylib; do
+            ID="$(otool -D "$f" | tail -n +2)" # nome proprio di una dylib (non è una dipendenza)
+            otool -L "$f" | tail -n +2 | awk '{print $1}' | while read -r d; do
+              [[ -n "$ID" && "$d" == "$ID" ]] && continue
+              case "$d" in
+                /usr/lib/*|/System/Library/*) ;;
+                *) echo "::error::$(basename "$f") dipende da $d (non di sistema)"; exit 1 ;;
+              esac
+            done
+          done
+          otool -L "$EXE"
+          if otool -l "$EXE" | grep -A2 LC_RPATH | grep -q "$GITHUB_WORKSPACE"; then
+            echo "::error::rpath verso la cartella di build"; exit 1; fi
+          # Metadati.
+          plutil -lint "$APP/Contents/Info.plist"
+          for k in CFBundleIdentifier CFBundleShortVersionString CFBundleExecutable CFBundleIconFile LSMinimumSystemVersion; do
+            echo "$k = $(/usr/libexec/PlistBuddy -c "Print :$k" "$APP/Contents/Info.plist" 2>/dev/null || echo '(assente)')"
+          done
+          # Firma: solo ad-hoc (nessun certificato). Su arm64 macOS esige almeno questa.
+          codesign -dv "$EXE" 2>&1 | grep -E 'Signature|Identifier|flags' || true
+          codesign --verify --verbose "$EXE"
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          EXE="$RUNNER_TEMP/clean/Zuer.app/Contents/MacOS/zuer-gui"
+          OUT="$("$EXE" --version 2>&1)"; echo "$OUT"
+          [[ "$OUT" == "zuer-gui $VERSION" ]] || { echo "::error::--version: '$OUT'"; exit 1; }
+          # Avvio vero con un file di testo: deve restare vivo (finestra aperta) per 8 s.
+          printf 'Zuer %s smoke test\n' "$VERSION" > "$RUNNER_TEMP/smoke.txt"
+          cd "$RUNNER_TEMP"
+          "$EXE" "$RUNNER_TEMP/smoke.txt" > smoke.log 2>&1 & P=$!
+          sleep 8
+          if kill -0 $P 2>/dev/null; then echo "vivo dopo 8 s"; kill $P; wait $P 2>/dev/null || true
+          else wait $P; RC=$?; cat smoke.log; echo "::error::zuer-gui uscito (rc=$RC) prima di 8 s"; exit 1; fi
+          cat smoke.log
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-arm64
+          path: ${{ runner.temp }}/dist/zuer-${{ needs.meta.outputs.version }}-macos-arm64.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  windows:
+    name: Windows x64
+    needs: meta
+    runs-on: windows-2022 # NSIS e MSYS2 preinstallati
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.meta.outputs.commit }}
+          path: Zuer
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: postadelmaga/zicro
+          ref: ${{ needs.meta.outputs.zicro }}
+          path: Zicro
+          persist-credentials: false
+      - name: Zig e strumenti
+        run: |
+          set -euo pipefail
+          curl -fsSL -o zig.zip "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-windows-$ZIG_VERSION.zip"
+          echo "b5663f69581dcf391293fbf16c06cb80d81d806545ce618b4d0bab7f0eb8c428  zig.zip" | sha256sum -c -
+          unzip -q zig.zip -d "$RUNNER_TEMP"
+          echo "$(cygpath -w "$RUNNER_TEMP/zig-x86_64-windows-$ZIG_VERSION")" >> "$GITHUB_PATH"
+          # glslc (shader), objdump (verifica import) e ImageMagick (icona) da MSYS2.
+          /c/msys64/usr/bin/pacman.exe -S --noconfirm --needed --noprogressbar \
+            mingw-w64-ucrt-x86_64-shaderc mingw-w64-ucrt-x86_64-binutils mingw-w64-ucrt-x86_64-imagemagick
+      - name: Build e installer (scripts/build-windows-installer.sh)
+        working-directory: Zuer
+        run: |
+          set -euo pipefail
+          # MSYS2 e NSIS in coda al PATH: non devono coprire gli strumenti di Git Bash.
+          export PATH="$PATH:/c/msys64/ucrt64/bin:/c/Program Files (x86)/NSIS"
+          zig version; glslc --version | head -1; makensis -VERSION
+          mkdir -p "$RUNNER_TEMP/dist"
+          scripts/build-windows-installer.sh --out "$(cygpath -w "$RUNNER_TEMP/dist/zuer-$VERSION-windows-x64-setup.exe")"
+      - name: Verifica binari e dipendenze
+        working-directory: Zuer
+        run: |
+          set -euo pipefail
+          export PATH="$PATH:/c/msys64/ucrt64/bin"
+          B=zig-out/win-installer/bin
+          ls -la "$B"
+          if find "$B" -type f \( -name '*.patch' -o -name '*.log' -o -name '*.pdb' -o -name '*.lib' \) | grep -q .; then
+            echo "::error::file di sviluppo nella staging"; exit 1; fi
+          for f in LICENSE.txt FFmpeg-LICENSE.txt FFmpeg-SOURCE.txt; do [[ -f "$B/$f" ]] || { echo "::error::$f assente"; exit 1; }; done
+          objdump -f "$B/zuer-gui.exe" | grep -q 'file format pei-x86-64' || { echo "::error::zuer-gui.exe non è PE x86-64"; exit 1; }
+          # Ogni DLL importata: o è nel pacchetto, o è di sistema (System32). Niente
+          # librerie presenti solo sulla macchina che compila.
+          MISSING=0
+          for f in "$B"/*.exe "$B"/*.dll; do
+            for d in $(objdump -p "$f" | awk '/DLL Name/{print $3}'); do
+              if [[ -f "$B/$d" ]]; then continue; fi
+              if [[ -f "/c/Windows/System32/$d" || -f "/c/Windows/System32/downlevel/$d" || "$d" == api-ms-win-* ]]; then continue; fi
+              echo "::warning::$(basename "$f") importa $d, né nel pacchetto né in System32"; MISSING=1
+            done
+          done
+          echo "vulkan-1.dll su questo runner: $([[ -f /c/Windows/System32/vulkan-1.dll ]] && echo presente || echo ASSENTE)"
+          [[ $MISSING == 0 ]] || { echo "::error::dipendenze non risolte (sopra)"; exit 1; }
+      - name: Installazione, smoke test, disinstallazione (cartella pulita)
+        env:
+          MSYS_NO_PATHCONV: "1" # /S, /D=, _?= vanno all'installer così come sono
+        run: |
+          set -euo pipefail
+          SETUP="$RUNNER_TEMP/dist/zuer-$VERSION-windows-x64-setup.exe"
+          DIR='C:\zuer-ci'; UDIR=/c/zuer-ci
+          rm -rf "$UDIR"
+          "$SETUP" /S "/D=$DIR"
+          ls -la "$UDIR"
+          for f in zuer-gui.exe uninstall.exe LICENSE.txt avformat-63.dll decoder_text.dll; do
+            [[ -f "$UDIR/$f" ]] || { echo "::error::$f non installato"; exit 1; }; done
+          reg query 'HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Zuer' | tee reg.txt
+          grep -q "DisplayVersion.*$VERSION" reg.txt || { echo "::error::DisplayVersion errata"; exit 1; }
+          # --version dalla copia installata.
+          OUT="$("$UDIR/zuer-gui.exe" --version 2>&1 | tr -d '\r')"; echo "$OUT"
+          [[ "$OUT" == "zuer-gui $VERSION" ]] || { echo "::error::--version: '$OUT'"; exit 1; }
+          # Avvio vero con un file di testo: vivo dopo 8 s (finestra aperta).
+          printf 'Zuer %s smoke test\r\n' "$VERSION" > "$RUNNER_TEMP/smoke.txt"
+          "$UDIR/zuer-gui.exe" "$(cygpath -w "$RUNNER_TEMP/smoke.txt")" > smoke.log 2>&1 & P=$!
+          sleep 8
+          if kill -0 $P 2>/dev/null; then echo "vivo dopo 8 s"; taskkill /F /IM zuer-gui.exe || true
+          else RC=0; wait $P || RC=$?; cat smoke.log; echo "::error::zuer-gui uscito (rc=$RC) prima di 8 s"; exit 1; fi
+          sleep 1
+          # Disinstallazione silenziosa (_?= la fa aspettare; lascia solo uninstall.exe).
+          "$UDIR/uninstall.exe" /S "_?=$DIR"
+          if reg query 'HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Zuer' >/dev/null 2>&1; then
+            echo "::error::voce di disinstallazione rimasta"; exit 1; fi
+          if reg query 'HKCU\Software\Classes\Zuer.Viewer' >/dev/null 2>&1; then
+            echo "::error::ProgID rimasto"; exit 1; fi
+          LEFT="$(ls "$UDIR" | grep -v '^uninstall.exe$' || true)"
+          [[ -z "$LEFT" ]] || { echo "::error::file rimasti: $LEFT"; exit 1; }
+          echo "disinstallazione pulita"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-x64
+          path: ${{ runner.temp }}/dist/zuer-${{ needs.meta.outputs.version }}-windows-x64-setup.exe
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: GitHub Release
+    needs: [meta, linux, macos, windows]
+    if: needs.meta.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.meta.outputs.tag }}
+      COMMIT: ${{ needs.meta.outputs.commit }}
+      VERSION: ${{ needs.meta.outputs.version }}
+      ZICRO: ${{ needs.meta.outputs.zicro }}
+      PRERELEASE: ${{ needs.meta.outputs.prerelease }}
+    steps:
+      # Solo le note: nessun codice del repository gira con il permesso di scrittura.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.meta.outputs.commit }}
+          sparse-checkout: RELEASE.md
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Artefatti, checksum e manifest
+        run: |
+          set -euo pipefail
+          cd dist
+          MAC="zuer-$VERSION-macos-arm64.tar.gz"; WIN="zuer-$VERSION-windows-x64-setup.exe"
+          for f in "$MAC" "$WIN"; do [[ -s "$f" ]] || { echo "::error::$f mancante"; exit 1; }; done
+          [[ "$(ls | wc -l)" == 2 ]] || { echo "::error::artefatti inattesi: $(ls)"; exit 1; }
+          sha256sum "$MAC" "$WIN" > SHA256SUMS
+          cat > manifest.json <<JSON
+          {
+            "name": "zuer",
+            "version": "$VERSION",
+            "tag": "$TAG",
+            "commit": "$COMMIT",
+            "zicro_commit": "$ZICRO",
+            "zig": "$ZIG_VERSION",
+            "workflow_run": "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID",
+            "artifacts": [
+              {"file": "$MAC", "os": "macos", "arch": "arm64", "sha256": "$(sha256sum "$MAC" | cut -d' ' -f1)", "signed": false},
+              {"file": "$WIN", "os": "windows", "arch": "x86_64", "sha256": "$(sha256sum "$WIN" | cut -d' ' -f1)", "signed": false}
+            ]
+          }
+          JSON
+          python3 -m json.tool manifest.json > /dev/null
+          sha256sum -c SHA256SUMS
+          cat SHA256SUMS manifest.json
+      - name: Note di rilascio
+        run: |
+          set -euo pipefail
+          {
+            echo "Commit \`$COMMIT\` (Zicro \`$ZICRO\`). Pacchetti **non firmati**: vedi la sezione Distribuzione."
+            echo
+            echo '```'; cat dist/SHA256SUMS; echo '```'
+            echo
+            sed '1{/^# /d}' RELEASE.md
+          } > notes.md
+      - name: Crea o aggiorna la release (solo se dello stesso commit)
+        run: |
+          set -euo pipefail
+          FLAGS=(); [[ "$PRERELEASE" == true ]] && FLAGS+=(--prerelease --latest=false)
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            ASSETS="$(gh release view "$TAG" --json assets -q '.assets[].name')"
+            if gh release download "$TAG" -p manifest.json -O old-manifest.json 2>/dev/null; then
+              OLD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["commit"])' old-manifest.json)"
+              [[ "$OLD" == "$COMMIT" ]] || { echo "::error::la release $TAG ha artefatti del commit $OLD, non $COMMIT: non li sovrascrivo"; exit 1; }
+            elif [[ -n "$ASSETS" ]]; then
+              echo "::error::la release $TAG ha già artefatti senza manifest: non li sovrascrivo"; exit 1
+            fi
+            gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --title "Zuer $VERSION" --notes-file notes.md "${FLAGS[@]}"
+          else
+            gh release create "$TAG" dist/* --verify-tag --title "Zuer $VERSION" --notes-file notes.md "${FLAGS[@]}"
+          fi
+          gh release view "$TAG" --json url,isPrerelease,assets -q '{url, isPrerelease, assets: [.assets[].name]}'
