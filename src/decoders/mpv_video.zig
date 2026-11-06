@@ -382,6 +382,12 @@ pub const MpvVideo = struct {
     pos: f64 = 0,
     hwdec_buf: [32]u8 = undefined,
     hwdec_len: usize = 0,
+    /// Un file è caricato e il suo END_FILE non è ancora arrivato: chi chiude
+    /// aspetta l'END_FILE solo se è vero (dopo una fine o un errore non ne arriva
+    /// un altro).
+    file_active: bool = false,
+    /// Il loop è stato spento per la sessione corrente (`setLoop(false)`).
+    loop_off: bool = false,
     video_id: ?i64 = null,
     audio_id: ?i64 = null,
     /// Contatori mpv della sessione (vedi `observeAll`); `avsync_max` = |scarto
@@ -567,9 +573,18 @@ pub const MpvVideo = struct {
     /// `setPaused(false)`), con l'audio acceso o spento per questa sorgente.
     pub fn loadFile(self: *MpvVideo, path: [:0]const u8, audio: bool, start_s: f64) void {
         self.resetObserved();
+        // `start` solo se serve: anche `start=0` è un seek preciso, e su un TS
+        // senza indice (troncato, corrotto) mpv ne esce col video già a fine
+        // stream e nessun frame. Senza, parte dal primo pacchetto.
+        if (self.loop_off) self.setLoop(true); // vale per una sessione sola
         var buf: [64]u8 = undefined;
-        const opts = std.mem.printSentinel(&buf, "pause=yes,aid={s},start={d:.3}", .{ if (audio) "auto" else "no", @max(0, start_s) }, 0) catch unreachable;
+        const aid = if (audio) "auto" else "no";
+        const opts = (if (start_s > 0)
+            std.mem.printSentinel(&buf, "pause=yes,aid={s},start={d:.3}", .{ aid, start_s }, 0)
+        else
+            std.mem.printSentinel(&buf, "pause=yes,aid={s}", .{aid}, 0)) catch unreachable;
         self.commandAsync(&.{ "loadfile", path, "replace", "-1", opts, null });
+        self.file_active = true;
     }
 
     /// Seek assoluto ed esatto (mpv decodifica dal keyframe fino al target).
@@ -579,6 +594,13 @@ pub const MpvVideo = struct {
         var buf: [64]u8 = undefined;
         const target = std.mem.printSentinel(&buf, "{d:.3}", .{@max(0, seconds)}, 0) catch return;
         self.commandAsync(&.{ "seek", target, "absolute+exact", null });
+    }
+
+    /// Loop del file (il default) o fermo sull'ultimo frame alla fine.
+    pub fn setLoop(self: *MpvVideo, on: bool) void {
+        _ = api.mpv_set_property_async(self.mpv, 0, "loop-file", c.MPV_FORMAT_STRING, @ptrCast(@constCast(&@as([*:0]const u8, if (on) "inf" else "no"))));
+        _ = api.mpv_set_property_async(self.mpv, 0, "keep-open", c.MPV_FORMAT_STRING, @ptrCast(@constCast(&@as([*:0]const u8, if (on) "no" else "yes"))));
+        self.loop_off = !on;
     }
 
     /// Pausa/riprende la riproduzione di mpv (audio, clock e video insieme).
@@ -696,6 +718,7 @@ pub const MpvVideo = struct {
                     const ef: *c.mpv_event_end_file = @ptrCast(@alignCast(e.*.data));
                     if (ef.reason == c.MPV_END_FILE_REASON_ERROR) ev.failed = true;
                     ev.ended = true;
+                    self.file_active = false;
                 },
                 c.MPV_EVENT_SHUTDOWN => {
                     ev.failed = true;

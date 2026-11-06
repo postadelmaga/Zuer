@@ -50,6 +50,26 @@ done
 out=$(run "$WORK/tone.mp3")
 check "mp3 (senza video) rifiutato senza crash" "! grep -q 'bench: open ms=' <<<\"\$out\""
 
+# Sorgenti malformate (TS senza indice: libavformat non vi si riposiziona). Prima:
+# apertura dopo 20 s di attesa del primo frame (anche `start=0` è un seek), chiusura
+# da 1000 ms dopo un'apertura fallita, loop a vuoto al 95% di CPU sul file corto.
+gen seg.ts "${SRC[@]}" "${TONE[@]}" -t 4 -c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac -shortest -f mpegts
+[ -f "$WORK/trunc.ts" ] && [ "$WORK/trunc.ts" -nt "$WORK/seg.ts" ] || head -c 1500000 "$WORK/seg.ts" > "$WORK/trunc.ts"
+[ -f "$WORK/tiny.ts" ] && [ "$WORK/tiny.ts" -nt "$WORK/seg.ts" ] || head -c 188000 "$WORK/seg.ts" > "$WORK/tiny.ts"
+[ -f "$WORK/garbage.ts" ] || head -c 2000000 /dev/urandom > "$WORK/garbage.ts"
+: > "$WORK/empty.ts"
+for clip in trunc.ts tiny.ts; do
+    out=$(ZUER_TRACE=1 run "$WORK/$clip" play 3 seek)
+    echo "$out" | sed "s|^|  [$clip] |"
+    check "$clip si apre in meno di 3 s" "awk '/bench: open ms=/{split(\$0,a,\"ms=\"); f=(a[2]+0 < 3000)} END{exit !f}' <<<\"\$out\""
+    check "$clip in riproduzione sotto 60% CPU" "awk '/bench: play/{split(\$0,a,\"cpu=\"); exit !(a[2]+0 < 60)}' <<<\"\$out\""
+done
+for clip in garbage.ts empty.ts; do
+    out=$(ZUER_TRACE=1 "$BENCH" "$WORK/$clip" 2>&1 || true)
+    check "$clip rifiutato senza crash" "grep -q 'bench: open fallita' <<<\"\$out\" && grep -q 'bench: end fds=4 threads=1' <<<\"\$out\""
+    check "$clip: il motore chiude in meno di 100 ms" "awk '/mpv stop in/{if (\$(NF-1)+0 >= 100) bad=1} END{exit bad}' <<<\"\$out\""
+done
+
 out=$(run "$WORK/h264.mp4" cycles 100 cycles-cold 30)
 echo "$out" | grep -E 'cycles|end' | sed 's|^|  [cicli] |'
 # A caldo gli fd oscillano di qualche unità (lo stream audio di PipeWire si apre e

@@ -505,6 +505,7 @@ pub const VideoDecoder = struct {
         var loaded = false;
         // mpv ha già un frame (dovuto e reso): manca solo la taglia per il poster.
         var shown = false;
+        var any_due = false;
         while (true) {
             const snap = ew.prepare();
             if (self.stop.load(.monotonic)) {
@@ -521,6 +522,7 @@ pub const VideoDecoder = struct {
                 trace("mpv file-loaded", .{});
                 loaded = true;
             }
+            if (ev.playback_restart) trace("mpv playback-restart", .{});
             // Partita (in pausa) senza traccia video: un audio, magari con
             // copertina (`audio-display=no`). Ci pensa il visualizzatore audio.
             if (ev.playback_restart and loaded and !m.hasVideo()) {
@@ -534,6 +536,7 @@ pub const VideoDecoder = struct {
             // (lo stesso frame, mpv lo consente) appena arriva.
             var ready = false;
             if (m.frameDue()) {
+                any_due = true;
                 trace("mpv primo frame dovuto", .{});
                 if (m.displaySize() == null) {
                     m.renderDiscard(FALLBACK_W, FALLBACK_H);
@@ -562,6 +565,17 @@ pub const VideoDecoder = struct {
                     }
                 }
             }
+            // Ripartita con una traccia video ma senza averne mai dato un frame
+            // (letto qui, dopo `frameDue` di questo giro): mpv ha il video già a
+            // fine stream (seek/partenza su un TS senza indice, troncato o
+            // corrotto) e in pausa ci resterebbe: si fallisce subito, come per
+            // una sorgente illeggibile, invece di aspettare il limite di 20 s.
+            // Su 91 aperture normali (6 formati) il frame arriva sempre prima.
+            if (ev.playback_restart and loaded and m.hasVideo() and !any_due) {
+                std.log.warn("zuer video: mpv è ripartito senza un frame video (stream non decodificabile da questa posizione)", .{});
+                self.finishStart(.failed);
+                return false;
+            }
             const elapsed: u64 = @intCast(monotonicNs() - t0);
             if (elapsed >= MPV_FIRST_FRAME_TIMEOUT_NS) {
                 std.log.warn("zuer video: mpv senza primo frame dopo {d} s", .{MPV_FIRST_FRAME_TIMEOUT_NS / std.time.ns_per_s});
@@ -579,6 +593,8 @@ pub const VideoDecoder = struct {
         var prod_gen: u32 = self.gen.load(.monotonic);
         // La sorgente parte in pausa (poster): il primo giro applica lo stato voluto.
         var applied_pause = true;
+        // Un frame è stato dovuto dall'ultimo playback_restart (il primo è già reso).
+        var due_since_restart = true;
         // Dopo un seek mpv rende ancora frame della posizione vecchia finché non
         // annuncia `playback_restart`: quelli non vanno presentati (era il frame
         // "sbagliato" mostrato subito dopo un seek all'indietro).
@@ -624,6 +640,18 @@ pub const VideoDecoder = struct {
             // disegno fino a 200 ms prima di andare avanti (log: "render() not
             // being called or stuck"), e intanto audio e video si fermano.
             const due = m.frameDue();
+            // Ripartita (loop o seek) senza un frame dal restart precedente: da qui
+            // il video non si riposiziona (TS senza indice, troncato: libavformat
+            // legge fino in fondo senza dare pacchetti) e col loop mpv rigirerebbe
+            // a vuoto al 95% di CPU. Il loop si spegne: mpv si ferma sull'ultimo frame.
+            if (ev.playback_restart) {
+                if (!due and !due_since_restart and m.hasVideo() and !m.loop_off) {
+                    std.log.warn("zuer video: il video non si riposiziona (ripartito senza frame): loop spento per questo file", .{});
+                    m.setLoop(false);
+                }
+                due_since_restart = false;
+            }
+            if (due) due_since_restart = true;
             if (m.displaySize() == null and due) {
                 m.renderDiscard(if (last_w > 0) last_w else FALLBACK_W, if (last_h > 0) last_h else FALLBACK_H);
             } else if (m.displaySize()) |d| {
@@ -989,14 +1017,22 @@ const MpvEngine = if (mpv_enabled) struct {
         // chiede solo dopo (chi apre aspetta, chi chiude no).
         const done = &s.engine_done;
         done.set();
+        // Si aspetta l'END_FILE solo se il file non è già finito: dopo un errore
+        // d'apertura o una fine naturale mpv non ne manda un altro, e qui si
+        // restava 1 s ad aspettarlo (misurato: 1000 ms su file vuoti/illeggibili).
+        // Il limite resta per un mpv che non risponde, e lo dice.
         const t0 = monotonicNs();
-        while (true) {
+        while (m.file_active) {
             const snap = eng.wake.prepare();
-            const ev = m.pollEvents();
+            _ = m.pollEvents();
             if (m.frameDue()) m.renderDiscard(@max(1, @as(u32, @intCast(m.fbo_w))), @max(1, @as(u32, @intCast(m.fbo_h))));
-            if (ev.ended) break;
+            if (!m.file_active) break;
             const el: u64 = @intCast(monotonicNs() - t0);
-            if (el >= std.time.ns_per_s) break;
+            if (el >= std.time.ns_per_s) {
+                std.log.warn("zuer video: mpv non ha chiuso il file entro 1 s", .{});
+                m.file_active = false;
+                break;
+            }
             eng.wake.wait(snap, std.time.ns_per_s - el);
         }
         trace("mpv stop in {d:.1} ms", .{@as(f64, @floatFromInt(monotonicNs() - t0)) / 1e6});
