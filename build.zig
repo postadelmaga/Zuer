@@ -23,6 +23,9 @@ pub fn build(b: *std.Build) void {
     const mpv_enabled = b.option(bool, "mpv", "Link libmpv render API for hw video (Linux only)") orelse
         (os_tag == .linux);
     const build_opts = b.addOptions();
+    // Versione unica, da build.zig.zon: `zuer --version`, `zuer-gui --version`.
+    const version: []const u8 = @import("build.zig.zon").version;
+    build_opts.addOption([]const u8, "version", version);
     // gui.zig/player.zig read `gpu` as "Vulkan renderer available"; `video` as "libav available".
     build_opts.addOption(bool, "gpu", vulkan_enabled);
     build_opts.addOption(bool, "video", ffmpeg_enabled);
@@ -192,6 +195,11 @@ pub fn build(b: *std.Build) void {
 
     // Add Zicro module import
     exe.root_module.addImport("zicro", dep_zicro.module("zicro"));
+    {
+        const vopts = b.addOptions();
+        vopts.addOption([]const u8, "version", version);
+        exe.root_module.addOptions("version_info", vopts);
+    }
     shaders.addTo(exe.root_module);
     // TinySoundFont anche nella TUI: costo ~nullo (oggetto C cached) e
     // src/midi_player.zig resta importabile da entrambi i frontend. Il DeviceOut

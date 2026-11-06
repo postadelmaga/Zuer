@@ -1,6 +1,6 @@
 .{
     .name = .zuer,
-    .version = "0.1.0",
+    .version = "1.0.0-rc.1",
     .fingerprint = 0xd17dbaadbb923cce,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{

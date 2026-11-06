@@ -32,6 +32,10 @@ pub fn main(init: std.process.Init) !void {
 
     var initial_file_path: ?[]const u8 = null;
     if (args.next()) |first_arg| {
+        if (std.mem.eql(u8, first_arg, "--version") or std.mem.eql(u8, first_arg, "-V")) {
+            std.debug.print("zuer {s}\n", .{@import("version_info").version});
+            return;
+        }
         if (std.mem.eql(u8, first_arg, "--json") or std.mem.eql(u8, first_arg, "-j")) {
             const in_path = args.next() orelse {
                 std.debug.print("Missing input path for --json\n", .{});

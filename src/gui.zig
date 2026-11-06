@@ -1120,7 +1120,10 @@ pub fn main(init: std.process.Init) !void {
     var follow = false;
     var arg_path_opt: ?[]const u8 = null;
     while (args.next()) |a| {
-        if (std.mem.eql(u8, a, "-f") or std.mem.eql(u8, a, "--follow")) {
+        if (std.mem.eql(u8, a, "--version") or std.mem.eql(u8, a, "-V")) {
+            std.debug.print("zuer-gui {s}\n", .{build_options.version});
+            return;
+        } else if (std.mem.eql(u8, a, "-f") or std.mem.eql(u8, a, "--follow")) {
             follow = true;
         } else if (arg_path_opt == null) {
             arg_path_opt = a;
