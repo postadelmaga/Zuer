@@ -259,6 +259,7 @@ pub fn build(b: *std.Build) void {
         // l'exe parte anche senza mpv, ripiegando sul decoder FFmpeg esistente.
         gui_exe.root_module.linkSystemLibrary("EGL", .{});
         gui_exe.root_module.linkSystemLibrary("GL", .{});
+        gui_exe.root_module.linkSystemLibrary("gbm", .{}); // buffer dmabuf del video (mesa)
         addMpvC(b, gui_exe.root_module);
     }
     // Backend audio zicro su Windows (waveOut/winmm).
@@ -313,6 +314,7 @@ pub fn build(b: *std.Build) void {
         if (mpv_enabled) {
             vbench.root_module.linkSystemLibrary("EGL", .{});
             vbench.root_module.linkSystemLibrary("GL", .{});
+            vbench.root_module.linkSystemLibrary("gbm", .{});
             addMpvC(b, vbench.root_module);
         }
         addStbTruetypeHeaders(b, vbench.root_module);
@@ -567,6 +569,7 @@ pub fn build(b: *std.Build) void {
         mpv_dbg.root_module.linkSystemLibrary("mpv", .{});
         mpv_dbg.root_module.linkSystemLibrary("EGL", .{});
         mpv_dbg.root_module.linkSystemLibrary("GL", .{});
+        mpv_dbg.root_module.linkSystemLibrary("gbm", .{});
         mpv_dbg.root_module.linkSystemLibrary("wayland-client", .{});
         // Tool a link diretto (non passa da ensureMpv/dlopen): build_options con
         // mpv_runtime=false fa usare a mpv_video.zig la tabella statica.

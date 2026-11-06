@@ -80,6 +80,26 @@ pub const Picked = struct { presented: bool = false, pts_s: f64 = 0 };
 
 pub const Backend = enum { ffmpeg, mpv };
 
+/// Un frame in un dmabuf, pronto per il compositor (vedi `Presenter`).
+pub const GpuFrame = struct { slot: u8, fd: i32, width: u32, height: u32, stride: u32, fourcc: u32, modifier: u64 };
+
+/// Chi mette a schermo i frame GPU: la finestra (`presentDmabuf` su un subsurface,
+/// da qualunque thread). `present` false = il compositor non lo supporta: si
+/// ripiega sul readback. `hide` toglie il piano a fine sessione.
+pub const Presenter = struct {
+    ctx: *anyopaque,
+    present: *const fn (ctx: *anyopaque, frame: *const GpuFrame) bool,
+    hide: *const fn (ctx: *anyopaque) void,
+};
+
+/// Il presenter del processo (uno per finestra; Zuer ne ha una): registrato una
+/// volta all'avvio, vale per ogni sessione mpv aperta dopo.
+var presenter_global: ?Presenter = null;
+
+pub fn setPresenter(p: ?Presenter) void {
+    presenter_global = p;
+}
+
 const StartState = enum(u8) { pending, ok, failed, no_video };
 
 pub const VideoDecoder = struct {
@@ -132,6 +152,12 @@ pub const VideoDecoder = struct {
     clock_bits: std.atomic.Value(u64) = .init(0),
     duration_bits: std.atomic.Value(u64) = .init(0),
     buffering: std.atomic.Value(bool) = .init(false),
+    presenter: ?Presenter = null,
+    /// I frame vanno a schermo come dmabuf (niente coda, niente copie CPU).
+    gpu_active: std.atomic.Value(bool) = .init(false),
+    /// Epoca (`gen`) dell'ultimo frame messo a schermo o in coda: uguale a `gen`
+    /// = il seek è chiuso e si vede la posizione nuova.
+    shown_gen: std.atomic.Value(u32) = .init(0),
 
     /// Poster (primo frame) + decoder avviato. Il chiamante prende possesso di
     /// `.rgba` (→ `static_rgba`) e del decoder (chiuso da `stopAndDestroy`).
@@ -213,6 +239,7 @@ pub const VideoDecoder = struct {
             .duration_s = 0,
             .frame_rate = 0,
             .want_audio = opts.audio,
+            .presenter = presenter_global,
         };
         var attached = false;
         defer if (!attached) self.freeMemory();
@@ -267,6 +294,10 @@ pub const VideoDecoder = struct {
                 }
                 MpvEngine.release(eng);
                 self.engine = null;
+                // Il piano video resta col suo ultimo frame finché non lo si toglie.
+                if (self.gpu_active.load(.acquire)) {
+                    if (self.presenter) |p| p.hide(p.ctx);
+                }
             }
         }
         if (self.player) |*p| p.deinit();
@@ -307,6 +338,17 @@ pub const VideoDecoder = struct {
     pub fn durationSeconds(self: *const VideoDecoder) f64 {
         if (self.backend == .mpv) return @bitCast(self.duration_bits.load(.acquire));
         return self.duration_s;
+    }
+
+    /// I frame vanno a schermo come dmabuf: il present non riceve frame CPU e
+    /// compone solo l'overlay (trasparente sul video).
+    pub fn gpuPresenting(self: *const VideoDecoder) bool {
+        return self.gpu_active.load(.acquire);
+    }
+
+    /// L'ultimo seek è chiuso: a schermo (o in coda) c'è la posizione nuova.
+    pub fn settled(self: *const VideoDecoder) bool {
+        return self.shown_gen.load(.acquire) == self.gen.load(.monotonic);
     }
 
     /// Lo stream di rete sta riempiendo la cache (mpv in pausa per buffering).
@@ -524,11 +566,16 @@ pub const VideoDecoder = struct {
                 if (due) dirty = true;
                 if (sz[0] != last_w or sz[1] != last_h) dirty = true; // resize: anche in pausa
                 const room = self.tail.load(.monotonic) - self.head.load(.acquire) < CAP;
-                if (dirty and !awaiting_restart and room) {
+                if (dirty and !awaiting_restart and self.presentGpu(m, sz, prod_gen)) {
+                    dirty = false;
+                    last_w = sz[0];
+                    last_h = sz[1];
+                } else if (dirty and !awaiting_restart and room) {
                     if (m.renderReadback(scratch, self.gpa, sz[0], sz[1]) catch null) |fr| {
                         const t = self.tail.load(.monotonic);
                         if (self.storeSlot(t, scratch.items, fr.width, fr.height, fr.pts_s, prod_gen)) {
                             self.tail.store(t + 1, .release);
+                            self.shown_gen.store(prod_gen, .release);
                         }
                     }
                     dirty = false;
@@ -544,6 +591,24 @@ pub const VideoDecoder = struct {
             }
             ew.wait(snap, null);
         }
+    }
+
+    /// Percorso GPU: rende nel prossimo dmabuf e lo passa al presenter. false se
+    /// non c'è presenter o il percorso non va (da lì in poi readback).
+    fn presentGpu(self: *VideoDecoder, m: *mpv_video.MpvVideo, sz: [2]u32, prod_gen: u32) bool {
+        const p = self.presenter orelse return false;
+        if (m.gpuDisabled()) return false;
+        const g = m.renderGpu(sz[0], sz[1]) orelse return false;
+        const frame: GpuFrame = .{ .slot = g.slot, .fd = g.fd, .width = g.width, .height = g.height, .stride = g.stride, .fourcc = g.fourcc, .modifier = g.modifier };
+        if (!p.present(p.ctx, &frame)) {
+            std.log.warn("zuer video: il compositor non accetta il piano dmabuf, readback CPU", .{});
+            m.disableGpu();
+            if (self.gpu_active.swap(false, .acq_rel)) p.hide(p.ctx);
+            return false;
+        }
+        if (!self.gpu_active.swap(true, .acq_rel)) logGpu(m);
+        self.shown_gen.store(prod_gen, .release);
+        return true;
     }
 
     /// Copia `pixels` nello slot di indice assoluto `t` (riallocandolo se serve).
@@ -809,6 +874,11 @@ pub fn shutdownEngines() void {
     MpvEngine.idle = null;
     MpvEngine.pool_lock.unlock();
     if (e) |eng| eng.shutdown();
+}
+
+fn logGpu(m: anytype) void {
+    const hw = m.hwdec();
+    std.log.info("zuer video: piano dmabuf attivo (hwdec={s}, XBGR8888 LINEAR, nessuna copia CPU per frame)", .{if (hw.len == 0) "no" else hw});
 }
 
 /// Una riga per sessione: quale motore, quale decodifica hw, dove va l'audio.

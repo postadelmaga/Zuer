@@ -156,6 +156,161 @@ fn trace(comptime what: []const u8) void {
     std.debug.print("[trace {d:.1}] " ++ what ++ "\n", .{ms});
 }
 
+// ── Bersagli GPU (dmabuf) ────────────────────────────────────────────────────
+// mpv rende RGB (con la sua gestione colore) direttamente in un buffer GBM
+// condiviso col compositor: il frame va a schermo come un subsurface, senza
+// readback né copie CPU. LINEAR + XBGR8888 perché ogni compositor li accetta
+// (una creazione di wl_buffer rifiutata è un errore di protocollo, fatale):
+// è anche un'immagine RGB come una wl_shm, quindi niente rappresentazione YUV
+// da negoziare (il tentativo VAAPI di agosto si era arenato proprio lì).
+
+/// DRM_FORMAT_XBGR8888 ('XB24'): byte R,G,B,X in memoria, come GL_RGBA8.
+pub const drm_xbgr8888: u32 = 0x34324258;
+pub const drm_mod_linear: u64 = 0;
+const GBM_BO_USE_RENDERING: u32 = 1 << 2;
+const GBM_BO_USE_LINEAR: u32 = 1 << 4;
+
+/// Slot che ruotano: il compositor legge l'ultimo presentato mentre mpv scrive
+/// il prossimo. Quattro coprono il frame a schermo più quelli in volo.
+pub const gpu_slots = 4;
+
+/// Un frame pronto nel suo dmabuf, da passare a `presentDmabuf`.
+pub const GpuFrame = struct { slot: u8, fd: i32, width: u32, height: u32, stride: u32, fourcc: u32, modifier: u64 };
+
+const GpuSlot = struct {
+    bo: ?*c.gbm_bo = null,
+    fd: c_int = -1,
+    stride: u32 = 0,
+    image: c.EGLImageKHR = null,
+    tex: c.GLuint = 0,
+    fbo: c.GLuint = 0,
+    /// Per i buffer in pensione dopo un resize: liberabile da questo conteggio di
+    /// presentazioni in poi (il compositor può averlo ancora in lettura).
+    retire_at: u64 = 0,
+};
+
+const EglExt = struct {
+    create_image: *const fn (c.EGLDisplay, c.EGLContext, c.EGLenum, c.EGLClientBuffer, [*c]const c.EGLint) callconv(.c) c.EGLImageKHR,
+    destroy_image: *const fn (c.EGLDisplay, c.EGLImageKHR) callconv(.c) c.EGLBoolean,
+    image_target_tex: *const fn (c.GLenum, ?*anyopaque) callconv(.c) void,
+    query_display_attrib: *const fn (c.EGLDisplay, c.EGLint, *c.EGLAttrib) callconv(.c) c.EGLBoolean,
+    query_device_string: *const fn (?*anyopaque, c.EGLint) callconv(.c) [*c]const u8,
+
+    fn load() ?EglExt {
+        var e: EglExt = undefined;
+        inline for (.{
+            .{ "create_image", "eglCreateImageKHR" },
+            .{ "destroy_image", "eglDestroyImageKHR" },
+            .{ "image_target_tex", "glEGLImageTargetTexture2DOES" },
+            .{ "query_display_attrib", "eglQueryDisplayAttribEXT" },
+            .{ "query_device_string", "eglQueryDeviceStringEXT" },
+        }) |pair| {
+            const f = c.eglGetProcAddress(pair[1]) orelse return null;
+            @field(e, pair[0]) = @ptrCast(f);
+        }
+        return e;
+    }
+};
+
+const GpuTargets = struct {
+    ext: EglExt,
+    drm_fd: c_int,
+    gbm: *c.gbm_device,
+    slots: [gpu_slots]GpuSlot = @splat(.{}),
+    w: u32 = 0,
+    h: u32 = 0,
+    next: u8 = 0,
+    presents: u64 = 0,
+    retired: [2 * gpu_slots]GpuSlot = @splat(.{}),
+
+    /// Il dispositivo GBM sulla stessa GPU del display EGL (quella del compositor).
+    fn init(egl_display: c.EGLDisplay) !GpuTargets {
+        const ext = EglExt.load() orelse return error.EglExtMissing;
+        var dev: c.EGLAttrib = 0;
+        if (ext.query_display_attrib(egl_display, c.EGL_DEVICE_EXT, &dev) == c.EGL_FALSE or dev == 0) return error.EglDeviceUnknown;
+        const node = ext.query_device_string(@ptrFromInt(@as(usize, @intCast(dev))), c.EGL_DRM_RENDER_NODE_FILE_EXT);
+        if (node == null) return error.NoRenderNode;
+        const fd = std.c.open(node, .{ .ACCMODE = .RDWR, .CLOEXEC = true });
+        if (fd < 0) return error.RenderNodeOpen;
+        errdefer _ = std.c.close(fd);
+        const gbm = c.gbm_create_device(fd) orelse return error.GbmDevice;
+        trace("dmabuf: GBM pronto");
+        return .{ .ext = ext, .drm_fd = fd, .gbm = gbm };
+    }
+
+    fn createSlot(t: *GpuTargets, display: c.EGLDisplay, w: u32, h: u32) !GpuSlot {
+        var sl: GpuSlot = .{};
+        errdefer t.freeSlot(display, &sl);
+        sl.bo = c.gbm_bo_create(t.gbm, w, h, drm_xbgr8888, GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR) orelse return error.GbmAlloc;
+        sl.fd = c.gbm_bo_get_fd(sl.bo);
+        if (sl.fd < 0) return error.GbmExport;
+        sl.stride = c.gbm_bo_get_stride(sl.bo);
+        const attrs = [_]c.EGLint{
+            c.EGL_WIDTH,                          @intCast(w),
+            c.EGL_HEIGHT,                         @intCast(h),
+            c.EGL_LINUX_DRM_FOURCC_EXT,           @bitCast(drm_xbgr8888),
+            c.EGL_DMA_BUF_PLANE0_FD_EXT,          sl.fd,
+            c.EGL_DMA_BUF_PLANE0_OFFSET_EXT,      0,
+            c.EGL_DMA_BUF_PLANE0_PITCH_EXT,       @intCast(sl.stride),
+            c.EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, 0,
+            c.EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, 0,
+            c.EGL_NONE,
+        };
+        sl.image = t.ext.create_image(display, c.EGL_NO_CONTEXT, c.EGL_LINUX_DMA_BUF_EXT, null, &attrs);
+        if (sl.image == c.EGL_NO_IMAGE_KHR) return error.EglImport;
+        c.glGenTextures(1, &sl.tex);
+        c.glBindTexture(c.GL_TEXTURE_2D, sl.tex);
+        t.ext.image_target_tex(c.GL_TEXTURE_2D, sl.image);
+        c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MIN_FILTER, c.GL_LINEAR);
+        c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MAG_FILTER, c.GL_LINEAR);
+        c.glGenFramebuffers(1, &sl.fbo);
+        c.glBindFramebuffer(c.GL_FRAMEBUFFER, sl.fbo);
+        c.glFramebufferTexture2D(c.GL_FRAMEBUFFER, c.GL_COLOR_ATTACHMENT0, c.GL_TEXTURE_2D, sl.tex, 0);
+        if (c.glCheckFramebufferStatus(c.GL_FRAMEBUFFER) != c.GL_FRAMEBUFFER_COMPLETE) return error.FboIncomplete;
+        return sl;
+    }
+
+    fn freeSlot(t: *GpuTargets, display: c.EGLDisplay, sl: *GpuSlot) void {
+        if (sl.fbo != 0) c.glDeleteFramebuffers(1, &sl.fbo);
+        if (sl.tex != 0) c.glDeleteTextures(1, &sl.tex);
+        if (sl.image != null and sl.image != c.EGL_NO_IMAGE_KHR) _ = t.ext.destroy_image(display, sl.image);
+        if (sl.fd >= 0) _ = std.c.close(sl.fd);
+        if (sl.bo) |b| c.gbm_bo_destroy(b);
+        sl.* = .{};
+    }
+
+    /// Cambio di taglia: i buffer vecchi vanno in pensione (il compositor può
+    /// ancora leggerne uno) e si liberano dopo qualche presentazione.
+    fn resize(t: *GpuTargets, display: c.EGLDisplay, w: u32, h: u32) void {
+        for (&t.slots) |*sl| {
+            if (sl.bo == null) continue;
+            var placed = false;
+            for (&t.retired) |*r| if (r.bo == null) {
+                r.* = sl.*;
+                r.retire_at = t.presents + 2 * gpu_slots;
+                placed = true;
+                break;
+            };
+            if (!placed) t.freeSlot(display, sl);
+            sl.* = .{};
+        }
+        t.w = w;
+        t.h = h;
+        t.next = 0;
+    }
+
+    fn reap(t: *GpuTargets, display: c.EGLDisplay, all: bool) void {
+        for (&t.retired) |*r| if (r.bo != null and (all or r.retire_at <= t.presents)) t.freeSlot(display, r);
+    }
+
+    fn deinit(t: *GpuTargets, display: c.EGLDisplay) void {
+        for (&t.slots) |*sl| t.freeSlot(display, sl);
+        t.reap(display, true);
+        c.gbm_device_destroy(t.gbm);
+        _ = std.c.close(t.drm_fd);
+    }
+};
+
 /// Chiamate GL/EGL/mpv-render fatte da un thread diverso da quello che ha creato
 /// il contesto (dovrebbe restare 0: lo legge il banco video).
 pub var wrong_thread_calls: std.atomic.Value(u32) = .init(0);
@@ -189,6 +344,9 @@ pub const MpvVideo = struct {
     audio_url: ?[:0]const u8 = null,
     /// Il thread che ha creato il contesto EGL: l'unico che può usarlo e smontarlo.
     owner: std.Thread.Id,
+    /// Bersagli dmabuf, creati al primo `renderGpu`; `gpu_off` dopo un fallimento.
+    gpu: ?GpuTargets = null,
+    gpu_off: bool = false,
     // Stato osservato (aggiornato da `pollEvents`, mai letto con chiamate sincrone).
     disp_w: i64 = 0,
     disp_h: i64 = 0,
@@ -337,6 +495,7 @@ pub const MpvVideo = struct {
     /// anche il display EGL (e con lui il fd DRM) prima di chiudere la connessione.
     pub fn deinit(self: *MpvVideo) void {
         checkThread(self.owner, "deinit");
+        if (self.gpu) |*g| g.deinit(self.egl_display);
         if (self.fbo != 0) c.glDeleteFramebuffers(1, &self.fbo);
         if (self.fbo_tex != 0) c.glDeleteTextures(1, &self.fbo_tex);
         api.mpv_render_context_set_update_callback(self.render_ctx, null, null);
@@ -581,6 +740,49 @@ pub const MpvVideo = struct {
             .{ .type = c.MPV_RENDER_PARAM_INVALID, .data = null },
         };
         return api.mpv_render_context_render(self.render_ctx, &render_params) >= 0;
+    }
+
+    /// Rende il frame corrente a w×h nel prossimo slot dmabuf e lo restituisce,
+    /// pronto per il compositor. null se il percorso GPU non va (si ripiega sul
+    /// readback per il resto della vita del motore, con il motivo nel log).
+    pub fn renderGpu(self: *MpvVideo, w: u32, h: u32) ?GpuFrame {
+        if (self.gpu_off) return null;
+        if (self.gpu == null) {
+            self.gpu = GpuTargets.init(self.egl_display) catch |e| {
+                std.log.warn("zuer video: percorso dmabuf non disponibile ({s}), readback CPU", .{@errorName(e)});
+                self.gpu_off = true;
+                return null;
+            };
+        }
+        const t = &self.gpu.?;
+        if (t.w != w or t.h != h) t.resize(self.egl_display, w, h);
+        const i = t.next;
+        if (t.slots[i].bo == null) {
+            t.slots[i] = t.createSlot(self.egl_display, w, h) catch |e| {
+                std.log.warn("zuer video: buffer dmabuf {d}x{d} non creato ({s}), readback CPU", .{ w, h, @errorName(e) });
+                self.gpu_off = true;
+                return null;
+            };
+        }
+        const sl = &t.slots[i];
+        if (!self.renderTo(sl.fbo, w, h)) return null;
+        // Sincronia implicita del dmabuf: il compositor attende il lavoro GPU
+        // sottomesso qui; basta che sia sottomesso.
+        c.glFlush();
+        t.next = @intCast((i + 1) % gpu_slots);
+        t.presents += 1;
+        t.reap(self.egl_display, false);
+        return .{ .slot = i, .fd = sl.fd, .width = w, .height = h, .stride = sl.stride, .fourcc = drm_xbgr8888, .modifier = drm_mod_linear };
+    }
+
+    /// Il percorso GPU ha fallito e non verrà ritentato.
+    pub fn gpuDisabled(self: *const MpvVideo) bool {
+        return self.gpu_off;
+    }
+
+    /// Spegne il percorso GPU (il presenter l'ha rifiutato): da qui readback.
+    pub fn disableGpu(self: *MpvVideo) void {
+        self.gpu_off = true;
     }
 
     /// Rende il frame dovuto e lo butta: tiene vivo il ciclo di mpv (che attende

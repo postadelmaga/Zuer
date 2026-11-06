@@ -395,6 +395,12 @@ fn renderWorker(
     var vid_pw: u32 = 0;
     var vid_ph: u32 = 0;
     var vid_prev_ctrl: f32 = -1;
+    // Video sul piano dmabuf: qui si compone solo l'overlay, trasparente sul video.
+    // `vid_prev_gpu` coglie l'ingresso/uscita (va ripresentato subito: il poster CPU
+    // coprirebbe il piano); `vid_ovl_acc` cadenza i controlli visibili a ~8 Hz.
+    var vid_prev_gpu = false;
+    var vid_ovl_acc: f32 = 0;
+    var vid_ovl_key: u64 = 0;
     // Dopo un cambio contenuto (navigazione) ripresenta per qualche frame: il
     // frame staged viene committato dal thread finestra solo su un suo "wake", e
     // se il primo redraw è differito (entrambi gli slot buffer occupati) resterebbe
@@ -546,7 +552,8 @@ fn renderWorker(
             vs.idle_s += frame_dt;
             const want: f32 = if (!vs.playing or vs.scrubbing or vs.idle_s < 2.5) 1.0 else 0.0;
             vs.controls += (want - vs.controls) * @min(1.0, frame_dt * 8.0);
-            if (want == 0.0 and vs.controls < 0.02) vs.controls = 0;
+            // La coda dell'esponenziale (invisibile) costerebbe un present per tick.
+            if (@abs(want - vs.controls) < 0.03) vs.controls = want;
             // Presenta solo se è cambiato qualcosa: nuovo frame, resize, oppure
             // l'alpha dei controlli si sta muovendo. In pausa a controlli fermi
             // non ricomponiamo (niente 60 Hz sprecati sullo stesso fotogramma).
@@ -559,7 +566,15 @@ fn renderWorker(
             const yt_anim = yt_active and (state.shared.yt.searching or state.shared.yt.opening);
             const yt_ch = state.shared.file_changed;
             state.shared.file_changed = false;
-            const do_present = new_frame or size_ch or ctrl_ch or vs.scrubbing or yt_ch or yt_anim or label_ch;
+            const gpu_video = !audio_only and if (vs.decoder) |d| d.gpuPresenting() else false;
+            const gpu_ch = gpu_video != vid_prev_gpu;
+            vid_ovl_acc += frame_dt;
+            // Si ricompone quando cambia ciò che i controlli mostrano (secondo o
+            // pixel del cursore: avanzamento, o un seek anche in pausa), al più a
+            // 8 Hz — su un video lungo il cursore si muove di rado.
+            const ovl_key: u64 = if (vs.dur_s > 0) @as(u64, @intFromFloat(@max(0, vs.pos_s))) << 32 | @as(u64, @intFromFloat(@max(0, vs.pos_s / vs.dur_s) * @as(f64, @floatFromInt(cur_w)))) else 0;
+            const ovl_tick = gpu_video and vs.controls > 0.01 and vid_ovl_acc >= 1.0 / 8.0 and ovl_key != vid_ovl_key;
+            const do_present = new_frame or size_ch or ctrl_ch or vs.scrubbing or yt_ch or yt_anim or label_ch or gpu_ch or ovl_tick;
             if (do_present) last_label_alpha = label_alpha;
             var pres_w: u32 = 0;
             var pres_h: u32 = 0;
@@ -572,6 +587,10 @@ fn renderWorker(
                     // Oscilloscopio disegnato a piena finestra (fr = cur_w×cur_h):
                     // niente static_rgba/composeFrame, si dipinge diretto nel buffer.
                     videomod.drawOscilloscope(composited_rgba.*, fr.w, fr.h, vs);
+                } else if (gpu_video) {
+                    // Il frame è già a schermo (subsurface dmabuf, sotto la finestra):
+                    // qui solo trasparenza, su cui vanno controlli e overlay.
+                    @memset(composited_rgba.*[0 .. @as(usize, fr.w) * fr.h * 4], 0);
                 } else {
                     // composeFrame copre l'intero buffer fr.w×fr.h (interno + margini
                     // azzerati riga per riga): nessun memset preventivo.
@@ -597,6 +616,9 @@ fn renderWorker(
                 vid_pw = cur_w;
                 vid_ph = cur_h;
                 vid_prev_ctrl = vs.controls;
+                vid_prev_gpu = gpu_video;
+                vid_ovl_acc = 0;
+                vid_ovl_key = ovl_key;
                 pres_w = fr.w;
                 pres_h = fr.h;
             }
@@ -952,6 +974,18 @@ fn renderWorker(
     }
 }
 
+/// Presenter dei frame video GPU: il piano dmabuf della finestra. Gli slot 4..7 di
+/// zicro (lo 0 è della mesh). Chiamato dal thread del motore video.
+fn presentGpuFrame(ctx: *anyopaque, f: *const videomod.GpuFrame) bool {
+    const w: *zrame.Window = @ptrCast(@alignCast(ctx));
+    return w.presentDmabuf(4 + f.slot, f.fd, f.width, f.height, f.stride, f.fourcc, f.modifier);
+}
+
+fn hideGpuVideo(ctx: *anyopaque) void {
+    const w: *zrame.Window = @ptrCast(@alignCast(ctx));
+    w.hideVideo();
+}
+
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
 /// Set a process env var so decoder plugins (loaded in-process) can read it via getenv.
@@ -1251,8 +1285,17 @@ pub fn main(init: std.process.Init) !void {
         .on_mouse = input.mouseCallback,
         .user = &gui_state,
         .style = gui_state_mod.minimalFrame(zrame.Style.fluent()),
+        // Il piano video (dmabuf) arriva già alla taglia del fit-rect: centrato a
+        // quella, coincide col frame che la GUI compone sopra (controlli, overlay).
+        .video_fit = .native,
     });
     defer win.deinit();
+    // `ZUER_VIDEO_PLANE=0`: niente piano dmabuf, frame video sul percorso CPU
+    // (diagnostica, o un compositor che lo accetta ma lo mostra male).
+    if (comptime has_video) {
+        const off = if (getenv("ZUER_VIDEO_PLANE")) |v| v[0] == '0' else false;
+        if (!off) videomod.setPresenter(.{ .ctx = win, .present = presentGpuFrame, .hide = hideGpuVideo });
+    }
     // La navigazione con le frecce usa la finestra per animare il resize sul
     // contenuto. Impostata prima di `win.run()` (dove partono le callback).
     gui_state.win = win;

@@ -12,3 +12,5 @@
 #include "GL/gl.h"
 #include "GL/glext.h"
 #include "wayland-client.h"
+// Buffer dmabuf LINEAR condivisi col compositor (percorso GPU senza readback).
+#include "gbm.h"

@@ -161,6 +161,14 @@ pub fn setupVideo(vs: *VideoState, path: []const u8, gpa: std.mem.Allocator) !Vi
     return .{ .rgba = r.rgba, .w = r.w, .h = r.h };
 }
 
+/// Il presenter dei frame GPU (la finestra): da registrare una volta all'avvio.
+pub const Presenter = if (@import("build_options").video) @import("video_decoder.zig").Presenter else void;
+pub const GpuFrame = if (@import("build_options").video) @import("video_decoder.zig").GpuFrame else void;
+
+pub fn setPresenter(p: ?Presenter) void {
+    if (comptime @import("build_options").video) @import("video_decoder.zig").setPresenter(p);
+}
+
 /// Chiude i motori video inattivi (mpv) sul loro thread: uscita ordinata e test.
 pub fn shutdownEngines() void {
     if (comptime @import("build_options").video) @import("video_decoder.zig").shutdownEngines();
@@ -279,6 +287,22 @@ pub fn setupAudio(vs: *VideoState, path: []const u8, gpa: std.mem.Allocator) !Vi
 /// quindi si presenta sempre l'ultimo arrivato; dopo un seek il primo della
 /// posizione nuova (anche in pausa).
 fn advanceEngineClock(sink: FrameSink, vs: *VideoState, dec: *VideoDecoder) bool {
+    // Piano dmabuf: i frame vanno a schermo dal thread del motore; qui solo
+    // comandi, clock e chiusura del settle (seek arrivato a schermo).
+    if (dec.gpuPresenting()) {
+        if (vs.seek_to >= 0) {
+            dec.seekAndFlush(vs.seek_to);
+            vs.pos_s = vs.seek_to;
+            vs.settle_seek = true;
+            vs.seek_to = -1;
+        }
+        dec.setPlaying(vs.playing);
+        const dg = dec.durationSeconds();
+        if (dg > 0) vs.dur_s = dg;
+        if (vs.settle_seek and dec.settled()) vs.settle_seek = false;
+        if (!vs.settle_seek) vs.pos_s = dec.clockSeconds();
+        return false;
+    }
     if (vs.seek_to >= 0) {
         dec.seekAndFlush(vs.seek_to);
         vs.pos_s = vs.seek_to;
@@ -718,14 +742,16 @@ pub fn drawVideoControls(buf: []u8, W: u32, H: u32, vs: *VideoState, raster: ?*g
     const L = ctrlLayout(W, H);
     const vwf: f32 = @floatFromInt(W);
 
-    // Scrim: sfuma da trasparente a scuro verso il basso.
-    const bands: u32 = 12;
+    // Scrim: sfuma da trasparente a scuro verso il basso, una riga alla volta e
+    // senza sovrapposizioni. Sul piano video dmabuf il buffer sotto è trasparente:
+    // una riga coperta due volte (le vecchie bande si accavallavano di 1 px) vi
+    // diventava una striscia più scura.
+    const rows: u32 = @intFromFloat(L.scrim_h);
+    const y_top = H - rows;
     var i: u32 = 0;
-    while (i < bands) : (i += 1) {
-        const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(bands));
-        const by = @as(f32, @floatFromInt(H)) - L.scrim_h + t * L.scrim_h;
-        const bh = L.scrim_h / @as(f32, @floatFromInt(bands)) + 1.0;
-        canvas.fillRoundedRect(0, by, vwf, bh, 0, paint.Color.rgba(0, 0, 0, 0.55 * t * t * a));
+    while (i < rows) : (i += 1) {
+        const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(rows));
+        canvas.fillRoundedRect(0, @floatFromInt(y_top + i), vwf, 1, 0, paint.Color.rgba(0, 0, 0, 0.55 * t * t * a));
     }
 
     // Timeline + knob.
