@@ -530,6 +530,7 @@ fn renderWorker(
             // "frame" è l'oscilloscopio disegnato più sotto direttamente nel buffer
             // finestra. `static_w/h` seguono la finestra così il fit-rect è pieno e
             // l'hit-test dei controlli (che usa le stesse dimensioni) resta corretto.
+            if (!vs.audio_only) if (vs.decoder) |dec| if (dec.engineLost()) nav.restartLostEngineLocked(state);
             const audio_only = vs.audio_only;
             // Taglia di presentazione al produttore: i prossimi frame arrivano
             // già alla dimensione del fit-rect (scalati con filtro di qualità nel

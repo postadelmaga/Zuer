@@ -181,6 +181,9 @@ pub const VideoDecoder = struct {
     /// Il motore ha lasciato la sessione: da qui la sua memoria si può liberare
     /// (`Once`: il motore non la tocca più dopo averlo segnalato).
     engine_done: Once = .{},
+    /// Il motore ha perso il contesto GPU (reset): la sessione è finita, il
+    /// motore non torna nel pool; chi la possiede la rifà (`engineLost`).
+    engine_lost: std.atomic.Value(bool) = .init(false),
     path_owned: [:0]const u8 = &[_:0]u8{},
     audio_url_owned: ?[:0]const u8 = null,
     want_audio: bool = true,
@@ -383,6 +386,12 @@ pub const VideoDecoder = struct {
         if (self.pause_req.load(.monotonic) == !playing) return;
         self.pause_req.store(!playing, .monotonic);
         self.cmd_wake.notify();
+    }
+
+    /// Il motore mpv ha perso il contesto GPU (reset del driver): la sessione non
+    /// produce più frame e va riaperta (`nav.restartLostEngineLocked`).
+    pub fn engineLost(self: *const VideoDecoder) bool {
+        return self.engine_lost.load(.acquire);
     }
 
     /// Posizione del motore (mpv): l'autorità temporale quando `audio_inside`.
@@ -631,6 +640,14 @@ pub const VideoDecoder = struct {
             }
             const ev = m.pollEvents();
             self.applyEvents(ev);
+            // Contesto GL perso (reset della GPU): le sue risorse non valgono più
+            // nulla. Fine della sessione su questo motore; il proprietario la rifà
+            // su un motore nuovo alla stessa posizione.
+            if (m.gpuLost()) {
+                std.log.warn("zuer video: contesto GPU perso (reset del driver), il motore video va rifatto", .{});
+                self.engine_lost.store(true, .release);
+                break;
+            }
             // Il decoder hardware ha ceduto a metà (mpv è passato al software): i
             // pacchetti dal keyframe in poi li hanno consumati i tentativi falliti,
             // e il software, partito a metà GOP, non mostra nulla fino al keyframe
@@ -1017,6 +1034,8 @@ const MpvEngine = if (mpv_enabled) struct {
         m.audio_url = s.audio_url_owned;
         m.loadFile(s.path_owned, s.want_audio, s.start_s);
         if (s.mpvFirstFrame(m, &eng.wake, scratch)) s.mpvLoop(m, &eng.wake);
+        // Contesto perso: questo motore non serve più nessuno (`release` lo distrugge).
+        if (s.engine_lost.load(.acquire)) eng.dead.store(true, .release);
         logEnd(s, m);
         m.stopPlayback();
         m.audio_url = null;
@@ -1035,7 +1054,7 @@ const MpvEngine = if (mpv_enabled) struct {
         while (m.file_active) {
             const snap = eng.wake.prepare();
             _ = m.pollEvents();
-            if (m.frameDue()) m.renderDiscard(@max(1, @as(u32, @intCast(m.fbo_w))), @max(1, @as(u32, @intCast(m.fbo_h))));
+            if (!m.lost and m.frameDue()) m.renderDiscard(@max(1, @as(u32, @intCast(m.fbo_w))), @max(1, @as(u32, @intCast(m.fbo_h))));
             if (!m.file_active) break;
             const el: u64 = @intCast(monotonicNs() - t0);
             if (el >= std.time.ns_per_s) {

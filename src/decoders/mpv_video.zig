@@ -372,6 +372,12 @@ pub const MpvVideo = struct {
     audio_url: ?[:0]const u8 = null,
     /// Il thread che ha creato il contesto EGL: l'unico che può usarlo e smontarlo.
     owner: std.Thread.Id,
+    /// `glGetGraphicsResetStatus` del contesto robusto; null se non lo è.
+    reset_status: ?ResetStatusFn = null,
+    /// Contesto perso (vedi `gpuLost`): da qui niente più GL su questo motore.
+    lost: bool = false,
+    /// Frame resi da questo motore (per la prova di guasto).
+    rendered: u64 = 0,
     /// Bersagli dmabuf, creati al primo `renderGpu`; `gpu_off` dopo un fallimento.
     gpu: ?GpuTargets = null,
     gpu_off: bool = false,
@@ -451,7 +457,26 @@ pub const MpvVideo = struct {
             c.EGL_CONTEXT_OPENGL_PROFILE_MASK, c.EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
             c.EGL_NONE,
         };
-        const egl_context = c.eglCreateContext(egl_display, egl_config, c.EGL_NO_CONTEXT, &context_attribs);
+        // Contesto robusto dove l'EGL lo offre (1.5, o EXT_create_context_robustness):
+        // dopo un reset della GPU (driver, sospensione su alcune schede) il contesto
+        // si dichiara perso (`gpuLost`) invece di rendere nel vuoto, e il motore si
+        // può rifare. Altrimenti il contesto di sempre.
+        const ext_robust = extInString(c.eglQueryString(egl_display, c.EGL_EXTENSIONS), "EGL_EXT_create_context_robustness");
+        const core15 = egl_major > 1 or (egl_major == 1 and egl_minor >= 5);
+        const robust_attribs = [_]c.EGLint{
+            c.EGL_CONTEXT_MAJOR_VERSION,                                3,
+            c.EGL_CONTEXT_MINOR_VERSION,                                3,
+            c.EGL_CONTEXT_OPENGL_PROFILE_MASK,                          c.EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+            if (core15) egl_robust_access else egl_robust_access_ext,   c.EGL_TRUE,
+            if (core15) egl_reset_strategy else egl_reset_strategy_ext, egl_lose_context_on_reset,
+            c.EGL_NONE,
+        };
+        var robust = core15 or ext_robust;
+        var egl_context = if (robust) c.eglCreateContext(egl_display, egl_config, c.EGL_NO_CONTEXT, &robust_attribs) else c.EGL_NO_CONTEXT;
+        if (egl_context == c.EGL_NO_CONTEXT) {
+            robust = false;
+            egl_context = c.eglCreateContext(egl_display, egl_config, c.EGL_NO_CONTEXT, &context_attribs);
+        }
         if (egl_context == c.EGL_NO_CONTEXT) return error.EglCreateContextFailed;
         errdefer _ = c.eglDestroyContext(egl_display, egl_context);
 
@@ -459,7 +484,16 @@ pub const MpvVideo = struct {
             return error.EglMakeCurrentFailed;
         }
 
+        // Lo stato di reset si legge solo da un contesto robusto (altrimenti è
+        // sempre GL_NO_ERROR, e la funzione può mancare).
+        const reset_status: ?ResetStatusFn = if (robust) blk: {
+            for ([_][*:0]const u8{ "glGetGraphicsResetStatus", "glGetGraphicsResetStatusARB", "glGetGraphicsResetStatusKHR" }) |n| {
+                if (c.eglGetProcAddress(n)) |f| break :blk @ptrCast(f);
+            }
+            break :blk null;
+        } else null;
         trace("EGL pronto");
+        if (std.c.getenv("ZUER_TRACE") != null) std.debug.print("[trace] contesto GL robusto: {}\n", .{reset_status != null});
         const mpv = api.mpv_create() orelse return error.MpvCreateFailed;
         errdefer api.mpv_terminate_destroy(mpv);
         // auto-safe: solo gli hwdec che mpv considera affidabili, con ripiego
@@ -523,7 +557,39 @@ pub const MpvVideo = struct {
             .render_ctx = render_ctx.?,
             .audio_url = opts.audio_url,
             .owner = std.Thread.getCurrentId(),
+            .reset_status = reset_status,
         };
+    }
+
+    const ResetStatusFn = *const fn () callconv(.c) c.GLenum;
+    const egl_robust_access: c.EGLint = 0x31B2; // EGL_CONTEXT_OPENGL_ROBUST_ACCESS (1.5)
+    const egl_reset_strategy: c.EGLint = 0x31BD; // EGL_CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY
+    const egl_robust_access_ext: c.EGLint = 0x30BF;
+    const egl_reset_strategy_ext: c.EGLint = 0x3138;
+    const egl_lose_context_on_reset: c.EGLint = 0x31BF;
+
+    fn extInString(list: ?[*:0]const u8, name: []const u8) bool {
+        var it = std.mem.tokenizeScalar(u8, std.mem.span(list orelse return false), ' ');
+        while (it.next()) |e| if (std.mem.eql(u8, e, name)) return true;
+        return false;
+    }
+
+    /// Prova di guasto: `ZUER_TEST_GPU_RESET_AFTER=N` fa dichiarare perso il
+    /// contesto del PRIMO motore dopo N frame resi (i motori rifatti dopo no).
+    var injected_reset = std.atomic.Value(bool).init(false);
+
+    /// Il contesto GL è stato perso (reset della GPU): le sue risorse non valgono
+    /// più nulla e non vanno toccate; il motore va rifatto. Thread del motore.
+    pub fn gpuLost(self: *MpvVideo) bool {
+        if (self.lost) return true;
+        if (self.reset_status) |f| {
+            if (f() != c.GL_NO_ERROR) self.lost = true;
+        }
+        if (!self.lost) if (std.c.getenv("ZUER_TEST_GPU_RESET_AFTER")) |v| {
+            const n = std.fmt.parseInt(u64, std.mem.span(v), 10) catch 0;
+            if (self.rendered >= n and !injected_reset.swap(true, .monotonic)) self.lost = true;
+        };
+        return self.lost;
     }
 
     fn getProcAddress(ctx: ?*anyopaque, name: [*c]const u8) callconv(.c) ?*anyopaque {
@@ -823,6 +889,7 @@ pub const MpvVideo = struct {
             .{ .type = c.MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, .data = &block },
             .{ .type = c.MPV_RENDER_PARAM_INVALID, .data = null },
         };
+        self.rendered += 1;
         return api.mpv_render_context_render(self.render_ctx, &render_params) >= 0;
     }
 

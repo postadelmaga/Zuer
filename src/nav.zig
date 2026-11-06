@@ -706,6 +706,32 @@ pub fn toggleVideoTrack(state: *GuiAppState) void {
     t.detach();
 }
 
+/// Il motore video ha perso il contesto GPU (reset del driver, sospensione su
+/// alcune schede): ripartenza controllata del solo motore, alla stessa posizione e
+/// con lo stesso stato di play/pausa, dallo stesso percorso della riaccensione col
+/// tasto `v` (apertura fuori dal lock, install sotto). Il motore perso non torna
+/// nel pool. Chiamata con `mutex` preso.
+pub fn restartLostEngineLocked(state: *GuiAppState) void {
+    if (comptime !has_video) return;
+    const vs = &state.video;
+    const dec = vs.decoder orelse return;
+    const src_ref = state.shared.av_src_video orelse return;
+    const src = state.gpa.dupe(u8, src_ref) catch return;
+    const audio_src: ?[]u8 = if (dec.audio_inside) (state.gpa.dupe(u8, dec.audio_url_owned orelse dec.path_owned) catch null) else null;
+    const pos = dec.clockSeconds();
+    std.log.warn("zuer video: riparto il motore video da {d:.2} s", .{pos});
+    vs.decoder = null;
+    dec.stopAndDestroy();
+    // Lo stato in cui `videoReopenWorker` installa (come a video spento).
+    vs.audio_only = true;
+    const t = std.Thread.spawn(.{}, videoReopenWorker, .{ state, src, audio_src, pos }) catch {
+        state.gpa.free(src);
+        if (audio_src) |a| state.gpa.free(a);
+        return;
+    };
+    t.detach();
+}
+
 /// Thread dello spegnimento del video (toggle 'v') con l'audio nel motore: apre
 /// l'audio in un `AudioPlayer` fuori dal lock, poi lo installa sotto `mutex` se
 /// nel frattempo il video è ancora acceso sulla stessa sorgente (altrimenti lo
