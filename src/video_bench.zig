@@ -83,6 +83,11 @@ const Sink = struct {
     }
 };
 
+/// Durata dell'ultima chiusura di sessione (deinit: stop di mpv compreso).
+var last_close_ms: f64 = 0;
+/// Tempo passato in buffering (rete) durante le fasi `play`, azzerato da `report`.
+var buffering_ns: i64 = 0;
+
 const Session = struct {
     vs: video.VideoState = .{},
     sink: Sink = .{},
@@ -90,14 +95,21 @@ const Session = struct {
 
     fn open(gpa: std.mem.Allocator, path: []const u8) !Session {
         var s: Session = .{ .gpa = gpa };
-        const first = try video.setupVideo(&s.vs, path, gpa);
+        // ZUER_BENCH_AUDIO_URL: traccia audio a parte, come un DASH di YouTube
+        // (stesso percorso di `yt_search.openWorker`).
+        const first = if (std.c.getenv("ZUER_BENCH_AUDIO_URL")) |a|
+            try video.setupStream(&s.vs, path, std.mem.span(a), gpa)
+        else
+            try video.setupVideo(&s.vs, path, gpa);
         s.sink = .{ .rgba = first.rgba, .w = first.w, .h = first.h };
         if (s.vs.decoder) |d| d.setTargetSize(first.w, first.h);
         return s;
     }
 
     fn close(s: *Session) void {
+        const t0 = nowNs();
         s.vs.deinit();
+        last_close_ms = @as(f64, @floatFromInt(nowNs() - t0)) / 1e6;
         if (s.sink.rgba.len > 0) s.gpa.free(s.sink.rgba);
         s.sink = .{};
     }
@@ -113,6 +125,9 @@ const Session = struct {
             const dt: f32 = @floatCast(@as(f64, @floatFromInt(t - last)) / 1e9);
             last = t;
             if (video.advanceVideo(s.sink.frameSink(s.gpa), &s.vs, dt)) presented += 1;
+            if (s.vs.decoder) |d| if (d.isBuffering()) {
+                buffering_ns += period;
+            };
             sleepNs(period - (nowNs() - t));
         }
         return presented;
@@ -121,11 +136,12 @@ const Session = struct {
 
 fn report(label: []const u8, secs: f64, ua: Usage, ub: Usage, frames: u64) void {
     const cpu_pct = @as(f64, @floatFromInt(ub.cpu_ns - ua.cpu_ns)) / (secs * 1e9) * 100.0;
-    std.debug.print("bench: {s} secs={d:.1} frames={d} fps={d:.1} cpu={d:.1}% vcsw/s={d:.0} ivcsw/s={d:.0} rss_mb={d}\n", .{
+    std.debug.print("bench: {s} secs={d:.1} frames={d} fps={d:.1} cpu={d:.1}% vcsw/s={d:.0} ivcsw/s={d:.0} rss_mb={d} buffering_s={d:.1}\n", .{
         label,                                               secs,                     frames,
         @as(f64, @floatFromInt(frames)) / secs,              cpu_pct,                  @as(f64, @floatFromInt(ub.vcsw - ua.vcsw)) / secs,
-        @as(f64, @floatFromInt(ub.ivcsw - ua.ivcsw)) / secs, statusKb("VmRSS") / 1024,
+        @as(f64, @floatFromInt(ub.ivcsw - ua.ivcsw)) / secs, statusKb("VmRSS") / 1024, @as(f64, @floatFromInt(buffering_ns)) / 1e9,
     });
+    buffering_ns = 0;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -143,7 +159,16 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("bench: start fds={d} threads={d}\n", .{ fd0, th0 });
 
     const t_open = nowNs();
-    var s = try Session.open(gpa, path);
+    var s = Session.open(gpa, path) catch |e| {
+        // Sorgente che non si apre (rete giù, server muto): conta quanto ci mette
+        // a dirlo e che non resti niente aperto.
+        std.debug.print("bench: open fallita ms={d:.1} err={s}\n", .{ @as(f64, @floatFromInt(nowNs() - t_open)) / 1e6, @errorName(e) });
+        if (@hasDecl(video, "shutdownEngines")) video.shutdownEngines();
+        const t_wait = nowNs();
+        while (countDir("/proc/self/task") > th0 and nowNs() - t_wait < 2 * std.time.ns_per_s) sleepNs(10 * std.time.ns_per_ms);
+        std.debug.print("bench: end fds={d} threads={d}\n", .{ countDir("/proc/self/fd"), countDir("/proc/self/task") });
+        return;
+    };
     std.debug.print("bench: open ms={d:.1} size={d}x{d} dur={d:.2}s fds={d} threads={d}\n", .{
         @as(f64, @floatFromInt(nowNs() - t_open)) / 1e6, s.sink.w, s.sink.h, s.vs.dur_s, countDir("/proc/self/fd"), countDir("/proc/self/task"),
     });
@@ -189,6 +214,7 @@ pub fn main(init: std.process.Init) !void {
             const ta = countDir("/proc/self/task");
             var i: u32 = 0;
             var open_ns: i64 = 0;
+            var max_close: f64 = 0;
             while (i < n) : (i += 1) {
                 const t0 = nowNs();
                 s = try Session.open(gpa, path);
@@ -199,11 +225,12 @@ pub fn main(init: std.process.Init) !void {
                     _ = s.run(0.02); // il seek parte, la chiusura lo trova in volo
                 } else _ = s.run(0.15);
                 s.close();
+                max_close = @max(max_close, last_close_ms);
                 if (cold) if (@hasDecl(video, "shutdownEngines")) video.shutdownEngines();
                 if (i % 10 == 9 or i + 1 == n) std.debug.print("bench: cycle {d} fds={d} threads={d}\n", .{ i + 1, countDir("/proc/self/fd"), countDir("/proc/self/task") });
             }
-            std.debug.print("bench: {s} n={d} fds {d}->{d} threads {d}->{d} avg_open_ms={d:.1}\n", .{
-                cmd, n, fa, countDir("/proc/self/fd"), ta, countDir("/proc/self/task"), @as(f64, @floatFromInt(open_ns)) / @as(f64, @floatFromInt(n)) / 1e6,
+            std.debug.print("bench: {s} n={d} fds {d}->{d} threads {d}->{d} avg_open_ms={d:.1} max_close_ms={d:.1}\n", .{
+                cmd, n, fa, countDir("/proc/self/fd"), ta, countDir("/proc/self/task"), @as(f64, @floatFromInt(open_ns)) / @as(f64, @floatFromInt(n)) / 1e6, max_close,
             });
             s = try Session.open(gpa, path);
         } else {
@@ -211,6 +238,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     s.close();
+    std.debug.print("bench: close ms={d:.1}\n", .{last_close_ms});
     const fe = countDir("/proc/self/fd");
     const te = countDir("/proc/self/task");
     if (@hasDecl(video, "shutdownEngines")) video.shutdownEngines();
