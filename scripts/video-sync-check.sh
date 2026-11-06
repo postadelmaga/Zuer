@@ -17,7 +17,10 @@ set -euo pipefail
 N=${1:-300}; shift || true
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 GUI=${ZUER_GUI:-$ROOT/zig-out/bin/zuer-gui}
-WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
+WORK=$(mktemp -d); GP=
+# Anche se una cattura fallisce (set -e): la GUI non deve restare aperta, una
+# seconda finestra falserebbe le verifiche successive.
+trap '[ -n "$GP" ] && kill $GP 2>/dev/null; rm -rf "$WORK"' EXIT
 [ -n "${WAYLAND_DISPLAY:-}" ] || { echo "serve WAYLAND_DISPLAY (compositor wlroots)"; exit 2; }
 command -v grim >/dev/null || { echo "serve grim"; exit 2; }
 export ZUER_MPV_OPTS="${ZUER_MPV_OPTS:-ao=null}"
@@ -30,7 +33,7 @@ env "$@" "$GUI" "$WORK/flash.mp4" > "$WORK/gui.log" 2>&1 &
 GP=$!
 sleep 4 # apertura e controlli che spariscono
 for i in $(seq -w 1 "$N"); do grim -t ppm "$WORK/s$i.ppm"; done
-kill $GP; wait $GP 2>/dev/null || true
+kill $GP; wait $GP 2>/dev/null || true; GP=
 grep -E "dmabuf su|piano dmabuf|readback" "$WORK/gui.log" || true
 
 python3 - "$WORK" <<'EOF'
