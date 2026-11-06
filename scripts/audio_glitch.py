@@ -2,6 +2,7 @@
 """Analizza una registrazione di un tono sinusoidale puro e conta le discontinuità.
 
   audio_glitch.py FILE.raw FREQ [T0_MONOTONIC] [EVENTI]
+  MARKERS=0.5 audio_glitch.py ...   (canale destro: impulsi ogni 0,5 s)
 
 FILE.raw: float32le stereo 48 kHz (es. `parec --raw --format=float32le` dal
 monitor di un sink). Un seno puro soddisfa x[n] = 2cos(w)·x[n-1] - x[n-2]: il
@@ -14,7 +15,14 @@ Con T0 (istante monotono dell'inizio registrazione) ed EVENTI (file con righe
 "istante_monotono etichetta") ogni anomalia viene attribuita all'evento più
 vicino nei 400 ms precedenti (seek, pausa, cambio sorgente…): quelle sono attese,
 le altre no.
+
+Con MARKERS=P il canale DESTRO porta un impulso breve ogni P secondi di contenuto
+(es. 2 kHz per 20 ms): l'intervallo tra due impulsi registrati è P più i buchi in
+mezzo, se la posizione si conserva. Il salto di posizione di un intervallo è
+P + buchi − intervallo (0 = nessun contenuto perso o ripetuto; > 0 = contenuto
+saltato). Serve per i passaggi tra un motore audio e l'altro (tasto `v`).
 """
+import os
 import sys
 
 import numpy as np
@@ -40,7 +48,11 @@ amp = np.abs(x)
 # Inviluppo su finestre di 1 ms: un ciclo intero a 1 kHz.
 win = RATE // 1000
 env = amp[: n // win * win].reshape(-1, win).max(axis=1)
-on = env > 0.01
+# Soglia relativa al livello della registrazione: i due motori audio possono
+# suonare a volumi diversi (volume ricordato per flusso), e una soglia fissa
+# scambiava per silenzio il più basso.
+peak = np.percentile(env, 99) if len(env) else 0
+on = env > max(0.25 * peak, 1e-4)
 if not on.any():
     print("glitch: nessun tono nella registrazione")
     sys.exit(1)
@@ -73,7 +85,7 @@ last_c = -RATE
 for b in bad:
     if b < first * win or b > (last + 1) * win or gap_mask[b]:
         continue
-    if amp[b - 2 : b + 2].max() < 0.01:
+    if amp[b - 2 : b + 2].max() < 0.25 * peak:
         continue
     if b - last_c > RATE // 100:
         clicks.append(b)
@@ -113,3 +125,33 @@ for s, l in gaps:
     print("  buco a %.3f s lungo %d ms %s" % (s / RATE, l, who(s)))
 for c in clicks[:40]:
     print("  click a %.3f s residuo=%.3f %s" % (c / RATE, abs(r[c - 2]), who(c)))
+
+
+period = float(os.environ.get("MARKERS", "0"))
+if period > 0:
+    y = np.abs(raw[1::2].astype(np.float64))
+    yenv = y[: len(y) // win * win].reshape(-1, win).max(axis=1)
+    mthr = 0.3 * np.percentile(yenv, 99.5)
+    onsets = []
+    below = 0
+    for i, v in enumerate(yenv):
+        if v > mthr:
+            if below >= 100:  # almeno 100 ms di quiete prima: un impulso nuovo
+                onsets.append(i)
+            below = 0
+        else:
+            below += 1
+    gap_ms = np.zeros(len(yenv))
+    for s0, l in gaps:
+        gap_ms[s0 // win : s0 // win + l] = 1
+    jumps = []
+    for a, b in zip(onsets, onsets[1:]):
+        iv = b - a
+        g = int(gap_ms[a:b].sum())
+        j = period * 1000 + g - iv
+        if abs(j) > 15 or g > 0:
+            jumps.append((a, iv, g, j))
+    big = [x for x in jumps if abs(x[3]) > 15]
+    print("marcatori: impulsi=%d intervalli_con_buchi=%d salti_oltre_15ms=%d" % (len(onsets), sum(1 for x in jumps if x[2] > 0), len(big)))
+    for a, iv, g, j in jumps[:60]:
+        print("  a %.3f s intervallo=%d ms buchi=%d ms salto_posizione=%+d ms %s" % (a * win / RATE, iv, g, j, who(a * win)))

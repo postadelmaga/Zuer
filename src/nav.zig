@@ -757,13 +757,16 @@ fn videoReopenWorker(state: *GuiAppState, src: []u8, audio_src: ?[]u8, pos: f64)
     const now_s = if (vs.audio) |a| a.clockSeconds() else @max(pos, 0);
     if (vo.dec.audio_inside) {
         // L'audio è tornato nel motore (stessa sessione, stesso clock): l'audio
-        // del toggle si chiude. Il motore è partito da `pos`; un seek solo se
-        // l'apertura ha lasciato indietro più di un quarto di secondo.
+        // del toggle si chiude. Il motore è partito da `pos` (posizione del tasto)
+        // e l'audio intanto è andato avanti per tutta l'apertura (~0,1 s col
+        // motore riusato): oltre 30 ms si riallinea, altrimenti mpv ripeteva quel
+        // tratto (misurato 67–147 ms di contenuto ripetuto con la vecchia
+        // tolleranza di 250 ms). Il seek costa un buco breve, non una ripetizione.
         if (vs.audio) |a| a.stopAndDestroy();
         vs.audio = null;
         if (vs.detached_audio_src) |a| std.heap.smp_allocator.free(a);
         vs.detached_audio_src = null;
-        if (@abs(now_s - pos) > 0.25) vs.seek_to = now_s;
+        if (@abs(now_s - pos) > 0.03) vs.seek_to = now_s;
     } else {
         // Ripiego FFmpeg: il video è muto, l'audio del toggle resta il clock.
         if (vs.audio) |a| a.loop.store(false, .monotonic);

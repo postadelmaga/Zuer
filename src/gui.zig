@@ -1071,6 +1071,11 @@ pub fn main(init: std.process.Init) !void {
     // Comunica ai plugin decoder che siamo in modalità GUI (quindi vogliamo la massima risoluzione possibile)
     setEnvVar("ZUER_GUI", "1");
 
+    // I flussi audio di Zicro (AudioPlayer del tasto `v`, MIDI) si presentano come
+    // quelli di mpv (`audio-client-name=zuer`): il volume ricordato dal mixer di
+    // sistema è uno solo e non salta passando da un motore all'altro.
+    zicro.audio_device.setAppId("zuer");
+
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
