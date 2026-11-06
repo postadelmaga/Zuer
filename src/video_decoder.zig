@@ -133,7 +133,9 @@ pub fn setPresenter(p: ?Presenter) void {
     presenter_global = p;
 }
 
-const StartState = enum(u8) { pending, ok, failed, no_video };
+/// `open_failed`: la sorgente non si apre (mpv l'ha rifiutata prima di caricarla);
+/// `failed`: il motore o il primo frame non arrivano — lì un altro decoder può servire.
+const StartState = enum(u8) { pending, ok, failed, open_failed, no_video };
 
 pub const VideoDecoder = struct {
     /// Solo col motore FFmpeg: con mpv la sorgente non viene mai aperta da Zuer.
@@ -209,13 +211,18 @@ pub const VideoDecoder = struct {
     };
 
     /// Apre la sessione su `path_z` e ne restituisce il poster. mpv se c'è;
-    /// altrimenti (o se mpv non riesce ad aprirla) FFmpeg. `error.NoVideoStream`
+    /// altrimenti (motore mpv non disponibile o guasto) FFmpeg; una sorgente che
+    /// mpv non apre è `error.OpenFailed` senza secondo tentativo. `error.NoVideoStream`
     /// se mpv ha aperto la sorgente e non ha video (un audio con copertina).
     pub fn start(path_z: [*:0]const u8, gpa: std.mem.Allocator, max_dim: usize, opts: StartOptions) !StartResult {
         if (comptime mpv_enabled) {
             if (std.c.getenv("ZUER_NO_MPV") == null) {
                 if (startMpv(path_z, gpa, max_dim, opts)) |r| return r else |e| switch (e) {
                     error.NoVideoStream => return e,
+                    // mpv apre con la stessa libavformat del ripiego: una sorgente che
+                    // non si apre (rete giù, 404, file illeggibile) non si aprirebbe
+                    // nemmeno lì — ritentare raddoppia solo connessioni e attesa.
+                    error.MpvOpenFailed => return error.OpenFailed,
                     error.MpvUnavailable => {}, // già detto una volta, all'init fallita
                     else => std.log.warn("zuer video: mpv non apre la sorgente ({s}), ripiego sul decoder FFmpeg", .{@errorName(e)}),
                 }
@@ -301,7 +308,11 @@ pub const VideoDecoder = struct {
         const st = self.start_state.load(.acquire);
         if (st != .ok) {
             self.stopAndDestroy();
-            return if (st == .no_video) error.NoVideoStream else error.MpvOpenFailed;
+            return switch (st) {
+                .no_video => error.NoVideoStream,
+                .open_failed => error.MpvOpenFailed,
+                else => error.MpvStartFailed,
+            };
         }
         // Lo slot 0 è del consumatore finché `head` non lo supera: il motore non
         // lo riscrive, la copia qui è sicura.
@@ -496,7 +507,7 @@ pub const VideoDecoder = struct {
             const ev = m.pollEvents();
             self.applyEvents(ev);
             if (ev.failed or (ev.ended and !loaded)) {
-                self.finishStart(.failed);
+                self.finishStart(if (loaded) .failed else .open_failed);
                 return false;
             }
             if (ev.file_loaded) {
