@@ -24,6 +24,7 @@ const builtin = @import("builtin");
 const vtcache = @import("vtcache.zig");
 const layout_mod = @import("layout.zig");
 const crash_report = @import("crash_report.zig");
+const hwdec_caps = @import("hwdec_caps.zig");
 
 /// Un risultato di ricerca (stringhe e miniatura possedute, vedi `freeResults`).
 pub const Result = struct {
@@ -666,16 +667,35 @@ fn openWorker(state: *GuiAppState, id: []u8, title_opt: ?[]u8, resume_s: f64, he
     // Selettore formato dalla qualità scelta nei chip dell'overlay.
     var fmt_buf: [48]u8 = undefined;
     const fmt_sel = std.fmt.bufPrint(&fmt_buf, "bv*[height<={d}]+ba/b", .{height}) catch "bv*[height<=720]+ba/b";
+    // A parità di risoluzione e fps, il codec che la GPU decodifica in hardware
+    // (altrimenti yt-dlp sceglie AV1/VP9 anche dove finirebbero in software).
+    var sort_buf: [48]u8 = undefined;
+    const sort: ?[]const u8 = if (hwdec_caps.get()) |caps| hwdec_caps.ytdlpSort(&sort_buf, caps, height) else null;
 
     // `--print urls` equivale a `-g`; con titolo da scoprire lo si stampa come
     // prima riga nella stessa estrazione (una sola chiamata yt-dlp).
-    const argv_with_title = [_][]const u8{
-        "yt-dlp", "--no-warnings", "--no-playlist", "--print", "%(title).96s", "--print", "urls", "-f", fmt_sel, url,
-    };
-    const argv_plain = [_][]const u8{
-        "yt-dlp", "--no-warnings", "--no-playlist", "-g", "-f", fmt_sel, url,
-    };
-    var res = decoder_mod.runCaptureTimeout(state.gpa, if (title_opt == null) &argv_with_title else &argv_plain, 30_000) catch |e| {
+    var argv_buf: [14][]const u8 = undefined;
+    var argc: usize = 0;
+    const head = [_][]const u8{ "yt-dlp", "--no-warnings", "--no-playlist" };
+    for (head) |a| {
+        argv_buf[argc] = a;
+        argc += 1;
+    }
+    const mid: []const []const u8 = if (title_opt == null) &.{ "--print", "%(title).96s", "--print", "urls" } else &.{"-g"};
+    for (mid) |a| {
+        argv_buf[argc] = a;
+        argc += 1;
+    }
+    if (sort) |srt| {
+        argv_buf[argc] = "-S";
+        argv_buf[argc + 1] = srt;
+        argc += 2;
+    }
+    argv_buf[argc] = "-f";
+    argv_buf[argc + 1] = fmt_sel;
+    argv_buf[argc + 2] = url;
+    argc += 3;
+    var res = decoder_mod.runCaptureTimeout(state.gpa, argv_buf[0..argc], 30_000) catch |e| {
         if (title_opt) |t| state.gpa.free(t);
         finishOpenErr(state, if (e == error.Timeout) "risoluzione stream scaduta" else "yt-dlp non eseguibile");
         return;

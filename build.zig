@@ -452,7 +452,7 @@ pub fn build(b: *std.Build) void {
 
     // Test unitari puri (nessuna dipendenza nativa): `zig build test`.
     const test_step = b.step("test", "Esegue i test unitari");
-    for ([_][]const u8{ "src/detect.zig", "src/scheduler.zig", "src/thumbs.zig", "src/meshcache.zig", "src/wake.zig" }) |src_path| {
+    for ([_][]const u8{ "src/detect.zig", "src/scheduler.zig", "src/thumbs.zig", "src/meshcache.zig", "src/wake.zig", "src/hwdec_caps.zig" }) |src_path| {
         const t = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path(src_path),
             .target = target,
