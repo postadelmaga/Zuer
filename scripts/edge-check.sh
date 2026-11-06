@@ -37,14 +37,17 @@ for f in empty.txt empty.png trunc.png wrongext.png random.bin bad.csv badutf8.t
     kind=$(head -c 200 "$W/out" | grep -oE '"type":"[a-z]+"' | head -1)
     check "$f: esito ${kind:-nessuno} in $ms ms (rc=$rc)" "[ $rc = 0 ] && [ -n '$kind' ]"
 done
-check "empty.txt è testo vuoto, non un errore" "(cd / && '$Z' --json '$W/empty.txt') | grep -q '\"type\":\"text\"'"
-check "fifo.txt rifiutata come file non regolare" "(cd / && '$Z' --json '$W/fifo.txt') | grep -q 'non regolare\|Non è un file regolare'"
-check "plugin trovati lanciando da /" "(cd / && '$Z' --json '$W/bad.csv') | grep -q '\"type\":\"csv\"'"
+# Ogni invocazione con un tetto: un caso che si appende non deve appendere lo script.
+json() { (cd / && timeout 30 "$Z" --json "$W/$1"); }
+check "empty.txt è testo vuoto, non un errore" "json empty.txt | grep -q '\"type\":\"text\"'"
+check "fifo.txt rifiutata come file non regolare" "json fifo.txt | grep -q 'Non è un file regolare'"
+check "plugin trovati lanciando da /" "json bad.csv | grep -q '\"type\":\"csv\"'"
 if [ -n "${WAYLAND_DISPLAY:-}" ]; then
     ZUER_MPV_OPTS=ao=null "$ROOT/zig-out/bin/zuer-gui" "$W/fifo.mp4" > "$W/gui.log" 2>&1 &
     gp=$!; sleep 3
     held=$(ls -l /proc/$gp/fd 2>/dev/null | grep -c 'fifo.mp4')
-    kill $gp 2>/dev/null; wait $gp 2>/dev/null; gp=
+    # SIGKILL: con un player appeso la GUI non uscirebbe al TERM (è il difetto cercato).
+    kill -9 $gp 2>/dev/null; wait $gp 2>/dev/null; gp=
     check "GUI: la FIFO .mp4 non viene aperta (fd tenuti: $held)" "[ $held = 0 ]"
 fi
 exit $fail
