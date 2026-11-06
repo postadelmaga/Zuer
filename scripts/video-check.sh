@@ -69,6 +69,21 @@ done
 out=$(run "$WORK/trunc.ts" open-at 1)
 echo "$out" | grep open-at | sed "s|^|  [trunc.ts] |"
 check "trunc.ts riaperto da 1 s in meno di 3 s" "awk '/bench: open-at/{split(\$0,a,\" ms=\"); f=(a[2]+0 < 3000 && /ok=true/)} END{exit !f}' <<<\"\$out\""
+# Decoder hardware che cede a metà: H.264 4:2:0 -> 4:4:4 (profilo che VA-API in genere
+# non decodifica) -> 4:2:0, GOP da 5 s. Senza la ripartenza dal keyframe il software
+# non mostrava nulla fino al keyframe successivo: 7 s di video fermo.
+for part in "a yuv420p high 0" "b yuv444p high444 6" "c yuv420p high 12"; do
+    set -- $part
+    gen "hw_$1.ts" -f lavfi -i testsrc2=size=1920x1080:rate=30 -t 6 -c:v libx264 -preset veryfast -g 150 -bf 0 -pix_fmt "$2" -profile:v "$3" -output_ts_offset "$4" -f mpegts
+done
+[ -f "$WORK/hwswitch.ts" ] && [ "$WORK/hwswitch.ts" -nt "$WORK/hw_c.ts" ] || cat "$WORK"/hw_{a,b,c}.ts > "$WORK/hwswitch.ts"
+out=$("$BENCH" "$WORK/hwswitch.ts" play 14 2>&1 || true)
+if grep -q 'riparto dal keyframe' <<<"$out"; then
+    echo "$out" | grep -E 'bench: play|riparto' | sed "s|^|  [hwswitch.ts] |"
+    check "hw->sw a metà: il video riparte subito (>= 330 frame in 14 s)" "awk '/bench: play/{split(\$0,a,\"frames=\"); exit !(a[2]+0 >= 330)}' <<<\"\$out\""
+else
+    echo "non applicabile: hw->sw a metà (qui l'hardware non cede sul 4:4:4, o non c'è)"
+fi
 for clip in garbage.ts empty.ts; do
     out=$(ZUER_TRACE=1 "$BENCH" "$WORK/$clip" 2>&1 || true)
     check "$clip rifiutato senza crash" "grep -q 'bench: open fallita' <<<\"\$out\" && grep -q 'bench: end fds=4 threads=1' <<<\"\$out\""

@@ -631,6 +631,16 @@ pub const VideoDecoder = struct {
             }
             const ev = m.pollEvents();
             self.applyEvents(ev);
+            // Il decoder hardware ha ceduto a metà (mpv è passato al software): i
+            // pacchetti dal keyframe in poi li hanno consumati i tentativi falliti,
+            // e il software, partito a metà GOP, non mostra nulla fino al keyframe
+            // successivo (misurato: 1,2 s con GOP da 1 s, 7 s con GOP da 5 s). Un
+            // seek esatto alla posizione corrente lo fa ripartire dal keyframe.
+            if (ev.hw_to_sw and !awaiting_restart) {
+                std.log.info("zuer video: decodifica hardware fallita, mpv passa al software; riparto dal keyframe a {d:.2} s", .{m.pos});
+                m.seek(m.pos);
+                awaiting_restart = true;
+            }
             if (ev.playback_restart and awaiting_restart) {
                 trace("mpv seek finito", .{});
                 awaiting_restart = false;

@@ -666,6 +666,9 @@ pub const MpvVideo = struct {
         failed: bool = false,
         /// La sorgente è stata scaricata (fine, errore o `stopPlayback`).
         ended: bool = false,
+        /// mpv è passato dalla decodifica hardware a quella software durante la
+        /// riproduzione (il decoder hw ha fallito, es. un profilo che non regge).
+        hw_to_sw: bool = false,
     };
 
     pub fn pollEvents(self: *MpvVideo) Events {
@@ -702,6 +705,8 @@ pub const MpvVideo = struct {
                         },
                         prop_hwdec => {
                             const str = std.mem.span(@as(*const [*:0]const u8, @ptrCast(@alignCast(p.data))).*);
+                            const was = self.hwdec();
+                            if (was.len > 0 and !std.mem.eql(u8, was, "no") and std.mem.eql(u8, str, "no")) ev.hw_to_sw = true;
                             const n = @min(str.len, self.hwdec_buf.len);
                             @memcpy(self.hwdec_buf[0..n], str[0..n]);
                             self.hwdec_len = n;
