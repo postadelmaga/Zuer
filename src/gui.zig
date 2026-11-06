@@ -1378,7 +1378,14 @@ pub fn main(init: std.process.Init) !void {
     if (!yt_start and !gui_state.shared.loading) nav.schedulePrefetchAround(&gui_state);
 
     installTermHandlers(win);
-    win.run() catch {};
+    // Un errore della connessione col compositor (anche uno di protocollo, che
+    // libwayland ha già stampato) non è una chiusura dell'utente: si dice e si
+    // esce con 1, non con 0 come prima.
+    var code: u8 = 0;
+    win.run() catch |e| {
+        std.log.err("zuer: la finestra si è chiusa per un errore ({s})", .{@errorName(e)});
+        code = 1;
+    };
     // Esc/chiusura: esci SUBITO. NON aspettare il join dei thread di decode: possono
     // essere dentro una decodifica non interrompibile in un plugin .so, e attenderli
     // renderebbe Esc lento. Un viewer non ha stato da salvare; il SO libera
@@ -1387,6 +1394,6 @@ pub fn main(init: std.process.Init) !void {
     // mentre i loro thread stanno ancora lavorando, e chiudendo con un video in
     // riproduzione uno di quei thread andava in segfault. Non c'è nulla da salvare,
     // quindi niente distruttori.
-    if (comptime builtin.link_libc and builtin.os.tag != .windows) std.c._exit(0);
-    std.process.exit(0);
+    if (comptime builtin.link_libc and builtin.os.tag != .windows) std.c._exit(code);
+    std.process.exit(code);
 }
