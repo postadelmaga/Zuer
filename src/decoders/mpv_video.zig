@@ -222,6 +222,8 @@ const GpuTargets = struct {
     next: u8 = 0,
     presents: u64 = 0,
     retired: [2 * gpu_slots]GpuSlot = @splat(.{}),
+    /// `glFinish` invece di `glFlush` prima di consegnare un frame (vedi `syncMode`).
+    finish: bool = false,
 
     /// Il dispositivo GBM sulla stessa GPU del display EGL (quella del compositor).
     fn init(egl_display: c.EGLDisplay) !GpuTargets {
@@ -235,7 +237,30 @@ const GpuTargets = struct {
         errdefer _ = std.c.close(fd);
         const gbm = c.gbm_create_device(fd) orelse return error.GbmDevice;
         trace("dmabuf: GBM pronto");
-        return .{ .ext = ext, .drm_fd = fd, .gbm = gbm };
+        const finish = syncMode();
+        std.log.info("zuer video: dmabuf su {s} ({s}), consegna: {s}", .{
+            glString(c.GL_RENDERER), std.mem.span(node), if (finish) "glFinish (driver senza sincronia implicita garantita)" else "glFlush + sincronia implicita (Mesa)",
+        });
+        return .{ .ext = ext, .drm_fd = fd, .gbm = gbm, .finish = finish };
+    }
+
+    /// Chi garantisce che il compositor non legga un frame a metà, e che mpv non
+    /// riscriva un buffer che il compositor sta ancora campionando? Con Mesa la
+    /// sincronia implicita del dmabuf: il lavoro GPU sottomesso (glFlush) lascia
+    /// il suo fence sul buffer, la lettura del compositor lo attende, e la nostra
+    /// scrittura successiva attende le sue letture. I driver non Mesa (NVIDIA
+    /// proprietario) non la garantiscono: lì si consegna solo a GPU finita
+    /// (glFinish). La scrittura dopo `wl_buffer.release` resta coperta solo dal
+    /// rilascio stesso — senza fence espliciti (linux-drm-syncobj) è il massimo.
+    /// `ZUER_VIDEO_SYNC=finish|flush` forza la scelta (diagnostica).
+    fn syncMode() bool {
+        if (std.c.getenv("ZUER_VIDEO_SYNC")) |v| return std.mem.eql(u8, std.mem.span(v), "finish");
+        return std.mem.indexOf(u8, glString(c.GL_VERSION), "Mesa") == null;
+    }
+
+    fn glString(name: c.GLenum) []const u8 {
+        const p = c.glGetString(name) orelse return "?";
+        return std.mem.span(@as([*:0]const u8, @ptrCast(p)));
     }
 
     fn createSlot(t: *GpuTargets, display: c.EGLDisplay, w: u32, h: u32) !GpuSlot {
@@ -361,6 +386,8 @@ pub const MpvVideo = struct {
     drops: i64 = 0,
     delayed: i64 = 0,
     avsync_max: f64 = 0,
+    /// Massimo |scarto A/V| dall'ultima lettura di `takeAvsyncWindow` (diagnostica a tempo).
+    avsync_win: f64 = 0,
 
     /// Come la sessione usa mpv. `audio`: false solo per chi vuole il video muto
     /// (la riaccensione del video col 'v' mentre l'audio gira altrove).
@@ -597,6 +624,7 @@ pub const MpvVideo = struct {
         self.drops = 0;
         self.delayed = 0;
         self.avsync_max = 0;
+        self.avsync_win = 0;
     }
 
     /// Ciò che è successo dall'ultima chiamata (eventi svuotati senza attendere).
@@ -641,7 +669,11 @@ pub const MpvVideo = struct {
                         prop_fps => self.fps = @as(*const f64, @ptrCast(@alignCast(p.data))).*,
                         prop_drops => self.drops = @as(*const i64, @ptrCast(@alignCast(p.data))).*,
                         prop_delayed => self.delayed = @as(*const i64, @ptrCast(@alignCast(p.data))).*,
-                        prop_avsync => self.avsync_max = @max(self.avsync_max, @abs(@as(*const f64, @ptrCast(@alignCast(p.data))).*)),
+                        prop_avsync => {
+                            const a = @abs(@as(*const f64, @ptrCast(@alignCast(p.data))).*);
+                            self.avsync_max = @max(self.avsync_max, a);
+                            self.avsync_win = @max(self.avsync_win, a);
+                        },
                         prop_hwdec => {
                             const str = std.mem.span(@as(*const [*:0]const u8, @ptrCast(@alignCast(p.data))).*);
                             const n = @min(str.len, self.hwdec_buf.len);
@@ -797,9 +829,8 @@ pub const MpvVideo = struct {
         }
         const sl = &t.slots[i];
         if (!self.renderTo(sl.fbo, w, h)) return .busy;
-        // Sincronia implicita del dmabuf: il compositor attende il lavoro GPU
-        // sottomesso qui; basta che sia sottomesso.
-        c.glFlush();
+        // Consegna: sottomesso (Mesa, sincronia implicita) o finito (vedi `syncMode`).
+        if (t.finish) c.glFinish() else c.glFlush();
         t.next = @intCast((i + 1) % gpu_slots);
         t.presents += 1;
         t.reap(self.egl_display, false);

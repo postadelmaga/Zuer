@@ -582,9 +582,15 @@ pub const VideoDecoder = struct {
         var last_w: u32 = 0;
         var last_h: u32 = 0;
         var slot_wait = false;
+        const tracing = std.c.getenv("ZUER_TRACE") != null;
+        var report_at = monotonicNs() + 10 * std.time.ns_per_s;
         while (true) {
             const snap = ew.prepare();
             if (self.stop.load(.monotonic)) break;
+            if (tracing and monotonicNs() >= report_at) {
+                report_at += 10 * std.time.ns_per_s;
+                traceState(self, m);
+            }
 
             const want_pause = self.pause_req.load(.monotonic);
             if (want_pause != applied_pause) {
@@ -648,7 +654,8 @@ pub const VideoDecoder = struct {
                     if (!awaiting_restart) dirty = false;
                 }
             }
-            ew.wait(snap, if (slot_wait) 2 * std.time.ns_per_ms else null);
+            const tmo: ?u64 = if (slot_wait) 2 * std.time.ns_per_ms else if (tracing) @intCast(@max(0, report_at - monotonicNs())) else null;
+            ew.wait(snap, tmo);
             slot_wait = false;
         }
     }
@@ -953,9 +960,24 @@ fn logEnd(s: *const VideoDecoder, m: anytype) void {
     });
 }
 
+/// Ogni 10 s con ZUER_TRACE: dove si è, scarto A/V massimo nell'intervallo,
+/// contatori di mpv e dei present. Per seguire le prove lunghe (clock, drop).
+fn traceState(s: *const VideoDecoder, m: *mpv_video.MpvVideo) void {
+    trace("stato: pos={d:.1} avsync_max_10s_ms={d:.1} mpv drop={d} vo_ritardati={d} dmabuf frame={d} persi={d}", .{
+        m.pos, m.avsync_win * 1000, m.drops, m.delayed, s.gpu_stats.frames, s.gpu_stats.busy_drops,
+    });
+    m.avsync_win = 0;
+}
+
 fn logGpu(m: anytype) void {
     const hw = m.hwdec();
-    std.log.info("zuer video: piano dmabuf attivo (hwdec={s}, XBGR8888 LINEAR, nessuna copia CPU per frame)", .{if (hw.len == 0) "no" else hw});
+    // `*-copy`: il decoder hw riporta i frame in RAM e mpv li ricarica (succede se
+    // il compositor gira su una GPU senza VA-API: decodifica sull'altra, con copia).
+    const copy = std.mem.endsWith(u8, hw, "-copy");
+    std.log.info("zuer video: piano dmabuf attivo (hwdec={s}, XBGR8888 LINEAR, {s})", .{
+        if (hw.len == 0) "no" else hw,
+        if (copy) "decodifica con copia in RAM, presentazione senza copie" else "nessuna copia CPU per frame",
+    });
 }
 
 /// Una riga per sessione: quale motore, quale decodifica hw, dove va l'audio.
