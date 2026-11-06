@@ -272,6 +272,7 @@ pub fn openVideoOnly(path: []const u8, audio_src: ?[]const u8, start_s: f64, gpa
             .audio = audio_src != null,
             .audio_url = audio_src,
             .start_s = start_s,
+            .paused = true,
         });
         return .{ .dec = r.dec, .rgba = r.rgba, .w = r.w, .h = r.h };
     }

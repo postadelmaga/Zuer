@@ -210,6 +210,9 @@ pub const VideoDecoder = struct {
         audio: bool = true,
         /// Posizione di partenza (s): la sessione apre lì, senza un seek dopo.
         start_s: f64 = 0,
+        /// La sessione resta in pausa dopo il primo frame finché `setPlaying(true)`:
+        /// chi chiude prima un altro audio non lo sente sovrapporsi (tasto v).
+        paused: bool = false,
     };
 
     /// Apre la sessione su `path_z` e ne restituisce il poster. mpv se c'è;
@@ -287,6 +290,7 @@ pub const VideoDecoder = struct {
             .want_audio = opts.audio,
             .start_s = opts.start_s,
             .presenter = presenter_global,
+            .pause_req = .init(opts.paused),
         };
         var attached = false;
         defer if (!attached) self.freeMemory();
@@ -595,17 +599,19 @@ pub const VideoDecoder = struct {
                 traceState(self, m);
             }
 
-            const want_pause = self.pause_req.load(.monotonic);
-            if (want_pause != applied_pause) {
-                m.setPaused(want_pause);
-                applied_pause = want_pause;
-            }
+            // Prima il seek, poi la ripresa: arrivati insieme, mpv non suona
+            // nemmeno un istante dalla posizione vecchia.
             const sk = self.seek_ms.swap(-1, .monotonic);
             if (sk >= 0) {
                 trace("mpv seek {d} ms", .{sk});
                 m.seek(@as(f64, @floatFromInt(sk)) / 1000.0);
                 prod_gen = self.gen.load(.monotonic);
                 awaiting_restart = true;
+            }
+            const want_pause = self.pause_req.load(.monotonic);
+            if (want_pause != applied_pause) {
+                m.setPaused(want_pause);
+                applied_pause = want_pause;
             }
             const ev = m.pollEvents();
             self.applyEvents(ev);
