@@ -304,3 +304,18 @@ file esisteva, ma lo scrive su un thread staccato, quindi due decode ravvicinati
 dello stesso GLB serializzavano entrambi. Ora un registro delle chiavi in scrittura
 lo impedisce: le istruzioni sono −1,3% rispetto alla versione vecchia e identiche
 in ogni esecuzione (prima variavano del 2% a seconda dei tempi).
+
+---
+
+## Licenza
+
+Copyright © 2026 Francesco Magazzù. Zuer è distribuito sotto la **GNU Affero General
+Public License v3.0 o successiva** (vedi [`LICENSE`](LICENSE)), come il framework
+[zicro](../Zicro).
+
+`SPDX-License-Identifier: AGPL-3.0-or-later`
+
+Componenti di terze parti in `vendor/`: stb (pubblico dominio / MIT), TinySoundFont
+(MIT), header e import-lib di FFmpeg (LGPL/GPL secondo la build), import-lib
+Vulkan generata da `vulkan.def`. Le DLL FFmpeg dell'installer Windows hanno la licenza della build
+scaricata.

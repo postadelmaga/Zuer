@@ -176,5 +176,7 @@ differenza).
    KDE prende Meta+Z. L'installer Windows invece non cambia i predefiniti.
 8. **Aperture ~9 ms più lente di `main`** (vedi Benchmark): costo del caricare senza
    `start=0`, che rendeva inapribili i TS senza indice.
-9. **Licenza:** il repository Zuer non contiene un file di licenza (Zicro è
-   AGPL-3.0-or-later con licenza commerciale). Va scelta prima di distribuire.
+
+## Licenza
+
+AGPL-3.0-or-later (`LICENSE`), come Zicro. Componenti di terze parti: vedi README.
