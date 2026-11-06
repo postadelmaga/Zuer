@@ -5,8 +5,10 @@ documenti, tabelle, immagini, mesh 3D e video — sia nel **terminale** (`zuer`)
 in una **finestra** (`zuer-gui`) — costruito sui framework [zicro](../Zicro) (UI/paint
 in stile egui) e [zrame](../Zicro/zrame) (finestra + input cross-platform).
 
-Gira su **Linux** (Wayland) e **Windows** (GDI); il rendering 3D passa per Vulkan e
-la decodifica video per libav (FFmpeg).
+Gira su **Linux** (Wayland) e **Windows** (GDI); il rendering 3D passa per Vulkan, il
+video per **libmpv** su Linux (decodifica hardware, piano dmabuf del compositor) e per
+libav (FFmpeg) dove mpv manca. Versione **1.0.0-rc.1**: cosa è verificato, cosa no e i
+limiti noti sono in [RELEASE.md](RELEASE.md).
 
 ---
 
@@ -18,7 +20,7 @@ la decodifica video per libav (FFmpeg).
 | **Tabelle** | `.csv`, `.tsv`, `.xlsx`, `.xls`, `.ods`, `.zip`, `.jar`, `.cbz`, `.epub`, … | griglia con header fisso; workbook multi-foglio con linguette |
 | **Immagini** | `.png`, `.jpg`, `.gif`, `.bmp`, `.webp`, `.tif`, `.avif`, `.heic`, `.ico` | decodifica nativa (stb_image; WebP con `libwebp` caricata a runtime su Linux), gli altri formati via ImageMagick |
 | **Mesh 3D** | `.obj`, `.stl`, `.glb`, `.gltf`, `.ply`, `.fbx`, `.dae`, `.3ds` | renderer Vulkan (PBR-ish, shadow pass), orbita col mouse |
-| **Video** | `.mp4`, `.mkv`, `.webm`, `.mov`, `.avi`, `.m4v`, … | player libav con timeline/scrubbing stile YouTube |
+| **Video** | `.mp4`, `.mkv`, `.webm`, `.mov`, `.avi`, `.m4v`, `.ts`, … | libmpv (Linux) o libav, timeline/scrubbing stile YouTube; audio: oscilloscopio |
 | **Documenti** | `.pdf`, office | reso come immagine di pagina (via `pdftoppm`/`soffice`, solo Linux) |
 
 Il formato si riconosce anche **senza estensione o con quella sbagliata**:
@@ -39,18 +41,29 @@ PagSu/PagGiù o la rotellina.
 - **Zig 0.17** (vedi `minimum_zig_version` in `build.zig.zon`)
 - **glslc** (shaderc) — compila gli shader GLSL → SPIR-V durante la build
 - Il framework **zicro** (con dentro **zrame**, il livello finestra) come repository fratello in `../Zicro`
-- **Linux**: loader Vulkan di sistema, FFmpeg (pkg-config), `wayland-client`;
-  opzionali per pdf/office: `poppler` (`pdftoppm`) e LibreOffice (`soffice`)
+- **Linux**: loader Vulkan di sistema, FFmpeg (pkg-config), `wayland-client`, EGL/GL,
+  GBM (Mesa), PipeWire, harfbuzz;
+  a runtime, facoltativi: **libmpv** (`libmpv.so.2`: senza, il video ripiega su
+  libav, senza piano dmabuf), `libva` (sonda hwdec), `poppler` (`pdftoppm`) e
+  LibreOffice (`soffice`) per pdf/office, ImageMagick per i formati immagine rari,
+  `yt-dlp` per i link YouTube
 
 ---
 
 ## Build & installazione (Linux)
 
 ```sh
-zig build                 # produce zig-out/bin/{zuer, zuer-gui} + i plugin decoder
+zig build -Doptimize=ReleaseFast   # zig-out/bin/{zuer, zuer-gui} + plugin in zig-out/lib
 ./install.sh              # installa in ~/.local/bin + associazioni file (ReleaseSafe)
 ./install.sh --fast       # build Debug senza LLVM: compila in pochi secondi (sviluppo)
+./install.sh --uninstall  # rimuove binari, plugin, voci di menu e associazioni
+zuer --version            # (anche zuer-gui --version)
 ```
+
+`install.sh` rende Zuer l'applicazione **predefinita** per immagini, testo, csv,
+markdown, obj/glb e zip (`xdg-mime default`) e su KDE registra Meta+Z e la voce
+"Anteprima rapida" di Dolphin. I plugin si cercano solo accanto all'eseguibile
+(`<exe>/decoders`, `<exe>`, `<exe>/../lib`), mai nella cartella corrente.
 
 Uso:
 
@@ -123,6 +136,12 @@ in sync (office/pdf sono Linux-only → non associati su Windows).
 | `ZUER_GPU=<indice\|nome>` | forza la GPU (es. `ZUER_GPU=intel` o `ZUER_GPU=0`); zuer logga i device che vede. Off-Linux preferisce l'**integrata** (readback economico) |
 | `ZUER_WORKERS=<n>` | numero massimo di worker dello scheduler condiviso (default: core logici − 1) |
 | `ZUER_THUMB_JOBS=<n>` | job paralleli delle miniature per cartella (default 2, mai oltre `ZUER_WORKERS`) |
+| `ZUER_TRACE=1` | diagnostica su stderr: avvio del motore video, contesto GL, ricomposizioni e costo dell'overlay al secondo, riga "fine sessione" (frame, persi, pacing, A/V) |
+| `ZUER_MPV_OPTS=k=v,…` | opzioni passate a mpv (es. `hwdec=no`, `ao=null` per i test muti) |
+| `ZUER_VIDEO_PLANE=0` | niente piano dmabuf: frame letti dalla GPU e composti in CPU |
+| `ZUER_NO_MPV=1` | video col solo decoder libav |
+| `ZUER_NO_CRASH_REPORT=1` | disattiva il report dei crash (vedi RELEASE.md) |
+| `ZUER_CRASH_NO_BROWSER=1` | report solo verso `ZUER_CRASH_URL`, mai il browser |
 | `ZUER_OPAQUE=1` | finestra **opaca** (BitBlt veloce) invece del vetro layered: utile per testare 3D/video fluidi **sotto Wine**, dove senza DWM il vetro va composto in software. Su Windows vero il DWM compone il vetro in GPU, quindi non serve |
 
 Due capacità native, ognuna con la sua import-lib, attivabili a parte:
