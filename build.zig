@@ -472,6 +472,16 @@ pub fn build(b: *std.Build) void {
         t.root_module.addImport("zicro", dep_zicro.module("zicro"));
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
+    {
+        // Lo scrim dei controlli video: solo `paint` di zicro.
+        const t = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("src/video_scrim.zig"),
+            .target = target,
+            .optimize = optimize,
+        }) });
+        t.root_module.addImport("zicro", dep_zicro.module("zicro"));
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
 
     // Benchmark di contesa: decode in primo piano mentre altri thread
     // decodificano in sfondo (`zig build bench-decode -- <fg> <bg...>`).

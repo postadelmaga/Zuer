@@ -400,6 +400,9 @@ fn renderWorker(
     // coprirebbe il piano); `vid_ovl_acc` cadenza i controlli visibili a ~8 Hz.
     var vid_prev_gpu = false;
     var vid_ovl_acc: f32 = 0;
+    // ZUER_TRACE: ricomposizioni dell'overlay video al secondo (piene / a fascia) e
+    // tempo speso a comporle e consegnarle.
+    var ovl_tr = struct { full: u32 = 0, band: u32 = 0, ns: u64 = 0, acc: f32 = 0 }{};
     var vid_ovl_key: u64 = 0;
     // Taglia del buffer all'ultimo present INTERO: un present della sola fascia dei
     // controlli vale solo se il resto del buffer è ancora quello.
@@ -590,6 +593,7 @@ fn renderWorker(
             if (do_present) last_label_alpha = label_alpha;
             var pres_w: u32 = 0;
             var pres_h: u32 = 0;
+            const ovl_t0 = if (trace_on) std.Io.Clock.awake.now(state.io).nanoseconds else 0;
             if (do_present) {
                 // Buffer STRETTO in aspect-fit: zrame lo centra nel vetro e ne arrotonda
                 // gli angoli col solito content_radius — stesso frame di ogni altro tipo
@@ -620,7 +624,9 @@ fn renderWorker(
                         if (sub_raster) |*r| videomod.drawSubtitle(composited_rgba.*, fr.w, fr.h, r, sub_txt);
                     }
                 }
-                videomod.drawVideoControls(composited_rgba.*, fr.w, fr.h, vs, raster);
+                // Fascia trasparente sotto i controlli: piano dmabuf e nessun sottotitolo
+                // (disegnato prima, può cadere nelle righe dello scrim).
+                videomod.drawVideoControls(composited_rgba.*, fr.w, fr.h, vs, raster, gpu_video and !state.shared.yt.subs_on);
                 // Fuori dalla fascia dei controlli il buffer è già quello buono.
                 if (pres_dirty == null) {
                     if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, fr.w, fr.h, r, std.fs.path.basename(state.shared.current_file_path), label_alpha);
@@ -652,6 +658,18 @@ fn renderWorker(
             // il worker è unico proprietario) nel mailbox di zrame → i callback
             // input non aspettano la copia del frame.
             if (do_present) win.presentRgbaRegion(pres_w, pres_h, composited_rgba.*, pres_dirty);
+            if (trace_on) {
+                if (do_present) {
+                    if (pres_dirty != null) ovl_tr.band += 1 else ovl_tr.full += 1;
+                    ovl_tr.ns += @intCast(std.Io.Clock.awake.now(state.io).nanoseconds - ovl_t0);
+                }
+                ovl_tr.acc += frame_dt;
+                if (ovl_tr.acc >= 1.0) {
+                    const n = ovl_tr.full + ovl_tr.band;
+                    std.debug.print("[trace] overlay video: piene={d} fascia={d} ms_totali={d:.1} ms_medi={d:.2}\n", .{ ovl_tr.full, ovl_tr.band, @as(f64, @floatFromInt(ovl_tr.ns)) / 1e6, if (n > 0) @as(f64, @floatFromInt(ovl_tr.ns)) / 1e6 / @as(f64, @floatFromInt(n)) else 0 });
+                    ovl_tr = .{};
+                }
+            }
             // Vsync: dopo un present in riproduzione, attendi il frame callback
             // del compositor (zrame.waitFrame) così la fase del loop si aggancia
             // al repaint reale — il frame appena committato viene mostrato al

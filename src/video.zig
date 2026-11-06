@@ -14,6 +14,7 @@ const compose = @import("compose.zig");
 const builtin = @import("builtin");
 const zicro = @import("zicro");
 const paint = zicro.paint;
+const video_scrim = @import("video_scrim.zig");
 const glyph = @import("glyph.zig");
 
 // player.zig fa un @cImport degli header libav: importalo solo quando il video è
@@ -800,13 +801,14 @@ fn drawText(buf: []u8, W: u32, H: u32, raster: *glyph.Raster, x: i32, baseline: 
 /// Controlli overlay su UNA riga (play/pausa · tempo · timeline · durata), stile
 /// player moderno, disegnati sul buffer video `W`×`H` (l'area video è l'intero
 /// buffer), modulati dall'alpha di fade `vs.controls`.
-pub fn drawVideoControls(buf: []u8, W: u32, H: u32, vs: *VideoState, raster: ?*glyph.Raster) void {
+/// `under_clear`: la fascia dei controlli nel buffer è trasparente (piano video
+/// dmabuf sotto la finestra): lo scrim si scrive per righe invece di comporlo.
+pub fn drawVideoControls(buf: []u8, W: u32, H: u32, vs: *VideoState, raster: ?*glyph.Raster, under_clear: bool) void {
     const a = std.math.clamp(vs.controls, 0.0, 1.0);
     if (a <= 0.01) return;
     const u32px: [*]u32 = @ptrCast(@alignCast(buf.ptr));
     var canvas = paint.Canvas.initRgba8(u32px[0 .. @as(usize, W) * H], W, H);
     const L = ctrlLayout(W, H);
-    const vwf: f32 = @floatFromInt(W);
 
     // Scrim: sfuma da trasparente a scuro verso il basso, una riga alla volta e
     // senza sovrapposizioni. Sul piano video dmabuf il buffer sotto è trasparente:
@@ -815,16 +817,7 @@ pub fn drawVideoControls(buf: []u8, W: u32, H: u32, vs: *VideoState, raster: ?*g
     // Ogni riga col clip a sé stessa: senza, `fillRoundedRect` visita anche le due
     // righe di antialiasing sopra e sotto (copertura zero, ma una SDF per pixel —
     // era più di metà del costo dei controlli). Stesso risultato, pixel per pixel.
-    const rows: u32 = @intFromFloat(L.scrim_h);
-    const y_top = H - rows;
-    const saved_clip = canvas.clip;
-    var i: u32 = 0;
-    while (i < rows) : (i += 1) {
-        const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(rows));
-        _ = canvas.setClip(0, y_top + i, W, 1);
-        canvas.fillRoundedRect(0, @floatFromInt(y_top + i), vwf, 1, 0, paint.Color.rgba(0, 0, 0, 0.55 * t * t * a));
-    }
-    canvas.clip = saved_clip;
+    video_scrim.draw(&canvas, u32px[0 .. @as(usize, W) * H], W, H, @intFromFloat(L.scrim_h), a, under_clear);
 
     // Timeline + knob.
     const bar_h: f32 = 4.0;
