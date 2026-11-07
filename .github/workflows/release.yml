@@ -250,11 +250,12 @@ jobs:
             -t 8 -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest "$D/clip.mp4"
           ffmpeg -loglevel error -f lavfi -i testsrc2=size=1280x720:rate=30 -t 4 -c:v hevc_videotoolbox -tag:v hvc1 "$D/clip-hevc.mp4" || true
           cd "$T"
+          # feature-probe scrive su stderr: ogni `| tee` va con 2>&1.
           "$P" doc "$D"/prova.pdf "$D"/prova.docx "$D"/prova.xlsx "$D"/prova.pptx "$D"/prova.odt "$D"/prova.ods "$D"/cubo.obj "$D"/prova.txt "$D"/clip.mp4
-          "$P" page "$D/prova.pdf" 2 | tee page2.log
+          "$P" page "$D/prova.pdf" 2 2>&1 | tee page2.log
           grep -q 'immagine 1650x1275' page2.log || { echo "::error::pagina ruotata di 90° non resa in orizzontale"; exit 1; }
           "$P" page "$D/prova.pdf" 3
-          "$P" video "$D/clip.mp4" | tee video.log
+          "$P" video "$D/clip.mp4" 2>&1 | tee video.log
           grep -q 'decodifica hardware: sì' video.log && echo "VideoToolbox: attivo" || echo "::warning::decodifica hardware non attiva sul runner (software)"
           [[ -f "$D/clip-hevc.mp4" ]] && "$P" video "$D/clip-hevc.mp4"
           if ! "$P" audio "$D/clip.mp4"; then echo "::warning::audio: nessun dispositivo di uscita utilizzabile sul runner"; fi
