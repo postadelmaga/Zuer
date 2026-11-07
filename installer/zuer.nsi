@@ -68,6 +68,9 @@ Section "Install"
   File "${STAGE}\zuer-gui.exe"
   File "${STAGE}\decoder_*.dll"
   File "${STAGE}\LICENSE.txt"
+  ; PDFium (motore PDF, BSD/Apache): scripts/fetch-pdfium.sh.
+  File "${STAGE}\pdfium.dll"
+  File "${STAGE}\PDFium-LICENSE.txt"
 !ifdef HAVE_FFMPEG
   ; DLL runtime FFmpeg (player video); versionate → wildcard.
   File "${STAGE}\avformat-*.dll"
@@ -146,6 +149,8 @@ Section "Uninstall"
   Delete "$INSTDIR\avutil-*.dll"
   Delete "$INSTDIR\swscale-*.dll"
   Delete "$INSTDIR\swresample-*.dll"
+  Delete "$INSTDIR\pdfium.dll"
+  Delete "$INSTDIR\PDFium-LICENSE.txt"
   Delete "$INSTDIR\zuer.ico"
   Delete "$INSTDIR\LICENSE.txt"
   Delete "$INSTDIR\FFmpeg-LICENSE.txt"

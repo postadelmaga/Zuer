@@ -2,11 +2,12 @@
 # Costruisce l'installer Windows di zuer-gui partendo da Linux:
 #   1. cross-compila `zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast`
 #      in una staging dir pulita (solo exe + DLL, niente .pdb);
-#   2. opzionalmente scarica le DLL runtime FFmpeg (player video) accanto all'exe;
+#   2. scarica pdfium.dll (PDF) e, salvo --no-ffmpeg, le DLL runtime FFmpeg (player
+#      video) accanto all'exe;
 #   3. genera un'icona .ico (se ImageMagick è presente);
 #   4. genera `installer/associations.nsh` con le estensioni note ai decoder
 #      effettivamente inclusi nel build Windows (text/csv/markdown/mesh/image/
-#      glb/archive/media — office/pdf sono Linux-only e quindi non associati);
+#      glb/archive/media/office/pdf);
 #   5. compila `installer/zuer.nsi` con `makensis` → un unico Zuer-Setup.exe.
 #
 # Uso:  scripts/build-windows-installer.sh [--no-ffmpeg] [--out FILE.exe]
@@ -54,6 +55,9 @@ NSIS_SCRIPT="$ROOT/installer/zuer.nsi"
 command -v cygpath >/dev/null && NSIS_SCRIPT="$(cygpath -w "$NSIS_SCRIPT")"
 NSIS_DEFS=(-DSTAGE="$NSIS_STAGE" -DVERSION="$VERSION" -DOUTFILE="$OUT")
 
+echo "→ [2/5] PDFium (motore PDF)"
+"$ROOT/scripts/fetch-pdfium.sh" "$BIN"
+
 case "$FFMPEG" in
   full)
     echo "→ [2/5] FFmpeg: scarico le DLL LGPL di BtbN (~76 MB)"
@@ -84,8 +88,7 @@ fi
 echo "→ [4/5] genero associations.nsh"
 # ── Estensioni per decoder incluso nel build Windows ────────────────────────
 # Fonte di verità: le stringhe `zuer_extensions` in src/decoders/*.zig. Escluse
-# le voci senza estensione reale (gitignore/editorconfig/dockerfile/make…) e il
-# decoder pdf (poppler/CoreGraphics: non costruito per Windows).
+# le voci senza estensione reale (gitignore/editorconfig/dockerfile/make…).
 EXTS="$(cat <<'LIST'
 txt text log nfo rst adoc asciidoc org tex bib srt vtt diff patch
 json jsonl ndjson yaml yml toml ini cfg conf properties env plist lock
@@ -100,6 +103,7 @@ glb
 zip jar apk cbz epub xpi whl
 mp3 wav flac ogg oga ogv opus m4a mp4 m4v mov mkv webm avi mid midi
 docx pptx odt odp xlsx xlsm ods
+pdf
 LIST
 )"
 

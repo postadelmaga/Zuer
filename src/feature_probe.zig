@@ -10,6 +10,11 @@
 //!                                       SOLO con un file a traccia muta (anullsrc),
 //!                                       la prova non deve mai essere udibile
 //!   feature-probe gpu                   init renderer + render offscreen di un cubo
+//!   feature-probe pixel <file> <fx> <fy> <r> <g> <b>
+//!                                       colore del pixel in (fx, fy) ∈ [0,1]² entro
+//!                                       ±48 per canale (ordine dei byte, orientamento)
+//!   feature-probe dump <file> <out.ppm> immagine decodificata in un PPM (confronti fra
+//!                                       motori, es. poppler contro PDFium)
 //!
 //! Va lanciato dove zuer-gui troverebbe plugin e librerie: accanto all'eseguibile
 //! del bundle (Contents/MacOS) o nella cartella dell'installazione Windows.
@@ -53,13 +58,21 @@ pub fn main(init: std.process.Init) !u8 {
         probeAudio(io, gpa, args.next() orelse return usage());
     } else if (std.mem.eql(u8, cmd, "gpu")) {
         probeGpu(gpa);
+    } else if (std.mem.eql(u8, cmd, "pixel")) {
+        const path = args.next() orelse return usage();
+        var v: [5]f64 = undefined;
+        for (&v) |*x| x.* = std.fmt.parseFloat(f64, args.next() orelse return usage()) catch return usage();
+        probePixel(io, gpa, path, v);
+    } else if (std.mem.eql(u8, cmd, "dump")) {
+        const path = args.next() orelse return usage();
+        probeDump(io, gpa, path, args.next() orelse return usage());
     } else return usage();
     decoder.closePluginCache(gpa);
     return if (failed) 1 else 0;
 }
 
 fn usage() u8 {
-    std.debug.print("uso: feature-probe doc <file>... | page <pdf> <N> | video <file> | audio <file> | gpu\n", .{});
+    std.debug.print("uso: feature-probe doc <file>... | page <pdf> <N> | video <file> | audio <file> | gpu | pixel <file> <fx> <fy> <r> <g> <b> | dump <file> <out.ppm>\n", .{});
     return 2;
 }
 
@@ -87,6 +100,41 @@ fn probeDoc(io: std.Io, gpa: std.mem.Allocator, path: []const u8, page: ?usize) 
             report(im.width > 0 and im.height > 0 and hi > lo, "{s}: immagine {d}x{d}, pagine {d}, contrasto {d}..{d} ({s})", .{ base, im.width, im.height, im.total_pages, lo, hi, im.name });
         },
     }
+}
+
+fn probePixel(io: std.Io, gpa: std.mem.Allocator, path: []const u8, v: [5]f64) void {
+    var d = decoder.decode(path, io, gpa);
+    defer d.deinit(gpa);
+    const base = std.fs.path.basename(path);
+    const im = switch (d) {
+        .image => |im| im,
+        else => return report(false, "{s}: non è un'immagine", .{base}),
+    };
+    const x: usize = @intFromFloat(@min(@as(f64, @floatFromInt(im.width - 1)), @max(0, v[0] * @as(f64, @floatFromInt(im.width)))));
+    const y: usize = @intFromFloat(@min(@as(f64, @floatFromInt(im.height - 1)), @max(0, v[1] * @as(f64, @floatFromInt(im.height)))));
+    const px = im.pixels[(y * im.width + x) * 3 ..][0..3];
+    var ok = true;
+    for (px, v[2..5]) |got, want| {
+        if (@abs(@as(f64, @floatFromInt(got)) - want) > 48) ok = false;
+    }
+    report(ok, "{s}: pixel ({d},{d}) di {d}x{d} = {d},{d},{d} (atteso {d},{d},{d})", .{ base, x, y, im.width, im.height, px[0], px[1], px[2], v[2], v[3], v[4] });
+}
+
+fn probeDump(io: std.Io, gpa: std.mem.Allocator, path: []const u8, out: []const u8) void {
+    var d = decoder.decode(path, io, gpa);
+    defer d.deinit(gpa);
+    const im = switch (d) {
+        .image => |im| im,
+        else => return report(false, "{s}: non è un'immagine", .{path}),
+    };
+    var f = std.Io.Dir.cwd().createFile(io, out, .{}) catch |e| return report(false, "dump: {s}", .{@errorName(e)});
+    defer f.close(io);
+    var buf: [64 * 1024]u8 = undefined;
+    var w = f.writer(io, &buf);
+    w.interface.print("P6\n{d} {d}\n255\n", .{ im.width, im.height }) catch return report(false, "dump: scrittura", .{});
+    w.interface.writeAll(im.pixels) catch return report(false, "dump: scrittura", .{});
+    w.interface.flush() catch return report(false, "dump: scrittura", .{});
+    report(true, "dump: {s} → {s} ({d}x{d})", .{ std.fs.path.basename(path), out, im.width, im.height });
 }
 
 fn probeVideo(gpa: std.mem.Allocator, path: []const u8) void {

@@ -451,9 +451,10 @@ pub fn build(b: *std.Build) void {
             });
         }
         // The media decoder needs FFmpeg (+ compute_vp9 on Linux). pdf rasterizes with
-        // poppler's tools (Linux: subprocess + POSIX temp dirs) or with CoreGraphics
-        // (macOS, system framework opened at runtime): not built for Windows, which has
-        // neither. office is pure Zig (ZIP + XML) and builds everywhere, like the core
+        // poppler's tools (Linux: subprocess + POSIX temp dirs), CoreGraphics (macOS,
+        // system framework) or PDFium (Windows, pdfium.dll shipped next to the exe by
+        // scripts/fetch-pdfium.sh): the last two are opened at runtime, nothing links.
+        // office is pure Zig (ZIP + XML) and builds everywhere, like the core
         // plugins (text/csv/markdown/mesh/image/glb/archive/tar).
         const needs_ffmpeg = comptime std.mem.eql(u8, name, "media");
         const needs_tools = comptime std.mem.eql(u8, name, "pdf");
@@ -478,7 +479,7 @@ pub fn build(b: *std.Build) void {
                 b.installArtifact(lib);
             }
         } else if (needs_tools) {
-            if (os_tag == .linux or os_tag == .macos) b.installArtifact(lib);
+            if (os_tag == .linux or os_tag == .macos or os_tag == .windows) b.installArtifact(lib);
         } else {
             b.installArtifact(lib);
         }

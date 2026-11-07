@@ -24,10 +24,17 @@ const ImageData = decoder.ImageData;
 const Decoded = decoder.Decoded;
 
 /// Motore di rasterizzazione: CoreGraphics su macOS (di sistema, vedi
-/// pdf_coregraphics.zig), poppler (`pdftoppm`/`pdfinfo`) altrove. Il resto del
-/// plugin (frammento #page=N, clamp, memo del conteggio, cache su disco) è comune.
-const use_coregraphics = builtin.os.tag == .macos;
-const cg = if (use_coregraphics) @import("pdf_coregraphics.zig") else struct {};
+/// pdf_coregraphics.zig), PDFium su Windows (DLL nel pacchetto, vedi
+/// pdf_pdfium.zig), poppler (`pdftoppm`/`pdfinfo`) su Linux. Il resto del plugin
+/// (frammento #page=N, clamp, memo del conteggio, cache su disco) è comune.
+const Engine = enum { poppler, coregraphics, pdfium };
+const engine: Engine = switch (builtin.os.tag) {
+    .macos => .coregraphics,
+    .windows => .pdfium,
+    else => .poppler,
+};
+const cg = if (engine == .coregraphics) @import("pdf_coregraphics.zig") else struct {};
+const pf = if (engine == .pdfium) @import("pdf_pdfium.zig") else struct {};
 
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 extern fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
@@ -131,6 +138,12 @@ fn decodeTier(path: []const u8, io: std.Io, filename: []const u8, allocator: std
             "documento protetto da password"
         else if (e == error.CoreGraphicsUnavailable)
             "CoreGraphics non disponibile"
+        else if (e == error.PdfiumUnavailable)
+            "pdfium.dll assente o non valida: reinstalla Zuer"
+        else if (e == error.PdfOpenFailed)
+            "file PDF danneggiato o non valido"
+        else if (e == error.PdfPageTooLarge)
+            "pagina troppo grande"
         else
             @errorName(err);
         const msg = std.fmt.allocPrint(allocator, "Errore rendering PDF: {s}", .{hint}) catch "";
@@ -145,6 +158,9 @@ fn decodeTier(path: []const u8, io: std.Io, filename: []const u8, allocator: std
 /// frattempo), usa il path originale ma prefissato con `./` quando è relativo
 /// e inizia con `-`. Il chiamante libera con lo stesso allocator.
 fn absPath(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+    // PDFium è in processo: nessun argv da proteggere, e `_fullpath` lavorerebbe
+    // nella code page ANSI rovinando i percorsi UTF-8 non ASCII.
+    if (comptime engine == .pdfium) return gpa.dupe(u8, path);
     const pz = try gpa.dupeSentinel(u8, path, 0);
     defer gpa.free(pz);
     var buf: [4096]u8 = undefined; // PATH_MAX
@@ -240,10 +256,13 @@ fn decodeInner(clean_path: []const u8, filename: []const u8, dpi: []const u8, pa
 /// subprocess; tutti i cambi pagina successivi leggono dalla memo.
 fn fetchPageCount(gpa: std.mem.Allocator, abs_path: []const u8, fkey: u64) !usize {
     if (pageCountLookup(fkey)) |n| return n;
-    if (comptime use_coregraphics) {
-        const n = try cg.pageCount(abs_path);
-        pageCountStore(fkey, n);
-        return n;
+    switch (engine) {
+        .coregraphics, .pdfium => {
+            const n = if (engine == .pdfium) try pf.pageCount(gpa, abs_path) else try cg.pageCount(abs_path);
+            pageCountStore(fkey, n);
+            return n;
+        },
+        .poppler => {},
     }
 
     var info = try decoder.runCapture(gpa, &.{ "pdfinfo", abs_path });
@@ -325,6 +344,7 @@ const Stamp = struct { size: u64 = 0, mtime_ns: i128 = 0 };
 /// mtime + dimensione via statx: se il PDF viene riscritto sotto lo stesso
 /// path, chiave diversa → memo e cache su disco si invalidano da sole.
 fn fileStamp(abs_path: []const u8) Stamp {
+    if (builtin.os.tag == .windows) return win_stamp.get(abs_path);
     if (builtin.os.tag != .linux) return .{};
     const linux = std.os.linux;
     var buf: [4096]u8 = undefined;
@@ -340,6 +360,32 @@ fn fileStamp(abs_path: []const u8) Stamp {
         .mtime_ns = @as(i128, stx.mtime.sec) * std.time.ns_per_s + stx.mtime.nsec,
     };
 }
+
+/// Windows: dimensione + ultima scrittura (FILETIME, unità di 100 ns) dagli
+/// attributi del file, senza aprirlo.
+const win_stamp = if (builtin.os.tag == .windows) struct {
+    const Data = extern struct {
+        attrs: u32,
+        created: u64 align(4),
+        accessed: u64 align(4),
+        written: u64 align(4),
+        size_high: u32,
+        size_low: u32,
+    };
+    extern "kernel32" fn GetFileAttributesExW(name: [*:0]const u16, level: c_int, info: *Data) callconv(.winapi) c_int;
+
+    fn get(path: []const u8) Stamp {
+        var wbuf: [4096]u16 = undefined;
+        const n = std.unicode.utf8ToUtf16Le(wbuf[0 .. wbuf.len - 1], path) catch return .{};
+        wbuf[n] = 0;
+        var d: Data = undefined;
+        if (GetFileAttributesExW(wbuf[0..n :0].ptr, 0, &d) == 0) return .{};
+        return .{
+            .size = (@as(u64, d.size_high) << 32) | d.size_low,
+            .mtime_ns = @as(i128, d.written) * 100,
+        };
+    }
+} else struct {};
 
 fn fileKey(abs_path: []const u8, stamp: Stamp) u64 {
     var h = std.hash.Wyhash.init(0x9e3779b97f4a7c15);
@@ -376,12 +422,20 @@ const Page = struct {
 /// arbitrario può raggiungere pdftoppm.
 fn renderPage(gpa: std.mem.Allocator, abs_path: []const u8, key: u64, flag: []const u8, value: []const u8, page: usize) !Page {
     if (cacheRead(gpa, key)) |cached| return cached;
-    if (comptime use_coregraphics) {
-        const v = std.fmt.parseInt(u32, value, 10) catch return error.BadScale;
-        const sc: cg.Scale = if (std.mem.eql(u8, flag, "-r")) .{ .dpi = v } else .{ .fit = v };
-        const r = try cg.render(gpa, abs_path, page, sc, 20000, max_page_bytes);
-        return .{ .width = r.width, .height = r.height, .pixels = r.pixels };
+    switch (engine) {
+        .coregraphics, .pdfium => {
+            const m = if (engine == .pdfium) pf else cg;
+            const v = std.fmt.parseInt(u32, value, 10) catch return error.BadScale;
+            const sc: m.Scale = if (std.mem.eql(u8, flag, "-r")) .{ .dpi = v } else .{ .fit = v };
+            const r = try m.render(gpa, abs_path, page, sc, 20000, max_page_bytes);
+            return .{ .width = r.width, .height = r.height, .pixels = r.pixels };
+        },
+        .poppler => return renderPoppler(gpa, abs_path, flag, value, page),
     }
+}
+
+/// pdftoppm in un PPM temporaneo (solo Linux: mkdtemp, opendir).
+fn renderPoppler(gpa: std.mem.Allocator, abs_path: []const u8, flag: []const u8, value: []const u8, page: usize) !Page {
 
     // Rasterizzazione in un PPM temporaneo, dentro una directory privata creata
     // con mkdtemp: nome imprevedibile, niente symlink pre-creabili. (pdftoppm
