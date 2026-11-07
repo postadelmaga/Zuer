@@ -1,38 +1,49 @@
-# Zuer 1.0.0-rc.1 — note di rilascio
+# Zuer 1.0.0 — note di rilascio
 
-Release candidate, tag `v1.0.0-rc.1`. Zicro al commit di `.github/zicro.ref`
-(`b784b75`: `main` 5b1cf99 più la correzione Cocoa per macOS). Ogni affermazione qui sotto dice **come** è stata verificata:
+Versione stabile, tag `v1.0.0`. Zicro al commit di `.github/zicro.ref` (`65cfc86`,
+`main` di Zicro). Ogni affermazione qui sotto dice **come** è stata verificata:
 
 - **verificato**: provato su questa macchina, con lo script indicato;
+- **CI**: provato da GitHub Actions su un runner vero della piattaforma (macchina
+  virtuale: niente GPU fisica, niente utente), con le prove indicate;
 - **guasto iniettato / simulato**: la reazione di Zuer è provata, l'evento vero no;
 - **non verificato**: non provato; può funzionare, nessuna garanzia;
 - **non supportato**: non funziona o non è previsto.
 
-Macchina di prova: Intel HD Graphics 520 (Skylake GT2), Mesa 26.2.6, VA-API (libva
-2.24), mpv 0.41, FFmpeg 9.0, PipeWire, CachyOS (kernel 7.3), Zig 0.17.0. Compositor:
-sway 1.12 headless (GLES2), KWin 6.8.2 `--virtual`, Weston headless.
+Macchina di prova Linux: Intel HD Graphics 520 (Skylake GT2), Mesa 26.2.6, VA-API
+(libva 2.24), mpv 0.41, FFmpeg 9.0, PipeWire, CachyOS (kernel 7.3), Zig 0.17.0.
+Compositor: sway 1.12 headless (GLES2), KWin 6.8.2 `--virtual`, Weston headless.
 
-## Dopo rc.1: ramo `platform-parity` (non ancora rilasciato)
+## Novità rispetto a 1.0.0-rc.1
 
-Queste modifiche **non sono nei pacchetti rc.1 pubblicati**; entreranno nella
-prossima RC. Stato di verifica di ciascuna in "Piattaforme" e "Verifiche".
-
-- **Vulkan opzionale ovunque.** Nessun binario importa più `vulkan-1.dll` /
-  `libvulkan.so.1`: il loader si apre a runtime (`src/renderer/vk_loader.zig`) e
-  ogni condizione ha il suo errore (loader assente o non valido, nessun driver,
-  istanza, enumerazione, nessuna GPU, nessuna coda grafica, device). Senza Vulkan
+- **Vulkan facoltativo ovunque.** Nessun binario importa più `vulkan-1.dll` /
+  `libvulkan.so.1`: il loader si apre a runtime (`src/renderer/vk_loader.zig`; su
+  Windows solo dalla cartella dell'app e da System32, mai dalla cartella corrente)
+  e ogni condizione ha il suo errore: loader assente o non valido, nessun driver,
+  istanza, enumerazione, nessuna GPU, nessuna coda grafica, device. Senza Vulkan
   Zuer parte e al posto di un modello 3D mostra il motivo. Device perso durante
   l'uso: il renderer si ricostruisce e il file si ricarica; dopo 2 perdite resta
-  spento.
-- **Office ovunque**: il plugin (DOCX, XLSX/XLSM, PPTX, ODT, ODS, ODP; Zig puro) ora
-  è anche nei pacchetti macOS e Windows.
+  spento. In rc.1 su Windows senza loader l'app non partiva nemmeno per il testo.
 - **macOS arm64 completo**: PDF con CoreGraphics (di sistema), video con FFmpeg LGPL
   nel bundle e decodifica VideoToolbox, audio con AudioQueue (Zicro), 3D con
   MoltenVK nel bundle. Le librerie si aprono a runtime: se mancano, la funzione
-  si spegne con un messaggio, l'app no.
-- **`feature-probe`** (strumento di prova, non distribuito) e prove reali in CI.
+  si spegne con un messaggio, l'app no. In rc.1 il pacchetto macOS apriva solo
+  testo, tabelle, immagini e archivi.
+- **Office ovunque**: il plugin (DOCX, XLSX/XLSM, PPTX, ODT, ODS, ODP; Zig puro) è
+  ora anche nei pacchetti macOS e Windows, con le associazioni dei file.
+- **Correzioni trovate dalle prove sui runner veri**:
+  - macOS: aprendo un PDF, un video o un modello 3D l'app moriva (AppKit,
+    "transaction must be valid"): il ridimensionamento della finestra partiva dal
+    thread di decodifica. Ora va sempre sul main thread (Zicro `65cfc86`).
+  - Linux e Windows: con un guasto Vulkan dopo la creazione dell'istanza
+    (enumerazione, device) la GUI andava in SIGSEGV leggendo un'immagine vuota
+    nell'istante fra l'errore e il messaggio sostitutivo. Corretto.
+  - macOS: una pagina PDF Letter a 150 dpi usciva di una riga più alta (1651
+    invece di 1650 pixel) per un errore di arrotondamento.
+- **`feature-probe`** (strumento di prova, non distribuito) e prove reali nella CI
+  di macOS e Windows (sotto, "Verifiche").
 
-## Novità rispetto a `main` (1234c9e)
+## Già in rc.1, rispetto a `main` (1234c9e)
 
 **Video**
 - Sorgenti malformate (MPEG-TS senza indice, troncati, rumore, vuoti): l'apertura
@@ -52,36 +63,26 @@ prossima RC. Stato di verifica di ciascuna in "Piattaforme" e "Verifiche".
 - FIFO e file speciali rifiutati con un messaggio. Prima una FIFO bloccava il
   decoder e, col nome di un video, impediva all'app di chiudersi.
 - Plugin cercati solo accanto all'eseguibile (`<exe>/decoders`, `<exe>`,
-  `<exe>/../lib`), mai nella cartella corrente. Prima `zuer` lanciato da un'altra
-  cartella non trovava i plugin, e lanciato da una cartella scaricata avrebbe
-  caricato i `.so` presenti lì.
+  `<exe>/../lib`), mai nella cartella corrente.
 
 **Rilascio**
-- Versione 1.0.0-rc.1, `zuer --version` e `zuer-gui --version`.
-- `install.sh --uninstall`; il desktop entry dichiara `StartupWMClass=it.zuer.gui`,
-  uguale all'`app_id` della finestra.
-- La GUI compila di nuovo per macOS: falliva anche su `main`.
-- macOS: al primo avvio vero su un Mac l'app moriva con un'eccezione Objective-C
-  (`platformWindow`, selettore del solo backend Cocotron). Corretto in Zicro.
+- `zuer --version` e `zuer-gui --version`; `install.sh --uninstall`; il desktop
+  entry dichiara `StartupWMClass=it.zuer.gui`, uguale all'`app_id` della finestra.
 - Pacchetti macOS arm64 e Windows x64 costruiti e verificati da GitHub Actions
-  (`.github/workflows/release.yml`); FFmpeg per Windows ripinnato su una build
-  LGPL, con licenza e riferimenti al sorgente nell'installer.
-
-**Nuove verifiche**: `scripts/gpu-reset-check.sh`, `scripts/edge-check.sh`, sorgenti
-malformate e cambio hw→sw in `scripts/video-check.sh`, `zuer-video-bench open-at`,
-test dello scrim in `zig build test`.
+  (`.github/workflows/release.yml`); FFmpeg per Windows su una build LGPL, con
+  licenza e riferimenti al sorgente nell'installer.
 
 ## Dipendenze a runtime (Linux)
 
-Obbligatorie: `wayland-client`, EGL + OpenGL, GBM (Mesa), loader Vulkan, PipeWire,
-ALSA (`libasound`), harfbuzz, FFmpeg (libavformat/codec/util, swscale, swresample).
+Obbligatorie: `wayland-client`, EGL + OpenGL, GBM (Mesa), PipeWire, ALSA
+(`libasound`), harfbuzz, FFmpeg (libavformat/codec/util, swscale, swresample).
 
 Facoltative, caricate solo al bisogno:
 
 | Libreria / programma | Se manca |
 |---|---|
+| `libvulkan.so.1` (+ driver) | niente modelli 3D, con il motivo a schermo; il resto funziona |
 | `libmpv.so.2` | il video usa il decoder libav: niente piano dmabuf, frame copiati in CPU |
-| `libvulkan.so.1` (+ driver) | *(dopo rc.1)* niente modelli 3D, con il motivo a schermo; il resto funziona |
 | `libva` (+ driver VA-API) | niente sonda dei codec hardware; mpv decide da sé |
 | `pdftoppm`, `pdfinfo` (poppler) | i PDF non si aprono (i documenti office non hanno dipendenze) |
 | ImageMagick (`convert`) | i formati immagine rari (HEIC, AVIF, TIFF…) non si aprono |
@@ -94,6 +95,9 @@ Facoltative, caricate solo al bisogno:
   di presentazione (dmabuf o readback) e perché, ricomposizioni dell'overlay al
   secondo e quanto costano, riga "fine sessione" (frame, persi, pacing, A/V).
 - `zuer --json <file>`: decodifica col codice della GUI e stampa il risultato.
+- Vulkan: il motivo per cui il 3D è spento è a schermo e nel log
+  (`init renderer Vulkan fallita: <errore>`). `ZUER_VULKAN_LOADER=<percorso>` usa un
+  loader preciso; `ZUER_VULKAN_LOADER=none` simula un sistema senza Vulkan.
 - Crash: il log va in `~/.cache/zuer/crash.log`. Al **riavvio successivo** Zuer apre
   il browser su una issue GitHub precompilata (`postadelmaga/Zuer`) con la coda del
   log; l'utente la rivede e decide se inviarla. Nulla parte da solo, salvo un
@@ -108,89 +112,122 @@ Facoltative, caricate solo al bisogno:
 | Linux, decodifica solo software | ✅ | ✅ verificato: `ZUER_MPV_OPTS=hwdec=no`, ripiego hw→sw |
 | Linux senza piano dmabuf (readback) | ✅ | ✅ verificato: `ZUER_VIDEO_PLANE=0` |
 | Linux senza libmpv (solo libav) | ✅ | ⚠️ verificato solo in parte (`ZUER_NO_MPV=1`) |
+| Linux senza Vulkan / senza driver | ✅ | ✅ verificato: `scripts/vulkan-fallback-check.sh` |
 | sway (wlroots) | — | ✅ verificato, headless |
 | KWin (Plasma 6) | — | ⚠️ `--virtual`, 2 monitor, scala 1,25: verificato; sessione Plasma reale **non verificata** |
 | Weston | — | ⚠️ headless pixman/gl: si apre e riproduce; lento (GL software) |
 | GNOME/Mutter | — | ❓ non verificato |
 | GPU AMD | — | ❓ non verificato |
 | NVIDIA (driver proprietario) | — | ❓ **non verificato**: ripiego glFinish previsto, mai provato |
-| Windows x64 (rc.1) | ✅ nativo (CI `windows-2022`) | ⚠️ CI: installazione silenziosa, `--version`, finestra aperta 8 s con un file di testo (runner senza GPU né driver Vulkan), disinstallazione; Wine: installazione/disinstallazione. Nessuna prova con un utente, una GPU vera, video o 3D |
-| Windows x64 (dopo rc.1) | ✅ cross-compilato; CI nativa **non ancora eseguita** | ⚠️ Wine 11.21 (questa macchina): installazione, DOCX/XLSX/PPTX/ODT/ODS, mesh, video (decodifica, seek), render 3D con winevulkan; senza loader (`vulkan-1=d`) e senza driver la GUI resta aperta con testo/docx/xlsx/video/3D e il 3D dice perché; disinstallazione pulita. Windows vero: **non verificato** |
-| macOS arm64 (rc.1) | ✅ nativo (CI `macos-15`, Apple Silicon) | ⚠️ CI: `--version`, finestra aperta 8 s con un file di testo; nessuna prova interattiva |
-| macOS arm64 (dopo rc.1) | ✅ cross-compilato da Linux; build nativa e prove **non ancora eseguite** (il workflow le prevede) | ❓ **non verificato**: PDF/CoreGraphics, VideoToolbox, AudioQueue, MoltenVK mai eseguiti su un Mac |
+| Windows x64 | ✅ nativo (CI `windows-2022`) | ✅ CI: installer, import dei binari, office, video (software, seek), GUI viva senza loader Vulkan e con loader senza driver, Vulkan funzionante (lavapipe, **software**), perdita del device, disinstallazione. ❓ **non verificati**: GPU fisica, decodifica hardware, audio (il runner non ha uscita audio), uso interattivo |
+| macOS arm64 | ✅ nativo (CI `macos-15`, Apple Silicon) | ✅ CI: bundle (arm64, dipendenze, rpath, licenze, firma ad-hoc), PDF con rotazione, office, VideoToolbox H.264/HEVC con seek, audio AudioQueue (orologio che avanza), 3D MoltenVK su Metal (GPU paravirtuale del runner), GUI viva con ogni tipo di file. ❓ **non verificati**: un Mac fisico, qualità audio e sincronia A/V, uso interattivo, Gatekeeper con un download vero |
 | macOS x86_64 | ✅ cross-compilato | ⛔ nessun pacchetto distribuito |
 | Android aarch64 (`libzuer.so`) | ✅ cross-compilato | ❓ non verificato |
 | Web | — | ⛔ non supportato (nessun target) |
 
 ## Verifiche
 
-Tutte su `rc-1.0` (Zuer d5cb407, Zicro 5b1cf99), sway headless, audio muto (sink
-nullo o `ao=null`) salvo dove detto.
+### Linux (questa macchina)
+
+Gate sul codice di 1.0.0 (Zuer `platform-parity` + versione, Zicro `65cfc86`),
+sway headless, audio muto (sink nullo o `ao=null`). Fasi in serie, una build per
+volta (`-j1`): il gate precedente era stato fermato dalla memoria della macchina.
 
 | Verifica | Esito | Cosa copre |
 |---|---|---|
-| `zig build test` (Zuer) | 43/43 | rilevamento formati, scheduler, miniature, cache mesh, scrim |
-| `zig build test` (Zicro) | 172/172 | framework: paint, testo, audio, finestra |
+| build ReleaseFast | ok (picco 640 MB) | `zuer`, `zuer-gui`, plugin |
+| `zig build test` (Zuer) | ok | rilevamento formati, scheduler, miniature, cache mesh, scrim |
+| `zig build test` (Zicro) | ok | framework: paint, testo, audio, finestra |
 | `scripts/video-check.sh` | 36/36 | H.264/HEVC/VP9/senza audio/corto: apertura, pausa < 2% CPU, seek, thread giusti; TS malformati; hw→sw a metà; 100 cicli a caldo e 30 a freddo senza fd/thread in più |
 | `scripts/net-check.sh` | 24/24 | rete lenta, muta, che cade, che non risponde; chiusura con la rete ferma |
 | `scripts/video-sync-check.sh` | 300 schermate, 0 strappate | sincronia del piano dmabuf |
-| `scripts/gpu-reset-check.sh` | 5/5 | contesto perso (guasto iniettato): motore rifatto, video di nuovo a schermo, nessun fd/thread in più, protocollo pulito |
+| `scripts/gpu-reset-check.sh` | 5/5 | contesto perso (guasto iniettato): motore rifatto, video di nuovo a schermo, nessun fd/thread in più, protocollo Wayland pulito (`wayland_check.py`) |
 | `scripts/edge-check.sh` | 24/24 | 20 file limite in apertura, FIFO, plugin trovati da `/` |
-| `scripts/wayland_check.py` | 0 violazioni | invarianti di protocollo (buffer, configure, formati) nelle tracce sopra |
-| `scripts/vulkan-fallback-check.sh` *(dopo rc.1)* | 27/27 | renderer con Vulkan vero; loader assente, non valido, senza driver, guasti iniettati su istanza/enumerazione/nessuna GPU/device: errore distinto (selftest) e GUI viva con cubo e testo; device perso una volta (ricostruito) e sempre (ripiego) |
+| `scripts/vulkan-fallback-check.sh` | 28/28 | Vulkan vero; loader assente, non valido, senza driver, guasti iniettati su istanza/enumerazione/nessuna GPU/device: errore distinto e GUI viva con cubo e testo; device perso una volta (ricostruito) e sempre (ripiego) |
+| `feature-probe` | ok | PDF (pagina ruotata 1650×1275), office, mesh, video (60 frame + seek, VA-API), render offscreen del cubo |
+| navigazione in GUI | 1000 cambi, nessuna crescita | ↓ ogni 250 ms in una cartella mista (testo, PDF, office, 3D, 3 video): RSS 50–54 MB, fd 18, thread 7 dal centesimo al millesimo cambio; Esc chiude in 329 ms |
 
-Al primo giro del gate `video-sync-check` ed `edge-check` sono falliti per `/tmp`
-pieno sulla macchina di prova (le schermate e un file da 300 MB non trovavano
-posto); liberato lo spazio sono passati entrambi.
+Il primo giro del gate ha trovato il SIGSEGV dopo un guasto Vulkan (sopra,
+"Correzioni"), corretto prima del rilascio; la schermata del messaggio sostitutivo
+è stata controllata a vista.
 
-**Mutazioni**: ogni correzione di questa RC è stata tolta di proposito e la sua
-verifica è fallita (start=0, fallimento rapido, attesa END_FILE, loop, ripresa
-hw→sw, ripartenza del motore perso, motore perso rimesso nel pool, scrim, FIFO nel
-decoder, FIFO nei player, plugin nella cartella corrente).
+**Già verificati in rc.1** (codice invariato da allora: video mpv, audio Linux):
+mutazioni di ogni correzione rc.1 (tolta di proposito, la sua verifica fallisce);
+audio sul dispositivo vero (Intel HDA, uscita muta con guardia e ripristino: 100 s
+misti e 280 s continui, nessun frame perso né duplicato, cambio e rimozione del
+dispositivo); 1000 aperture/chiusure a caldo, 100 a freddo, 200 con seek.
 
-**Audio sul dispositivo vero** (Intel HDA, uscita MUTA con guardia e ripristino,
-registrazione dal monitor): 100 s misti e 280 s continui con pause, seek, v
-spento/acceso, cambio file; nessun xrun oltre quelli fisiologici del risveglio del
-dispositivo, frequenza 1000,01 Hz su 1000, nessun frame perso né duplicato. Cambio e
-rimozione del dispositivo di uscita: entrambi i motori si spostano e riprendono.
+### macOS arm64 (CI, runner `macos-15`, macOS 15.8, Apple Silicon virtualizzato)
 
-**Memoria e cicli di vita**: 1000 cambi di file in GUI (RSS fra 190 e 294 MB, senza
-crescita; fd 26–30, thread 14–22, stabili); 1000 aperture/chiusure a caldo, 100 a
-freddo, 200 con seek (fd e thread tornano ai valori iniziali, 4 e 1).
+Pacchetto estratto in una cartella pulita; `feature-probe` dentro una copia del
+bundle (stessi plugin e librerie dell'app).
 
-**Benchmark** (1080p60 H.264, 12 s, riscaldamento + 5 ripetizioni, due giri
-alternati `main`/rc, mediana ± deviazione):
+| Prova | Esito |
+|---|---|
+| architettura di ogni binario e dylib | arm64 |
+| dipendenze dinamiche | solo `/usr/lib`, `/System/Library` o `@rpath` verso `Contents/Frameworks`; nessun rpath verso la macchina di build; `zuer-gui` non linka Vulkan né libav |
+| licenze nel bundle | `LICENSE`, `FFmpeg-LICENSE.txt` (LGPL), `FFmpeg-SOURCE.txt`, `MoltenVK-LICENSE.txt` (Apache-2.0) |
+| firma | ad-hoc, `codesign --verify --strict --deep` ok (nessun Developer ID, nessuna notarizzazione) |
+| PDF (CoreGraphics) | 3 pagine; pagina 2 con `/Rotate 90` resa 1650×1275 |
+| office | DOCX, XLSX (2 fogli), PPTX, ODT, ODS con il loro contenuto |
+| video | H.264 e HEVC: 60 frame 1280×720 con **VideoToolbox attivo**, seek |
+| audio | AudioQueue: orologio di riproduzione a 0,57 s dopo 400 ms (traccia muta) |
+| 3D | MoltenVK su "Apple Paravirtual device" (Metal): cubo renderizzato offscreen |
+| senza Vulkan | `ZUER_VULKAN_LOADER=none`: errore `VulkanLoaderMissing`, nessun crash |
+| GUI | finestra viva 6 s con testo, PDF, DOCX, XLSX, video, cubo, cubo senza Vulkan |
 
-| Misura | `main` (1234c9e) | rc-1.0 |
+### Windows x64 (CI, runner `windows-2022`, nessuna GPU, nessun loader Vulkan)
+
+| Prova | Esito |
+|---|---|
+| import di `zuer-gui.exe` e di ogni DLL | nessuno importa `vulkan-1.dll`; ogni DLL importata è nel pacchetto o in System32 |
+| installazione silenziosa | file, voce di disinstallazione, `DisplayVersion`, associazione `.docx` |
+| office, mesh, testo | DOCX, XLSX, PPTX, ODT, ODS, OBJ, TXT con il loro contenuto |
+| video | decodifica software (il runner non ha GPU), 60 frame e seek |
+| senza loader Vulkan | GUI viva con testo, cubo, DOCX, video; il 3D dice `VulkanLoaderMissing` |
+| loader senza driver | `VulkanNoDriver`, GUI viva col cubo |
+| Vulkan funzionante (lavapipe, rasterizzatore **software** di Mesa) | cubo renderizzato offscreen e in GUI |
+| device perso (iniettato) | una volta: renderer ricostruito; sempre: ripiego, app viva |
+| disinstallazione | pulita (resta solo `uninstall.exe`, che si cancella dopo) |
+| audio | **non verificato**: il runner non ha un dispositivo di uscita |
+
+### Benchmark (Linux, 1080p60 H.264, rc.1 contro 1.0.0)
+
+Build alternate, riscaldamento + 5 ripetizioni, due giri. **Carico di sistema alto
+durante le misure** (load average 3–5 per un'altra build sulla macchina, contro ~1
+delle misure di rc.1): i valori assoluti sono più rumorosi, il confronto fra le due
+build regge perché alternato.
+
+| Misura | rc.1 | 1.0.0 |
 |---|---|---|
-| CPU processo, piano dmabuf | 25 ± 0,7% | 25 ± 0,8% |
-| CPU processo, readback | 70 ± 0,6% | 70–71 ± 0,8% |
-| frame scartati da mpv in 10 s, dmabuf | 0–0,4 | 0 |
-| frame scartati da mpv in 10 s, readback | 2 | 1,6–1,8 |
-| frame persi (slot occupati), entrambi | 0 | 0 |
-| RSS in riproduzione, dmabuf | 280–281 MB | 281–283 MB |
-| apertura a caldo (media di 50, mediana di 5) | 71 ± 3 ms | 80 ± 3 ms |
-| apertura a freddo (media di 10, mediana di 5) | 159 ± 2 ms | 168 ± 3 ms |
-| chiusura (massimo) | 16 ms | 14 ms |
+| CPU processo, piano dmabuf (media dei giri) | 11–14% | 11–22% |
+| CPU processo, readback | 72–92% | 90–91% |
+| RSS in riproduzione, dmabuf | 281 MB | 282 MB |
+| RSS in riproduzione, readback | 307–309 MB | 309–310 MB |
+| fd in riproduzione | 26 / 19 | 26 / 19 |
+| frame persi (slot dmabuf) | 0 | 0 |
+| seek (60 per build, alternate) | mediana 99 ms, media 110, p90 154 | mediana 107 ms, media 115, p90 152 |
+| apertura a caldo (mediana di 5 × 50) | 94 ms | 91 ms |
+| apertura a freddo (mediana di 5 × 10) | 242 ms | 242 ms |
 
-Riproduzione invariata. Le aperture costano ~9 ms in più, misurato e attribuito:
-`loadfile` senza `start=0` (provato a parità di tutto il resto: 68 → 79 ms a caldo).
-`start=0` è un seek preciso e su un MPEG-TS senza indice lasciava il video a fine
-stream senza frame (apertura fallita dopo 20 s): tenuto il comportamento corretto,
-accettato il costo. Il contesto GL robusto è stato escluso come causa (A/B, nessuna
-differenza).
+Il percorso video Linux (mpv, piano dmabuf, audio) non è cambiato fra rc.1 e 1.0.0:
+le differenze stanno nel rumore del carico. Misure a macchina scarica: quelle di
+rc.1 (CPU dmabuf 25%, readback 70%, apertura a caldo 80 ms, a freddo 168 ms).
 
 ## Distribuzione
 
 I pacchetti sono costruiti da GitHub Actions (`.github/workflows/release.yml`) al
 push del tag, e allegati alla GitHub Release del tag con `SHA256SUMS` e
-`manifest.json` (versione, commit di Zuer e Zicro, architettura, sha256).
+`manifest.json` (versione, commit di Zuer e Zicro, architettura, sha256). Il
+workflow pubblica solo se il tag punta al commit costruito e si chiama
+`v<versione di build.zig.zon>`; rilanciato sullo stesso tag aggiorna la release
+solo se è dello stesso commit.
 
 | Sistema | Architettura | Artefatto | Costruito su |
 |---|---|---|---|
-| macOS 13 o successivo | Apple Silicon (arm64) | `zuer-<versione>-macos-arm64.tar.gz` (`Zuer.app`; dopo rc.1 con `Contents/Frameworks`: FFmpeg, MoltenVK) | `macos-15`, arm64 nativo |
+| macOS 13 o successivo | Apple Silicon (arm64) | `zuer-<versione>-macos-arm64.tar.gz` (`Zuer.app`, ~25 MB di cui 20 MB in `Contents/Frameworks`: FFmpeg, MoltenVK) | `macos-15`, arm64 nativo |
 | Windows 10/11 | x64 | `zuer-<versione>-windows-x64-setup.exe` | `windows-2022` |
-| Linux | x64 | dai sorgenti: `zig build` + `install.sh` (sopra) | — |
+| Linux | x64 | dai sorgenti: `zig build` + `install.sh` | — |
 
 Non ci sono pacchetti macOS Intel, universali o Windows ARM.
 
@@ -200,50 +237,48 @@ Non ci sono pacchetti macOS Intel, universali o Windows ARM.
 `Get-FileHash .\zuer-…-setup.exe -Algorithm SHA256` e confronto a mano.
 
 **macOS**: estrarre l'archivio e trascinare `Zuer.app` in Applicazioni. Il pacchetto
-**non è firmato né notarizzato** (nessun certificato Apple Developer): al primo
-avvio Gatekeeper lo blocca; tasto destro → Apri, oppure
-`xattr -dr com.apple.quarantine /Applications/Zuer.app`. Su arm64 il binario ha
-la firma ad-hoc del linker, obbligatoria per avviarsi, che non identifica
-l'autore. Disinstallazione: cancellare `Zuer.app` (cache in
-`~/.cache/zuer`). Il pacchetto rc.1 apre testo, codice, markdown, tabelle,
-immagini e archivi. Dalla prossima RC anche PDF (CoreGraphics), documenti office,
-video e audio (FFmpeg LGPL e VideoToolbox) e modelli 3D (MoltenVK): le librerie
-stanno in `Zuer.app/Contents/Frameworks` con licenze e sorgente in
-`Contents/Resources` (`FFmpeg-LICENSE.txt`, `FFmpeg-SOURCE.txt`,
-`MoltenVK-LICENSE.txt`); senza GPU Metal il 3D si spegne con un messaggio.
+**non è firmato con un Developer ID né notarizzato** (nessun certificato Apple
+Developer): al primo avvio Gatekeeper lo blocca; tasto destro → Apri, oppure
+`xattr -dr com.apple.quarantine /Applications/Zuer.app`. La firma è solo ad-hoc,
+obbligatoria su arm64 per avviarsi, e non identifica l'autore. Apre testo, codice,
+markdown, tabelle, immagini, archivi, PDF (CoreGraphics), documenti office, video e
+audio (FFmpeg LGPL e VideoToolbox) e modelli 3D (MoltenVK): le librerie stanno in
+`Zuer.app/Contents/Frameworks`, licenze e sorgente in `Contents/Resources`. Senza
+GPU Metal il 3D si spegne con un messaggio. Disinstallazione: cancellare
+`Zuer.app` (cache in `~/.cache/zuer`).
 
 **Windows**: eseguire l'installer. Installa per l'utente corrente (nessun permesso
 di amministratore) in `%LOCALAPPDATA%\Programs\Zuer`, aggiunge il menu Start e
 "Apri con" senza cambiare le app predefinite. L'installer **non è firmato**:
 SmartScreen avvisa ("Ulteriori informazioni" → "Esegui comunque").
 Disinstallazione da Impostazioni → App installate, o `uninstall.exe` nella
-cartella; in silenzio: `zuer-…-setup.exe /S`, `uninstall.exe /S`. Il video usa le DLL FFmpeg
-incluse (LGPL-3.0, build BtbN: vedi `FFmpeg-SOURCE.txt` nella cartella).
+cartella; in silenzio: `zuer-…-setup.exe /S`, `uninstall.exe /S`. Il video usa le
+DLL FFmpeg incluse (LGPL, build BtbN: vedi `FFmpeg-SOURCE.txt` nella cartella).
+Vulkan non è un requisito: senza loader o senza driver Zuer parte e solo i modelli
+3D non si vedono, con il motivo a schermo. **I PDF non sono supportati su Windows**
+(nessun motore PDF incluso); i documenti office sì.
 
-Vulkan: in rc.1 il loader (`vulkan-1.dll`, installato con qualsiasi driver GPU
-recente) è un requisito, senza l'eseguibile non parte. Dalla prossima RC non lo è
-più: senza loader o senza driver Zuer parte e solo i modelli 3D non si vedono
-(con il motivo a schermo). Dalla prossima RC l'installer apre anche i documenti
-office; i PDF restano non supportati su Windows (nessun motore PDF incluso).
+**Licenze nei pacchetti**: `LICENSE` (AGPL-3.0-or-later) in entrambi; FFmpeg
+(LGPL) con `FFmpeg-LICENSE.txt` e `FFmpeg-SOURCE.txt` (commit FFmpeg
+`5d85b7bfb2b024fd367ae3a938b4ac46a39e3a26` e indirizzi del sorgente: su macOS
+compilato da quel commit con `scripts/build-ffmpeg-macos.sh`, librerie dinamiche
+sostituibili); su macOS MoltenVK (Apache-2.0) con `MoltenVK-LICENSE.txt`. Il
+sorgente di Zuer per ogni versione è il tag su GitHub; quello di Zicro è il commit
+in `.github/zicro.ref`.
 
-**Licenze nei pacchetti**: `LICENSE` (AGPL-3.0-or-later) in entrambi; nell'installer
-Windows anche `FFmpeg-LICENSE.txt` e `FFmpeg-SOURCE.txt` (commit FFmpeg e
-indirizzi del sorgente corrispondente). Il sorgente di Zuer per ogni versione è
-il tag su GitHub; quello di Zicro è il commit in `.github/zicro.ref`.
+### Fare una nuova versione
 
-### Fare una nuova RC
-
-1. Su `main`, aggiornare `.version` in `build.zig.zon` (es. `1.0.0-rc.2`) e
+1. Su `main`, aggiornare `.version` in `build.zig.zon` (es. `1.0.1`) e
    `android:versionName`; se Zicro è cambiato, il suo commit (già su GitHub) in
    `.github/zicro.ref`.
-2. Gate locale: `zig build test`, `scripts/video-check.sh`, `net-check.sh`,
-   `video-sync-check.sh`, `gpu-reset-check.sh`, `edge-check.sh`,
-   `vulkan-fallback-check.sh`.
-3. Prova del workflow senza pubblicare: Actions → release → Run workflow con
-   `tag=main` e `dry_run` (o `gh workflow run release.yml -f tag=main -f dry_run=true`).
-4. Tag annotato sul commit provato e push: `git tag -a v1.0.0-rc.2 -m "…"`,
-   `git push origin v1.0.0-rc.2`. Il workflow parte da solo e pubblica.
-5. Se serve rifarlo sullo stesso tag: `gh workflow run release.yml -f tag=v1.0.0-rc.2`
+2. Gate locale, una fase per volta: `zig build test` (Zuer e Zicro),
+   `scripts/video-check.sh`, `net-check.sh`, `video-sync-check.sh`,
+   `gpu-reset-check.sh`, `edge-check.sh`, `vulkan-fallback-check.sh`.
+3. Prova del workflow senza pubblicare, **con il workflow del ramo**:
+   `gh workflow run release.yml --ref main -f tag=main -f dry_run=true`.
+4. Tag annotato sul commit provato e push: `git tag -a v1.0.1 -m "…"`,
+   `git push origin v1.0.1`. Il workflow parte da solo e pubblica.
+5. Se serve rifarlo sullo stesso tag: `gh workflow run release.yml -f tag=v1.0.1`
    (aggiorna la release solo se è dello stesso commit, senza duplicati).
 6. Se `fetch-ffmpeg-dlls.sh` dà 404, BtbN ha ritirato l'autobuild pinnato:
    sceglierne uno recente come spiegato nello script, e portare lo stesso commit
@@ -252,46 +287,40 @@ il tag su GitHub; quello di Zicro è il commit in `.github/zicro.ref`.
 
 ## Limiti noti
 
-1. **Reset GPU e sospensione veri non provati.** La ripresa dopo un contesto perso è
-   provata solo per **guasto iniettato** (`ZUER_TEST_GPU_RESET_AFTER`). Un reset vero
-   del driver e un suspend/resume reale non sono stati eseguiti, perché avrebbero
-   sospeso la macchina di sviluppo. Senza contesto robusto (driver senza
+1. **Reset GPU e sospensione veri non provati.** La ripresa dopo un contesto perso
+   (video) e dopo un device Vulkan perso (3D) è provata solo per **guasto
+   iniettato**. Un reset vero del driver e un suspend/resume reale non sono stati
+   eseguiti. Senza contesto robusto (driver senza
    `EGL_EXT_create_context_robustness` né EGL 1.5) la perdita non si vede: serve
    riaprire il video.
 2. **Spegnendo il video col tasto `v`** l'audio passa dal motore mpv al player
    Zicro. Sul dispositivo vero si ripete un tratto di 11–55 ms (un quanto del grafo
-   PipeWire), con un click. libmpv non espone la latenza della sua coda verso il
-   dispositivo. Riaccendendo il video la pausa è di ~85 ms.
-3. **Passaggio hw→sw a metà:** restano ~0,4 s di immagine ferma. È mpv che riprova
-   i backend hardware (Vulkan, NVDEC, VA-API, VDPAU) prima del software; non li
-   abbiamo tolti, perché su altre macchine servono.
+   PipeWire), con un click. Riaccendendo il video la pausa è di ~85 ms.
+3. **Passaggio hw→sw a metà:** restano ~0,4 s di immagine ferma (mpv riprova i
+   backend hardware prima del software).
 4. **KWin importa i dmabuf in ritardo:** se rifiuta un buffer, il client non lo
-   sa (il protocollo non lo dice) e quel frame non compare. Su sway il rifiuto
-   arriva e Zuer ripiega sul readback.
-5. **Readback a 1080p60** (senza piano dmabuf, es. compositor senza
-   linux-dmabuf): ~70% di un core e ~2 frame scartati da mpv ogni 10 s sulla HD 520.
-6. **Chiusura con la rete ferma:** fino a ~180 ms, perché si attende
-   l'interruzione di libav.
+   sa e quel frame non compare. Su sway il rifiuto arriva e Zuer ripiega sul readback.
+5. **Readback a 1080p60** (senza piano dmabuf): ~70% di un core e ~2 frame scartati
+   da mpv ogni 10 s sulla HD 520.
+6. **Chiusura con la rete ferma:** fino a ~180 ms (attesa dell'interruzione di libav).
 7. **`install.sh`** rende Zuer l'applicazione predefinita per diversi tipi MIME e su
    KDE prende Meta+Z. L'installer Windows invece non cambia i predefiniti.
 8. **Pacchetti non firmati**: nessun certificato Apple Developer ID né Windows
-   Authenticode configurato. macOS: solo firma ad-hoc, nessuna notarizzazione
-   (Gatekeeper chiede conferma); Windows: SmartScreen avvisa. Il workflow non finge
-   firme: `manifest.json` dice `"signed": false`.
-9. **Windows senza loader Vulkan** (`vulkan-1.dll`, es. macchine virtuali senza
-   driver GPU): in rc.1 `zuer-gui.exe` non parte, nemmeno per il testo, perché il
-   loader è importato staticamente. Corretto dopo rc.1 (vedi sopra).
-10. **macOS**: in rc.1 build ridotta (testo, tabelle, immagini, archivi; niente
-   video, 3D, PDF, office); dopo rc.1 completa ma **non ancora eseguita su un Mac**.
-   Restano: niente AV1 software (FFmpeg senza dav1d: solo dove VideoToolbox lo
-   decodifica, M3 e successivi), niente cache su disco delle pagine PDF né
-   eviction LRU delle cache (solo Linux), audio senza misura della latenza del
-   dispositivo (sincronia A/V meno precisa che su PipeWire), 3D solo con una GPU
-   Metal. `CFBundleShortVersionString` è `1.0.0` (macOS vuole x.y.z).
+   Authenticode. macOS: firma ad-hoc, nessuna notarizzazione (Gatekeeper chiede
+   conferma); Windows: SmartScreen avvisa. `manifest.json` dice `"signed": false`.
+9. **macOS e Windows provati su runner virtuali**, non su macchine fisiche: su
+   macOS la GPU è quella paravirtuale di Apple, su Windows il 3D è provato con
+   lavapipe (software). Mai provati con un utente, né su Windows l'audio e la
+   decodifica hardware.
+10. **macOS**: niente AV1 software (FFmpeg senza dav1d: solo dove VideoToolbox lo
+   decodifica, M3 e successivi); niente cache su disco delle pagine PDF né eviction
+   LRU delle cache (solo Linux); audio senza misura della latenza del dispositivo
+   (sincronia A/V meno precisa che su PipeWire, non misurata); 3D solo con una GPU
+   Metal.
 11. **Formati office binari** (DOC, XLS, PPT) non supportati su nessuna piattaforma;
-   PDF non supportato su Windows.
-12. **Aperture ~9 ms più lente di `main`** (vedi Benchmark): costo del caricare senza
-   `start=0`, che rendeva inapribili i TS senza indice.
+   **PDF non supportato su Windows**.
+12. **Aperture ~9 ms più lente di `main` 1234c9e** (misura di rc.1): costo del
+   caricare senza `start=0`, che rendeva inapribili i TS senza indice.
 
 ## Licenza
 

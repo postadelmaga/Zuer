@@ -5,10 +5,11 @@ documenti, tabelle, immagini, mesh 3D e video — sia nel **terminale** (`zuer`)
 in una **finestra** (`zuer-gui`) — costruito sui framework [zicro](../Zicro) (UI/paint
 in stile egui) e [zrame](../Zicro/zrame) (finestra + input cross-platform).
 
-Gira su **Linux** (Wayland) e **Windows** (GDI); il rendering 3D passa per Vulkan, il
+Gira su **Linux** (Wayland), **Windows** x64 (GDI) e **macOS** arm64 (Cocoa); il
+rendering 3D passa per Vulkan (MoltenVK su macOS), aperto a runtime e facoltativo; il
 video per **libmpv** su Linux (decodifica hardware, piano dmabuf del compositor) e per
-libav (FFmpeg) dove mpv manca. Versione **1.0.0-rc.1**: cosa è verificato, cosa no e i
-limiti noti sono in [RELEASE.md](RELEASE.md).
+libav (FFmpeg) dove mpv manca, con VideoToolbox su macOS. Versione **1.0.0**: cosa è
+verificato, cosa no e i limiti noti sono in [RELEASE.md](RELEASE.md).
 
 ---
 
@@ -21,7 +22,8 @@ limiti noti sono in [RELEASE.md](RELEASE.md).
 | **Immagini** | `.png`, `.jpg`, `.gif`, `.bmp`, `.webp`, `.tif`, `.avif`, `.heic`, `.ico` | decodifica nativa (stb_image; WebP con `libwebp` caricata a runtime su Linux), gli altri formati via ImageMagick |
 | **Mesh 3D** | `.obj`, `.stl`, `.glb`, `.gltf`, `.ply`, `.fbx`, `.dae`, `.3ds` | renderer Vulkan (PBR-ish, shadow pass), orbita col mouse |
 | **Video** | `.mp4`, `.mkv`, `.webm`, `.mov`, `.avi`, `.m4v`, `.ts`, … | libmpv (Linux) o libav, timeline/scrubbing stile YouTube; audio: oscilloscopio |
-| **Documenti** | `.pdf`, office | reso come immagine di pagina (via `pdftoppm`/`soffice`, solo Linux) |
+| **Documenti** | `.pdf` | pagina resa come immagine: poppler (`pdftoppm`) su Linux, CoreGraphics su macOS; **non supportato su Windows** |
+| **Office** | `.docx`, `.xlsx`, `.xlsm`, `.pptx`, `.odt`, `.ods`, `.odp` | decoder Zig, nessuna dipendenza, tutte le piattaforme; `.doc`/`.xls`/`.ppt` non supportati |
 
 Il formato si riconosce anche **senza estensione o con quella sbagliata**:
 `src/detect.zig` legge i byte magici dai primi 8 KB (immagini, PDF, ZIP/tar/gzip,
@@ -77,9 +79,10 @@ zuer-gui ~/cartella/       # naviga i file della cartella con le frecce
 
 ## Windows (cross-compile da Linux)
 
-`zuer-gui.exe` gira su Windows — verificato sotto Wine, mesh 3D e video inclusi.
-Il rendering GPU passa per il loader Vulkan di sistema (o `winevulkan`), il testo/
-immagini per il compositing CPU. La finestra è **frameless con vetro**, come su
+`zuer-gui.exe` gira su Windows — provato in CI su Windows Server 2022 (installer,
+office, video, 3D con lavapipe, senza loader Vulkan) e sotto Wine. Il rendering GPU
+passa per il loader Vulkan di sistema (`vulkan-1.dll`, aperto a runtime: senza
+loader o driver si spegne solo il 3D), il testo/immagini per il compositing CPU. La finestra è **frameless con vetro**, come su
 Wayland: pannello arrotondato, ombra decorativa e traslucenza sono dipinti
 client-side (stesso `drawChrome` di zicro) e spinti con alpha per-pixel via
 `UpdateLayeredWindow` — quindi si vedono **anche sotto Wine**. L'unico pezzo
@@ -123,7 +126,7 @@ decoder inclusi (testo/codice, csv, markdown, mesh, immagini, glb, archivi,
 media): Zuer compare in "Apri con" e tra le **App predefinite** di Windows —
 senza rubare i default esistenti (l'utente lo elegge default dal pannello). Le
 estensioni sono rigenerate a ogni build da `src/decoders/*.zig`, quindi restano
-in sync (office/pdf sono Linux-only → non associati su Windows).
+in sync (office incluso; i PDF su Windows non sono supportati → non associati).
 
 > **Compila sempre con `-Doptimize=ReleaseFast`.** Il default di `zig build` è Debug:
 > il rendering GPU resta veloce (lo fa la GPU) ma il **compositing CPU** dei frame
@@ -316,6 +319,7 @@ Public License v3.0 o successiva** (vedi [`LICENSE`](LICENSE)), come il framewor
 `SPDX-License-Identifier: AGPL-3.0-or-later`
 
 Componenti di terze parti in `vendor/`: stb (pubblico dominio / MIT), TinySoundFont
-(MIT), header e import-lib di FFmpeg (LGPL/GPL secondo la build), import-lib
-Vulkan generata da `vulkan.def`. Le DLL FFmpeg dell'installer Windows hanno la licenza della build
-scaricata.
+(MIT), header e import-lib di FFmpeg (LGPL/GPL secondo la build). Le DLL FFmpeg
+dell'installer Windows hanno la licenza della build scaricata (LGPL); nel bundle
+macOS FFmpeg è compilato LGPL dallo stesso commit e MoltenVK è Apache-2.0: licenze e
+riferimenti al sorgente in `Zuer.app/Contents/Resources`.
