@@ -492,10 +492,15 @@ jobs:
           # Ripiego waveOut (forzato): continua a funzionare.
           ZICRO_AUDIO=waveout "$UDIR/feature-probe.exe" audio "$(W "$D/clip.mp4")"
           # Dispositivo rimosso a metà riproduzione e poi rimesso: la riproduzione riprende.
-          SID="$(powershell -NoProfile -Command "(Get-PnpDevice -Class MEDIA | Where-Object FriendlyName -like '*VB-Audio*' | Select-Object -First 1).InstanceId" | tr -d '\r')"
-          echo "VB-CABLE: $SID"; [[ -n "$SID" ]] || { echo "::error::dispositivo VB-CABLE non trovato"; exit 1; }
+          # Si disattiva l'ENDPOINT di uscita (SWD\MMDEVAPI\…): il device radice
+          # ROOT\MEDIA non si spegne a caldo (pnputil: riavvio richiesto, 194).
+          SID="$(powershell -NoProfile -Command "(Get-PnpDevice -Class AudioEndpoint | Where-Object FriendlyName -like 'Speakers (VB-Audio*' | Select-Object -First 1).InstanceId" | tr -d '\r')"
+          echo "endpoint VB-CABLE: $SID"; [[ -n "$SID" ]] || { echo "::error::endpoint VB-CABLE non trovato"; exit 1; }
           "$UDIR/feature-probe.exe" audio-survive "$(W "$D/tono.m4a")" 14 > survive.log 2>&1 & SP=$!
-          sleep 4; pnputil /disable-device "$SID"; sleep 3; pnputil /enable-device "$SID"
+          sleep 4
+          pnputil /disable-device "$SID" || { echo "::error::pnputil /disable-device fallito ($?)"; kill $SP; exit 1; }
+          sleep 3
+          pnputil /enable-device "$SID" || { echo "::error::pnputil /enable-device fallito ($?)"; kill $SP; exit 1; }
           RC=0; wait $SP || RC=$?; tr -d '\r' < survive.log
           [[ $RC == 0 ]] || { echo "::error::audio non ripreso dopo la rimozione del dispositivo"; exit 1; }
           "$UDIR/feature-probe.exe" gpu > gpu-noloader.log 2>&1 || true; cat gpu-noloader.log
