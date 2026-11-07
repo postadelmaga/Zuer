@@ -13,6 +13,7 @@ const builtin = @import("builtin");
 const decoder = @import("decoder.zig");
 
 const vk = @import("renderer/vk.zig");
+const vk_loader = @import("renderer/vk_loader.zig");
 const vtex = @import("vtex.zig");
 const vtcache = @import("vtcache.zig");
 const VtexPool = @import("vtex_pool.zig").VtexPool;
@@ -479,22 +480,41 @@ pub const Renderer = struct {
             .pApplicationName = "zuer",
             .apiVersion = (1 << 22) | (1 << 12), // 1.1
         };
+        // Loader caricato a runtime (vk_loader.zig): senza loader né driver
+        // l'errore torna al chiamante, che spegne solo il renderer GPU.
+        try vk_loader.ensureLoaded();
         var instance: VkInstance = null;
-        try check(vkCreateInstance(&.{
-            .pApplicationInfo = &app_info,
-            .enabledExtensionCount = @intCast(opts.instance_extensions.len),
-            .ppEnabledExtensionNames = if (opts.instance_extensions.len > 0) opts.instance_extensions.ptr else null,
-        }, null, &instance));
+        const inst_result = if (vk_loader.testFailure("instance"))
+            vk.VK_ERROR_INITIALIZATION_FAILED
+        else
+            vkCreateInstance(&.{
+                .pApplicationInfo = &app_info,
+                .enabledExtensionCount = @intCast(opts.instance_extensions.len),
+                .ppEnabledExtensionNames = if (opts.instance_extensions.len > 0) opts.instance_extensions.ptr else null,
+            }, null, &instance);
+        switch (inst_result) {
+            VK_SUCCESS => {},
+            // Loader presente, nessun driver (ICD) che lo accetti.
+            vk.VK_ERROR_INCOMPATIBLE_DRIVER => return error.VulkanNoDriver,
+            else => return error.VulkanInstanceFailed,
+        }
+        vk_loader.ensureInstance(instance) catch |e| {
+            vk_loader.destroyInstanceUnresolved(instance);
+            return e;
+        };
         errdefer vkDestroyInstance(instance, null);
 
         // Primo device fisico con una queue family grafica; l'import host-pointer
         // è un plus, non un requisito.
         var dev_count: u32 = 8;
         var devices: [8]VkPhysicalDevice = @splat(null);
-        const enum_result = vkEnumeratePhysicalDevices(instance, &dev_count, &devices);
+        const enum_result = if (vk_loader.testFailure("enumerate"))
+            vk.VK_ERROR_INITIALIZATION_FAILED
+        else
+            vkEnumeratePhysicalDevices(instance, &dev_count, &devices);
         // VK_INCOMPLETE (5) va bene: più di 8 device, ne bastano i primi.
-        if (enum_result != VK_SUCCESS and enum_result != 5) return error.NoGpu;
-        if (dev_count == 0) return error.NoGpu;
+        if (enum_result != VK_SUCCESS and enum_result != 5) return error.VulkanEnumerateFailed;
+        if (dev_count == 0 or vk_loader.testFailure("nogpu")) return error.NoGpu;
 
         // Pick the physical device with a graphics queue. The default *preference* differs by
         // present path: this renderer draws offscreen and, off Linux, reads the frame back to
@@ -552,7 +572,8 @@ pub const Renderer = struct {
                 best_score = score;
             }
         }
-        if (physical == null) return error.NoGpu;
+        // Device presenti ma nessuno con una coda grafica.
+        if (physical == null) return error.NoSuitableGpu;
         {
             var props: vk.VkPhysicalDeviceProperties = undefined;
             vkGetPhysicalDeviceProperties(physical, &props);
@@ -584,11 +605,12 @@ pub const Renderer = struct {
         try dev_exts.appendSlice(gpa, opts.device_extensions);
 
         var device: VkDevice = null;
-        try check(vkCreateDevice(physical, &.{
+        if (vk_loader.testFailure("device")) return error.VulkanDeviceFailed;
+        if (vkCreateDevice(physical, &.{
             .pQueueCreateInfos = &.{ .queueFamilyIndex = queue_family, .pQueuePriorities = &priority },
             .enabledExtensionCount = @intCast(dev_exts.items.len),
             .ppEnabledExtensionNames = if (dev_exts.items.len > 0) dev_exts.items.ptr else null,
-        }, null, &device));
+        }, null, &device) != VK_SUCCESS) return error.VulkanDeviceFailed;
         errdefer vkDestroyDevice(device, null);
 
         var queue: VkQueue = null;
@@ -1288,6 +1310,7 @@ pub const Renderer = struct {
     /// di usare il risultato di questa funzione.
     pub fn render(self: *Renderer, width: u32, height: u32, pc: *const PushConstants) ![]const u8 {
         if (self.mesh_buf == VK_NULL) return error.NoMesh;
+        if (vk_loader.testDeviceLost()) return error.VulkanDeviceLost;
         if (width == 0 or height == 0) return error.EmptyTarget;
         // Il target va (ri)creato PRIMA di leggere frame_index: su un resize
         // destroyTarget azzera frame_index e le fence, e slot/prev_slot calcolati
@@ -1500,6 +1523,7 @@ pub const Renderer = struct {
     /// Renderizza la griglia voxel e ne fa il readback (RGBA, valido fino alla
     /// prossima chiamata).
     pub fn renderVoxel(self: *Renderer, width: u32, height: u32, pc: *const VoxelPush) ![]const u8 {
+        if (vk_loader.testDeviceLost()) return error.VulkanDeviceLost;
         try self.recordVoxel(width, height, pc);
         return self.readback_ptr.?[0 .. @as(usize, width) * height * 4];
     }
@@ -2029,6 +2053,7 @@ pub const Renderer = struct {
     /// Ritorna i pixel RGBA letti (validi fino alla chiamata successiva).
     pub fn renderText(self: *Renderer, vertex_bytes: []const u8, vertex_count: u32, atlas_pixels: []const u8, atlas_w: u32, atlas_h: u32, out_w: u32, out_h: u32, clear: [4]f32) ![]const u8 {
         if (out_w == 0 or out_h == 0) return error.EmptyTarget;
+        if (vk_loader.testDeviceLost()) return error.VulkanDeviceLost;
         try self.ensureTextPipe();
         try self.uploadAtlas(atlas_pixels, atlas_w, atlas_h);
         try self.ensureTextVertexBuffer(vertex_bytes);

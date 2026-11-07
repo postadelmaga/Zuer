@@ -1,9 +1,13 @@
+const std = @import("std");
+
 // ---------------------------------------------------------------------------
 // Binding Vulkan minimali (esportati per uso modulare)
 // ---------------------------------------------------------------------------
 
 pub const VkResult = i32;
 pub const VK_SUCCESS: VkResult = 0;
+pub const VK_ERROR_INITIALIZATION_FAILED: VkResult = -3;
+pub const VK_ERROR_INCOMPATIBLE_DRIVER: VkResult = -9;
 
 pub const VkInstance = ?*opaque {};
 pub const VkPhysicalDevice = ?*opaque {};
@@ -600,63 +604,177 @@ pub const ACCESS_TRANSFER_WRITE: u32 = 0x1000;
 pub const ACCESS_HOST_READ: u32 = 0x2000;
 pub const SUBPASS_EXTERNAL: u32 = 0xFFFFFFFF;
 
-pub extern "vulkan" fn vkCreateInstance(*const VkInstanceCreateInfo, ?*const anyopaque, *VkInstance) VkResult;
-pub extern "vulkan" fn vkDestroyInstance(VkInstance, ?*const anyopaque) void;
-pub extern "vulkan" fn vkEnumeratePhysicalDevices(VkInstance, *u32, ?[*]VkPhysicalDevice) VkResult;
-pub extern "vulkan" fn vkGetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice, *u32, ?[*]VkQueueFamilyProperties) void;
-pub extern "vulkan" fn vkGetPhysicalDeviceMemoryProperties(VkPhysicalDevice, *VkPhysicalDeviceMemoryProperties) void;
-pub extern "vulkan" fn vkGetPhysicalDeviceProperties(VkPhysicalDevice, *VkPhysicalDeviceProperties) void;
-pub extern "vulkan" fn vkEnumerateDeviceExtensionProperties(VkPhysicalDevice, ?[*:0]const u8, *u32, ?[*]VkExtensionProperties) VkResult;
-pub extern "vulkan" fn vkCreateDevice(VkPhysicalDevice, *const VkDeviceCreateInfo, ?*const anyopaque, *VkDevice) VkResult;
-pub extern "vulkan" fn vkDestroyDevice(VkDevice, ?*const anyopaque) void;
-pub extern "vulkan" fn vkGetDeviceQueue(VkDevice, u32, u32, *VkQueue) void;
-pub extern "vulkan" fn vkGetDeviceProcAddr(VkDevice, [*:0]const u8) ?*const fn () callconv(.c) void;
-pub extern "vulkan" fn vkCreateBuffer(VkDevice, *const VkBufferCreateInfo, ?*const anyopaque, *VkBuffer) VkResult;
-pub extern "vulkan" fn vkDestroyBuffer(VkDevice, VkBuffer, ?*const anyopaque) void;
-pub extern "vulkan" fn vkGetBufferMemoryRequirements(VkDevice, VkBuffer, *VkMemoryRequirements) void;
-pub extern "vulkan" fn vkAllocateMemory(VkDevice, *const VkMemoryAllocateInfo, ?*const anyopaque, *VkDeviceMemory) VkResult;
-pub extern "vulkan" fn vkFreeMemory(VkDevice, VkDeviceMemory, ?*const anyopaque) void;
-pub extern "vulkan" fn vkBindBufferMemory(VkDevice, VkBuffer, VkDeviceMemory, u64) VkResult;
-pub extern "vulkan" fn vkMapMemory(VkDevice, VkDeviceMemory, u64, u64, u32, **anyopaque) VkResult;
-pub extern "vulkan" fn vkCreateImage(VkDevice, *const VkImageCreateInfo, ?*const anyopaque, *VkImage) VkResult;
-pub extern "vulkan" fn vkDestroyImage(VkDevice, VkImage, ?*const anyopaque) void;
-pub extern "vulkan" fn vkGetImageMemoryRequirements(VkDevice, VkImage, *VkMemoryRequirements) void;
-pub extern "vulkan" fn vkBindImageMemory(VkDevice, VkImage, VkDeviceMemory, u64) VkResult;
-pub extern "vulkan" fn vkCreateImageView(VkDevice, *const VkImageViewCreateInfo, ?*const anyopaque, *VkImageView) VkResult;
-pub extern "vulkan" fn vkDestroyImageView(VkDevice, VkImageView, ?*const anyopaque) void;
-pub extern "vulkan" fn vkCreateShaderModule(VkDevice, *const VkShaderModuleCreateInfo, ?*const anyopaque, *VkShaderModule) VkResult;
-pub extern "vulkan" fn vkDestroyShaderModule(VkDevice, VkShaderModule, ?*const anyopaque) void;
-pub extern "vulkan" fn vkCreatePipelineLayout(VkDevice, *const VkPipelineLayoutCreateInfo, ?*const anyopaque, *VkPipelineLayout) VkResult;
-pub extern "vulkan" fn vkDestroyPipelineLayout(VkDevice, VkPipelineLayout, ?*const anyopaque) void;
-pub extern "vulkan" fn vkCreateRenderPass(VkDevice, *const VkRenderPassCreateInfo, ?*const anyopaque, *VkRenderPass) VkResult;
-pub extern "vulkan" fn vkDestroyRenderPass(VkDevice, VkRenderPass, ?*const anyopaque) void;
-pub extern "vulkan" fn vkCreateFramebuffer(VkDevice, *const VkFramebufferCreateInfo, ?*const anyopaque, *VkFramebuffer) VkResult;
-pub extern "vulkan" fn vkDestroyFramebuffer(VkDevice, VkFramebuffer, ?*const anyopaque) void;
-pub extern "vulkan" fn vkCreateGraphicsPipelines(VkDevice, u64, u32, [*]const VkGraphicsPipelineCreateInfo, ?*const anyopaque, [*]VkPipeline) VkResult;
-pub extern "vulkan" fn vkDestroyPipeline(VkDevice, VkPipeline, ?*const anyopaque) void;
-pub extern "vulkan" fn vkCreateCommandPool(VkDevice, *const VkCommandPoolCreateInfo, ?*const anyopaque, *VkCommandPool) VkResult;
-pub extern "vulkan" fn vkDestroyCommandPool(VkDevice, VkCommandPool, ?*const anyopaque) void;
-pub extern "vulkan" fn vkAllocateCommandBuffers(VkDevice, *const VkCommandBufferAllocateInfo, [*]VkCommandBuffer) VkResult;
-pub extern "vulkan" fn vkBeginCommandBuffer(VkCommandBuffer, *const VkCommandBufferBeginInfo) VkResult;
-pub extern "vulkan" fn vkEndCommandBuffer(VkCommandBuffer) VkResult;
-pub extern "vulkan" fn vkCmdBeginRenderPass(VkCommandBuffer, *const VkRenderPassBeginInfo, u32) void;
-pub extern "vulkan" fn vkCmdEndRenderPass(VkCommandBuffer) void;
-pub extern "vulkan" fn vkCmdBindPipeline(VkCommandBuffer, u32, VkPipeline) void;
-pub extern "vulkan" fn vkCmdSetViewport(VkCommandBuffer, u32, u32, [*]const VkViewport) void;
-pub extern "vulkan" fn vkCmdSetScissor(VkCommandBuffer, u32, u32, [*]const VkRect2D) void;
-pub extern "vulkan" fn vkCmdBindVertexBuffers(VkCommandBuffer, u32, u32, [*]const VkBuffer, [*]const u64) void;
-pub extern "vulkan" fn vkCmdBindIndexBuffer(VkCommandBuffer, VkBuffer, u64, u32) void;
-pub extern "vulkan" fn vkCmdPushConstants(VkCommandBuffer, VkPipelineLayout, u32, u32, u32, *const anyopaque) void;
-pub extern "vulkan" fn vkCmdDrawIndexed(VkCommandBuffer, u32, u32, u32, i32, u32) void;
-pub extern "vulkan" fn vkCmdCopyImageToBuffer(VkCommandBuffer, VkImage, u32, VkBuffer, u32, [*]const VkBufferImageCopy) void;
-pub extern "vulkan" fn vkCmdCopyBufferToImage(VkCommandBuffer, VkBuffer, VkImage, u32, u32, [*]const VkBufferImageCopy) void;
-pub extern "vulkan" fn vkCmdPipelineBarrier(VkCommandBuffer, u32, u32, u32, u32, ?*const anyopaque, u32, ?[*]const VkBufferMemoryBarrier, u32, ?[*]const VkImageMemoryBarrier) void;
-pub extern "vulkan" fn vkCreateFence(VkDevice, *const VkFenceCreateInfo, ?*const anyopaque, *VkFence) VkResult;
-pub extern "vulkan" fn vkDestroyFence(VkDevice, VkFence, ?*const anyopaque) void;
-pub extern "vulkan" fn vkResetFences(VkDevice, u32, [*]const VkFence) VkResult;
-pub extern "vulkan" fn vkWaitForFences(VkDevice, u32, [*]const VkFence, u32, u64) VkResult;
-pub extern "vulkan" fn vkQueueSubmit(VkQueue, u32, [*]const VkSubmitInfo, VkFence) VkResult;
-pub extern "vulkan" fn vkDeviceWaitIdle(VkDevice) VkResult;
+pub inline fn vkCreateInstance(a0: *const VkInstanceCreateInfo, a1: ?*const anyopaque, a2: *VkInstance) VkResult {
+    return dispatch.vkCreateInstance(a0, a1, a2);
+}
+pub inline fn vkDestroyInstance(a0: VkInstance, a1: ?*const anyopaque) void {
+    return dispatch.vkDestroyInstance(a0, a1);
+}
+pub inline fn vkEnumeratePhysicalDevices(a0: VkInstance, a1: *u32, a2: ?[*]VkPhysicalDevice) VkResult {
+    return dispatch.vkEnumeratePhysicalDevices(a0, a1, a2);
+}
+pub inline fn vkGetPhysicalDeviceQueueFamilyProperties(a0: VkPhysicalDevice, a1: *u32, a2: ?[*]VkQueueFamilyProperties) void {
+    return dispatch.vkGetPhysicalDeviceQueueFamilyProperties(a0, a1, a2);
+}
+pub inline fn vkGetPhysicalDeviceMemoryProperties(a0: VkPhysicalDevice, a1: *VkPhysicalDeviceMemoryProperties) void {
+    return dispatch.vkGetPhysicalDeviceMemoryProperties(a0, a1);
+}
+pub inline fn vkGetPhysicalDeviceProperties(a0: VkPhysicalDevice, a1: *VkPhysicalDeviceProperties) void {
+    return dispatch.vkGetPhysicalDeviceProperties(a0, a1);
+}
+pub inline fn vkEnumerateDeviceExtensionProperties(a0: VkPhysicalDevice, a1: ?[*:0]const u8, a2: *u32, a3: ?[*]VkExtensionProperties) VkResult {
+    return dispatch.vkEnumerateDeviceExtensionProperties(a0, a1, a2, a3);
+}
+pub inline fn vkCreateDevice(a0: VkPhysicalDevice, a1: *const VkDeviceCreateInfo, a2: ?*const anyopaque, a3: *VkDevice) VkResult {
+    return dispatch.vkCreateDevice(a0, a1, a2, a3);
+}
+pub inline fn vkDestroyDevice(a0: VkDevice, a1: ?*const anyopaque) void {
+    return dispatch.vkDestroyDevice(a0, a1);
+}
+pub inline fn vkGetDeviceQueue(a0: VkDevice, a1: u32, a2: u32, a3: *VkQueue) void {
+    return dispatch.vkGetDeviceQueue(a0, a1, a2, a3);
+}
+pub inline fn vkGetDeviceProcAddr(a0: VkDevice, a1: [*:0]const u8) ?PfnVoidFunction {
+    return dispatch.vkGetDeviceProcAddr(a0, a1);
+}
+pub inline fn vkCreateBuffer(a0: VkDevice, a1: *const VkBufferCreateInfo, a2: ?*const anyopaque, a3: *VkBuffer) VkResult {
+    return dispatch.vkCreateBuffer(a0, a1, a2, a3);
+}
+pub inline fn vkDestroyBuffer(a0: VkDevice, a1: VkBuffer, a2: ?*const anyopaque) void {
+    return dispatch.vkDestroyBuffer(a0, a1, a2);
+}
+pub inline fn vkGetBufferMemoryRequirements(a0: VkDevice, a1: VkBuffer, a2: *VkMemoryRequirements) void {
+    return dispatch.vkGetBufferMemoryRequirements(a0, a1, a2);
+}
+pub inline fn vkAllocateMemory(a0: VkDevice, a1: *const VkMemoryAllocateInfo, a2: ?*const anyopaque, a3: *VkDeviceMemory) VkResult {
+    return dispatch.vkAllocateMemory(a0, a1, a2, a3);
+}
+pub inline fn vkFreeMemory(a0: VkDevice, a1: VkDeviceMemory, a2: ?*const anyopaque) void {
+    return dispatch.vkFreeMemory(a0, a1, a2);
+}
+pub inline fn vkBindBufferMemory(a0: VkDevice, a1: VkBuffer, a2: VkDeviceMemory, a3: u64) VkResult {
+    return dispatch.vkBindBufferMemory(a0, a1, a2, a3);
+}
+pub inline fn vkMapMemory(a0: VkDevice, a1: VkDeviceMemory, a2: u64, a3: u64, a4: u32, a5: **anyopaque) VkResult {
+    return dispatch.vkMapMemory(a0, a1, a2, a3, a4, a5);
+}
+pub inline fn vkCreateImage(a0: VkDevice, a1: *const VkImageCreateInfo, a2: ?*const anyopaque, a3: *VkImage) VkResult {
+    return dispatch.vkCreateImage(a0, a1, a2, a3);
+}
+pub inline fn vkDestroyImage(a0: VkDevice, a1: VkImage, a2: ?*const anyopaque) void {
+    return dispatch.vkDestroyImage(a0, a1, a2);
+}
+pub inline fn vkGetImageMemoryRequirements(a0: VkDevice, a1: VkImage, a2: *VkMemoryRequirements) void {
+    return dispatch.vkGetImageMemoryRequirements(a0, a1, a2);
+}
+pub inline fn vkBindImageMemory(a0: VkDevice, a1: VkImage, a2: VkDeviceMemory, a3: u64) VkResult {
+    return dispatch.vkBindImageMemory(a0, a1, a2, a3);
+}
+pub inline fn vkCreateImageView(a0: VkDevice, a1: *const VkImageViewCreateInfo, a2: ?*const anyopaque, a3: *VkImageView) VkResult {
+    return dispatch.vkCreateImageView(a0, a1, a2, a3);
+}
+pub inline fn vkDestroyImageView(a0: VkDevice, a1: VkImageView, a2: ?*const anyopaque) void {
+    return dispatch.vkDestroyImageView(a0, a1, a2);
+}
+pub inline fn vkCreateShaderModule(a0: VkDevice, a1: *const VkShaderModuleCreateInfo, a2: ?*const anyopaque, a3: *VkShaderModule) VkResult {
+    return dispatch.vkCreateShaderModule(a0, a1, a2, a3);
+}
+pub inline fn vkDestroyShaderModule(a0: VkDevice, a1: VkShaderModule, a2: ?*const anyopaque) void {
+    return dispatch.vkDestroyShaderModule(a0, a1, a2);
+}
+pub inline fn vkCreatePipelineLayout(a0: VkDevice, a1: *const VkPipelineLayoutCreateInfo, a2: ?*const anyopaque, a3: *VkPipelineLayout) VkResult {
+    return dispatch.vkCreatePipelineLayout(a0, a1, a2, a3);
+}
+pub inline fn vkDestroyPipelineLayout(a0: VkDevice, a1: VkPipelineLayout, a2: ?*const anyopaque) void {
+    return dispatch.vkDestroyPipelineLayout(a0, a1, a2);
+}
+pub inline fn vkCreateRenderPass(a0: VkDevice, a1: *const VkRenderPassCreateInfo, a2: ?*const anyopaque, a3: *VkRenderPass) VkResult {
+    return dispatch.vkCreateRenderPass(a0, a1, a2, a3);
+}
+pub inline fn vkDestroyRenderPass(a0: VkDevice, a1: VkRenderPass, a2: ?*const anyopaque) void {
+    return dispatch.vkDestroyRenderPass(a0, a1, a2);
+}
+pub inline fn vkCreateFramebuffer(a0: VkDevice, a1: *const VkFramebufferCreateInfo, a2: ?*const anyopaque, a3: *VkFramebuffer) VkResult {
+    return dispatch.vkCreateFramebuffer(a0, a1, a2, a3);
+}
+pub inline fn vkDestroyFramebuffer(a0: VkDevice, a1: VkFramebuffer, a2: ?*const anyopaque) void {
+    return dispatch.vkDestroyFramebuffer(a0, a1, a2);
+}
+pub inline fn vkCreateGraphicsPipelines(a0: VkDevice, a1: u64, a2: u32, a3: [*]const VkGraphicsPipelineCreateInfo, a4: ?*const anyopaque, a5: [*]VkPipeline) VkResult {
+    return dispatch.vkCreateGraphicsPipelines(a0, a1, a2, a3, a4, a5);
+}
+pub inline fn vkDestroyPipeline(a0: VkDevice, a1: VkPipeline, a2: ?*const anyopaque) void {
+    return dispatch.vkDestroyPipeline(a0, a1, a2);
+}
+pub inline fn vkCreateCommandPool(a0: VkDevice, a1: *const VkCommandPoolCreateInfo, a2: ?*const anyopaque, a3: *VkCommandPool) VkResult {
+    return dispatch.vkCreateCommandPool(a0, a1, a2, a3);
+}
+pub inline fn vkDestroyCommandPool(a0: VkDevice, a1: VkCommandPool, a2: ?*const anyopaque) void {
+    return dispatch.vkDestroyCommandPool(a0, a1, a2);
+}
+pub inline fn vkAllocateCommandBuffers(a0: VkDevice, a1: *const VkCommandBufferAllocateInfo, a2: [*]VkCommandBuffer) VkResult {
+    return dispatch.vkAllocateCommandBuffers(a0, a1, a2);
+}
+pub inline fn vkBeginCommandBuffer(a0: VkCommandBuffer, a1: *const VkCommandBufferBeginInfo) VkResult {
+    return dispatch.vkBeginCommandBuffer(a0, a1);
+}
+pub inline fn vkEndCommandBuffer(a0: VkCommandBuffer) VkResult {
+    return dispatch.vkEndCommandBuffer(a0);
+}
+pub inline fn vkCmdBeginRenderPass(a0: VkCommandBuffer, a1: *const VkRenderPassBeginInfo, a2: u32) void {
+    return dispatch.vkCmdBeginRenderPass(a0, a1, a2);
+}
+pub inline fn vkCmdEndRenderPass(a0: VkCommandBuffer) void {
+    return dispatch.vkCmdEndRenderPass(a0);
+}
+pub inline fn vkCmdBindPipeline(a0: VkCommandBuffer, a1: u32, a2: VkPipeline) void {
+    return dispatch.vkCmdBindPipeline(a0, a1, a2);
+}
+pub inline fn vkCmdSetViewport(a0: VkCommandBuffer, a1: u32, a2: u32, a3: [*]const VkViewport) void {
+    return dispatch.vkCmdSetViewport(a0, a1, a2, a3);
+}
+pub inline fn vkCmdSetScissor(a0: VkCommandBuffer, a1: u32, a2: u32, a3: [*]const VkRect2D) void {
+    return dispatch.vkCmdSetScissor(a0, a1, a2, a3);
+}
+pub inline fn vkCmdBindVertexBuffers(a0: VkCommandBuffer, a1: u32, a2: u32, a3: [*]const VkBuffer, a4: [*]const u64) void {
+    return dispatch.vkCmdBindVertexBuffers(a0, a1, a2, a3, a4);
+}
+pub inline fn vkCmdBindIndexBuffer(a0: VkCommandBuffer, a1: VkBuffer, a2: u64, a3: u32) void {
+    return dispatch.vkCmdBindIndexBuffer(a0, a1, a2, a3);
+}
+pub inline fn vkCmdPushConstants(a0: VkCommandBuffer, a1: VkPipelineLayout, a2: u32, a3: u32, a4: u32, a5: *const anyopaque) void {
+    return dispatch.vkCmdPushConstants(a0, a1, a2, a3, a4, a5);
+}
+pub inline fn vkCmdDrawIndexed(a0: VkCommandBuffer, a1: u32, a2: u32, a3: u32, a4: i32, a5: u32) void {
+    return dispatch.vkCmdDrawIndexed(a0, a1, a2, a3, a4, a5);
+}
+pub inline fn vkCmdCopyImageToBuffer(a0: VkCommandBuffer, a1: VkImage, a2: u32, a3: VkBuffer, a4: u32, a5: [*]const VkBufferImageCopy) void {
+    return dispatch.vkCmdCopyImageToBuffer(a0, a1, a2, a3, a4, a5);
+}
+pub inline fn vkCmdCopyBufferToImage(a0: VkCommandBuffer, a1: VkBuffer, a2: VkImage, a3: u32, a4: u32, a5: [*]const VkBufferImageCopy) void {
+    return dispatch.vkCmdCopyBufferToImage(a0, a1, a2, a3, a4, a5);
+}
+pub inline fn vkCmdPipelineBarrier(a0: VkCommandBuffer, a1: u32, a2: u32, a3: u32, a4: u32, a5: ?*const anyopaque, a6: u32, a7: ?[*]const VkBufferMemoryBarrier, a8: u32, a9: ?[*]const VkImageMemoryBarrier) void {
+    return dispatch.vkCmdPipelineBarrier(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9);
+}
+pub inline fn vkCreateFence(a0: VkDevice, a1: *const VkFenceCreateInfo, a2: ?*const anyopaque, a3: *VkFence) VkResult {
+    return dispatch.vkCreateFence(a0, a1, a2, a3);
+}
+pub inline fn vkDestroyFence(a0: VkDevice, a1: VkFence, a2: ?*const anyopaque) void {
+    return dispatch.vkDestroyFence(a0, a1, a2);
+}
+pub inline fn vkResetFences(a0: VkDevice, a1: u32, a2: [*]const VkFence) VkResult {
+    return dispatch.vkResetFences(a0, a1, a2);
+}
+pub inline fn vkWaitForFences(a0: VkDevice, a1: u32, a2: [*]const VkFence, a3: u32, a4: u64) VkResult {
+    return dispatch.vkWaitForFences(a0, a1, a2, a3, a4);
+}
+pub inline fn vkQueueSubmit(a0: VkQueue, a1: u32, a2: [*]const VkSubmitInfo, a3: VkFence) VkResult {
+    return dispatch.vkQueueSubmit(a0, a1, a2, a3);
+}
+pub inline fn vkDeviceWaitIdle(a0: VkDevice) VkResult {
+    return dispatch.vkDeviceWaitIdle(a0);
+}
 
 pub const PfnGetMemoryHostPointerProperties = *const fn (VkDevice, u32, *const anyopaque, *VkMemoryHostPointerPropertiesEXT) callconv(.c) VkResult;
 
@@ -733,15 +851,23 @@ pub const VkSubresourceLayout = extern struct {
 
 // Core dal loader (nessun GetDeviceProcAddr): stesso trattamento di
 // vkGetImageMemoryRequirements più sopra.
-pub extern "vulkan" fn vkGetImageSubresourceLayout(VkDevice, VkImage, *const VkImageSubresource, *VkSubresourceLayout) void;
+pub inline fn vkGetImageSubresourceLayout(a0: VkDevice, a1: VkImage, a2: *const VkImageSubresource, a3: *VkSubresourceLayout) void {
+    return dispatch.vkGetImageSubresourceLayout(a0, a1, a2, a3);
+}
 
 // Estensioni: caricate via vkGetDeviceProcAddr solo se il device le supporta
 // (stesso pattern di PfnGetMemoryHostPointerProperties).
 pub const PfnGetMemoryFd = *const fn (VkDevice, *const VkMemoryGetFdInfoKHR, *i32) callconv(.c) VkResult;
 pub const PfnGetImageDrmFormatModifierProperties = *const fn (VkDevice, VkImage, *VkImageDrmFormatModifierPropertiesEXT) callconv(.c) VkResult;
 
+pub const VK_ERROR_DEVICE_LOST: VkResult = -4;
+
+/// `VK_ERROR_DEVICE_LOST` ha un errore suo: il chiamante deve distruggere il
+/// renderer (non ritentare il frame su un device che non tornerà).
 pub fn check(r: VkResult) !void {
-    if (r != VK_SUCCESS) return error.VulkanError;
+    if (r == VK_SUCCESS) return;
+    if (r == VK_ERROR_DEVICE_LOST) return error.VulkanDeviceLost;
+    return error.VulkanError;
 }
 
 pub const ST_SAMPLER_CREATE_INFO: VkStructureType = 31;
@@ -848,13 +974,126 @@ pub const VkWriteDescriptorSet = extern struct {
     pTexelBufferView: ?*const anyopaque = null,
 };
 
-pub extern "vulkan" fn vkCreateSampler(VkDevice, *const VkSamplerCreateInfo, ?*const anyopaque, *VkSampler) VkResult;
-pub extern "vulkan" fn vkDestroySampler(VkDevice, VkSampler, ?*const anyopaque) void;
-pub extern "vulkan" fn vkCreateDescriptorSetLayout(VkDevice, *const VkDescriptorSetLayoutCreateInfo, ?*const anyopaque, *VkDescriptorSetLayout) VkResult;
-pub extern "vulkan" fn vkDestroyDescriptorSetLayout(VkDevice, VkDescriptorSetLayout, ?*const anyopaque) void;
-pub extern "vulkan" fn vkCreateDescriptorPool(VkDevice, *const VkDescriptorPoolCreateInfo, ?*const anyopaque, *VkDescriptorPool) VkResult;
-pub extern "vulkan" fn vkDestroyDescriptorPool(VkDevice, VkDescriptorPool, ?*const anyopaque) void;
-pub extern "vulkan" fn vkAllocateDescriptorSets(VkDevice, *const VkDescriptorSetAllocateInfo, *VkDescriptorSet) VkResult;
-pub extern "vulkan" fn vkUpdateDescriptorSets(VkDevice, u32, [*]const VkWriteDescriptorSet, u32, ?*const anyopaque) void;
-pub extern "vulkan" fn vkCmdBindDescriptorSets(VkCommandBuffer, u32, VkPipelineLayout, u32, u32, [*]const VkDescriptorSet, u32, ?*const u32) void;
-pub extern "vulkan" fn vkCmdDraw(VkCommandBuffer, u32, u32, u32, u32) void;
+pub inline fn vkCreateSampler(a0: VkDevice, a1: *const VkSamplerCreateInfo, a2: ?*const anyopaque, a3: *VkSampler) VkResult {
+    return dispatch.vkCreateSampler(a0, a1, a2, a3);
+}
+pub inline fn vkDestroySampler(a0: VkDevice, a1: VkSampler, a2: ?*const anyopaque) void {
+    return dispatch.vkDestroySampler(a0, a1, a2);
+}
+pub inline fn vkCreateDescriptorSetLayout(a0: VkDevice, a1: *const VkDescriptorSetLayoutCreateInfo, a2: ?*const anyopaque, a3: *VkDescriptorSetLayout) VkResult {
+    return dispatch.vkCreateDescriptorSetLayout(a0, a1, a2, a3);
+}
+pub inline fn vkDestroyDescriptorSetLayout(a0: VkDevice, a1: VkDescriptorSetLayout, a2: ?*const anyopaque) void {
+    return dispatch.vkDestroyDescriptorSetLayout(a0, a1, a2);
+}
+pub inline fn vkCreateDescriptorPool(a0: VkDevice, a1: *const VkDescriptorPoolCreateInfo, a2: ?*const anyopaque, a3: *VkDescriptorPool) VkResult {
+    return dispatch.vkCreateDescriptorPool(a0, a1, a2, a3);
+}
+pub inline fn vkDestroyDescriptorPool(a0: VkDevice, a1: VkDescriptorPool, a2: ?*const anyopaque) void {
+    return dispatch.vkDestroyDescriptorPool(a0, a1, a2);
+}
+pub inline fn vkAllocateDescriptorSets(a0: VkDevice, a1: *const VkDescriptorSetAllocateInfo, a2: *VkDescriptorSet) VkResult {
+    return dispatch.vkAllocateDescriptorSets(a0, a1, a2);
+}
+pub inline fn vkUpdateDescriptorSets(a0: VkDevice, a1: u32, a2: [*]const VkWriteDescriptorSet, a3: u32, a4: ?*const anyopaque) void {
+    return dispatch.vkUpdateDescriptorSets(a0, a1, a2, a3, a4);
+}
+pub inline fn vkCmdBindDescriptorSets(a0: VkCommandBuffer, a1: u32, a2: VkPipelineLayout, a3: u32, a4: u32, a5: [*]const VkDescriptorSet, a6: u32, a7: ?*const u32) void {
+    return dispatch.vkCmdBindDescriptorSets(a0, a1, a2, a3, a4, a5, a6, a7);
+}
+pub inline fn vkCmdDraw(a0: VkCommandBuffer, a1: u32, a2: u32, a3: u32, a4: u32) void {
+    return dispatch.vkCmdDraw(a0, a1, a2, a3, a4);
+}
+
+// ---------------------------------------------------------------------------
+// Tabella di dispatch: riempita a runtime da `loader.zig` (nessun import statico
+// del loader Vulkan). Generata dalle firme sopra; livello di ogni comando in
+// `Level` (global → vkGetInstanceProcAddr(NULL), il resto → (instance)).
+// ---------------------------------------------------------------------------
+pub const Dispatch = struct {
+    vkCreateInstance: *const fn (*const VkInstanceCreateInfo, ?*const anyopaque, *VkInstance) callconv(.c) VkResult,
+    vkDestroyInstance: *const fn (VkInstance, ?*const anyopaque) callconv(.c) void,
+    vkEnumeratePhysicalDevices: *const fn (VkInstance, *u32, ?[*]VkPhysicalDevice) callconv(.c) VkResult,
+    vkGetPhysicalDeviceQueueFamilyProperties: *const fn (VkPhysicalDevice, *u32, ?[*]VkQueueFamilyProperties) callconv(.c) void,
+    vkGetPhysicalDeviceMemoryProperties: *const fn (VkPhysicalDevice, *VkPhysicalDeviceMemoryProperties) callconv(.c) void,
+    vkGetPhysicalDeviceProperties: *const fn (VkPhysicalDevice, *VkPhysicalDeviceProperties) callconv(.c) void,
+    vkEnumerateDeviceExtensionProperties: *const fn (VkPhysicalDevice, ?[*:0]const u8, *u32, ?[*]VkExtensionProperties) callconv(.c) VkResult,
+    vkCreateDevice: *const fn (VkPhysicalDevice, *const VkDeviceCreateInfo, ?*const anyopaque, *VkDevice) callconv(.c) VkResult,
+    vkDestroyDevice: *const fn (VkDevice, ?*const anyopaque) callconv(.c) void,
+    vkGetDeviceQueue: *const fn (VkDevice, u32, u32, *VkQueue) callconv(.c) void,
+    vkGetDeviceProcAddr: *const fn (VkDevice, [*:0]const u8) callconv(.c) ?PfnVoidFunction,
+    vkCreateBuffer: *const fn (VkDevice, *const VkBufferCreateInfo, ?*const anyopaque, *VkBuffer) callconv(.c) VkResult,
+    vkDestroyBuffer: *const fn (VkDevice, VkBuffer, ?*const anyopaque) callconv(.c) void,
+    vkGetBufferMemoryRequirements: *const fn (VkDevice, VkBuffer, *VkMemoryRequirements) callconv(.c) void,
+    vkAllocateMemory: *const fn (VkDevice, *const VkMemoryAllocateInfo, ?*const anyopaque, *VkDeviceMemory) callconv(.c) VkResult,
+    vkFreeMemory: *const fn (VkDevice, VkDeviceMemory, ?*const anyopaque) callconv(.c) void,
+    vkBindBufferMemory: *const fn (VkDevice, VkBuffer, VkDeviceMemory, u64) callconv(.c) VkResult,
+    vkMapMemory: *const fn (VkDevice, VkDeviceMemory, u64, u64, u32, **anyopaque) callconv(.c) VkResult,
+    vkCreateImage: *const fn (VkDevice, *const VkImageCreateInfo, ?*const anyopaque, *VkImage) callconv(.c) VkResult,
+    vkDestroyImage: *const fn (VkDevice, VkImage, ?*const anyopaque) callconv(.c) void,
+    vkGetImageMemoryRequirements: *const fn (VkDevice, VkImage, *VkMemoryRequirements) callconv(.c) void,
+    vkBindImageMemory: *const fn (VkDevice, VkImage, VkDeviceMemory, u64) callconv(.c) VkResult,
+    vkCreateImageView: *const fn (VkDevice, *const VkImageViewCreateInfo, ?*const anyopaque, *VkImageView) callconv(.c) VkResult,
+    vkDestroyImageView: *const fn (VkDevice, VkImageView, ?*const anyopaque) callconv(.c) void,
+    vkCreateShaderModule: *const fn (VkDevice, *const VkShaderModuleCreateInfo, ?*const anyopaque, *VkShaderModule) callconv(.c) VkResult,
+    vkDestroyShaderModule: *const fn (VkDevice, VkShaderModule, ?*const anyopaque) callconv(.c) void,
+    vkCreatePipelineLayout: *const fn (VkDevice, *const VkPipelineLayoutCreateInfo, ?*const anyopaque, *VkPipelineLayout) callconv(.c) VkResult,
+    vkDestroyPipelineLayout: *const fn (VkDevice, VkPipelineLayout, ?*const anyopaque) callconv(.c) void,
+    vkCreateRenderPass: *const fn (VkDevice, *const VkRenderPassCreateInfo, ?*const anyopaque, *VkRenderPass) callconv(.c) VkResult,
+    vkDestroyRenderPass: *const fn (VkDevice, VkRenderPass, ?*const anyopaque) callconv(.c) void,
+    vkCreateFramebuffer: *const fn (VkDevice, *const VkFramebufferCreateInfo, ?*const anyopaque, *VkFramebuffer) callconv(.c) VkResult,
+    vkDestroyFramebuffer: *const fn (VkDevice, VkFramebuffer, ?*const anyopaque) callconv(.c) void,
+    vkCreateGraphicsPipelines: *const fn (VkDevice, u64, u32, [*]const VkGraphicsPipelineCreateInfo, ?*const anyopaque, [*]VkPipeline) callconv(.c) VkResult,
+    vkDestroyPipeline: *const fn (VkDevice, VkPipeline, ?*const anyopaque) callconv(.c) void,
+    vkCreateCommandPool: *const fn (VkDevice, *const VkCommandPoolCreateInfo, ?*const anyopaque, *VkCommandPool) callconv(.c) VkResult,
+    vkDestroyCommandPool: *const fn (VkDevice, VkCommandPool, ?*const anyopaque) callconv(.c) void,
+    vkAllocateCommandBuffers: *const fn (VkDevice, *const VkCommandBufferAllocateInfo, [*]VkCommandBuffer) callconv(.c) VkResult,
+    vkBeginCommandBuffer: *const fn (VkCommandBuffer, *const VkCommandBufferBeginInfo) callconv(.c) VkResult,
+    vkEndCommandBuffer: *const fn (VkCommandBuffer) callconv(.c) VkResult,
+    vkCmdBeginRenderPass: *const fn (VkCommandBuffer, *const VkRenderPassBeginInfo, u32) callconv(.c) void,
+    vkCmdEndRenderPass: *const fn (VkCommandBuffer) callconv(.c) void,
+    vkCmdBindPipeline: *const fn (VkCommandBuffer, u32, VkPipeline) callconv(.c) void,
+    vkCmdSetViewport: *const fn (VkCommandBuffer, u32, u32, [*]const VkViewport) callconv(.c) void,
+    vkCmdSetScissor: *const fn (VkCommandBuffer, u32, u32, [*]const VkRect2D) callconv(.c) void,
+    vkCmdBindVertexBuffers: *const fn (VkCommandBuffer, u32, u32, [*]const VkBuffer, [*]const u64) callconv(.c) void,
+    vkCmdBindIndexBuffer: *const fn (VkCommandBuffer, VkBuffer, u64, u32) callconv(.c) void,
+    vkCmdPushConstants: *const fn (VkCommandBuffer, VkPipelineLayout, u32, u32, u32, *const anyopaque) callconv(.c) void,
+    vkCmdDrawIndexed: *const fn (VkCommandBuffer, u32, u32, u32, i32, u32) callconv(.c) void,
+    vkCmdCopyImageToBuffer: *const fn (VkCommandBuffer, VkImage, u32, VkBuffer, u32, [*]const VkBufferImageCopy) callconv(.c) void,
+    vkCmdCopyBufferToImage: *const fn (VkCommandBuffer, VkBuffer, VkImage, u32, u32, [*]const VkBufferImageCopy) callconv(.c) void,
+    vkCmdPipelineBarrier: *const fn (VkCommandBuffer, u32, u32, u32, u32, ?*const anyopaque, u32, ?[*]const VkBufferMemoryBarrier, u32, ?[*]const VkImageMemoryBarrier) callconv(.c) void,
+    vkCreateFence: *const fn (VkDevice, *const VkFenceCreateInfo, ?*const anyopaque, *VkFence) callconv(.c) VkResult,
+    vkDestroyFence: *const fn (VkDevice, VkFence, ?*const anyopaque) callconv(.c) void,
+    vkResetFences: *const fn (VkDevice, u32, [*]const VkFence) callconv(.c) VkResult,
+    vkWaitForFences: *const fn (VkDevice, u32, [*]const VkFence, u32, u64) callconv(.c) VkResult,
+    vkQueueSubmit: *const fn (VkQueue, u32, [*]const VkSubmitInfo, VkFence) callconv(.c) VkResult,
+    vkDeviceWaitIdle: *const fn (VkDevice) callconv(.c) VkResult,
+    vkGetImageSubresourceLayout: *const fn (VkDevice, VkImage, *const VkImageSubresource, *VkSubresourceLayout) callconv(.c) void,
+    vkCreateSampler: *const fn (VkDevice, *const VkSamplerCreateInfo, ?*const anyopaque, *VkSampler) callconv(.c) VkResult,
+    vkDestroySampler: *const fn (VkDevice, VkSampler, ?*const anyopaque) callconv(.c) void,
+    vkCreateDescriptorSetLayout: *const fn (VkDevice, *const VkDescriptorSetLayoutCreateInfo, ?*const anyopaque, *VkDescriptorSetLayout) callconv(.c) VkResult,
+    vkDestroyDescriptorSetLayout: *const fn (VkDevice, VkDescriptorSetLayout, ?*const anyopaque) callconv(.c) void,
+    vkCreateDescriptorPool: *const fn (VkDevice, *const VkDescriptorPoolCreateInfo, ?*const anyopaque, *VkDescriptorPool) callconv(.c) VkResult,
+    vkDestroyDescriptorPool: *const fn (VkDevice, VkDescriptorPool, ?*const anyopaque) callconv(.c) void,
+    vkAllocateDescriptorSets: *const fn (VkDevice, *const VkDescriptorSetAllocateInfo, *VkDescriptorSet) callconv(.c) VkResult,
+    vkUpdateDescriptorSets: *const fn (VkDevice, u32, [*]const VkWriteDescriptorSet, u32, ?*const anyopaque) callconv(.c) void,
+    vkCmdBindDescriptorSets: *const fn (VkCommandBuffer, u32, VkPipelineLayout, u32, u32, [*]const VkDescriptorSet, u32, ?*const u32) callconv(.c) void,
+    vkCmdDraw: *const fn (VkCommandBuffer, u32, u32, u32, u32) callconv(.c) void,
+};
+
+pub const PfnVoidFunction = *const fn () callconv(.c) void;
+pub const PfnGetInstanceProcAddr = *const fn (VkInstance, [*:0]const u8) callconv(.c) ?PfnVoidFunction;
+
+pub const Level = enum { global, instance, device };
+pub fn level(comptime name: []const u8) Level {
+    @setEvalBranchQuota(20_000);
+    const global = [_][]const u8{"vkCreateInstance"};
+    const instance = [_][]const u8{ "vkCreateDevice", "vkDestroyInstance", "vkEnumerateDeviceExtensionProperties", "vkEnumeratePhysicalDevices", "vkGetDeviceProcAddr", "vkGetPhysicalDeviceMemoryProperties", "vkGetPhysicalDeviceProperties", "vkGetPhysicalDeviceQueueFamilyProperties" };
+    inline for (global) |g| if (comptime std.mem.eql(u8, g, name)) return .global;
+    inline for (instance) |g| if (comptime std.mem.eql(u8, g, name)) return .instance;
+    return .device;
+}
+
+/// Puntatori risolti. Validi solo dopo `loader.ensureLoaded()` + `loader.ensureInstance()`
+/// riusciti: Renderer.init è l'unico ingresso e li chiama prima di ogni comando.
+pub var dispatch: Dispatch = undefined;

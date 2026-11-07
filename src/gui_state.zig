@@ -248,6 +248,11 @@ pub const GuiAppState = struct {
     renderer_ready: bool = false,
     /// Init già tentata e fallita: non riprovare (e non ri-loggare) a ogni frame.
     renderer_failed: bool = false,
+    /// Ultimo errore del renderer (init fallita o device perso), per il messaggio
+    /// mostrato al posto della mesh.
+    renderer_error: ?anyerror = null,
+    /// Device persi finora: oltre `max_renderer_losses` il renderer resta spento.
+    renderer_losses: u8 = 0,
     renderer_mutex: std.Io.Mutex = .init,
     // Player video nativo (posseduto; player null = nessun video). Lo stato
     // interno del player è condiviso col worker sotto `shared.mutex`
@@ -372,10 +377,34 @@ pub fn ensureRendererLocked(state: *GuiAppState) bool {
     if (state.renderer_failed) return false;
     state.renderer = gpu.Renderer.init(state.gpa, .{}) catch |e| {
         state.renderer_failed = true;
+        state.renderer_error = e;
         std.debug.print("zuer: init renderer Vulkan fallita: {s} (mesh/3D non disponibili)\n", .{@errorName(e)});
         return false;
     };
     state.renderer_ready = true;
+    return true;
+}
+
+pub const max_renderer_losses = 2;
+
+/// Device Vulkan perso (`error.VulkanDeviceLost` da un render): distrugge il
+/// renderer, che non è più utilizzabile. Ritorna true se si può ricostruirlo
+/// (alla prossima `ensureRendererLocked`, con ricarica del file corrente da
+/// parte del chiamante); false = troppe perdite, il renderer resta spento e la
+/// GUI prosegue senza GPU. Da chiamare con `renderer_mutex` acquisito.
+pub fn rendererLostLocked(state: *GuiAppState) bool {
+    if (comptime !@import("build_options").gpu) return false;
+    if (!state.renderer_ready) return false;
+    state.renderer.deinit();
+    state.renderer_ready = false;
+    state.renderer_error = error.VulkanDeviceLost;
+    state.renderer_losses += 1;
+    if (state.renderer_losses > max_renderer_losses) {
+        state.renderer_failed = true;
+        std.debug.print("zuer: device Vulkan perso {d} volte, renderer GPU spento (mesh/3D non disponibili)\n", .{state.renderer_losses});
+        return false;
+    }
+    std.debug.print("zuer: device Vulkan perso, ricostruisco il renderer ({d}/{d})\n", .{ state.renderer_losses, max_renderer_losses });
     return true;
 }
 

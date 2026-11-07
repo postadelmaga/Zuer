@@ -73,9 +73,9 @@ fn rasterizeText(state: *GuiAppState, width: u32, text_zoom: f32) void {
     const pointsize: usize = @intFromFloat(@round(14.0 * text_zoom));
     const opts = text_render.RenderOpts{ .width = @max(width, 64), .pointsize = @max(pointsize, 6) };
 
+    // GPU solo se riesce: renderer assente, fallito o perso → percorso CPU qui sotto.
     if (native and state.text_gpu) {
-        rasterizeTextGpu(state, std.fs.path.basename(state.shared.current_file_path), opts);
-        return;
+        if (rasterizeTextGpu(state, std.fs.path.basename(state.shared.current_file_path), opts)) return;
     }
 
     // La geometria (wrapping) cambia con larghezza/zoom: la vecchia selezione
@@ -162,10 +162,10 @@ fn rasterizeText(state: *GuiAppState, width: u32, text_zoom: f32) void {
 
 /// Percorso GPU (Soluzione B): costruisce i quad glifo + atlante e li renderizza
 /// con la pipeline testo Vulkan, poi copia i pixel RGBA nel buffer statico.
-fn rasterizeTextGpu(state: *GuiAppState, name: []const u8, opts: text_render.RenderOpts) void {
+fn rasterizeTextGpu(state: *GuiAppState, name: []const u8, opts: text_render.RenderOpts) bool {
     var mesh = text_render.buildTextMesh(state.gpa, &state.shared.decoded, name, opts) catch |err| {
         std.debug.print("Impossibile costruire i quad del testo: {s}\n", .{@errorName(err)});
-        return;
+        return false;
     };
     defer mesh.deinit(state.gpa);
 
@@ -174,7 +174,7 @@ fn rasterizeTextGpu(state: *GuiAppState, name: []const u8, opts: text_render.Ren
     state.renderer_mutex.lockUncancelable(state.io);
     if (!gui_state_mod.ensureRendererLocked(state)) {
         state.renderer_mutex.unlock(state.io);
-        return;
+        return false;
     }
     const rgba_src = state.renderer.renderText(
         std.mem.sliceAsBytes(mesh.vertices),
@@ -186,21 +186,23 @@ fn rasterizeTextGpu(state: *GuiAppState, name: []const u8, opts: text_render.Ren
         @intCast(mesh.height),
         text_render.clear_bg,
     ) catch |err| {
+        if (err == error.VulkanDeviceLost) _ = gui_state_mod.rendererLostLocked(state);
         state.renderer_mutex.unlock(state.io);
         std.debug.print("Render testo GPU fallito: {s}\n", .{@errorName(err)});
-        return;
+        return false;
     };
     defer state.renderer_mutex.unlock(state.io);
 
     // Il readback è riusato dalla chiamata successiva: copiane una proprietà.
     // Allineato a 4: `composeTextFrame` aliasa `static_rgba` come []u32 (color-key
     // a word), quindi il buffer deve essere word-aligned come gli altri percorsi.
-    const rgba = state.gpa.alignedAlloc(u8, .@"4", rgba_src.len) catch return;
+    const rgba = state.gpa.alignedAlloc(u8, .@"4", rgba_src.len) catch return false;
     @memcpy(rgba, rgba_src);
     state.gpa.free(state.shared.static_rgba);
     state.shared.static_rgba = rgba;
     state.shared.static_w = @intCast(mesh.width);
     state.shared.static_h = @intCast(mesh.height);
+    return true;
 }
 
 /// Poll della modalità follow (-f), da chiamare con `state.shared.mutex` acquisito
@@ -912,6 +914,7 @@ fn renderWorker(
             // stesso render (via ensureTarget) a decidere se color_image è
             // esportabile per questa size — nessun'altra fonte di scrittura corre.
             var mesh_dmabuf: ?gpu.Renderer.DmabufInfo = null;
+            var device_lost = false;
             const mesh_rgba: ?[]const u8 = blk: {
                 // Difensivo: con push non-null il setMesh ha già inizializzato
                 // il renderer; se l'init era fallita, salta il frame GPU.
@@ -920,7 +923,9 @@ fn renderWorker(
                     break :blk state.renderer.renderVoxel(cur_w, cur_h, vpc) catch |e| {
                         // Errore Vulkan transitorio: non uccidere il worker (finestra
                         // congelata per sempre) — logga, riarma il redraw e riprova.
+                        // Device perso: il renderer va rifatto (sotto).
                         std.debug.print("[gui] renderVoxel fallito: {s}\n", .{@errorName(e)});
+                        if (e == error.VulkanDeviceLost) device_lost = true;
                         break :blk null;
                     };
                 }
@@ -928,12 +933,27 @@ fn renderWorker(
                 const r = state.renderer.render(cur_w, cur_h, &mesh_push.?) catch |e| {
                     // Come sopra: salta il frame invece di terminare il loop.
                     std.debug.print("[gui] render mesh fallito: {s}\n", .{@errorName(e)});
+                    if (e == error.VulkanDeviceLost) device_lost = true;
                     break :blk null;
                 };
                 mesh_dmabuf = state.renderer.colorDmabuf();
                 break :blk r;
             };
+            // Device perso: geometria e texture sono andate con lui. Si distrugge
+            // il renderer e si ricarica il file corrente (la mesh si ricarica su
+            // un device nuovo, o — oltre i tentativi — mostra il messaggio di
+            // renderer non disponibile invece di una finestra congelata).
+            if (device_lost) _ = gui_state_mod.rendererLostLocked(state);
             state.renderer_mutex.unlock(state.io);
+            if (device_lost) {
+                state.shared.mutex.lockUncancelable(state.io);
+                const reload = state.gpa.dupe(u8, state.shared.current_file_path) catch null;
+                state.shared.mutex.unlock(state.io);
+                if (reload) |p| {
+                    defer state.gpa.free(p);
+                    nav.enqueueLoad(state, p);
+                }
+            }
             if (mesh_rgba) |mr| {
                 if (mesh_dmabuf) |d| {
                     // Fast path zero-copy: color_image va presentata DIRETTAMENTE

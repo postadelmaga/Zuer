@@ -8,8 +8,9 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // Two independent native capabilities, each with its own import-lib requirement:
-    //  -Dvulkan: the offscreen Vulkan mesh/text renderer. Works on Linux (system loader)
-    //            and Windows (vendored vulkan-1 import lib → runs on Wine's winevulkan).
+    //  -Dvulkan: the offscreen Vulkan mesh/text renderer. The loader is opened at runtime
+    //            (src/renderer/vk_loader.zig): nothing links against it, so the binaries
+    //            start without Vulkan and only the GPU renderer turns off.
     //  -Dffmpeg: the libav-backed native video player. Linux-only until FFmpeg Windows
     //            import libs are vendored (video files just don't open elsewhere).
     // On Windows zuer-gui is otherwise CPU-only (text/csv/image composited in software).
@@ -48,14 +49,9 @@ pub fn build(b: *std.Build) void {
     build_opts_linked.addOption(bool, "video", ffmpeg_enabled);
     build_opts_linked.addOption(bool, "av_runtime", false);
 
-    // Link the Vulkan loader into a module: system loader on Linux, the vendored
-    // vulkan-1 import lib on Windows (vk.zig's `extern "vulkan"` emits `-lvulkan`).
-    const LinkVk = struct {
-        fn link(bld: *std.Build, m: *std.Build.Module, tgt: std.Build.ResolvedTarget) void {
-            if (tgt.result.os.tag == .windows) m.addLibraryPath(bld.path("vendor/vulkan"));
-            m.linkSystemLibrary("vulkan", .{});
-        }
-    };
+    // Il loader Vulkan NON si linka più: src/renderer/vk_loader.zig lo apre a
+    // runtime (LoadLibrary/dlopen) alla prima init del renderer, così gli
+    // eseguibili partono anche senza vulkan-1.dll / libvulkan.so.1 / MoltenVK.
 
     // Link libav (native video). Linux uses the system FFmpeg (pkg-config names have the
     // `lib` prefix); Windows uses the vendored headers + import libs under vendor/ffmpeg
@@ -207,7 +203,6 @@ pub fn build(b: *std.Build) void {
     addTsf(b, exe.root_module);
     if (os_tag == .linux) exe.root_module.linkSystemLibrary("asound", .{});
     // The TUI pulls the Vulkan renderer through tui.zig (mesh preview).
-    if (vulkan_enabled) LinkVk.link(b, exe.root_module, target);
     // Its GPU present forwards a memfd across processes (Linux kitty graphics protocol),
     // so the TUI is Linux-only for now; on other targets it isn't installed (mesh in the
     // *GUI* still works via a plain CPU staging buffer). Making the TUI cross-platform is
@@ -233,7 +228,6 @@ pub fn build(b: *std.Build) void {
     shaders.addTo(gui_exe.root_module);
     // Vulkan mesh/text renderer: Linux + Windows (vendored import lib). On Windows this
     // presents through zrame's GDI backend after an offscreen render+readback.
-    if (vulkan_enabled) LinkVk.link(b, gui_exe.root_module, target);
     if (ffmpeg_enabled) {
         // Player video nativo: il worker decodifica i frame in tempo reale con libav
         // (src/decoders/player.zig, importato da gui.zig). gui_exe non linka mai ffmpeg
@@ -318,7 +312,6 @@ pub fn build(b: *std.Build) void {
         addCvp9C(b, vbench.root_module);
         vbench.root_module.linkSystemLibrary("wayland-client", .{});
         vbench.root_module.linkSystemLibrary("asound", .{});
-        if (vulkan_enabled) LinkVk.link(b, vbench.root_module, target);
         if (mpv_enabled) {
             vbench.root_module.linkSystemLibrary("EGL", .{});
             vbench.root_module.linkSystemLibrary("GL", .{});
@@ -349,7 +342,6 @@ pub fn build(b: *std.Build) void {
     addStbTruetypeHeaders(b, raster_dbg.root_module);
     // Anche il percorso GPU (gpu_renderer + shader) per confrontare CPU vs atlante.
     shaders.addTo(raster_dbg.root_module);
-    LinkVk.link(b, raster_dbg.root_module, target);
     const raster_dbg_run = b.addRunArtifact(raster_dbg);
     raster_dbg_run.addPassthruArgs();
     b.step("raster-debug", "Rasterizza un file su PPM (stdout)").dependOn(&raster_dbg_run.step);
@@ -367,7 +359,6 @@ pub fn build(b: *std.Build) void {
     });
     gpu_selftest.root_module.addImport("zicro", dep_zicro.module("zicro"));
     shaders.addTo(gpu_selftest.root_module);
-    LinkVk.link(b, gpu_selftest.root_module, target);
     const gpu_selftest_run = b.addRunArtifact(gpu_selftest);
     b.step("gpu-selftest", "Render headless di un cubo per validare la pipeline mesh").dependOn(&gpu_selftest_run.step);
 
@@ -384,7 +375,6 @@ pub fn build(b: *std.Build) void {
     });
     gpu_shot.root_module.addImport("zicro", dep_zicro.module("zicro"));
     shaders.addTo(gpu_shot.root_module);
-    LinkVk.link(b, gpu_shot.root_module, target);
     // Niente installArtifact: è un tool di sviluppo, lo step `gpu-shot` lo
     // compila già on demand senza pesare su ogni `zig build`.
     const gpu_shot_run = b.addRunArtifact(gpu_shot);

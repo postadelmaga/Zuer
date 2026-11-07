@@ -131,6 +131,13 @@ pub fn postLoad(state: *GuiAppState, new_path: []const u8) void {
         installFromCache(state, pf, new_path);
         return;
     }
+    enqueueLoad(state, new_path);
+}
+
+/// Accoda il decode di `new_path` al loader thread, SENZA passare dalla cache
+/// di prefetch: nessun `applyDecoded` sul thread chiamante, quindi va bene
+/// anche dal render worker (ricarica dopo un device Vulkan perso).
+pub fn enqueueLoad(state: *GuiAppState, new_path: []const u8) void {
     // Duplica prima di toccare lo stato: se l'alloc fallisce nessuna
     // richiesta viene accodata, quindi `loading` non va acceso (spinner
     // infinito senza nessuno che lo spenga).
@@ -145,6 +152,16 @@ pub fn postLoad(state: *GuiAppState, new_path: []const u8) void {
     state.shared.file_changed = true;
     state.shared.mutex.unlock(state.io);
     state.nav.cond.signal(state.io);
+}
+
+/// Un modello 3D senza renderer GPU (loader/driver Vulkan assenti, device perso
+/// troppe volte) non resta su uno spinner o su una finestra vuota: al suo posto
+/// si mostra il motivo, come per un file illeggibile.
+fn showApplyFailure(state: *GuiAppState, err: anyerror, path: []const u8, gen: ?u32) void {
+    if (err != error.RendererInit) return;
+    const why = if (state.renderer_error) |e| @errorName(e) else "sconosciuto";
+    const msg = std.fmt.allocPrint(state.gpa, "Modello 3D non visualizzabile: renderer GPU (Vulkan) non disponibile.\nMotivo: {s}", .{why}) catch return;
+    applyDecoded(state, .{ .text = msg }, .{}, path, gen) catch {};
 }
 
 /// True se una navigazione più recente è arrivata dopo che il worker ha preso
@@ -991,8 +1008,10 @@ fn installFromCache(state: *GuiAppState, pf: Prefetched, path: []const u8) void 
     // (la generazione è appena stata invalidata qui sopra, e la navigazione
     // gira solo sul thread finestra) → installa sempre. Player A/V e MIDI
     // non sono mai preparati dal prefetch: `applyDecoded` li apre qui.
-    applyDecoded(state, pf.decoded, .{ .stage = pf.stage, .rgba = pf.rgba }, path, null) catch |err|
+    applyDecoded(state, pf.decoded, .{ .stage = pf.stage, .rgba = pf.rgba }, path, null) catch |err| {
         std.debug.print("Impossibile applicare il file (cache): {s}\n", .{@errorName(err)});
+        showApplyFailure(state, err, path, null);
+    };
     // Contenuto nuovo installato: ridimensiona la finestra sulla forma del
     // contenuto (stessa euristica del sizing iniziale) con un'animazione.
     resizeToContent(state);
@@ -1133,8 +1152,10 @@ pub fn decodeInitial(state: *GuiAppState, path: []const u8) void {
     }
     // Staging GPU, RGBA, player A/V e MIDI preparati QUI, fuori lock.
     const pre = prepareFor(state, &d, path, true);
-    applyDecoded(state, d, pre, path, gen) catch |e|
+    applyDecoded(state, d, pre, path, gen) catch |e| {
         std.debug.print("Impossibile applicare il file decodificato: {s}\n", .{@errorName(e)});
+        showApplyFailure(state, e, path, gen);
+    };
     if (navSuperseded(state, gen)) return;
     // La finestra è nata sulla forma stimata (estensione): adattala al contenuto
     // reale, a meno che main l'abbia già dimensionata su dimensioni certe
@@ -1214,8 +1235,10 @@ pub fn loadWorker(state: *GuiAppState) void {
             // Staging GPU, RGBA, player A/V e MIDI preparati fuori lock (era
             // tutto dentro `applyDecoded`, con spinner e input congelati).
             const pre = prepareFor(state, &d, path, true);
-            applyDecoded(state, d, pre, path, gen) catch |e|
+            applyDecoded(state, d, pre, path, gen) catch |e| {
                 std.debug.print("Impossibile applicare il file (async): {s}\n", .{@errorName(e)});
+                showApplyFailure(state, e, path, gen);
+            };
         }
         // Se nel frattempo la richiesta è stata superata, l'install è stato
         // abortito dentro `applyDecoded`: niente resize/prefetch su contenuto
