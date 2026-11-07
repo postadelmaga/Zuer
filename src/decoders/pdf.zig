@@ -140,7 +140,7 @@ fn decodeTier(path: []const u8, io: std.Io, filename: []const u8, allocator: std
             "CoreGraphics non disponibile"
         else if (e == error.PdfiumUnavailable)
             "pdfium.dll assente o non valida: reinstalla Zuer"
-        else if (e == error.PdfOpenFailed)
+        else if (e == error.PdfOpenFailed or e == error.PdfToPpmFailed)
             "file PDF danneggiato o non valido"
         else if (e == error.PdfPageTooLarge)
             "pagina troppo grande"
@@ -456,7 +456,15 @@ fn renderPoppler(gpa: std.mem.Allocator, abs_path: []const u8, flag: []const u8,
     defer run_result.deinit(gpa);
     if (run_result.exit_code != 0) return error.PdfToPpmFailed;
 
-    return readPageFile(prefix, page, gpa) orelse return error.NoPagesRendered;
+    const p = readPageFile(prefix, page, gpa) orelse return error.NoPagesRendered;
+    // Pagina oltre i limiti di allocazione di poppler: pdftoppm stampa "Bogus memory
+    // allocation size", esce con 0 e scrive un PPM di 1×1 pixel. Nessuna pagina vera
+    // è così piccola a ≥72 DPI: è un errore, non una pagina bianca.
+    if (p.width <= 1 and p.height <= 1) {
+        gpa.free(p.pixels);
+        return error.PdfPageTooLarge;
+    }
+    return p;
 }
 
 /// pdftoppm zero-padda il numero di pagina in base al totale: si prova ogni
@@ -648,7 +656,9 @@ fn cacheRead(gpa: std.mem.Allocator, key: u64) ?Page {
     const w = rd32(&hdr, 4);
     const h = rd32(&hdr, 8);
     const pages = rd32(&hdr, 12);
-    if (w == 0 or h == 0 or w > 20000 or h > 20000) return null;
+    // 1×1: il PPM degenere di pdftoppm su una pagina troppo grande, salvato in
+    // cache dalle versioni ≤ 1.0.0 (vedi renderPoppler): si ignora e si rifà.
+    if (w == 0 or h == 0 or w > 20000 or h > 20000 or (w <= 1 and h <= 1)) return null;
     const n = @as(usize, w) * h * 3;
     if (n > max_page_bytes) return null;
     const buf = gpa.alloc(u8, n) catch return null;

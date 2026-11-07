@@ -139,7 +139,7 @@ rs py pyi js mjs cjs jsx ts tsx c h cc cpp cxx hpp hh cs java kt kts go rb php s
 csv tsv
 md markdown
 obj stl
-png jpg jpeg gif bmp tga psd hdr pic pnm pbm pgm ppm svg svgz webp tif tiff ico avif
+png jpg jpeg gif bmp tga psd hdr pic pnm pbm pgm ppm svg svgz webp tif tiff ico avif heic heif
 glb
 zip jar apk cbz epub xpi whl
 docx pptx odt odp xlsx xlsm ods

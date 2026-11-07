@@ -44,6 +44,47 @@ CT = '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxml
 REL = '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">%s</Relationships>'
 
 pdf(os.path.join(out, "prova.pdf"))
+
+def pdf_raw(path, page_objs, media=(612, 792), extra=()):
+    """PDF di una pagina: `page_objs` sono gli oggetti dopo Catalog e Pages, il
+    primo è la pagina (riferita come 3 0 R)."""
+    body = [b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"] + list(page_objs)
+    data = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offs = []
+    for n_, o in enumerate(body, 1):
+        offs.append(len(data))
+        data += b"%d 0 obj\n" % n_ + o + b"\nendobj\n"
+    xref = len(data)
+    data += b"xref\n0 %d\n0000000000 65535 f \n" % (len(body) + 1)
+    for off in offs:
+        data += b"%010d 00000 n \n" % off
+    data += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(body) + 1, xref)
+    open(path, "wb").write(data)
+
+# Pagina con testo E un'immagine JPEG vera (DCTDecode): la foto di esempio di
+# ImageMagick in tests/images, scalata a 300x200 punti in (72, 400).
+here = os.path.dirname(os.path.abspath(__file__))
+jpg = open(os.path.join(here, "..", "tests", "images", "rose.jpg"), "rb").read()
+cs = b"q 300 0 0 200 72 400 cm /Im1 Do Q BT /F1 24 Tf 72 300 Td (Testo e immagine) Tj ET"
+pdf_raw(os.path.join(out, "immagine.pdf"), [
+    b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /Im1 5 0 R >> "
+    b"/Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> /Contents 4 0 R >>",
+    b"<< /Length %d >>\nstream\n" % len(cs) + cs + b"\nendstream",
+    b"<< /Type /XObject /Subtype /Image /Width 70 /Height 46 /ColorSpace /DeviceRGB /BitsPerComponent 8 "
+    b"/Filter /DCTDecode /Length %d >>\nstream\n" % len(jpg) + jpg + b"\nendstream",
+])
+# Pagina enorme (200 × 200 pollici): a 150 DPI sarebbero 30000 px per lato.
+cs = b"0 0 1 rg 0 0 14400 14400 re f"
+pdf_raw(os.path.join(out, "enorme.pdf"), [
+    b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 14400 14400] /Contents 4 0 R >>",
+    b"<< /Length %d >>\nstream\n" % len(cs) + cs + b"\nendstream",
+])
+# Danneggiato: i primi 200 byte di un PDF valido.
+open(os.path.join(out, "rotto.pdf"), "wb").write(open(os.path.join(out, "prova.pdf"), "rb").read()[:200])
+# Non è un PDF affatto, ma ha l'estensione.
+open(os.path.join(out, "finto.pdf"), "wb").write(b"questo non e' un pdf\n" * 10)
+# Nome non ASCII: il percorso deve arrivare intatto al motore (UTF-8/UTF-16).
+open(os.path.join(out, "perché è così.pdf"), "wb").write(open(os.path.join(out, "prova.pdf"), "rb").read())
 zipdoc(os.path.join(out, "prova.docx"), {
     "[Content_Types].xml": CT % '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>',
     "_rels/.rels": REL % '<Relationship Id="r1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>',

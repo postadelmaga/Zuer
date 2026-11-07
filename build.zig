@@ -450,6 +450,7 @@ pub fn build(b: *std.Build) void {
                 .flags = &.{ "-O2", "-fno-sanitize=undefined" },
             });
         }
+        if (comptime std.mem.eql(u8, name, "image")) addImageCodecs(b, lib.root_module);
         // The media decoder needs FFmpeg (+ compute_vp9 on Linux). pdf rasterizes with
         // poppler's tools (Linux: subprocess + POSIX temp dirs), CoreGraphics (macOS,
         // system framework) or PDFium (Windows, pdfium.dll shipped next to the exe by
@@ -494,7 +495,7 @@ pub fn build(b: *std.Build) void {
 
     // Test unitari puri (nessuna dipendenza nativa): `zig build test`.
     const test_step = b.step("test", "Esegue i test unitari");
-    for ([_][]const u8{ "src/detect.zig", "src/scheduler.zig", "src/thumbs.zig", "src/meshcache.zig", "src/wake.zig", "src/hwdec_caps.zig" }) |src_path| {
+    for ([_][]const u8{ "src/detect.zig", "src/scheduler.zig", "src/thumbs.zig", "src/meshcache.zig", "src/wake.zig", "src/hwdec_caps.zig", "src/decoders/exif.zig" }) |src_path| {
         const t = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path(src_path),
             .target = target,
@@ -745,6 +746,8 @@ pub fn build(b: *std.Build) void {
                 .file = b.path("vendor/stb/stb_image_impl.c"),
                 .flags = &.{ "-O2", "-fno-sanitize=undefined" },
             });
+            // WebP e SVG: gli stessi codec del plugin desktop (image.zig li dichiara).
+            addImageCodecs(b, lib.root_module);
             lib.root_module.addLibraryPath(.{ .cwd_relative = sysroot_lib });
             lib.root_module.linkSystemLibrary("android", .{}); // ANativeWindow, AInputEvent…
             lib.root_module.linkSystemLibrary("log", .{}); // __android_log_* (usato dalla glue)
@@ -810,6 +813,56 @@ fn addTsf(b: *std.Build, mod: *std.Build.Module) void {
         if (t.result.os.tag != .windows) mod.linkSystemLibrary("m", .{});
     }
 }
+
+/// Codec immagine compilati nel decoder immagini (src/c/image_codecs.c): libwebp
+/// (decoder + demux, dipendenza Zig `libwebp`: sorgenti ufficiali, hash in
+/// build.zig.zon) e nanosvg (vendor/nanosvg). Stesso motore su ogni piattaforma; su
+/// Windows in più WIC, il codec di sistema (src/c/wic_decode.c).
+fn addImageCodecs(b: *std.Build, mod: *std.Build.Module) void {
+    const flags: []const []const u8 = &.{ "-O2", "-fno-sanitize=undefined" };
+    const webp = b.lazyDependency("libwebp", .{}) orelse return;
+    mod.addIncludePath(webp.path(""));
+    mod.addIncludePath(webp.path("src"));
+    mod.addIncludePath(b.path("vendor/nanosvg"));
+    mod.addCSourceFiles(.{ .root = webp.path("src"), .files = &webp_dec_sources, .flags = flags });
+    mod.addCSourceFile(.{ .file = b.path("src/c/image_codecs.c"), .flags = flags });
+    if (mod.resolved_target) |t| {
+        if (t.result.os.tag != .windows) mod.linkSystemLibrary("m", .{});
+        if (t.result.os.tag == .windows) {
+            mod.addCSourceFile(.{ .file = b.path("src/c/wic_decode.c"), .flags = flags });
+            mod.linkSystemLibrary("ole32", .{});
+        }
+    }
+}
+
+/// Decoder WebP: src/dec, src/dsp e src/utils del ramo "decode" (le liste
+/// `WEBP_DEC_SRCS`/`WEBP_DSP_DEC_SRCS`/`WEBP_UTILS_DEC_SRCS` del CMakeLists di
+/// libwebp 1.5.0) più il demux per i WebP animati. Le varianti SIMD di altre
+/// architetture si compilano vuote.
+const webp_dec_sources = [_][]const u8{
+    "dec/alpha_dec.c",            "dec/buffer_dec.c",             "dec/frame_dec.c",
+    "dec/idec_dec.c",             "dec/io_dec.c",                 "dec/quant_dec.c",
+    "dec/tree_dec.c",             "dec/vp8_dec.c",                "dec/vp8l_dec.c",
+    "dec/webp_dec.c",             "demux/demux.c",                "dsp/alpha_processing.c",
+    "dsp/cpu.c",                  "dsp/dec.c",                    "dsp/dec_clip_tables.c",
+    "dsp/filters.c",              "dsp/lossless.c",               "dsp/rescaler.c",
+    "dsp/upsampling.c",           "dsp/yuv.c",                    "dsp/alpha_processing_sse41.c",
+    "dsp/dec_sse41.c",            "dsp/lossless_sse41.c",         "dsp/upsampling_sse41.c",
+    "dsp/yuv_sse41.c",            "dsp/alpha_processing_sse2.c",  "dsp/dec_sse2.c",
+    "dsp/filters_sse2.c",         "dsp/lossless_sse2.c",          "dsp/rescaler_sse2.c",
+    "dsp/upsampling_sse2.c",      "dsp/yuv_sse2.c",               "dsp/alpha_processing_neon.c",
+    "dsp/dec_neon.c",             "dsp/filters_neon.c",           "dsp/lossless_neon.c",
+    "dsp/rescaler_neon.c",        "dsp/upsampling_neon.c",        "dsp/yuv_neon.c",
+    "dsp/dec_msa.c",              "dsp/filters_msa.c",            "dsp/lossless_msa.c",
+    "dsp/rescaler_msa.c",         "dsp/upsampling_msa.c",         "dsp/dec_mips32.c",
+    "dsp/rescaler_mips32.c",      "dsp/yuv_mips32.c",             "dsp/alpha_processing_mips_dsp_r2.c",
+    "dsp/dec_mips_dsp_r2.c",      "dsp/filters_mips_dsp_r2.c",    "dsp/lossless_mips_dsp_r2.c",
+    "dsp/rescaler_mips_dsp_r2.c", "dsp/upsampling_mips_dsp_r2.c", "dsp/yuv_mips_dsp_r2.c",
+    "utils/bit_reader_utils.c",   "utils/color_cache_utils.c",    "utils/filters_utils.c",
+    "utils/huffman_utils.c",      "utils/palette.c",              "utils/quant_levels_dec_utils.c",
+    "utils/rescaler_utils.c",     "utils/random_utils.c",         "utils/thread_utils.c",
+    "utils/utils.c",
+};
 
 /// Solo gli HEADER di stb_truetype: l'include path più il modulo translate-c
 /// (`stb_c`, per glyph.zig). Nessuno dei due consumatori vuole anche

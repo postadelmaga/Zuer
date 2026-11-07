@@ -13,6 +13,8 @@
 //!   feature-probe pixel <file> <fx> <fy> <r> <g> <b>
 //!                                       colore del pixel in (fx, fy) ∈ [0,1]² entro
 //!                                       ±48 per canale (ordine dei byte, orientamento)
+//!   feature-probe fail <file> <testo>  il decode DEVE fallire con un errore che
+//!                                       contiene <testo> (file corrotti, troppo grandi)
 //!   feature-probe dump <file> <out.ppm> immagine decodificata in un PPM (confronti fra
 //!                                       motori, es. poppler contro PDFium)
 //!
@@ -63,6 +65,9 @@ pub fn main(init: std.process.Init) !u8 {
         var v: [5]f64 = undefined;
         for (&v) |*x| x.* = std.fmt.parseFloat(f64, args.next() orelse return usage()) catch return usage();
         probePixel(io, gpa, path, v);
+    } else if (std.mem.eql(u8, cmd, "fail")) {
+        const path = args.next() orelse return usage();
+        probeFail(io, gpa, path, args.next() orelse return usage());
     } else if (std.mem.eql(u8, cmd, "dump")) {
         const path = args.next() orelse return usage();
         probeDump(io, gpa, path, args.next() orelse return usage());
@@ -72,7 +77,7 @@ pub fn main(init: std.process.Init) !u8 {
 }
 
 fn usage() u8 {
-    std.debug.print("uso: feature-probe doc <file>... | page <pdf> <N> | video <file> | audio <file> | gpu | pixel <file> <fx> <fy> <r> <g> <b> | dump <file> <out.ppm>\n", .{});
+    std.debug.print("uso: feature-probe doc <file>... | page <pdf> <N> | video <file> | audio <file> | gpu | pixel <file> <fx> <fy> <r> <g> <b> | fail <file> <testo> | dump <file> <out.ppm>\n", .{});
     return 2;
 }
 
@@ -118,6 +123,16 @@ fn probePixel(io: std.Io, gpa: std.mem.Allocator, path: []const u8, v: [5]f64) v
         if (@abs(@as(f64, @floatFromInt(got)) - want) > 48) ok = false;
     }
     report(ok, "{s}: pixel ({d},{d}) di {d}x{d} = {d},{d},{d} (atteso {d},{d},{d})", .{ base, x, y, im.width, im.height, px[0], px[1], px[2], v[2], v[3], v[4] });
+}
+
+fn probeFail(io: std.Io, gpa: std.mem.Allocator, path: []const u8, want: []const u8) void {
+    var d = decoder.decode(path, io, gpa);
+    defer d.deinit(gpa);
+    const base = std.fs.path.basename(path);
+    switch (d) {
+        .err => |e| report(std.mem.indexOf(u8, e, want) != null, "{s}: errore atteso \"{s}\" ({s})", .{ base, e, want }),
+        else => report(false, "{s}: decodificato, atteso un errore con \"{s}\"", .{ base, want }),
+    }
 }
 
 fn probeDump(io: std.Io, gpa: std.mem.Allocator, path: []const u8, out: []const u8) void {

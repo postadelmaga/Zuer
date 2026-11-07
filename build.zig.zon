@@ -7,6 +7,11 @@
         .zicro = .{
             .path = "../Zicro",
         },
+        .libwebp = .{
+            .url = "https://github.com/webmproject/libwebp/archive/refs/tags/v1.5.0.tar.gz",
+            .hash = "N-V-__8AAOM4egDNF1p7XMh92AC7yc-Da9ArradyeGsfMXkm",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",

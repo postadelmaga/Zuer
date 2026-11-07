@@ -98,7 +98,7 @@ rs py pyi js mjs cjs jsx ts tsx c h cc cpp cxx hpp hh cs java kt kts go rb php s
 csv tsv
 md markdown
 obj stl
-png jpg jpeg gif bmp tga psd hdr pic pnm pbm pgm ppm svg svgz webp tif tiff ico avif
+png jpg jpeg gif bmp tga psd hdr pic pnm pbm pgm ppm svg svgz webp tif tiff ico avif heic heif
 glb
 zip jar apk cbz epub xpi whl
 mp3 wav flac ogg oga ogv opus m4a mp4 m4v mov mkv webm avi mid midi

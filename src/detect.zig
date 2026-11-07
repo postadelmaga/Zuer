@@ -95,7 +95,9 @@ fn info(f: Format) Info {
         .psd => .{ .plugin = "image", .mime = "image/vnd.adobe.photoshop", .label = "PSD", .min_len = 26 },
         .hdr => .{ .plugin = "image", .mime = "image/vnd.radiance", .label = "Radiance HDR" },
         .avif => .{ .plugin = "image", .mime = "image/avif", .label = "AVIF" },
-        .heif => .{ .plugin = null, .mime = "image/heif", .label = "HEIF/HEIC" },
+        // HEIF/HEIC: nessun codec in processo, decide il codec di sistema del plugin
+        // immagini (ImageIO su macOS, WIC su Windows, ImageMagick su Linux).
+        .heif => .{ .plugin = "image", .mime = "image/heif", .label = "HEIF/HEIC" },
         .pdf => .{ .plugin = "pdf", .mime = "application/pdf", .label = "PDF" },
         .zip => .{ .plugin = "archive", .mime = "application/zip", .label = "ZIP" },
         .tar => .{ .plugin = "tar", .mime = "application/x-tar", .label = "tar" },
@@ -302,7 +304,7 @@ test "contenitori ftyp: mp4, avif, heic" {
     // AVIF con major brand mif1: decide il compatible brand.
     try expectFormat("\x00\x00\x00\x18ftypmif1\x00\x00\x00\x00mif1avif", .avif);
     try expectFormat("\x00\x00\x00\x18ftypheic\x00\x00\x00\x00mif1heic", .heif);
-    try std.testing.expect(detect("\x00\x00\x00\x18ftypheic\x00\x00\x00\x00mif1heic", 24).plugin == null);
+    try std.testing.expectEqualStrings("image", detect("\x00\x00\x00\x18ftypheic\x00\x00\x00\x00mif1heic", 24).plugin.?);
 }
 
 test "documenti, archivi, media" {

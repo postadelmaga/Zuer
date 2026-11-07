@@ -1,10 +1,13 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const decoder = @import("decoder");
+const exif = @import("exif.zig");
 const ImageData = decoder.ImageData;
 const Decoded = decoder.Decoded;
 
 // stb_image (vendor/stb), compilato dentro il plugin: decodifica nativa di
-// PNG/JPEG/GIF/BMP direttamente dai byte già letti, senza processi esterni.
+// PNG/JPEG/GIF/BMP/TGA/PSD/HDR/PIC/PNM direttamente dai byte già letti, senza
+// processi esterni.
 extern fn stbi_load_from_memory(
     buffer: [*]const u8,
     len: c_int,
@@ -14,6 +17,7 @@ extern fn stbi_load_from_memory(
     desired_channels: c_int,
 ) ?[*]u8;
 extern fn stbi_image_free(retval_from_stbi_load: ?*anyopaque) void;
+extern fn stbi_info_from_memory(buffer: [*]const u8, len: c_int, x: *c_int, y: *c_int, comp: *c_int) c_int;
 extern fn stbi_failure_reason() ?[*:0]const u8;
 
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
@@ -21,7 +25,7 @@ extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 // Canonicalizzazione per-OS: realpath(3) su POSIX, _fullpath (CRT) su Windows.
 // Switch comptime come per `sub` in decoder.zig: solo il ramo selezionato viene
 // analizzato, quindi l'extern dell'altro OS non arriva mai al link.
-const canon = switch (@import("builtin").os.tag) {
+const canon = switch (builtin.os.tag) {
     .windows => struct {
         extern fn _fullpath(resolved: [*]u8, path: [*:0]const u8, max_len: usize) ?[*:0]u8;
         fn resolve(pz: [*:0]const u8, buf: []u8) ?[*:0]u8 {
@@ -71,43 +75,86 @@ pub const coarse_max_dim: usize = 512;
 pub fn decodeWithMax(path: []const u8, file_bytes: []const u8, filename: []const u8, allocator: std.mem.Allocator, max_dim: usize) Decoded {
     // I subprocess (SVG/ImageMagick) usano decoder.runCapture (fork/exec diretti),
     // quindi qui non serve l'io dell'host.
+    //
+    // Ordine dei motori, IDENTICO su ogni piattaforma salvo il codec di sistema:
+    //   1. SVG: rsvg-convert (non su Windows), poi nanosvg (in processo, ovunque);
+    //   2. WebP: libwebp (in processo, ovunque; anche i WebP animati: 1° fotogramma);
+    //   3. ICO: parser in Zig, voci PNG/BMP decodificate con stb;
+    //   4. stb_image: PNG, JPEG (con orientamento EXIF), GIF, BMP, TGA, PSD, HDR, PIC, PNM;
+    //   5. codec di sistema: ImageIO su macOS, WIC su Windows (TIFF, HEIC/AVIF…);
+    //   6. ImageMagick, non su Windows (là `convert.exe` è lo strumento di sistema
+    //      che converte i FILESYSTEM FAT in NTFS: mai lanciarlo).
+    // L'alpha si compone sempre su bianco, come i viewer di documenti.
+    var last_err: anyerror = error.UnsupportedImageFormat;
 
-    // SVG: prima librsvg (rendering di qualità, gestisce anche .svgz),
-    // poi il fallback ImageMagick come per gli altri formati non-stb.
     if (hasSvgExtension(filename)) {
-        if (decodeWithRsvg(path, filename, max_dim, allocator)) |img| {
+        if (comptime !is_windows) {
+            if (decodeWithRsvg(path, filename, max_dim, allocator)) |img| {
+                return .{ .image = img };
+            } else |_| {}
+        }
+        if (decodeSvgNano(file_bytes, filename, max_dim, allocator)) |img| {
             return .{ .image = img };
-        } else |_| {}
-    }
-
-    // WebP: libwebp a runtime, in processo. Senza (libreria assente, WebP
-    // animato, altro OS) si prosegue verso stb e poi ImageMagick come prima.
-    if (isWebp(file_bytes)) {
+        } else |e| last_err = e;
+    } else if (isWebp(file_bytes)) {
         if (decodeWebp(file_bytes, filename, max_dim, allocator)) |img| {
             return .{ .image = img };
-        } else |_| {}
+        } else |e| last_err = e;
+    } else if (isIco(file_bytes)) {
+        if (decodeIco(file_bytes, filename, max_dim, allocator)) |img| {
+            return .{ .image = img };
+        } else |e| last_err = e;
+    } else if (decodeNative(file_bytes, filename, max_dim, allocator)) |img| {
+        return .{ .image = img };
+    } else |e| {
+        last_err = e;
+    }
+    if (last_err == error.ImageTooLarge or last_err == error.OutOfMemory) return errResult(allocator, last_err, null);
+
+    if (decodeSystem(file_bytes, filename, max_dim, allocator)) |img| {
+        return .{ .image = img };
+    } else |e| {
+        if (e == error.ImageTooLarge or e == error.OutOfMemory) return errResult(allocator, e, null);
     }
 
-    if (decodeNative(file_bytes, filename, max_dim, allocator)) |img| {
-        return .{ .image = img };
-    } else |native_err| {
-        const native_reason: []const u8 = switch (native_err) {
-            error.UnsupportedImageFormat => if (stbi_failure_reason()) |r| std.mem.span(r) else "formato non riconosciuto",
-            else => @errorName(native_err),
-        };
-
-        // Formati vettoriali non coperti da stb_image (es. SVG): fallback a ImageMagick.
-        if (decodeWithImageMagick(path, filename, max_dim, allocator)) |img| {
-            return .{ .image = img };
-        } else |im_err| {
-            const msg = std.fmt.allocPrint(
-                allocator,
-                "Errore caricamento immagine: {s} (fallback ImageMagick: {s})",
-                .{ native_reason, @errorName(im_err) },
-            ) catch "";
+    if (comptime is_windows) {
+        // AVIF/HEIC in WIC esistono solo con le estensioni del Microsoft Store:
+        // il messaggio dice quale manca invece di "formato non riconosciuto".
+        if (isoBrand(file_bytes)) |brand| {
+            const ext = if (brand == .avif) "AV1 Video Extension" else "HEIF Image Extensions + HEVC Video Extensions";
+            const msg = std.fmt.allocPrint(allocator, "Errore caricamento immagine: {s} richiede il codec di Windows «{s}» (Microsoft Store)", .{ if (brand == .avif) "AVIF" else "HEIC/HEIF", ext }) catch "";
             return .{ .err = msg };
         }
+        return errResult(allocator, last_err, null);
     }
+    // Formati vettoriali o non coperti: fallback a ImageMagick.
+    if (decodeWithImageMagick(path, filename, max_dim, allocator)) |img| {
+        return .{ .image = img };
+    } else |im_err| {
+        return errResult(allocator, last_err, im_err);
+    }
+}
+
+const is_windows = builtin.os.tag == .windows;
+const is_macos = builtin.os.tag == .macos;
+
+/// Tetto sui pixel di una singola immagine SORGENTE (verificato prima di
+/// decodificare): ~150 megapixel = 600 MB di RGBA. Oltre, un errore chiaro invece
+/// di un'allocazione che può esaurire la memoria della macchina.
+pub const max_source_pixels: usize = 150_000_000;
+
+fn errResult(allocator: std.mem.Allocator, err: anyerror, im_err: ?anyerror) Decoded {
+    const reason: []const u8 = switch (err) {
+        error.UnsupportedImageFormat => if (stbi_failure_reason()) |r| std.mem.span(r) else "formato non riconosciuto",
+        error.ImageTooLarge => "immagine troppo grande (oltre 150 megapixel)",
+        error.OutOfMemory => "memoria esaurita",
+        else => @errorName(err),
+    };
+    const msg = if (im_err) |e|
+        std.fmt.allocPrint(allocator, "Errore caricamento immagine: {s} (fallback ImageMagick: {s})", .{ reason, @errorName(e) }) catch ""
+    else
+        std.fmt.allocPrint(allocator, "Errore caricamento immagine: {s}", .{reason}) catch "";
+    return .{ .err = msg };
 }
 
 fn hasSvgExtension(filename: []const u8) bool {
@@ -127,16 +174,7 @@ fn hasSvgExtension(filename: []const u8) bool {
 /// Rasterizza l'SVG con librsvg in un PNG in memoria (adattato al box
 /// max_dim×max_dim), poi lo decodifica con stb come qualsiasi altro PNG.
 fn decodeWithRsvg(path: []const u8, filename: []const u8, max_dim: usize, allocator: std.mem.Allocator) !ImageData {
-    // La rasterizzazione rsvg costa ~col quadrato del lato: a 4096 un SVG complesso
-    // può prendere decine di secondi (35 s misurati), mentre a 2048 è ~4× più veloce
-    // con qualità indistinguibile a schermo. Cappiamo quindi il lato SVG a 2048
-    // (i raster restano al max_dim pieno). Override: ZUER_SVG_MAX.
-    var svg_dim: usize = @min(max_dim, 2048);
-    if (getenv("ZUER_SVG_MAX")) |v| {
-        if (std.fmt.parseInt(usize, std.mem.span(v), 10)) |m| {
-            if (m > 0) svg_dim = m;
-        } else |_| {}
-    }
+    const svg_dim = svgDim(max_dim);
     var dim_buf: [16]u8 = undefined;
     const dim_str = try std.fmt.bufPrint(&dim_buf, "{d}", .{svg_dim});
 
@@ -155,135 +193,268 @@ fn decodeWithRsvg(path: []const u8, filename: []const u8, max_dim: usize, alloca
     return decodeNative(result.stdout, filename, svg_dim, allocator);
 }
 
+/// La rasterizzazione costa ~col quadrato del lato: a 4096 un SVG complesso può
+/// prendere decine di secondi (35 s misurati con rsvg), mentre a 2048 è ~4× più
+/// veloce con qualità indistinguibile a schermo. Lato SVG cappato a 2048 (i
+/// raster restano al max_dim pieno). Override: ZUER_SVG_MAX.
+fn svgDim(max_dim: usize) usize {
+    var svg_dim: usize = @min(max_dim, 2048);
+    if (getenv("ZUER_SVG_MAX")) |v| {
+        if (std.fmt.parseInt(usize, std.mem.span(v), 10)) |m| {
+            if (m > 0) svg_dim = m;
+        } else |_| {}
+    }
+    return svg_dim;
+}
+
+// ── Codec in C compilati nel plugin (src/c/image_codecs.c, src/c/wic_decode.c) ──
+extern fn zuer_img_free(p: ?*anyopaque) void;
+extern fn zuer_webp_rgba(data: [*]const u8, len: usize, max_pixels: c_int, out: *?[*]u8, w: *c_int, h: *c_int) c_int;
+extern fn zuer_svg_rgba(data: [*:0]u8, max_dim: c_int, out: *?[*]u8, w: *c_int, h: *c_int) c_int;
+const wic = if (is_windows) struct {
+    extern fn zuer_wic_rgba(data: [*]const u8, len: usize, max_pixels: c_int, out: *?[*]u8, w: *c_int, h: *c_int) c_int;
+} else struct {};
+const imageio = if (is_macos) @import("image_imageio.zig") else struct {};
+
+/// Pixel RGBA da un codec C (malloc): composti su bianco e ridimensionati.
+fn finishC(rc: c_int, px: ?[*]u8, w: c_int, h: c_int, filename: []const u8, max_dim: usize, allocator: std.mem.Allocator) !ImageData {
+    switch (rc) {
+        0 => {},
+        -2 => return error.OutOfMemory,
+        -3 => return error.ImageTooLarge,
+        else => return error.UnsupportedImageFormat,
+    }
+    const p = px orelse return error.UnsupportedImageFormat;
+    defer zuer_img_free(p);
+    if (w <= 0 or h <= 0) return error.InvalidImageSize;
+    return resizeToFit(p, 4, @intCast(w), @intCast(h), 1, filename, max_dim, allocator);
+}
+
+fn decodeWebp(file_bytes: []const u8, filename: []const u8, max_dim: usize, allocator: std.mem.Allocator) !ImageData {
+    var px: ?[*]u8 = null;
+    var w: c_int = 0;
+    var h: c_int = 0;
+    const rc = zuer_webp_rgba(file_bytes.ptr, file_bytes.len, @intCast(max_source_pixels), &px, &w, &h);
+    return finishC(rc, px, w, h, filename, max_dim, allocator);
+}
+
+/// nanosvg: il parser lavora sul posto, quindi su una copia terminata da NUL.
+/// `.svgz` (gzip) viene prima decompresso con la flate della std.
+fn decodeSvgNano(file_bytes: []const u8, filename: []const u8, max_dim: usize, allocator: std.mem.Allocator) !ImageData {
+    const max_svg_bytes = 64 * 1024 * 1024;
+    var text: []u8 = undefined;
+    if (file_bytes.len >= 2 and file_bytes[0] == 0x1f and file_bytes[1] == 0x8b) {
+        var in: std.Io.Reader = .fixed(file_bytes);
+        var window: [std.compress.flate.max_window_len]u8 = undefined;
+        var dec: std.compress.flate.Decompress = .init(&in, .gzip, &window);
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        _ = dec.reader.streamRemaining(&out.writer) catch return error.UnsupportedImageFormat;
+        if (out.written().len > max_svg_bytes) return error.ImageTooLarge;
+        text = try allocator.alloc(u8, out.written().len + 1);
+        @memcpy(text[0 .. text.len - 1], out.written());
+    } else {
+        if (file_bytes.len > max_svg_bytes) return error.ImageTooLarge;
+        text = try allocator.alloc(u8, file_bytes.len + 1);
+        @memcpy(text[0 .. text.len - 1], file_bytes);
+    }
+    defer allocator.free(text);
+    text[text.len - 1] = 0;
+    const dim = svgDim(max_dim);
+    var px: ?[*]u8 = null;
+    var w: c_int = 0;
+    var h: c_int = 0;
+    const rc = zuer_svg_rgba(text[0 .. text.len - 1 :0].ptr, @intCast(dim), &px, &w, &h);
+    return finishC(rc, px, w, h, filename, dim, allocator);
+}
+
+/// Codec di sistema: ImageIO (macOS) o WIC (Windows). Altrove non c'è.
+fn decodeSystem(file_bytes: []const u8, filename: []const u8, max_dim: usize, allocator: std.mem.Allocator) !ImageData {
+    if (comptime is_windows) {
+        var px: ?[*]u8 = null;
+        var w: c_int = 0;
+        var h: c_int = 0;
+        const rc = wic.zuer_wic_rgba(file_bytes.ptr, file_bytes.len, @intCast(max_source_pixels), &px, &w, &h);
+        return finishC(rc, px, w, h, filename, max_dim, allocator);
+    } else if (comptime is_macos) {
+        const r = try imageio.decode(allocator, file_bytes, max_source_pixels);
+        defer allocator.free(r.rgba);
+        return resizeToFit(r.rgba.ptr, 4, r.width, r.height, 1, filename, max_dim, allocator);
+    } else return error.UnsupportedImageFormat;
+}
+
 fn decodeNative(file_bytes: []const u8, filename: []const u8, max_dim: usize, allocator: std.mem.Allocator) !ImageData {
     if (file_bytes.len == 0 or file_bytes.len > std.math.maxInt(c_int)) return error.UnsupportedImageFormat;
 
+    // Dimensioni dall'header PRIMA di decodificare: il tetto vale anche per stb.
     var w: c_int = 0;
     var h: c_int = 0;
     var channels: c_int = 0;
-    const data = stbi_load_from_memory(file_bytes.ptr, @intCast(file_bytes.len), &w, &h, &channels, 3) orelse
+    if (stbi_info_from_memory(file_bytes.ptr, @intCast(file_bytes.len), &w, &h, &channels) == 0)
+        return error.UnsupportedImageFormat;
+    if (w <= 0 or h <= 0) return error.InvalidImageSize;
+    if (@as(usize, @intCast(w)) * @as(usize, @intCast(h)) > max_source_pixels) return error.ImageTooLarge;
+
+    const data = stbi_load_from_memory(file_bytes.ptr, @intCast(file_bytes.len), &w, &h, &channels, 4) orelse
         return error.UnsupportedImageFormat;
     defer stbi_image_free(data);
 
     if (w <= 0 or h <= 0) return error.InvalidImageSize;
-    return resizeToFit(data, @intCast(w), @intCast(h), filename, max_dim, allocator);
+    return resizeToFit(data, 4, @intCast(w), @intCast(h), exif.orientation(file_bytes), filename, max_dim, allocator);
+}
+
+/// Contenitore ISO-BMFF d'immagine (`....ftyp<brand>`): AVIF o HEIF.
+fn isoBrand(b: []const u8) ?enum { avif, heif } {
+    if (b.len < 12 or !std.mem.eql(u8, b[4..8], "ftyp")) return null;
+    const brand = b[8..12];
+    if (std.mem.eql(u8, brand, "avif") or std.mem.eql(u8, brand, "avis")) return .avif;
+    inline for (.{ "heic", "heix", "hevc", "hevx", "heim", "heis", "mif1", "msf1" }) |h| {
+        if (std.mem.eql(u8, brand, h)) return .heif;
+    }
+    return null;
 }
 
 fn isWebp(b: []const u8) bool {
     return b.len >= 12 and std.mem.eql(u8, b[0..4], "RIFF") and std.mem.eql(u8, b[8..12], "WEBP");
 }
 
-/// `libwebp` caricata con dlopen al primo WebP: nessuna dipendenza di build e
-/// niente processo esterno. Prima i WebP passavano da ImageMagick (un processo
-/// per file, multi-thread, ~0,4 s l'uno; e il `magick` di molte distro non ha
-/// nemmeno il delegate WebP). Solo Linux: altrove `load` dà sempre null.
-const webp = struct {
-    const GetInfo = *const fn ([*]const u8, usize, *c_int, *c_int) callconv(.c) c_int;
-    const DecodeRGB = *const fn ([*]const u8, usize, *c_int, *c_int) callconv(.c) ?[*]u8;
-    const Free = *const fn (?*anyopaque) callconv(.c) void;
-    const Api = struct { get_info: GetInfo, decode_rgb: DecodeRGB, free: Free };
+// ── ICO ─────────────────────────────────────────────────────────────────────
+// Un contenitore di più immagini: si sceglie la più grande (a parità, quella con
+// più bit per pixel). Una voce è un PNG intero oppure un DIB "nudo" (header
+// BITMAPINFOHEADER con altezza raddoppiata, pixel XOR, poi la maschera AND a 1 bit).
 
-    const dl = switch (@import("builtin").os.tag) {
-        .linux => struct {
-            extern "c" fn dlopen(path: [*:0]const u8, mode: c_int) ?*anyopaque;
-            extern "c" fn dlsym(handle: ?*anyopaque, symbol: [*:0]const u8) ?*anyopaque;
-        },
-        else => void,
-    };
-
-    // 0 = da provare, 1 = pronta, 2 = assente. Due decode concorrenti al
-    // primo WebP possono caricarla entrambi: dlopen conta i riferimenti e
-    // l'handle è lo stesso, quindi la corsa è innocua.
-    var state: std.atomic.Value(u8) = .init(0);
-    var api: Api = undefined;
-
-    fn load() ?*const Api {
-        switch (state.load(.acquire)) {
-            1 => return &api,
-            2 => return null,
-            else => {},
-        }
-        if (dl == void) {
-            state.store(2, .release);
-            return null;
-        }
-        const RTLD_NOW = 2;
-        const h = dl.dlopen("libwebp.so.7", RTLD_NOW) orelse dl.dlopen("libwebp.so", RTLD_NOW) orelse {
-            state.store(2, .release);
-            return null;
-        };
-        const gi = dl.dlsym(h, "WebPGetInfo");
-        const dr = dl.dlsym(h, "WebPDecodeRGB");
-        const fr = dl.dlsym(h, "WebPFree");
-        if (gi == null or dr == null or fr == null) {
-            state.store(2, .release);
-            return null;
-        }
-        api = .{ .get_info = @ptrCast(@alignCast(gi)), .decode_rgb = @ptrCast(@alignCast(dr)), .free = @ptrCast(@alignCast(fr)) };
-        state.store(1, .release);
-        return &api;
-    }
-};
-
-fn decodeWebp(file_bytes: []const u8, filename: []const u8, max_dim: usize, allocator: std.mem.Allocator) !ImageData {
-    const a = webp.load() orelse return error.WebpUnavailable;
-    var w: c_int = 0;
-    var h: c_int = 0;
-    if (a.get_info(file_bytes.ptr, file_bytes.len, &w, &h) == 0) return error.UnsupportedImageFormat;
-    // I WebP animati non passano dall'API semplice: NULL → ripiego.
-    const data = a.decode_rgb(file_bytes.ptr, file_bytes.len, &w, &h) orelse return error.UnsupportedImageFormat;
-    defer a.free(data);
-    if (w <= 0 or h <= 0) return error.InvalidImageSize;
-    return resizeToFit(data, @intCast(w), @intCast(h), filename, max_dim, allocator);
+fn isIco(b: []const u8) bool {
+    return b.len >= 6 and b[0] == 0 and b[1] == 0 and b[2] == 1 and b[3] == 0 and
+        std.mem.readInt(u16, b[4..6], .little) > 0;
 }
 
-/// Ridimensiona i pixel RGB per stare entro max_dim×max_dim (media per area,
-/// solo riduzione) copiandoli in un buffer di proprietà dell'allocator del chiamante.
-fn resizeToFit(src: [*]const u8, src_w: usize, src_h: usize, filename: []const u8, max_dim: usize, allocator: std.mem.Allocator) !ImageData {
+fn decodeIco(bytes: []const u8, filename: []const u8, max_dim: usize, allocator: std.mem.Allocator) !ImageData {
+    const count = std.mem.readInt(u16, bytes[4..6], .little);
+    var best: ?struct { off: usize, size: usize, area: usize, bpp: u16 } = null;
+    for (0..count) |i| {
+        const e = 6 + i * 16;
+        if (e + 16 > bytes.len) break;
+        const ew: usize = if (bytes[e] == 0) 256 else bytes[e];
+        const eh: usize = if (bytes[e + 1] == 0) 256 else bytes[e + 1];
+        const bpp = std.mem.readInt(u16, bytes[e + 6 ..][0..2], .little);
+        const size = std.mem.readInt(u32, bytes[e + 8 ..][0..4], .little);
+        const off = std.mem.readInt(u32, bytes[e + 12 ..][0..4], .little);
+        if (size == 0 or off >= bytes.len or size > bytes.len - off) continue;
+        const area = ew * eh;
+        if (best == null or area > best.?.area or (area == best.?.area and bpp > best.?.bpp))
+            best = .{ .off = off, .size = size, .area = area, .bpp = bpp };
+    }
+    const b = best orelse return error.UnsupportedImageFormat;
+    const entry = bytes[b.off..][0..b.size];
+    if (entry.len >= 8 and std.mem.eql(u8, entry[0..8], "\x89PNG\r\n\x1a\n"))
+        return decodeNative(entry, filename, max_dim, allocator);
+    return decodeIcoDib(entry, filename, max_dim, allocator);
+}
+
+/// DIB di un'icona → file BMP ricostruito (header di 14 byte, altezza dimezzata)
+/// decodificato da stb; poi la maschera AND rende trasparenti i pixel che la
+/// richiedono (le icone a 32 bit hanno già l'alpha e la maschera si ignora).
+fn decodeIcoDib(dib: []const u8, filename: []const u8, max_dim: usize, allocator: std.mem.Allocator) !ImageData {
+    if (dib.len < 40) return error.UnsupportedImageFormat;
+    const hdr_size = std.mem.readInt(u32, dib[0..4], .little);
+    if (hdr_size < 40 or hdr_size > dib.len) return error.UnsupportedImageFormat;
+    const w = std.mem.readInt(i32, dib[4..8], .little);
+    const h2 = std.mem.readInt(i32, dib[8..12], .little);
+    const bpp = std.mem.readInt(u16, dib[14..16], .little);
+    const clr_used = std.mem.readInt(u32, dib[32..36], .little);
+    if (w <= 0 or w > 4096 or h2 <= 0 or h2 > 8192 or @rem(h2, 2) != 0) return error.UnsupportedImageFormat;
+    const uw: usize = @intCast(w);
+    const uh: usize = @intCast(@divExact(h2, 2));
+    const colors: usize = if (bpp <= 8) (if (clr_used != 0) clr_used else @as(usize, 1) << @intCast(bpp)) else clr_used;
+    const pix_off = 14 + hdr_size + colors * 4;
+    const xor_row = ((uw * bpp + 31) / 32) * 4;
+    const and_row = ((uw + 31) / 32) * 4;
+
+    const bmp = try allocator.alloc(u8, 14 + dib.len);
+    defer allocator.free(bmp);
+    @memcpy(bmp[0..2], "BM");
+    std.mem.writeInt(u32, bmp[2..6], @intCast(bmp.len), .little);
+    std.mem.writeInt(u32, bmp[6..10], 0, .little);
+    std.mem.writeInt(u32, bmp[10..14], @intCast(pix_off), .little);
+    @memcpy(bmp[14..], dib);
+    std.mem.writeInt(i32, bmp[14 + 8 ..][0..4], @intCast(uh), .little);
+
+    var ow: c_int = 0;
+    var oh: c_int = 0;
+    var ch: c_int = 0;
+    const data = stbi_load_from_memory(bmp.ptr, @intCast(bmp.len), &ow, &oh, &ch, 4) orelse
+        return error.UnsupportedImageFormat;
+    defer stbi_image_free(data);
+    if (ow != w or oh != @as(c_int, @intCast(uh))) return error.UnsupportedImageFormat;
+
+    // Maschera AND (righe dal basso verso l'alto): 1 = trasparente.
+    const mask_off = pix_off - 14 + xor_row * uh;
+    if (bpp < 32 and mask_off + and_row * uh <= dib.len) {
+        for (0..uh) |y| {
+            const row = dib[mask_off + (uh - 1 - y) * and_row ..][0..and_row];
+            for (0..uw) |x| {
+                if ((row[x / 8] >> @intCast(7 - x % 8)) & 1 != 0) data[(y * uw + x) * 4 + 3] = 0;
+            }
+        }
+    }
+    return resizeToFit(data, 4, uw, uh, 1, filename, max_dim, allocator);
+}
+
+/// Ridimensiona i pixel (`ch` = 3 RGB o 4 RGBA) per stare entro max_dim×max_dim
+/// (media per area, solo riduzione), componendo l'alpha su bianco e applicando
+/// l'orientamento EXIF `orient` (1 = nessuno), in un buffer RGB di proprietà
+/// dell'allocator del chiamante. Tutto in un passaggio: nessuna copia intermedia
+/// a piena risoluzione.
+fn resizeToFit(src: [*]const u8, ch: usize, src_w: usize, src_h: usize, orient: u8, filename: []const u8, max_dim: usize, allocator: std.mem.Allocator) !ImageData {
     const fw: f32 = @floatFromInt(src_w);
     const fh: f32 = @floatFromInt(src_h);
     const fmax: f32 = @floatFromInt(max_dim);
     const scale = @min(1.0, @min(fmax / fw, fmax / fh));
 
+    // Dimensioni ridotte nello spazio della SORGENTE; l'orientamento le scambia dopo.
     const dst_w = @max(1, @as(usize, @intFromFloat(@round(fw * scale))));
     const dst_h = @max(1, @as(usize, @intFromFloat(@round(fh * scale))));
+    const swap = orient >= 5 and orient <= 8;
+    const out_w = if (swap) dst_h else dst_w;
+    const out_h = if (swap) dst_w else dst_h;
 
     const name = try allocator.dupe(u8, filename);
     errdefer allocator.free(name);
     const pixels = try allocator.alloc(u8, dst_w * dst_h * 3);
     errdefer allocator.free(pixels);
 
-    if (dst_w == src_w and dst_h == src_h) {
-        @memcpy(pixels, src[0 .. src_w * src_h * 3]);
-    } else {
-        for (0..dst_h) |dy| {
+    for (0..out_h) |oy| {
+        for (0..out_w) |ox| {
+            const sp = exif.srcCoord(orient, dst_w, dst_h, ox, oy);
+            const dx = sp[0];
+            const dy = sp[1];
             const y0 = dy * src_h / dst_h;
             const y1 = @max(y0 + 1, (dy + 1) * src_h / dst_h);
-            for (0..dst_w) |dx| {
-                const x0 = dx * src_w / dst_w;
-                const x1 = @max(x0 + 1, (dx + 1) * src_w / dst_w);
+            const x0 = dx * src_w / dst_w;
+            const x1 = @max(x0 + 1, (dx + 1) * src_w / dst_w);
 
-                var sum = [3]u64{ 0, 0, 0 };
-                for (y0..y1) |sy| {
-                    for (x0..x1) |sx| {
-                        const s = (sy * src_w + sx) * 3;
-                        sum[0] += src[s];
-                        sum[1] += src[s + 1];
-                        sum[2] += src[s + 2];
+            var sum = [3]u64{ 0, 0, 0 };
+            for (y0..y1) |sy| {
+                for (x0..x1) |sx| {
+                    const s = (sy * src_w + sx) * ch;
+                    if (ch == 4) {
+                        // Composizione su bianco: c·a + 255·(255−a), in unità 1/255.
+                        const a: u64 = src[s + 3];
+                        inline for (0..3) |c| sum[c] += (@as(u64, src[s + c]) * a + 255 * (255 - a) + 127) / 255;
+                    } else {
+                        inline for (0..3) |c| sum[c] += src[s + c];
                     }
                 }
-                const count: u64 = @intCast((y1 - y0) * (x1 - x0));
-                const d = (dy * dst_w + dx) * 3;
-                pixels[d] = @intCast(sum[0] / count);
-                pixels[d + 1] = @intCast(sum[1] / count);
-                pixels[d + 2] = @intCast(sum[2] / count);
             }
+            const count: u64 = @intCast((y1 - y0) * (x1 - x0));
+            const d = (oy * out_w + ox) * 3;
+            inline for (0..3) |c| pixels[d + c] = @intCast(sum[c] / count);
         }
     }
 
     return .{
-        .width = dst_w,
-        .height = dst_h,
+        .width = out_w,
+        .height = out_h,
         .pixels = pixels,
         .name = name,
     };
@@ -396,10 +567,10 @@ fn zuer_decode_coarse(
     return decodeExport(path, content, allocator_ptr, true);
 }
 
-// stb_image copre nativamente PNG/JPEG/GIF/BMP/TGA/PSD/HDR/PIC/PNM; i formati
-// vettoriali o non coperti (SVG, WebP, TIFF, ICO, AVIF) passano dal fallback
-// ImageMagick già presente in decode().
-pub const extensions = "png,jpg,jpeg,gif,bmp,tga,psd,hdr,pic,pnm,pbm,pgm,ppm,svg,svgz,webp,tif,tiff,ico,avif";
+// In processo su ogni piattaforma: stb_image (PNG/JPEG/GIF/BMP/TGA/PSD/HDR/PIC/PNM),
+// libwebp (WebP), nanosvg (SVG/SVGZ), il parser ICO. TIFF e AVIF passano dal codec
+// di sistema (ImageIO su macOS, WIC su Windows) o da ImageMagick su Linux.
+pub const extensions = "png,jpg,jpeg,gif,bmp,tga,psd,hdr,pic,pnm,pbm,pgm,ppm,svg,svgz,webp,tif,tiff,ico,avif,heic,heif";
 
 fn zuer_extensions() callconv(.c) decoder.SliceC {
     return decoder.SliceC.fromSlice(extensions);

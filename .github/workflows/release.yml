@@ -255,6 +255,9 @@ jobs:
           "$P" page "$D/prova.pdf" 2 2>&1 | tee page2.log
           grep -q 'immagine 1650x1275' page2.log || { echo "::error::pagina ruotata di 90° non resa in orizzontale"; exit 1; }
           "$P" page "$D/prova.pdf" 3
+          # PDF e immagini: le stesse prove (stessi file, stessi esiti) delle altre piattaforme.
+          bash "$GITHUB_WORKSPACE/Zuer/scripts/pdf-check.sh" "$P" "$D"
+          bash "$GITHUB_WORKSPACE/Zuer/scripts/image-check.sh" "$P" "$GITHUB_WORKSPACE/Zuer/tests/images"
           "$P" video "$D/clip.mp4" 2>&1 | tee video.log
           grep -q 'decodifica hardware: sì' video.log && echo "VideoToolbox: attivo" || echo "::warning::decodifica hardware non attiva sul runner (software)"
           [[ -f "$D/clip-hevc.mp4" ]] && "$P" video "$D/clip-hevc.mp4"
@@ -292,6 +295,8 @@ jobs:
           }
           run "$D/prova.txt"
           run "$D/prova.pdf"
+          run "$GITHUB_WORKSPACE/Zuer/tests/images/logo.webp"
+          run "$GITHUB_WORKSPACE/Zuer/tests/images/logo.svg"
           run "$D/prova.docx"
           run "$D/prova.xlsx"
           run "$D/clip.mp4"
@@ -368,7 +373,8 @@ jobs:
           ls -la "$B"
           if find "$B" -type f \( -name '*.patch' -o -name '*.log' -o -name '*.pdb' -o -name '*.lib' \) | grep -q .; then
             echo "::error::file di sviluppo nella staging"; exit 1; fi
-          for f in LICENSE.txt FFmpeg-LICENSE.txt FFmpeg-SOURCE.txt decoder_office.dll decoder_media.dll; do [[ -f "$B/$f" ]] || { echo "::error::$f assente"; exit 1; }; done
+          for f in LICENSE.txt FFmpeg-LICENSE.txt FFmpeg-SOURCE.txt PDFium-LICENSE.txt pdfium.dll decoder_office.dll decoder_media.dll decoder_pdf.dll; do [[ -f "$B/$f" ]] || { echo "::error::$f assente"; exit 1; }; done
+          grep -q 'Copyright 2014 The PDFium Authors' "$B/PDFium-LICENSE.txt" || { echo "::error::licenza PDFium incompleta"; exit 1; }
           objdump -f "$B/zuer-gui.exe" | grep -q 'file format pei-x86-64' || { echo "::error::zuer-gui.exe non è PE x86-64"; exit 1; }
           # Ogni DLL importata: o è nel pacchetto, o è di sistema (System32). Vulkan
           # non è MAI importato: il loader si apre a runtime (src/renderer/vk_loader.zig).
@@ -393,11 +399,12 @@ jobs:
           rm -rf "$UDIR"
           "$SETUP" /S "/D=$DIR"
           ls -la "$UDIR"
-          for f in zuer-gui.exe uninstall.exe LICENSE.txt avformat-63.dll decoder_text.dll decoder_office.dll; do
+          for f in zuer-gui.exe uninstall.exe LICENSE.txt avformat-63.dll decoder_text.dll decoder_office.dll decoder_pdf.dll pdfium.dll PDFium-LICENSE.txt; do
             [[ -f "$UDIR/$f" ]] || { echo "::error::$f non installato"; exit 1; }; done
           reg query 'HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Zuer' | tee reg.txt
           grep -q "DisplayVersion.*$VERSION" reg.txt || { echo "::error::DisplayVersion errata"; exit 1; }
           reg query 'HKCU\Software\Classes\.docx\OpenWithProgids' | grep -q Zuer.Viewer || { echo "::error::.docx non associato"; exit 1; }
+          reg query 'HKCU\Software\Classes\.pdf\OpenWithProgids' | grep -q Zuer.Viewer || { echo "::error::.pdf non associato"; exit 1; }
           # Il runner NON ha alcun loader Vulkan: è esattamente il caso "Windows senza
           # Vulkan" che deve funzionare. Nulla viene aggiunto al PATH.
           [[ ! -f /c/Windows/System32/vulkan-1.dll ]] || { echo "::error::il runner ha vulkan-1.dll: la prova senza loader non è valida"; exit 1; }
@@ -410,6 +417,10 @@ jobs:
           cp "$RUNNER_TEMP/probe/bin/feature-probe.exe" "$UDIR/"
           W() { cygpath -w "$1"; }
           "$UDIR/feature-probe.exe" doc "$(W "$D/prova.docx")" "$(W "$D/prova.xlsx")" "$(W "$D/prova.pptx")" "$(W "$D/prova.odt")" "$(W "$D/prova.ods")" "$(W "$D/cubo.obj")" "$(W "$D/prova.txt")" "$(W "$D/clip.mp4")"
+          # PDF (PDFium) e immagini (stb, libwebp, nanosvg, WIC): le stesse prove di Linux e macOS.
+          bash "$GITHUB_WORKSPACE/Zuer/scripts/pdf-check.sh" "$UDIR/feature-probe.exe" "$D"
+          ZUER_PDFIUM=none "$UDIR/feature-probe.exe" fail "$(W "$D/prova.pdf")" "pdfium.dll"
+          bash "$GITHUB_WORKSPACE/Zuer/scripts/image-check.sh" "$UDIR/feature-probe.exe" "$GITHUB_WORKSPACE/Zuer/tests/images"
           "$UDIR/feature-probe.exe" video "$(W "$D/clip.mp4")"
           if ! "$UDIR/feature-probe.exe" audio "$(W "$D/clip.mp4")"; then echo "::warning::audio: nessun dispositivo di uscita utilizzabile sul runner"; fi
           "$UDIR/feature-probe.exe" gpu > gpu-noloader.log 2>&1 || true; cat gpu-noloader.log
@@ -424,6 +435,8 @@ jobs:
           gui "senza loader Vulkan, testo" "$D/prova.txt"
           gui "senza loader Vulkan, modello 3D" "$D/cubo.obj"
           gui "senza loader Vulkan, docx" "$D/prova.docx"
+          gui "PDF (PDFium)" "$D/prova.pdf"
+          gui "immagine WebP" "$GITHUB_WORKSPACE/Zuer/tests/images/logo.webp"
           gui "senza loader Vulkan, video (audio muto)" "$D/clip.mp4"
           # Il loader di MSYS2 (FUORI dal pacchetto) indicato esplicitamente: Zuer non
           # cerca vulkan-1.dll nel PATH (solo cartella dell'app e System32), e il runner
