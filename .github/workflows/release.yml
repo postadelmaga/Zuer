@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag da costruire (es. v1.0.0-rc.1). Con dry_run anche un ramo o un commit."
+        description: "Tag da costruire (es. v1.0.0). Con dry_run anche un ramo o un commit."
         required: true
         type: string
       dry_run:
@@ -334,7 +334,8 @@ jobs:
           # loader Vulkan di MSYS2 serve SOLO alla prova "loader senza driver".
           /c/msys64/usr/bin/pacman.exe -S --noconfirm --needed --noprogressbar \
             mingw-w64-ucrt-x86_64-shaderc mingw-w64-ucrt-x86_64-binutils mingw-w64-ucrt-x86_64-imagemagick \
-            mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-vulkan-loader mingw-w64-ucrt-x86_64-ffmpeg
+            mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-vulkan-loader mingw-w64-ucrt-x86_64-ffmpeg \
+            mingw-w64-ucrt-x86_64-mesa
       - name: Build e installer (scripts/build-windows-installer.sh)
         working-directory: Zuer
         run: |
@@ -419,14 +420,39 @@ jobs:
           gui "senza loader Vulkan, modello 3D" "$D/cubo.obj"
           gui "senza loader Vulkan, docx" "$D/prova.docx"
           gui "senza loader Vulkan, video (audio muto)" "$D/clip.mp4"
-          # Loader presente ma nessun driver: il loader di MSYS2, fuori dal pacchetto.
-          mkdir -p "$RUNNER_TEMP/vk"
-          cp "$(find /c/msys64/ucrt64/bin -maxdepth 1 -iname '*vulkan-1*.dll' | head -1)" "$RUNNER_TEMP/vk/vulkan-1.dll"
+          # Il loader di MSYS2 (FUORI dal pacchetto) indicato esplicitamente: Zuer non
+          # cerca vulkan-1.dll nel PATH (solo cartella dell'app e System32), e il runner
+          # non ha GPU. Le DLL da cui dipende stanno in ucrt64/bin, aggiunta al PATH
+          # solo per queste prove.
+          VKL='C:\msys64\ucrt64\bin\vulkan-1.dll'; [[ -f /c/msys64/ucrt64/bin/vulkan-1.dll ]] || { echo "::error::loader MSYS2 assente"; exit 1; }
+          LVP='C:\msys64\ucrt64\share\vulkan\icd.d\lvp_icd.x86_64.json'
+          VKPATH="/c/msys64/ucrt64/bin:$PATH"
           cp "$RUNNER_TEMP/probe/bin/feature-probe.exe" "$UDIR/"
-          PATH="$RUNNER_TEMP/vk:$PATH" "$UDIR/feature-probe.exe" gpu > gpu-nodriver.log 2>&1 || true; cat gpu-nodriver.log
+          # 1. Loader presente, nessun driver.
+          PATH="$VKPATH" ZUER_VULKAN_LOADER="$VKL" VK_DRIVER_FILES='C:\nessun-driver.json' \
+            "$UDIR/feature-probe.exe" gpu > gpu-nodriver.log 2>&1 || true; cat gpu-nodriver.log
           grep -qE 'VulkanNoDriver|NoGpu' gpu-nodriver.log || { echo "::error::loader senza driver: atteso VulkanNoDriver/NoGpu"; exit 1; }
+          PATH="$VKPATH" ZUER_VULKAN_LOADER="$VKL" VK_DRIVER_FILES='C:\nessun-driver.json' gui "loader senza driver, modello 3D" "$D/cubo.obj"
+          # 2. Vulkan funzionante: lavapipe (Mesa, rasterizzatore SOFTWARE). Prova il
+          # percorso Vulkan completo su Windows vero, non una GPU fisica.
+          PATH="$VKPATH" ZUER_VULKAN_LOADER="$VKL" VK_DRIVER_FILES="$LVP" "$UDIR/feature-probe.exe" gpu 2>&1 | tee gpu-lvp.log
+          grep -q 'ok: gpu: cubo renderizzato' gpu-lvp.log || { echo "::error::render Vulkan (lavapipe) fallito"; exit 1; }
           rm -f "$UDIR/feature-probe.exe"
-          PATH="$RUNNER_TEMP/vk:$PATH" gui "loader senza driver, modello 3D" "$D/cubo.obj"
+          gvk() { # $1 etichetta, $2 secondi, $3.. ambiente in più: GUI con il cubo e lavapipe
+            local label=$1 secs=$2; shift 2
+            env PATH="$VKPATH" ZUER_VULKAN_LOADER="$VKL" VK_DRIVER_FILES="$LVP" "$@" "$UDIR/zuer-gui.exe" "$(cygpath -w "$D/cubo.obj")" > gui.log 2>&1 & local P=$!
+            sleep "$secs"
+            if kill -0 $P 2>/dev/null; then echo "ok: $label — viva dopo $secs s"; taskkill /F /IM zuer-gui.exe > /dev/null || true; sleep 1
+            else RC=0; wait $P || RC=$?; cat gui.log; echo "::error::zuer-gui uscito (rc=$RC): $label"; exit 1; fi
+            grep -E 'zuer gpu|Vulkan|renderer' gui.log || true
+          }
+          gvk "Vulkan lavapipe, cubo" 8
+          grep -q 'zuer gpu: using' gui.log || { echo "::error::GUI: renderer Vulkan non acceso con lavapipe"; exit 1; }
+          # 3. Device perso (iniettato): una volta → ricostruito; sempre → ripiego.
+          gvk "device perso una volta" 12 ZUER_TEST_VK_LOST_AFTER=3
+          grep -q 'device Vulkan perso, ricostruisco' gui.log && [[ $(grep -c 'zuer gpu: using' gui.log) -ge 2 ]] || { echo "::error::perdita del device non recuperata"; exit 1; }
+          gvk "device perso sempre" 15 ZUER_TEST_VK_LOST_AFTER=3 ZUER_TEST_VK_LOST_REPEAT=1
+          grep -q 'renderer GPU spento' gui.log || { echo "::error::nessun ripiego dopo perdite ripetute"; exit 1; }
           # Disinstallazione silenziosa (_?= la fa aspettare; lascia solo uninstall.exe).
           "$UDIR/uninstall.exe" /S "_?=$DIR"
           if reg query 'HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Zuer' >/dev/null 2>&1; then
@@ -509,7 +535,8 @@ jobs:
       - name: Crea o aggiorna la release (solo se dello stesso commit)
         run: |
           set -euo pipefail
-          FLAGS=(); [[ "$PRERELEASE" == true ]] && FLAGS+=(--prerelease --latest=false)
+          # Stabile: marcata come tale anche se la release esisteva come prerelease.
+          if [[ "$PRERELEASE" == true ]]; then FLAGS=(--prerelease --latest=false); else FLAGS=(--prerelease=false --latest); fi
           if gh release view "$TAG" > /dev/null 2>&1; then
             ASSETS="$(gh release view "$TAG" --json assets -q '.assets[].name')"
             if gh release download "$TAG" -p manifest.json -O old-manifest.json 2>/dev/null; then
