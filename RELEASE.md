@@ -1,7 +1,7 @@
 # Zuer 1.0.0-rc.1 — note di rilascio
 
-Release candidate. Ramo `rc-1.0` (Zuer) su Zicro `rc-1.0` (= `main` 5b1cf99): nessun
-tag, nulla pubblicato. Ogni affermazione qui sotto dice **come** è stata verificata:
+Release candidate, tag `v1.0.0-rc.1`. Zicro al commit di `.github/zicro.ref`
+(`b784b75`: `main` 5b1cf99 più la correzione Cocoa per macOS). Ogni affermazione qui sotto dice **come** è stata verificata:
 
 - **verificato**: provato su questa macchina, con lo script indicato;
 - **guasto iniettato / simulato**: la reazione di Zuer è provata, l'evento vero no;
@@ -41,6 +41,11 @@ sway 1.12 headless (GLES2), KWin 6.8.2 `--virtual`, Weston headless.
 - `install.sh --uninstall`; il desktop entry dichiara `StartupWMClass=it.zuer.gui`,
   uguale all'`app_id` della finestra.
 - La GUI compila di nuovo per macOS: falliva anche su `main`.
+- macOS: al primo avvio vero su un Mac l'app moriva con un'eccezione Objective-C
+  (`platformWindow`, selettore del solo backend Cocotron). Corretto in Zicro.
+- Pacchetti macOS arm64 e Windows x64 costruiti e verificati da GitHub Actions
+  (`.github/workflows/release.yml`); FFmpeg per Windows ripinnato su una build
+  LGPL, con licenza e riferimenti al sorgente nell'installer.
 
 **Nuove verifiche**: `scripts/gpu-reset-check.sh`, `scripts/edge-check.sh`, sorgenti
 malformate e cambio hw→sw in `scripts/video-check.sh`, `zuer-video-bench open-at`,
@@ -88,8 +93,9 @@ Facoltative, caricate solo al bisogno:
 | GNOME/Mutter | — | ❓ non verificato |
 | GPU AMD | — | ❓ non verificato |
 | NVIDIA (driver proprietario) | — | ❓ **non verificato**: ripiego glFinish previsto, mai provato |
-| Windows x86_64 | ✅ cross-compilato | ⚠️ in passato provato sotto Wine; questa RC no |
-| macOS arm64 / x86_64 | ✅ cross-compilato | ❓ mai avviato |
+| Windows x64 | ✅ nativo (CI `windows-2022`) | ⚠️ CI: installazione silenziosa, `--version`, finestra aperta 8 s con un file di testo (runner senza GPU né driver Vulkan), disinstallazione; Wine: installazione/disinstallazione. Nessuna prova con un utente, una GPU vera, video o 3D |
+| macOS arm64 | ✅ nativo (CI `macos-15`, Apple Silicon) | ⚠️ CI: `--version`, finestra aperta 8 s con un file di testo; nessuna prova interattiva |
+| macOS x86_64 | ✅ cross-compilato | ⛔ nessun pacchetto distribuito |
 | Android aarch64 (`libzuer.so`) | ✅ cross-compilato | ❓ non verificato |
 | Web | — | ⛔ non supportato (nessun target) |
 
@@ -150,6 +156,69 @@ stream senza frame (apertura fallita dopo 20 s): tenuto il comportamento corrett
 accettato il costo. Il contesto GL robusto è stato escluso come causa (A/B, nessuna
 differenza).
 
+## Distribuzione
+
+I pacchetti sono costruiti da GitHub Actions (`.github/workflows/release.yml`) al
+push del tag, e allegati alla GitHub Release del tag con `SHA256SUMS` e
+`manifest.json` (versione, commit di Zuer e Zicro, architettura, sha256).
+
+| Sistema | Architettura | Artefatto | Costruito su |
+|---|---|---|---|
+| macOS 13 o successivo | Apple Silicon (arm64) | `zuer-<versione>-macos-arm64.tar.gz` (`Zuer.app`) | `macos-15`, arm64 nativo |
+| Windows 10/11 | x64 | `zuer-<versione>-windows-x64-setup.exe` | `windows-2022` |
+| Linux | x64 | dai sorgenti: `zig build` + `install.sh` (sopra) | — |
+
+Non ci sono pacchetti macOS Intel, universali o Windows ARM.
+
+**Verifica del download**: nella cartella dei file scaricati,
+`sha256sum -c SHA256SUMS --ignore-missing` (Linux/Git Bash) oppure
+`shasum -a 256 -c SHA256SUMS` (macOS); su Windows anche
+`Get-FileHash .\zuer-…-setup.exe -Algorithm SHA256` e confronto a mano.
+
+**macOS**: estrarre l'archivio e trascinare `Zuer.app` in Applicazioni. Il pacchetto
+**non è firmato né notarizzato** (nessun certificato Apple Developer): al primo
+avvio Gatekeeper lo blocca; tasto destro → Apri, oppure
+`xattr -dr com.apple.quarantine /Applications/Zuer.app`. Su arm64 il binario ha
+la firma ad-hoc del linker, obbligatoria per avviarsi, che non identifica
+l'autore. Disinstallazione: cancellare `Zuer.app` (cache in
+`~/.cache/zuer`). Su macOS questa build apre testo, codice, markdown, tabelle,
+immagini e archivi: video, modelli 3D (renderer Vulkan), PDF e documenti office
+non sono inclusi.
+
+**Windows**: eseguire l'installer. Installa per l'utente corrente (nessun permesso
+di amministratore) in `%LOCALAPPDATA%\Programs\Zuer`, aggiunge il menu Start e
+"Apri con" senza cambiare le app predefinite. L'installer **non è firmato**:
+SmartScreen avvisa ("Ulteriori informazioni" → "Esegui comunque").
+Disinstallazione da Impostazioni → App installate, o `uninstall.exe` nella
+cartella; in silenzio: `zuer-…-setup.exe /S`, `uninstall.exe /S`. Requisito:
+loader Vulkan (`vulkan-1.dll`, installato con qualsiasi driver GPU recente). Il video usa le DLL FFmpeg
+incluse (LGPL-3.0, build BtbN: vedi `FFmpeg-SOURCE.txt` nella cartella).
+
+Il loader Vulkan è un requisito di sistema: senza `vulkan-1.dll` l'eseguibile non
+parte. Con il loader ma senza driver Vulkan (verificato sul runner, che non ha GPU)
+Zuer parte e mostra i file; il renderer 3D/testo GPU non è disponibile.
+
+**Licenze nei pacchetti**: `LICENSE` (AGPL-3.0-or-later) in entrambi; nell'installer
+Windows anche `FFmpeg-LICENSE.txt` e `FFmpeg-SOURCE.txt` (commit FFmpeg e
+indirizzi del sorgente corrispondente). Il sorgente di Zuer per ogni versione è
+il tag su GitHub; quello di Zicro è il commit in `.github/zicro.ref`.
+
+### Fare una nuova RC
+
+1. Su `main`, aggiornare `.version` in `build.zig.zon` (es. `1.0.0-rc.2`) e
+   `android:versionName`; se Zicro è cambiato, il suo commit (già su GitHub) in
+   `.github/zicro.ref`.
+2. Gate locale: `zig build test`, `scripts/video-check.sh`, `net-check.sh`,
+   `video-sync-check.sh`, `gpu-reset-check.sh`, `edge-check.sh`.
+3. Prova del workflow senza pubblicare: Actions → release → Run workflow con
+   `tag=main` e `dry_run` (o `gh workflow run release.yml -f tag=main -f dry_run=true`).
+4. Tag annotato sul commit provato e push: `git tag -a v1.0.0-rc.2 -m "…"`,
+   `git push origin v1.0.0-rc.2`. Il workflow parte da solo e pubblica.
+5. Se serve rifarlo sullo stesso tag: `gh workflow run release.yml -f tag=v1.0.0-rc.2`
+   (aggiorna la release solo se è dello stesso commit, senza duplicati).
+6. Se `fetch-ffmpeg-dlls.sh` dà 404, BtbN ha ritirato l'autobuild pinnato:
+   sceglierne uno recente come spiegato nello script.
+
 ## Limiti noti
 
 1. **Reset GPU e sospensione veri non provati.** La ripresa dopo un contesto perso è
@@ -174,7 +243,16 @@ differenza).
    l'interruzione di libav.
 7. **`install.sh`** rende Zuer l'applicazione predefinita per diversi tipi MIME e su
    KDE prende Meta+Z. L'installer Windows invece non cambia i predefiniti.
-8. **Aperture ~9 ms più lente di `main`** (vedi Benchmark): costo del caricare senza
+8. **Pacchetti non firmati**: nessun certificato Apple Developer ID né Windows
+   Authenticode configurato. macOS: solo firma ad-hoc, nessuna notarizzazione
+   (Gatekeeper chiede conferma); Windows: SmartScreen avvisa. Il workflow non finge
+   firme: `manifest.json` dice `"signed": false`.
+9. **Windows senza loader Vulkan** (`vulkan-1.dll`, es. macchine virtuali senza
+   driver GPU): `zuer-gui.exe` non parte, nemmeno per il testo, perché il loader è
+   importato staticamente.
+10. **macOS**: build ridotta (testo, tabelle, immagini, archivi; niente video, 3D,
+   PDF, office); `CFBundleShortVersionString` è `1.0.0` (macOS vuole x.y.z).
+11. **Aperture ~9 ms più lente di `main`** (vedi Benchmark): costo del caricare senza
    `start=0`, che rendeva inapribili i TS senza indice.
 
 ## Licenza
