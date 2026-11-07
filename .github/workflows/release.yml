@@ -259,7 +259,7 @@ jobs:
           # glslc (shader), objdump (verifica import) e ImageMagick (icona) da MSYS2.
           /c/msys64/usr/bin/pacman.exe -S --noconfirm --needed --noprogressbar \
             mingw-w64-ucrt-x86_64-shaderc mingw-w64-ucrt-x86_64-binutils mingw-w64-ucrt-x86_64-imagemagick \
-            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-vulkan-loader
       - name: Build e installer (scripts/build-windows-installer.sh)
         working-directory: Zuer
         run: |
@@ -293,6 +293,9 @@ jobs:
           for f in "$B"/*.exe "$B"/*.dll; do
             for d in $(objdump -p "$f" | awk '/DLL Name/{print $3}'); do
               if [[ -f "$B/$d" ]]; then continue; fi
+              # Requisito di sistema dichiarato (RELEASE.md): il loader Vulkan arriva col
+              # driver della GPU; non si distribuisce con l'app.
+              if [[ "$d" == vulkan-1.dll ]]; then echo "requisito di sistema: $(basename "$f") -> $d"; continue; fi
               if [[ -f "/c/Windows/System32/$d" || -f "/c/Windows/System32/downlevel/$d" || "$d" == api-ms-win-* ]]; then continue; fi
               echo "::warning::$(basename "$f") importa $d, né nel pacchetto né in System32"; MISSING=1
             done
@@ -313,6 +316,12 @@ jobs:
             [[ -f "$UDIR/$f" ]] || { echo "::error::$f non installato"; exit 1; }; done
           reg query 'HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Zuer' | tee reg.txt
           grep -q "DisplayVersion.*$VERSION" reg.txt || { echo "::error::DisplayVersion errata"; exit 1; }
+          # Il runner non ha GPU né loader Vulkan (requisito di sistema, vedi sopra): per
+          # l'avvio si mette nel PATH il solo loader di MSYS2 come vulkan-1.dll, fuori dal
+          # pacchetto. Senza driver Vulkan: è il caso di una macchina senza GPU Vulkan.
+          mkdir -p "$RUNNER_TEMP/vk" && cp /c/msys64/ucrt64/bin/libvulkan-1.dll "$RUNNER_TEMP/vk/vulkan-1.dll"
+          /c/msys64/ucrt64/bin/objdump -p "$RUNNER_TEMP/vk/vulkan-1.dll" | awk '/DLL Name/{print "  loader importa: "$3}'
+          export PATH="$RUNNER_TEMP/vk:$PATH"
           # --version dalla copia installata.
           OUT="$("$UDIR/zuer-gui.exe" --version 2>&1 | tr -d '\r')"; echo "$OUT"
           [[ "$OUT" == "zuer-gui $VERSION" ]] || { echo "::error::--version: '$OUT'"; exit 1; }
