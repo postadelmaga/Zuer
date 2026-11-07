@@ -154,7 +154,7 @@ jobs:
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
           # shaderc: SPIR-V a build time; molten-vk: Vulkan su Metal, va NEL bundle;
           # ffmpeg (CLI): solo per generare la clip di prova, non entra nel pacchetto.
-          brew install --quiet shaderc imagemagick molten-vk ffmpeg
+          brew install --quiet shaderc imagemagick molten-vk ffmpeg meson ninja
           brew info --json=v2 molten-vk | python3 -c 'import json,sys; f=json.load(sys.stdin)["formulae"][0]; print("molten-vk", f["installed"][0]["version"], f["license"])'
       # FFmpeg LGPL per il bundle: ~5 min di compilazione, in cache per commit+flag.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -265,6 +265,10 @@ jobs:
           "$P" video "$D/clip.mp4" 2>&1 | tee video.log
           grep -q 'decodifica hardware: sì' video.log && echo "VideoToolbox: attivo" || echo "::warning::decodifica hardware non attiva sul runner (software)"
           [[ -f "$D/clip-hevc.mp4" ]] && "$P" video "$D/clip-hevc.mp4"
+          # AV1 in software (dav1d dentro libavcodec del bundle): il runner M1 non lo
+          # decodifica in hardware, quindi senza dav1d qui fallirebbe.
+          ffmpeg -loglevel error -f lavfi -i testsrc2=size=1280x720:rate=30 -t 4 -c:v libsvtav1 -preset 10 "$D/clip-av1.mp4"
+          "$P" video "$D/clip-av1.mp4"
           if ! "$P" audio "$D/clip.mp4"; then echo "::warning::audio: nessun dispositivo di uscita utilizzabile sul runner"; fi
           # 3D: MoltenVK del bundle su Metal. Se il runner non espone Metal è un limite
           # dell'hardware virtuale (dichiarato), non un esito positivo.
@@ -411,7 +415,10 @@ jobs:
           # non arriva mai. Solo su questa VM effimera.
           $sig = Get-AuthenticodeSignature "$drv\Scream.sys"
           "firma: $($sig.Status) — $($sig.SignerCertificate.Subject)"
-          if ($sig.Status -ne 'Valid') { throw "firma di Scream.sys non valida: $($sig.Status)" }
+          # Status è UnknownError: la catena passa per AddTrust External CA Root, scaduta
+          # nel 2020. L'integrità la garantisce lo sha256 dello zip qui sopra; qui si
+          # controlla solo che il certificato da rendere attendibile sia dell'editore.
+          if ($sig.SignerCertificate.Subject -notmatch 'CN=Tom Kistner') { throw "editore inatteso: $($sig.SignerCertificate.Subject)" }
           $sig.SignerCertificate | Export-Certificate -FilePath "$env:RUNNER_TEMP\scream.cer" | Out-Null
           Import-Certificate -FilePath "$env:RUNNER_TEMP\scream.cer" -CertStoreLocation Cert:\LocalMachine\TrustedPublisher | Out-Null
           Set-Service AudioEndpointBuilder -StartupType Automatic; Start-Service AudioEndpointBuilder
