@@ -142,8 +142,10 @@ pub fn render(gpa: std.mem.Allocator, abs_path: []const u8, page: usize, scale: 
         .dpi => |dpi| @as(f64, @floatFromInt(dpi)) / 72.0,
         .fit => |side| @as(f64, @floatFromInt(side)) / @max(ow, oh),
     };
-    const wf = @ceil(ow * s);
-    const hf = @ceil(oh * s);
+    // Come pdftoppm: per eccesso, ma senza che l'errore di arrotondamento di
+    // 792 × 150/72 = 1650,000…01 aggiunga una riga (1651).
+    const wf = @ceil(ow * s - 1e-6);
+    const hf = @ceil(oh * s - 1e-6);
     if (!(wf >= 1 and hf >= 1) or wf > @as(f64, @floatFromInt(max_side)) or hf > @as(f64, @floatFromInt(max_side)))
         return error.PdfPageTooLarge;
     const w: usize = @intFromFloat(wf);
