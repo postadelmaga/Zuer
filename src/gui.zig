@@ -871,8 +871,14 @@ fn renderWorker(
             } else {
                 // Sorgente assente (es. win_kind video ma setupVideo fallito, o
                 // alloc immagine fallita): frame vuoto — composeFrame con 0×0
-                // dividerebbe per zero (NaN → panic su @intFromFloat).
-                if (state.shared.static_w == 0 or state.shared.static_h == 0) {
+                // dividerebbe per zero (NaN → panic su @intFromFloat). Né pixel
+                // meno di w×h: dopo un init del renderer fallito, fra l'errore e il
+                // messaggio sostitutivo, `decoded` è ancora la mesh con
+                // `is_mesh` già falso e w/h sono quelle di un documento di testo
+                // (pixel vuoti): leggerli andrebbe fuori memoria.
+                if (state.shared.static_w == 0 or state.shared.static_h == 0 or
+                    state.shared.static_rgba.len < @as(usize, state.shared.static_w) * state.shared.static_h * 4)
+                {
                     @memset(composited_rgba.*[0 .. @as(usize, cur_w) * cur_h * 4], 0);
                 } else {
                     // Mantieni l'immagine sempre centrata / dentro i bordi (no re-center manuale).
