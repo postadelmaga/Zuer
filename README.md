@@ -8,8 +8,11 @@ in stile egui) e [zrame](../Zicro/zrame) (finestra + input cross-platform).
 Gira su **Linux** (Wayland), **Windows** x64 (GDI) e **macOS** arm64 (Cocoa); il
 rendering 3D passa per Vulkan (MoltenVK su macOS), aperto a runtime e facoltativo; il
 video per **libmpv** su Linux (decodifica hardware, piano dmabuf del compositor) e per
-libav (FFmpeg) dove mpv manca, con VideoToolbox su macOS. Versione **1.0.0**: cosa è
-verificato, cosa no e i limiti noti sono in [RELEASE.md](RELEASE.md).
+libav (FFmpeg) dove mpv manca, con VideoToolbox su macOS e D3D11VA su Windows. Versione
+**1.0.0**: cosa è verificato, cosa no e i limiti noti sono in [RELEASE.md](RELEASE.md);
+il lavoro per la 1.1.0 (parità Windows/macOS, non pubblicata) in
+[RELEASE-1.1.0.md](RELEASE-1.1.0.md). Le prove su macchine fisiche:
+[docs/prove-hardware.md](docs/prove-hardware.md).
 
 ---
 
@@ -19,10 +22,10 @@ verificato, cosa no e i limiti noti sono in [RELEASE.md](RELEASE.md).
 |-----------|-----------|------|
 | **Testo / codice / markdown** | `.txt`, sorgenti, `.md`, … | rasterizzazione nativa (stb_truetype), selezione + copia |
 | **Tabelle** | `.csv`, `.tsv`, `.xlsx`, `.xls`, `.ods`, `.zip`, `.jar`, `.cbz`, `.epub`, … | griglia con header fisso; workbook multi-foglio con linguette |
-| **Immagini** | `.png`, `.jpg`, `.gif`, `.bmp`, `.webp`, `.tif`, `.avif`, `.heic`, `.ico` | decodifica nativa (stb_image; WebP con `libwebp` caricata a runtime su Linux), gli altri formati via ImageMagick |
+| **Immagini** | `.png`, `.jpg`, `.gif`, `.bmp`, `.webp`, `.svg`, `.svgz`, `.ico`, `.tga`, `.psd`, `.hdr`, `.ppm`, `.tif`, `.avif`, `.heic` | in processo ovunque: stb_image, libwebp (anche il primo frame dei WebP animati), nanosvg, ICO in Zig; orientamento EXIF dei JPEG. TIFF/AVIF/HEIC dal codec di sistema (ImageIO su macOS, WIC su Windows: AVIF e HEIC richiedono le estensioni gratuite dello Store) o ImageMagick su Linux |
 | **Mesh 3D** | `.obj`, `.stl`, `.glb`, `.gltf`, `.ply`, `.fbx`, `.dae`, `.3ds` | renderer Vulkan (PBR-ish, shadow pass), orbita col mouse |
 | **Video** | `.mp4`, `.mkv`, `.webm`, `.mov`, `.avi`, `.m4v`, `.ts`, … | libmpv (Linux) o libav, timeline/scrubbing stile YouTube; audio: oscilloscopio |
-| **Documenti** | `.pdf` | pagina resa come immagine: poppler (`pdftoppm`) su Linux, CoreGraphics su macOS; **non supportato su Windows** |
+| **Documenti** | `.pdf` | pagina resa come immagine: poppler (`pdftoppm`) su Linux, CoreGraphics su macOS, PDFium (incluso nell'installer) su Windows |
 | **Office** | `.docx`, `.xlsx`, `.xlsm`, `.pptx`, `.odt`, `.ods`, `.odp` | decoder Zig, nessuna dipendenza, tutte le piattaforme; `.doc`/`.xls`/`.ppt` non supportati |
 
 Il formato si riconosce anche **senza estensione o con quella sbagliata**:
@@ -126,7 +129,7 @@ decoder inclusi (testo/codice, csv, markdown, mesh, immagini, glb, archivi,
 media): Zuer compare in "Apri con" e tra le **App predefinite** di Windows —
 senza rubare i default esistenti (l'utente lo elegge default dal pannello). Le
 estensioni sono rigenerate a ogni build da `src/decoders/*.zig`, quindi restano
-in sync (office incluso; i PDF su Windows non sono supportati → non associati).
+in sync (office e PDF inclusi: il PDF usa `pdfium.dll`, installata accanto all'app).
 
 > **Compila sempre con `-Doptimize=ReleaseFast`.** Il default di `zig build` è Debug:
 > il rendering GPU resta veloce (lo fa la GPU) ma il **compositing CPU** dei frame
@@ -238,7 +241,7 @@ benchmark). Aprendo una cartella:
 
 Limiti: 96 miniature in RAM (≈24 MB) e 96 decode per cartella; niente miniatura oltre
 256 MB; **un solo decode "pesante" alla volta** (PDF, video, formati che passano da
-rsvg/ImageMagick — fuori da Linux anche il WebP —, file oltre 8 MiB: processi esterni
+rsvg, codec di sistema o ImageMagick, file oltre 8 MiB: processi esterni
 già multi-thread o picchi di RAM da centinaia di MB); cache su disco in `~/.cache/zuer/thumbs` con tetto LRU di
 128 MB. Un decode fallito lascia in cache una voce negativa valida 24 ore, così la
 cartella non lo ritenta a ogni visita.
@@ -319,7 +322,11 @@ Public License v3.0 o successiva** (vedi [`LICENSE`](LICENSE)), come il framewor
 `SPDX-License-Identifier: AGPL-3.0-or-later`
 
 Componenti di terze parti in `vendor/`: stb (pubblico dominio / MIT), TinySoundFont
-(MIT), header e import-lib di FFmpeg (LGPL/GPL secondo la build). Le DLL FFmpeg
+(MIT), nanosvg (zlib), header e import-lib di FFmpeg (LGPL/GPL secondo la build).
+libwebp (BSD-3-Clause) è una dipendenza Zig compilata dal sorgente (`build.zig.zon`).
+L'installer Windows include PDFium (BSD-3-Clause e licenze dei componenti, in
+`PDFium-LICENSE.txt`, build `bblanchon/pdfium-binaries` fissata in
+`scripts/fetch-pdfium.sh`); il FFmpeg del bundle macOS contiene dav1d (BSD-2-Clause). Le DLL FFmpeg
 dell'installer Windows hanno la licenza della build scaricata (LGPL); nel bundle
 macOS FFmpeg è compilato LGPL dallo stesso commit e MoltenVK è Apache-2.0: licenze e
 riferimenti al sorgente in `Zuer.app/Contents/Resources`.

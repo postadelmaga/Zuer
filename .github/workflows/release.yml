@@ -311,6 +311,21 @@ jobs:
           run "$D/cubo.obj"
           run "$D/cubo.obj" ZUER_VULKAN_LOADER=none
           [[ $FAIL == 0 ]] || exit 1
+      # Kit per le prove manuali su hardware fisico (docs/prove-hardware.md): non
+      # è un pacchetto, non va nella release.
+      - name: Kit di prova
+        shell: bash
+        run: |
+          K="$RUNNER_TEMP/kit/zuer-prove"; mkdir -p "$K"
+          cp "$GITHUB_WORKSPACE/Zuer/zig-out/bin/feature-probe" "$K/"
+          cp -r "$GITHUB_WORKSPACE/Zuer/scripts/"{pdf,image,office}-check.sh "$GITHUB_WORKSPACE/Zuer/scripts/make-test-docs.py" \
+                "$GITHUB_WORKSPACE/Zuer/tests/images" "$GITHUB_WORKSPACE/Zuer/tests/office" "$GITHUB_WORKSPACE/Zuer/docs/prove-hardware.md" "$K/"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: prove-macos-arm64
+          path: ${{ runner.temp }}/kit
+          if-no-files-found: error
+          retention-days: 14
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos-arm64
@@ -397,33 +412,38 @@ jobs:
             done
           done
           [[ $MISSING == 0 ]] || { echo "::error::dipendenze non risolte o Vulkan importato (sopra)"; exit 1; }
-      # Il runner non ha schede audio: Scream (MS-PL, driver firmato) è una scheda
-      # VIRTUALE che manda il mix in rete — niente di udibile. Serve a provare WASAPI
-      # davvero (apertura, riproduzione, latenza, loopback, rimozione del dispositivo).
+      # Il runner non ha schede audio: VB-CABLE è una scheda VIRTUALE (il mix finisce
+      # in un ingresso virtuale, niente di udibile). Serve a provare WASAPI davvero
+      # (apertura, riproduzione, latenza, loopback, rimozione del dispositivo).
+      # Solo strumento di prova della CI, scaricato sulla VM effimera: non è una
+      # dipendenza di Zuer né va nei pacchetti (VB-CABLE è donationware, uso
+      # consentito, ridistribuzione integrata no). Scream (MS-PL) è stato provato
+      # prima: devcon resta in attesa di una conferma anche con l'editore attendibile
+      # (certificato Sectigo successivo al 2015, firma incrociata non accettata).
+      # Procedura di LABSN/sound-ci-helpers; devcon dallo zip di Scream 4.0, fissato.
       # Su Windows Server il servizio audio è spento di default.
-      - name: Scheda audio virtuale (Scream 4.0)
+      - name: Scheda audio virtuale (VB-CABLE)
         shell: pwsh
         timeout-minutes: 6
         run: |
           $ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'
-          Invoke-WebRequest https://github.com/duncanthrax/scream/releases/download/4.0/Scream4.0.zip -OutFile "$env:RUNNER_TEMP\scream.zip"
-          if ((Get-FileHash "$env:RUNNER_TEMP\scream.zip" -Algorithm SHA256).Hash -ne 'FA33E25F9A46C61E4E0CD83362C51C3D2A45C6FE4091AAD7507E240E40F1A520') { throw 'sha256 di Scream4.0.zip non corrisponde' }
-          Expand-Archive "$env:RUNNER_TEMP\scream.zip" -DestinationPath "$env:RUNNER_TEMP\scream"
-          $drv = "$env:RUNNER_TEMP\scream\Install\driver\x64"
-          # Il driver è firmato da Tom Kistner (Sectigo, firma incrociata): senza
-          # l'editore tra quelli attendibili devcon aspetta una conferma che sul runner
-          # non arriva mai. Solo su questa VM effimera.
-          $sig = Get-AuthenticodeSignature "$drv\Scream.sys"
+          $T = $env:RUNNER_TEMP
+          Invoke-WebRequest https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip -OutFile "$T\vbcable.zip"
+          if ((Get-FileHash "$T\vbcable.zip" -Algorithm SHA256).Hash -ne '66FD0A4D9F4896FF41632B7E3D53892C085C4561F53E8AE8D0F0BC10EEDD1CDD') { throw 'sha256 di VBCABLE_Driver_Pack43.zip non corrisponde' }
+          Expand-Archive "$T\vbcable.zip" -DestinationPath "$T\vbcable"
+          Invoke-WebRequest https://github.com/duncanthrax/scream/releases/download/4.0/Scream4.0.zip -OutFile "$T\scream.zip"
+          if ((Get-FileHash "$T\scream.zip" -Algorithm SHA256).Hash -ne 'FA33E25F9A46C61E4E0CD83362C51C3D2A45C6FE4091AAD7507E240E40F1A520') { throw 'sha256 di Scream4.0.zip non corrisponde' }
+          Expand-Archive "$T\scream.zip" -DestinationPath "$T\scream"
+          # Editore del catalogo (Vincent Burel) tra quelli attendibili, solo su questa VM:
+          # senza, devcon aspetta una conferma che sul runner non arriva mai.
+          $sig = Get-AuthenticodeSignature "$T\vbcable\vbaudio_cable64_win7.cat"
           "firma: $($sig.Status) — $($sig.SignerCertificate.Subject)"
-          # Status è UnknownError: la catena passa per AddTrust External CA Root, scaduta
-          # nel 2020. L'integrità la garantisce lo sha256 dello zip qui sopra; qui si
-          # controlla solo che il certificato da rendere attendibile sia dell'editore.
-          if ($sig.SignerCertificate.Subject -notmatch 'CN=Tom Kistner') { throw "editore inatteso: $($sig.SignerCertificate.Subject)" }
-          $sig.SignerCertificate | Export-Certificate -FilePath "$env:RUNNER_TEMP\scream.cer" | Out-Null
-          Import-Certificate -FilePath "$env:RUNNER_TEMP\scream.cer" -CertStoreLocation Cert:\LocalMachine\TrustedPublisher | Out-Null
+          if ($sig.SignerCertificate.Subject -notmatch 'CN=Vincent Burel') { throw "editore inatteso: $($sig.SignerCertificate.Subject)" }
+          $sig.SignerCertificate | Export-Certificate -FilePath "$T\vbcable.cer" | Out-Null
+          Import-Certificate -FilePath "$T\vbcable.cer" -CertStoreLocation Cert:\LocalMachine\TrustedPublisher | Out-Null
           Set-Service AudioEndpointBuilder -StartupType Automatic; Start-Service AudioEndpointBuilder
           Set-Service Audiosrv -StartupType Automatic; Start-Service Audiosrv
-          $p = Start-Process "$env:RUNNER_TEMP\scream\Install\helpers\devcon-x64.exe" -ArgumentList 'install',"$drv\Scream.inf",'*Scream' -NoNewWindow -PassThru
+          $p = Start-Process "$T\scream\Install\helpers\devcon-x64.exe" -ArgumentList 'install',"$T\vbcable\vbMmeCable64_win7.inf",'VBAudioVACWDM' -NoNewWindow -PassThru
           if (-not $p.WaitForExit(120000)) { $p.Kill(); throw 'devcon bloccato (richiesta di conferma?)' }
           "devcon: exit $($p.ExitCode)"
           Start-Sleep 5
@@ -463,7 +483,7 @@ jobs:
           bash "$GITHUB_WORKSPACE/Zuer/scripts/image-check.sh" "$UDIR/feature-probe.exe" "$GITHUB_WORKSPACE/Zuer/tests/images"
           bash "$GITHUB_WORKSPACE/Zuer/scripts/office-check.sh" "$UDIR/feature-probe.exe" "$GITHUB_WORKSPACE/Zuer/tests/office"
           "$UDIR/feature-probe.exe" video "$(W "$D/clip.mp4")"
-          # Audio su WASAPI, sulla scheda virtuale Scream (il mix va in rete: inudibile).
+          # Audio su WASAPI, sulla scheda virtuale VB-CABLE (inudibile).
           "$UDIR/feature-probe.exe" audio-devices
           "$UDIR/feature-probe.exe" audio "$(W "$D/clip.mp4")"
           /c/msys64/ucrt64/bin/ffmpeg.exe -loglevel error -f lavfi -i sine=frequency=1000:sample_rate=48000:duration=25 -ac 2 -c:a aac "$(W "$D/tono.m4a")"
@@ -472,8 +492,8 @@ jobs:
           # Ripiego waveOut (forzato): continua a funzionare.
           ZICRO_AUDIO=waveout "$UDIR/feature-probe.exe" audio "$(W "$D/clip.mp4")"
           # Dispositivo rimosso a metà riproduzione e poi rimesso: la riproduzione riprende.
-          SID="$(powershell -NoProfile -Command "(Get-PnpDevice -Class MEDIA | Where-Object FriendlyName -like '*Scream*' | Select-Object -First 1).InstanceId" | tr -d '\r')"
-          echo "Scream: $SID"; [[ -n "$SID" ]] || { echo "::error::dispositivo Scream non trovato"; exit 1; }
+          SID="$(powershell -NoProfile -Command "(Get-PnpDevice -Class MEDIA | Where-Object FriendlyName -like '*VB-Audio*' | Select-Object -First 1).InstanceId" | tr -d '\r')"
+          echo "VB-CABLE: $SID"; [[ -n "$SID" ]] || { echo "::error::dispositivo VB-CABLE non trovato"; exit 1; }
           "$UDIR/feature-probe.exe" audio-survive "$(W "$D/tono.m4a")" 14 > survive.log 2>&1 & SP=$!
           sleep 4; pnputil /disable-device "$SID"; sleep 3; pnputil /enable-device "$SID"
           RC=0; wait $SP || RC=$?; tr -d '\r' < survive.log
@@ -544,6 +564,21 @@ jobs:
           LEFT="$(ls "$UDIR" | grep -v '^uninstall.exe$' || true)"
           [[ -z "$LEFT" ]] || { echo "::error::file rimasti: $LEFT"; exit 1; }
           echo "disinstallazione pulita"
+      # Kit per le prove manuali su hardware fisico (docs/prove-hardware.md): non
+      # è un pacchetto, non va nella release.
+      - name: Kit di prova
+        shell: bash
+        run: |
+          K="$RUNNER_TEMP/kit/zuer-prove"; mkdir -p "$K"
+          cp "$RUNNER_TEMP/probe/bin/feature-probe.exe" "$K/"
+          cp -r "$GITHUB_WORKSPACE/Zuer/scripts/"{pdf,image,office}-check.sh "$GITHUB_WORKSPACE/Zuer/scripts/make-test-docs.py" \
+                "$GITHUB_WORKSPACE/Zuer/tests/images" "$GITHUB_WORKSPACE/Zuer/tests/office" "$GITHUB_WORKSPACE/Zuer/docs/prove-hardware.md" "$K/"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: prove-windows-x64
+          path: ${{ runner.temp }}/kit
+          if-no-files-found: error
+          retention-days: 14
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-x64
@@ -574,10 +609,15 @@ jobs:
           sparse-checkout: RELEASE.md
           sparse-checkout-cone-mode: false
           persist-credentials: false
+      # Solo i pacchetti: i kit di prova (prove-*) non vanno nella release.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
+          name: macos-arm64
           path: dist
-          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-x64
+          path: dist
       - name: Artefatti, checksum e manifest
         run: |
           set -euo pipefail
