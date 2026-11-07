@@ -328,9 +328,12 @@ fn probeSurvive(io: std.Io, gpa: std.mem.Allocator, path: []const u8, secs: usiz
     for (0..n) |i| {
         io.sleep(.fromSeconds(1), .awake) catch {};
         clocks[i] = ap.clockSeconds();
-        std.debug.print("  t={d}s orologio {d:.2}s latenza {?d} frame\n", .{ i + 1, clocks[i], ap.dev.latencyFrames() });
+        std.debug.print("  t={d}s orologio {d:.2}s latenza {?d} frame riaperture {?d}\n", .{ i + 1, clocks[i], ap.dev.latencyFrames(), ap.dev.reopens() });
     }
     if (n < 4) return report(false, "audio-survive: servono almeno 4 s", .{});
+    // La rimozione deve essersi VISTA (dove il backend lo dice: WASAPI), altrimenti
+    // l'orologio che avanza non prova niente.
+    if (ap.dev.reopens()) |r| report(r >= 1, "audio-survive: flusso riaperto {d} volte dopo la rimozione", .{r});
     const tail = clocks[n - 1] - clocks[n - 4];
     report(tail >= 2.0, "audio-survive: negli ultimi 3 s l'orologio è avanzato di {d:.2}s (riproduzione ripresa)", .{tail});
 }
