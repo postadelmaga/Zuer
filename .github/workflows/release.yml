@@ -258,6 +258,10 @@ jobs:
           # PDF e immagini: le stesse prove (stessi file, stessi esiti) delle altre piattaforme.
           bash "$GITHUB_WORKSPACE/Zuer/scripts/pdf-check.sh" "$P" "$D"
           bash "$GITHUB_WORKSPACE/Zuer/scripts/image-check.sh" "$P" "$GITHUB_WORKSPACE/Zuer/tests/images"
+          bash "$GITHUB_WORKSPACE/Zuer/scripts/office-check.sh" "$P" "$GITHUB_WORKSPACE/Zuer/tests/office"
+          # Ripiego hw→sw a metà stream (guasto iniettato): il video prosegue senza buchi.
+          ZUER_TEST_HWFAIL_AFTER=10 "$P" video "$D/clip.mp4" 2>&1 | tee hwfail.log
+          grep -q 'pts continui' hwfail.log || { echo "::error::video interrotto dopo il ripiego hw→sw"; exit 1; }
           "$P" video "$D/clip.mp4" 2>&1 | tee video.log
           grep -q 'decodifica hardware: sì' video.log && echo "VideoToolbox: attivo" || echo "::warning::decodifica hardware non attiva sul runner (software)"
           [[ -f "$D/clip-hevc.mp4" ]] && "$P" video "$D/clip-hevc.mp4"
@@ -395,14 +399,26 @@ jobs:
       # Su Windows Server il servizio audio è spento di default.
       - name: Scheda audio virtuale (Scream 4.0)
         shell: pwsh
+        timeout-minutes: 6
         run: |
           $ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'
           Invoke-WebRequest https://github.com/duncanthrax/scream/releases/download/4.0/Scream4.0.zip -OutFile "$env:RUNNER_TEMP\scream.zip"
           if ((Get-FileHash "$env:RUNNER_TEMP\scream.zip" -Algorithm SHA256).Hash -ne 'FA33E25F9A46C61E4E0CD83362C51C3D2A45C6FE4091AAD7507E240E40F1A520') { throw 'sha256 di Scream4.0.zip non corrisponde' }
           Expand-Archive "$env:RUNNER_TEMP\scream.zip" -DestinationPath "$env:RUNNER_TEMP\scream"
+          $drv = "$env:RUNNER_TEMP\scream\Install\driver\x64"
+          # Il driver è firmato da Tom Kistner (Sectigo, firma incrociata): senza
+          # l'editore tra quelli attendibili devcon aspetta una conferma che sul runner
+          # non arriva mai. Solo su questa VM effimera.
+          $sig = Get-AuthenticodeSignature "$drv\Scream.sys"
+          "firma: $($sig.Status) — $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { throw "firma di Scream.sys non valida: $($sig.Status)" }
+          $sig.SignerCertificate | Export-Certificate -FilePath "$env:RUNNER_TEMP\scream.cer" | Out-Null
+          Import-Certificate -FilePath "$env:RUNNER_TEMP\scream.cer" -CertStoreLocation Cert:\LocalMachine\TrustedPublisher | Out-Null
           Set-Service AudioEndpointBuilder -StartupType Automatic; Start-Service AudioEndpointBuilder
           Set-Service Audiosrv -StartupType Automatic; Start-Service Audiosrv
-          & "$env:RUNNER_TEMP\scream\Install\helpers\devcon-x64.exe" install "$env:RUNNER_TEMP\scream\Install\driver\x64\Scream.inf" '*Scream'
+          $p = Start-Process "$env:RUNNER_TEMP\scream\Install\helpers\devcon-x64.exe" -ArgumentList 'install',"$drv\Scream.inf",'*Scream' -NoNewWindow -PassThru
+          if (-not $p.WaitForExit(120000)) { $p.Kill(); throw 'devcon bloccato (richiesta di conferma?)' }
+          "devcon: exit $($p.ExitCode)"
           Start-Sleep 5
           Get-PnpDevice -Class AudioEndpoint,MEDIA -ErrorAction SilentlyContinue | Format-Table -AutoSize Status,Class,FriendlyName,InstanceId
           Get-Service Audiosrv,AudioEndpointBuilder | Format-Table -AutoSize Name,Status
@@ -438,6 +454,7 @@ jobs:
           bash "$GITHUB_WORKSPACE/Zuer/scripts/pdf-check.sh" "$UDIR/feature-probe.exe" "$D"
           ZUER_PDFIUM=none "$UDIR/feature-probe.exe" fail "$(W "$D/prova.pdf")" "pdfium.dll"
           bash "$GITHUB_WORKSPACE/Zuer/scripts/image-check.sh" "$UDIR/feature-probe.exe" "$GITHUB_WORKSPACE/Zuer/tests/images"
+          bash "$GITHUB_WORKSPACE/Zuer/scripts/office-check.sh" "$UDIR/feature-probe.exe" "$GITHUB_WORKSPACE/Zuer/tests/office"
           "$UDIR/feature-probe.exe" video "$(W "$D/clip.mp4")"
           # Audio su WASAPI, sulla scheda virtuale Scream (il mix va in rete: inudibile).
           "$UDIR/feature-probe.exe" audio-devices

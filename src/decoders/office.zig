@@ -34,6 +34,12 @@ pub fn sheetFromPath(path: []const u8) ?usize {
 pub fn decode(bytes: []const u8, filename: []const u8, want_sheet: ?usize, allocator: std.mem.Allocator) Decoded {
     defer allocator.free(bytes);
 
+    // Contenitore OLE/CFB invece di ZIP: un docx/xlsx/pptx cifrato con password
+    // (Office lo incapsula così) o un vecchio formato binario rinominato.
+    if (bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], "\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")) {
+        return errMsg(allocator, "Documento Office protetto da password o in formato binario (DOC/XLS/PPT): non supportato", .{});
+    }
+
     // Central directory parsata una volta sola: tutte le letture di entry
     // successive sono lookup in memoria sulla stessa lista.
     const entries = parseCentralDirectory(bytes, allocator) catch |err| {
@@ -258,27 +264,7 @@ fn xmlToText(xml: []const u8, w: *std.Io.Writer) !void {
             }
             i = end + 1;
         } else if (c == '&') {
-            // Entity più comuni; le sconosciute passano letterali
-            const entities = [_]struct { name: []const u8, ch: u8 }{
-                .{ .name = "&amp;", .ch = '&' },
-                .{ .name = "&lt;", .ch = '<' },
-                .{ .name = "&gt;", .ch = '>' },
-                .{ .name = "&quot;", .ch = '"' },
-                .{ .name = "&apos;", .ch = '\'' },
-            };
-            var matched = false;
-            for (entities) |e| {
-                if (std.mem.startsWith(u8, xml[i..], e.name)) {
-                    try w.writeByte(e.ch);
-                    i += e.name.len;
-                    matched = true;
-                    break;
-                }
-            }
-            if (!matched) {
-                try w.writeByte(c);
-                i += 1;
-            }
+            i += try appendEntity(w, xml[i..]);
         } else {
             try w.writeByte(c);
             i += 1;
@@ -329,31 +315,50 @@ fn appendXmlText(w: *std.Io.Writer, text: []const u8) !void {
     var i: usize = 0;
     while (i < text.len) {
         if (text[i] == '&') {
-            const entities = [_]struct { name: []const u8, ch: u8 }{
-                .{ .name = "&amp;", .ch = '&' },
-                .{ .name = "&lt;", .ch = '<' },
-                .{ .name = "&gt;", .ch = '>' },
-                .{ .name = "&quot;", .ch = '"' },
-                .{ .name = "&apos;", .ch = '\'' },
-            };
-            var matched = false;
-            for (entities) |e| {
-                if (std.mem.startsWith(u8, text[i..], e.name)) {
-                    try w.writeByte(e.ch);
-                    i += e.name.len;
-                    matched = true;
-                    break;
-                }
-            }
-            if (!matched) {
-                try w.writeByte(text[i]);
-                i += 1;
-            }
+            i += try appendEntity(w, text[i..]);
         } else {
             try w.writeByte(text[i]);
             i += 1;
         }
     }
+}
+
+/// Decodifica il riferimento che inizia a `text[0] == '&'`: le cinque entity
+/// predefinite di XML e i riferimenti numerici (`&#10;`, `&#x1F61C;`) in UTF-8.
+/// Ritorna i byte consumati; un riferimento sconosciuto o malformato passa
+/// letterale (consuma solo la `&`). Mai DTD né entity esterne.
+fn appendEntity(w: *std.Io.Writer, text: []const u8) !usize {
+    const named = [_]struct { name: []const u8, ch: u8 }{
+        .{ .name = "&amp;", .ch = '&' },
+        .{ .name = "&lt;", .ch = '<' },
+        .{ .name = "&gt;", .ch = '>' },
+        .{ .name = "&quot;", .ch = '"' },
+        .{ .name = "&apos;", .ch = '\'' },
+    };
+    for (named) |e| {
+        if (std.mem.startsWith(u8, text, e.name)) {
+            try w.writeByte(e.ch);
+            return e.name.len;
+        }
+    }
+    if (text.len >= 4 and text[1] == '#') {
+        const semi = std.mem.indexOfScalar(u8, text[0..@min(text.len, 12)], ';') orelse {
+            try w.writeByte('&');
+            return 1;
+        };
+        const hex = text[2] == 'x' or text[2] == 'X';
+        const digits = text[(if (hex) @as(usize, 3) else 2)..semi];
+        const cp = std.fmt.parseInt(u21, digits, if (hex) 16 else 10) catch null;
+        if (cp) |v| {
+            var buf: [4]u8 = undefined;
+            if (std.unicode.utf8Encode(v, &buf)) |n| {
+                try w.writeAll(buf[0..n]);
+                return semi + 1;
+            } else |_| {}
+        }
+    }
+    try w.writeByte('&');
+    return 1;
 }
 
 fn xmlTextDupe(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
@@ -364,17 +369,58 @@ fn xmlTextDupe(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
 }
 
 /// Trova la prossima occorrenza del tag `name` (aperto: `<name ` / `<name>` /
-/// `<name/>`) a partire da `from`. Restituisce l'indice del `<`.
+/// `<name/>`) a partire da `from`, con o senza prefisso di namespace (`<x:row>`:
+/// l'OpenXML SDK di Microsoft scrive SpreadsheetML col prefisso `x:`).
+/// Restituisce l'indice del `<`.
 fn findTag(xml: []const u8, from: usize, comptime name: []const u8) ?usize {
     var pos = from;
-    while (std.mem.indexOfPos(u8, xml, pos, "<" ++ name)) |at| {
-        const after = at + 1 + name.len;
-        if (after >= xml.len) return null;
-        const c = xml[after];
-        if (c == ' ' or c == '>' or c == '/') return at;
-        pos = after;
+    while (std.mem.indexOfScalarPos(u8, xml, pos, '<')) |at| {
+        pos = at + 1;
+        if (nameAt(xml, at + 1, name)) |after| {
+            if (after >= xml.len) return null;
+            const c = xml[after];
+            if (c == ' ' or c == '>' or c == '/' or c == '\t' or c == '\n' or c == '\r') return at;
+        }
     }
     return null;
+}
+
+/// `name` in `xml[i..]`, direttamente o dopo un prefisso `ns:`. Indice dopo il nome.
+fn nameAt(xml: []const u8, i: usize, comptime name: []const u8) ?usize {
+    if (std.mem.startsWith(u8, xml[i..], name)) return i + name.len;
+    var j = i;
+    while (j < xml.len and j - i < 32 and (std.ascii.isAlphanumeric(xml[j]) or xml[j] == '_' or xml[j] == '-' or xml[j] == '.')) j += 1;
+    if (j == i or j >= xml.len or xml[j] != ':') return null;
+    if (std.mem.startsWith(u8, xml[j + 1 ..], name)) return j + 1 + name.len;
+    return null;
+}
+
+/// Prossimo tag di chiusura `</name>` o `</ns:name>` da `from`: [inizio, fine).
+fn findClose(xml: []const u8, from: usize, comptime name: []const u8) ?[2]usize {
+    var pos = from;
+    while (std.mem.indexOfPos(u8, xml, pos, "</")) |at| {
+        pos = at + 2;
+        if (nameAt(xml, at + 2, name)) |after| {
+            if (after < xml.len and xml[after] == '>') return .{ at, after + 1 };
+        }
+    }
+    return null;
+}
+
+/// Concatena il testo di tutti i `<t>` di `inner` (i run di una stringa ricca:
+/// `<si>` condivisa o `<is>` inline), con le entity decodificate.
+fn appendRuns(w: *std.Io.Writer, inner: []const u8) !void {
+    var tpos: usize = 0;
+    while (findTag(inner, tpos, "t")) |t_at| {
+        const t_open_end = std.mem.indexOfScalarPos(u8, inner, t_at, '>') orelse break;
+        if (inner[t_open_end - 1] == '/') {
+            tpos = t_open_end + 1;
+            continue;
+        }
+        const t_end = findClose(inner, t_open_end, "t") orelse break;
+        try appendXmlText(w, inner[t_open_end + 1 .. t_end[0]]);
+        tpos = t_end[1];
+    }
 }
 
 /// Valore dell'attributo `name="…"` dentro il tag di apertura `tag`.
@@ -698,8 +744,8 @@ fn parseSheetRows(sheet_xml: []const u8, shared: []const []const u8, allocator: 
             pos = open_end + 1;
             continue;
         }
-        const r_end = std.mem.indexOfPos(u8, sheet_xml, open_end, "</row>") orelse break;
-        const inner = sheet_xml[open_end + 1 .. r_end];
+        const r_close = findClose(sheet_xml, open_end, "row") orelse break;
+        const inner = sheet_xml[open_end + 1 .. r_close[0]];
 
         var cells = std.ArrayList([]const u8).empty;
         errdefer {
@@ -726,11 +772,11 @@ fn parseSheetRows(sheet_xml: []const u8, shared: []const []const u8, allocator: 
 
             var value: []const u8 = allocator.dupe(u8, "") catch break;
             if (!self_closing) {
-                const c_end = std.mem.indexOfPos(u8, inner, c_open_end, "</c>") orelse {
+                const c_close = findClose(inner, c_open_end, "c") orelse {
                     allocator.free(value);
                     break;
                 };
-                const cell_inner = inner[c_open_end + 1 .. c_end];
+                const cell_inner = inner[c_open_end + 1 .. c_close[0]];
                 const cell_type = attrValue(open_tag, "t") orelse "";
 
                 if (extractTagText(cell_inner, "v")) |raw| {
@@ -747,12 +793,17 @@ fn parseSheetRows(sheet_xml: []const u8, shared: []const []const u8, allocator: 
                         value = xmlTextDupe(allocator, raw) catch break;
                     }
                 } else if (std.mem.eql(u8, cell_type, "inlineStr")) {
-                    if (extractTagText(cell_inner, "t")) |raw| {
-                        allocator.free(value);
-                        value = xmlTextDupe(allocator, raw) catch break;
-                    }
+                    // `<is>` con uno o più run (`<r><t>…</t></r>`): tutti, in ordine.
+                    var buf: std.Io.Writer.Allocating = .init(allocator);
+                    defer buf.deinit();
+                    if (appendRuns(&buf.writer, cell_inner)) |_| {
+                        if (buf.toOwnedSlice()) |txt| {
+                            allocator.free(value);
+                            value = txt;
+                        } else |_| {}
+                    } else |_| {}
                 }
-                cpos = c_end + "</c>".len;
+                cpos = c_close[1];
             } else {
                 cpos = c_open_end + 1;
             }
@@ -764,7 +815,7 @@ fn parseSheetRows(sheet_xml: []const u8, shared: []const []const u8, allocator: 
         }
 
         builder.rows.append(allocator, cells.toOwnedSlice(allocator) catch break) catch break;
-        pos = r_end + "</row>".len;
+        pos = r_close[1];
     }
 
     return builder.toCsv(allocator);
@@ -775,8 +826,8 @@ fn extractTagText(xml: []const u8, comptime name: []const u8) ?[]const u8 {
     const at = findTag(xml, 0, name) orelse return null;
     const open_end = std.mem.indexOfScalarPos(u8, xml, at, '>') orelse return null;
     if (xml[open_end - 1] == '/') return null;
-    const close = std.mem.indexOfPos(u8, xml, open_end, "</" ++ name ++ ">") orelse return null;
-    return xml[open_end + 1 .. close];
+    const close = findClose(xml, open_end, name) orelse return null;
+    return xml[open_end + 1 .. close[0]];
 }
 
 /// Popola `out` con le stringhe condivise: ogni <si> concatena i suoi <t>.
@@ -784,26 +835,15 @@ fn parseSharedStrings(xml: []const u8, allocator: std.mem.Allocator, out: *std.A
     var pos: usize = 0;
     while (findTag(xml, pos, "si")) |si_at| {
         const open_end = std.mem.indexOfScalarPos(u8, xml, si_at, '>') orelse break;
-        const si_end = std.mem.indexOfPos(u8, xml, open_end, "</si>") orelse break;
-        const inner = xml[open_end + 1 .. si_end];
+        const si_close = findClose(xml, open_end, "si") orelse break;
+        const inner = xml[open_end + 1 .. si_close[0]];
 
         var buf: std.Io.Writer.Allocating = .init(allocator);
         defer buf.deinit();
-
-        var tpos: usize = 0;
-        while (findTag(inner, tpos, "t")) |t_at| {
-            const t_open_end = std.mem.indexOfScalarPos(u8, inner, t_at, '>') orelse break;
-            if (inner[t_open_end - 1] == '/') {
-                tpos = t_open_end + 1;
-                continue;
-            }
-            const t_end = std.mem.indexOfPos(u8, inner, t_open_end, "</t>") orelse break;
-            try appendXmlText(&buf.writer, inner[t_open_end + 1 .. t_end]);
-            tpos = t_end + "</t>".len;
-        }
+        try appendRuns(&buf.writer, inner);
 
         try out.append(allocator, try buf.toOwnedSlice());
-        pos = si_end + "</si>".len;
+        pos = si_close[1];
     }
 }
 

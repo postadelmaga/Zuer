@@ -24,6 +24,7 @@
 //!                                       ±48 per canale (ordine dei byte, orientamento)
 //!   feature-probe fail <file> <testo>  il decode DEVE fallire con un errore che
 //!                                       contiene <testo> (file corrotti, troppo grandi)
+//!   feature-probe contains <file> <testo>  il testo/la tabella decodificati contengono <testo>
 //!   feature-probe dump <file> <out.ppm> immagine decodificata in un PPM (confronti fra
 //!                                       motori, es. poppler contro PDFium)
 //!
@@ -91,6 +92,9 @@ pub fn main(init: std.process.Init) !u8 {
     } else if (std.mem.eql(u8, cmd, "fail")) {
         const path = args.next() orelse return usage();
         probeFail(io, gpa, path, args.next() orelse return usage());
+    } else if (std.mem.eql(u8, cmd, "contains")) {
+        const path = args.next() orelse return usage();
+        probeContains(io, gpa, path, args.next() orelse return usage());
     } else if (std.mem.eql(u8, cmd, "dump")) {
         const path = args.next() orelse return usage();
         probeDump(io, gpa, path, args.next() orelse return usage());
@@ -114,7 +118,9 @@ fn probeDoc(io: std.Io, gpa: std.mem.Allocator, path: []const u8, page: ?usize) 
         .err => |e| report(false, "{s}: errore \"{s}\"", .{ base, e }),
         .text => |t| report(t.len > 0, "{s}: testo, {d} byte", .{ base, t.len }),
         .markdown => |m| report(m.content.len > 0, "{s}: markdown, {d} byte", .{ base, m.content.len }),
-        .csv => |c_| report(c_.rows.len > 0, "{s}: tabella, {d} righe", .{ base, c_.rows.len }),
+        // Righe di dati + intestazione (la prima riga del foglio): un foglio di una riga
+        // sola ha zero righe di dati ma non è vuoto.
+        .csv => |c_| report(c_.rows.len > 0 or c_.headers.len > 0, "{s}: tabella, {d} colonne, {d} righe dopo l'intestazione", .{ base, c_.headers.len, c_.rows.len }),
         .workbook => |w| report(w.sheets.len > 0, "{s}: cartella di lavoro, {d} fogli", .{ base, w.sheets.len }),
         .mesh => |m| report(m.vertices.len > 0, "{s}: mesh, {d} vertici", .{ base, m.vertices.len }),
         .image => |im| {
@@ -156,6 +162,32 @@ fn probeFail(io: std.Io, gpa: std.mem.Allocator, path: []const u8, want: []const
         .err => |e| report(std.mem.indexOf(u8, e, want) != null, "{s}: errore atteso \"{s}\" ({s})", .{ base, e, want }),
         else => report(false, "{s}: decodificato, atteso un errore con \"{s}\"", .{ base, want }),
     }
+}
+
+fn probeContains(io: std.Io, gpa: std.mem.Allocator, path: []const u8, want: []const u8) void {
+    var d = decoder.decode(path, io, gpa);
+    defer d.deinit(gpa);
+    const base = std.fs.path.basename(path);
+    const found = switch (d) {
+        .text => |t| std.mem.indexOf(u8, t, want) != null,
+        .markdown => |m| std.mem.indexOf(u8, m.content, want) != null,
+        .csv => |c_| blk: {
+            for (c_.headers) |h| if (std.mem.indexOf(u8, h, want) != null) break :blk true;
+            for (c_.rows) |r| for (r) |cell| if (std.mem.indexOf(u8, cell, want) != null) break :blk true;
+            break :blk false;
+        },
+        .workbook => |w| blk: {
+            for (w.sheets) |sh| {
+                if (std.mem.indexOf(u8, sh.name, want) != null) break :blk true;
+                for (sh.data.headers) |h| if (std.mem.indexOf(u8, h, want) != null) break :blk true;
+                for (sh.data.rows) |r| for (r) |cell| if (std.mem.indexOf(u8, cell, want) != null) break :blk true;
+            }
+            break :blk false;
+        },
+        .err => |e| return report(false, "{s}: errore \"{s}\"", .{ base, e }),
+        else => false,
+    };
+    report(found, "{s}: contiene \"{s}\"", .{ base, want });
 }
 
 fn probeDump(io: std.Io, gpa: std.mem.Allocator, path: []const u8, out: []const u8) void {
