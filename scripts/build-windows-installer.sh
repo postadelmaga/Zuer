@@ -84,8 +84,8 @@ fi
 echo "→ [4/5] genero associations.nsh"
 # ── Estensioni per decoder incluso nel build Windows ────────────────────────
 # Fonte di verità: le stringhe `zuer_extensions` in src/decoders/*.zig. Escluse
-# le voci senza estensione reale (gitignore/editorconfig/dockerfile/make…) e i
-# decoder Linux-only (office: xlsx/docx/…, pdf).
+# le voci senza estensione reale (gitignore/editorconfig/dockerfile/make…) e il
+# decoder pdf (poppler/CoreGraphics: non costruito per Windows).
 EXTS="$(cat <<'LIST'
 txt text log nfo rst adoc asciidoc org tex bib srt vtt diff patch
 json jsonl ndjson yaml yml toml ini cfg conf properties env plist lock
@@ -99,6 +99,7 @@ png jpg jpeg gif bmp tga psd hdr pic pnm pbm pgm ppm svg svgz webp tif tiff ico 
 glb
 zip jar apk cbz epub xpi whl
 mp3 wav flac ogg oga ogv opus m4a mp4 m4v mov mkv webm avi mid midi
+docx pptx odt odp xlsx xlsm ods
 LIST
 )"
 

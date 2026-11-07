@@ -23,6 +23,12 @@ const evict = @import("cache_evict.zig");
 const ImageData = decoder.ImageData;
 const Decoded = decoder.Decoded;
 
+/// Motore di rasterizzazione: CoreGraphics su macOS (di sistema, vedi
+/// pdf_coregraphics.zig), poppler (`pdftoppm`/`pdfinfo`) altrove. Il resto del
+/// plugin (frammento #page=N, clamp, memo del conteggio, cache su disco) è comune.
+const use_coregraphics = builtin.os.tag == .macos;
+const cg = if (use_coregraphics) @import("pdf_coregraphics.zig") else struct {};
+
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 extern fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
 extern fn rmdir(path: [*:0]const u8) c_int;
@@ -117,10 +123,16 @@ fn decodeTier(path: []const u8, io: std.Io, filename: []const u8, allocator: std
     }
 
     return decodeInner(clean_path, clean_filename, dpi, page_num, coarse, allocator) catch |err| {
-        const hint = switch (err) {
-            error.CommandNotFound => "pdftoppm/pdfinfo non trovati: installa poppler-utils",
-            else => @errorName(err),
-        };
+        // anyerror: l'insieme degli errori cambia col motore (poppler/CoreGraphics).
+        const e: anyerror = err;
+        const hint = if (e == error.CommandNotFound)
+            "pdftoppm/pdfinfo non trovati: installa poppler-utils"
+        else if (e == error.PdfEncrypted)
+            "documento protetto da password"
+        else if (e == error.CoreGraphicsUnavailable)
+            "CoreGraphics non disponibile"
+        else
+            @errorName(err);
         const msg = std.fmt.allocPrint(allocator, "Errore rendering PDF: {s}", .{hint}) catch "";
         return .{ .err = msg };
     };
@@ -228,6 +240,11 @@ fn decodeInner(clean_path: []const u8, filename: []const u8, dpi: []const u8, pa
 /// subprocess; tutti i cambi pagina successivi leggono dalla memo.
 fn fetchPageCount(gpa: std.mem.Allocator, abs_path: []const u8, fkey: u64) !usize {
     if (pageCountLookup(fkey)) |n| return n;
+    if (comptime use_coregraphics) {
+        const n = try cg.pageCount(abs_path);
+        pageCountStore(fkey, n);
+        return n;
+    }
 
     var info = try decoder.runCapture(gpa, &.{ "pdfinfo", abs_path });
     defer info.deinit(gpa);
@@ -359,6 +376,12 @@ const Page = struct {
 /// arbitrario può raggiungere pdftoppm.
 fn renderPage(gpa: std.mem.Allocator, abs_path: []const u8, key: u64, flag: []const u8, value: []const u8, page: usize) !Page {
     if (cacheRead(gpa, key)) |cached| return cached;
+    if (comptime use_coregraphics) {
+        const v = std.fmt.parseInt(u32, value, 10) catch return error.BadScale;
+        const sc: cg.Scale = if (std.mem.eql(u8, flag, "-r")) .{ .dpi = v } else .{ .fit = v };
+        const r = try cg.render(gpa, abs_path, page, sc, 20000, max_page_bytes);
+        return .{ .width = r.width, .height = r.height, .pixels = r.pixels };
+    }
 
     // Rasterizzazione in un PPM temporaneo, dentro una directory privata creata
     // con mkdtemp: nome imprevedibile, niente symlink pre-creabili. (pdftoppm

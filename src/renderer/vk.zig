@@ -8,6 +8,9 @@ pub const VkResult = i32;
 pub const VK_SUCCESS: VkResult = 0;
 pub const VK_ERROR_INITIALIZATION_FAILED: VkResult = -3;
 pub const VK_ERROR_INCOMPATIBLE_DRIVER: VkResult = -9;
+/// VK_KHR_portability_enumeration: senza, il loader nasconde i driver "portability"
+/// (MoltenVK su macOS) e l'istanza non vede GPU.
+pub const INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR: u32 = 0x1;
 
 pub const VkInstance = ?*opaque {};
 pub const VkPhysicalDevice = ?*opaque {};
@@ -607,6 +610,9 @@ pub const SUBPASS_EXTERNAL: u32 = 0xFFFFFFFF;
 pub inline fn vkCreateInstance(a0: *const VkInstanceCreateInfo, a1: ?*const anyopaque, a2: *VkInstance) VkResult {
     return dispatch.vkCreateInstance(a0, a1, a2);
 }
+pub inline fn vkEnumerateInstanceExtensionProperties(a0: ?[*:0]const u8, a1: *u32, a2: ?[*]VkExtensionProperties) VkResult {
+    return dispatch.vkEnumerateInstanceExtensionProperties(a0, a1, a2);
+}
 pub inline fn vkDestroyInstance(a0: VkInstance, a1: ?*const anyopaque) void {
     return dispatch.vkDestroyInstance(a0, a1);
 }
@@ -1012,6 +1018,7 @@ pub inline fn vkCmdDraw(a0: VkCommandBuffer, a1: u32, a2: u32, a3: u32, a4: u32)
 // ---------------------------------------------------------------------------
 pub const Dispatch = struct {
     vkCreateInstance: *const fn (*const VkInstanceCreateInfo, ?*const anyopaque, *VkInstance) callconv(.c) VkResult,
+    vkEnumerateInstanceExtensionProperties: *const fn (?[*:0]const u8, *u32, ?[*]VkExtensionProperties) callconv(.c) VkResult,
     vkDestroyInstance: *const fn (VkInstance, ?*const anyopaque) callconv(.c) void,
     vkEnumeratePhysicalDevices: *const fn (VkInstance, *u32, ?[*]VkPhysicalDevice) callconv(.c) VkResult,
     vkGetPhysicalDeviceQueueFamilyProperties: *const fn (VkPhysicalDevice, *u32, ?[*]VkQueueFamilyProperties) callconv(.c) void,
@@ -1087,7 +1094,7 @@ pub const PfnGetInstanceProcAddr = *const fn (VkInstance, [*:0]const u8) callcon
 pub const Level = enum { global, instance, device };
 pub fn level(comptime name: []const u8) Level {
     @setEvalBranchQuota(20_000);
-    const global = [_][]const u8{"vkCreateInstance"};
+    const global = [_][]const u8{ "vkCreateInstance", "vkEnumerateInstanceExtensionProperties" };
     const instance = [_][]const u8{ "vkCreateDevice", "vkDestroyInstance", "vkEnumerateDeviceExtensionProperties", "vkEnumeratePhysicalDevices", "vkGetDeviceProcAddr", "vkGetPhysicalDeviceMemoryProperties", "vkGetPhysicalDeviceProperties", "vkGetPhysicalDeviceQueueFamilyProperties" };
     inline for (global) |g| if (comptime std.mem.eql(u8, g, name)) return .global;
     inline for (instance) |g| if (comptime std.mem.eql(u8, g, name)) return .instance;

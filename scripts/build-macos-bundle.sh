@@ -11,6 +11,13 @@
 #            arm64 → zig-out/bin+lib, x86_64 → zig-out/macos-x64/bin+lib)
 #   --build  ricompila prima di impacchettare (di default NO: si riusa zig-out)
 #   --out    directory di uscita (default: zig-out/macos)
+#   --require-full  errore se mancano FFmpeg o MoltenVK (build di release)
+#
+# Librerie native opzionali, copiate in Contents/Frameworks e aperte a runtime:
+#   ZUER_FFMPEG_DIR  prefix di scripts/build-ffmpeg-macos.sh (video/audio)
+#   ZUER_MOLTENVK    percorso di libMoltenVK.dylib (renderer 3D Vulkan su Metal)
+#   ZUER_MOLTENVK_LICENSE  sua licenza (Apache-2.0)
+# Senza, il bundle funziona lo stesso: video e 3D dicono perché non partono.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -18,12 +25,14 @@ cd "$ROOT"
 
 ARCH=arm64
 DO_BUILD=0
+REQUIRE_FULL=0
 OUT="$ROOT/zig-out/macos"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --arch) ARCH="$2"; shift 2 ;;
     --build) DO_BUILD=1; shift ;;
     --out) OUT="$2"; shift 2 ;;
+    --require-full) REQUIRE_FULL=1; shift ;;
     *) echo "opzione sconosciuta: $1" >&2; exit 2 ;;
   esac
 done
@@ -55,6 +64,36 @@ cp "$BIN/zuer-gui" "$APP/Contents/MacOS/"
 cp "$ROOT/LICENSE" "$APP/Contents/Resources/LICENSE" # AGPL-3.0-or-later
 # I plugin accanto all'exe: il registro li scansiona in <exe_dir>/decoders.
 cp "$LIB"/libdecoder_*.dylib "$APP/Contents/MacOS/decoders/"
+
+# ── Librerie native opzionali (Contents/Frameworks) ─────────────────────────
+FW="$APP/Contents/Frameworks"
+HAVE_FFMPEG=0
+HAVE_MOLTENVK=0
+if [[ -n "${ZUER_FFMPEG_DIR:-}" ]]; then
+  mkdir -p "$FW"
+  for n in avutil swresample swscale avcodec avformat; do
+    # Nome col solo major (= install name, quello che zuer-gui apre): -L copia il file vero.
+    src="$(ls "$ZUER_FFMPEG_DIR"/lib/lib$n.*.dylib | grep -E "/lib$n\.[0-9]+\.dylib$" | head -1)"
+    [[ -n "$src" ]] || { echo "✗ lib$n.N.dylib assente in $ZUER_FFMPEG_DIR/lib"; exit 1; }
+    cp -L "$src" "$FW/"
+  done
+  cp "$ZUER_FFMPEG_DIR/share/zuer/FFmpeg-LICENSE.txt" "$ZUER_FFMPEG_DIR/share/zuer/FFmpeg-SOURCE.txt" "$APP/Contents/Resources/"
+  HAVE_FFMPEG=1
+  echo "  ✓ FFmpeg (LGPL): $(cd "$FW" && ls libav*.dylib libsw*.dylib | tr '\n' ' ')"
+fi
+if [[ -n "${ZUER_MOLTENVK:-}" ]]; then
+  mkdir -p "$FW"
+  cp -L "$ZUER_MOLTENVK" "$FW/libMoltenVK.dylib"
+  chmod u+w "$FW/libMoltenVK.dylib"
+  command -v install_name_tool >/dev/null && install_name_tool -id @rpath/libMoltenVK.dylib "$FW/libMoltenVK.dylib" 2>/dev/null
+  [[ -n "${ZUER_MOLTENVK_LICENSE:-}" ]] && cp "$ZUER_MOLTENVK_LICENSE" "$APP/Contents/Resources/MoltenVK-LICENSE.txt"
+  HAVE_MOLTENVK=1
+  echo "  ✓ MoltenVK (Apache-2.0)"
+fi
+if [[ $REQUIRE_FULL -eq 1 && ( $HAVE_FFMPEG -eq 0 || $HAVE_MOLTENVK -eq 0 ) ]]; then
+  echo "✗ --require-full: FFmpeg=$HAVE_FFMPEG MoltenVK=$HAVE_MOLTENVK (imposta ZUER_FFMPEG_DIR e ZUER_MOLTENVK)"
+  exit 1
+fi
 
 # Icona .icns (stessa "Z" su tondo blu dell'installer Windows), multi-risoluzione.
 # L'ICNS è assemblato a mano da python3 (header 'icns' + chunk PNG tipizzati):
@@ -88,9 +127,9 @@ fi
 [[ $HAVE_ICON -eq 1 ]] && echo "  ✓ zuer.icns" || echo "  · icona non generata (serve ImageMagick + python3)"
 
 # Estensioni note ai decoder inclusi nel build macOS. Stessa lista dell'installer
-# Windows (fonte di verità: `zuer_extensions` in src/decoders/*.zig), MENO i
-# media (mp3/mp4/…): su macOS ffmpeg è spento di default, aprire file che non si
-# possono decodificare sarebbe solo rumore in "Apri con".
+# Windows (fonte di verità: `zuer_extensions` in src/decoders/*.zig), PIÙ il pdf
+# (CoreGraphics). I media si dichiarano solo se le dylib FFmpeg sono nel bundle:
+# aprire file che non si possono decodificare sarebbe solo rumore in "Apri con".
 EXTS="$(cat <<'LIST'
 txt text log nfo rst adoc asciidoc org tex bib srt vtt diff patch
 json jsonl ndjson yaml yml toml ini cfg conf properties env plist lock
@@ -103,8 +142,12 @@ obj stl
 png jpg jpeg gif bmp tga psd hdr pic pnm pbm pgm ppm svg svgz webp tif tiff ico avif
 glb
 zip jar apk cbz epub xpi whl
+docx pptx odt odp xlsx xlsm ods
+pdf
 LIST
 )"
+[[ $HAVE_FFMPEG -eq 1 ]] && EXTS="$EXTS
+mp3 wav flac ogg oga ogv opus m4a mp4 m4v mov mkv webm avi mid midi"
 
 PLIST="$APP/Contents/Info.plist"
 {
@@ -158,6 +201,7 @@ printf 'APPL????' > "$APP/Contents/PkgInfo"
 # l'autore: niente certificato Developer ID, niente notarizzazione.
 if command -v codesign >/dev/null; then
   codesign --force --sign - "$APP"/Contents/MacOS/decoders/*.dylib
+  if [[ -d "$FW" ]]; then codesign --force --sign - "$FW"/*.dylib; fi
   codesign --force --sign - "$APP"
   codesign --verify --strict --verbose=1 "$APP"
   echo "  ✓ firma ad-hoc del bundle"

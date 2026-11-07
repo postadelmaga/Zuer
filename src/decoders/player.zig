@@ -116,9 +116,17 @@ pub const av: *const AvApi = if (av_dynamic) &av_runtime_table else &av_static;
 fn libName(comptime base: []const u8, comptime major: u32) [:0]const u8 {
     return switch (builtin.os.tag) {
         .windows => std.fmt.comptimePrint("{s}-{d}.dll", .{ base, major }),
+        // Dylib LGPL del bundle (Zuer.app/Contents/Frameworks); fuori dal bundle
+        // (sviluppo) si riprova col solo nome, vedi ensureAvRuntime.
+        .macos => std.fmt.comptimePrint("@executable_path/../Frameworks/lib{s}.{d}.dylib", .{ base, major }),
         else => std.fmt.comptimePrint("lib{s}.so.{d}", .{ base, major }),
     };
 }
+
+/// Decodifica hardware: VideoToolbox su macOS, VAAPI altrove (su Windows il
+/// device VAAPI non si apre e si resta in software, come prima).
+const hw_device_type = if (builtin.os.tag == .macos) c.AV_HWDEVICE_TYPE_VIDEOTOOLBOX else c.AV_HWDEVICE_TYPE_VAAPI;
+const hw_pix_fmt = if (builtin.os.tag == .macos) c.AV_PIX_FMT_VIDEOTOOLBOX else c.AV_PIX_FMT_VAAPI;
 
 /// In ordine di dipendenza (avutil prima di tutti). File-scope: il nome deve
 /// essere comptime-known per la conversione UTF-16 nell'inline for (Windows).
@@ -167,7 +175,11 @@ fn ensureAvRuntime() bool {
         libs[i] = (if (is_win) blk: {
             const wide = comptime std.unicode.utf8ToUtf16LeStringLiteral(n);
             break :blk win.LoadLibraryW(wide);
-        } else std.c.dlopen(n.ptr, .{ .NOW = true })) orelse {
+        } else std.c.dlopen(n.ptr, .{ .NOW = true }) orelse
+            (if (comptime builtin.os.tag == .macos)
+                std.c.dlopen(comptime n[std.mem.lastIndexOfScalar(u8, n, '/').? + 1 ..].ptr, .{ .NOW = true })
+            else
+                null)) orelse {
             std.debug.print("zuer: libav non disponibile ({s} mancante): niente audio/video\n", .{n});
             for (libs[0..opened]) |l| {
                 if (is_win) _ = win.FreeLibrary(l) else _ = std.c.dlclose(l);
@@ -243,7 +255,7 @@ fn pickVaapiFormat(ctx: [*c]c.AVCodecContext, fmts: [*c]const c.enum_AVPixelForm
     _ = ctx;
     var i: usize = 0;
     while (fmts[i] != c.AV_PIX_FMT_NONE) : (i += 1) {
-        if (fmts[i] == c.AV_PIX_FMT_VAAPI) return c.AV_PIX_FMT_VAAPI;
+        if (fmts[i] == hw_pix_fmt) return hw_pix_fmt;
     }
     // Niente VAAPI nella lista: primo formato NON hardware (un formato hw di un
     // altro tipo non sarebbe usabile senza il relativo device context).
@@ -310,13 +322,13 @@ fn tryOpenVaapiDevice(
 ) ?OpenedHw {
     var hw_device_ctx: [*c]c.AVBufferRef = null;
     const dev_c: [*c]const u8 = if (device_path) |p| p else null;
-    if (av.av_hwdevice_ctx_create(&hw_device_ctx, c.AV_HWDEVICE_TYPE_VAAPI, dev_c, null, 0) < 0) return null;
+    if (av.av_hwdevice_ctx_create(&hw_device_ctx, hw_device_type, dev_c, null, 0) < 0) return null;
 
     var supported = false;
     var ci: c_int = 0;
     while (av.avcodec_get_hw_config(codec, ci)) |cfg| : (ci += 1) {
         if ((cfg.*.methods & c.AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) != 0 and
-            cfg.*.device_type == c.AV_HWDEVICE_TYPE_VAAPI)
+            cfg.*.device_type == hw_device_type)
         {
             supported = true;
             break;
@@ -395,7 +407,7 @@ fn probeHwDevice(
         const r = av.avcodec_receive_frame(opened.codec_ctx, probe_frame);
         if (r == c.AVERROR(c.EAGAIN)) continue;
         if (r < 0) break;
-        real_hw = probe_frame.*.format == c.AV_PIX_FMT_VAAPI;
+        real_hw = probe_frame.*.format == hw_pix_fmt;
         break;
     }
     // Sempre: il chiamante (prossimo device, o il player stesso se abbiamo
@@ -884,7 +896,7 @@ pub const Player = struct {
             if (pts < target) return null; // scartato: niente download/scale
         }
         var src: [*c]c.AVFrame = self.frame;
-        if (self.frame.*.format == c.AV_PIX_FMT_VAAPI) {
+        if (self.frame.*.format == hw_pix_fmt) {
             var ok = self.sw_frame != null;
             if (ok) {
                 av.av_frame_unref(self.sw_frame);

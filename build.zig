@@ -15,10 +15,12 @@ pub fn build(b: *std.Build) void {
     //            import libs are vendored (video files just don't open elsewhere).
     // On Windows zuer-gui is otherwise CPU-only (text/csv/image composited in software).
     const os_tag = target.result.os.tag;
-    const vulkan_enabled = b.option(bool, "vulkan", "Link the Vulkan mesh/text renderer") orelse
-        (os_tag == .linux or os_tag == .windows);
-    const ffmpeg_enabled = b.option(bool, "ffmpeg", "Link the libav native video player") orelse
-        (os_tag == .linux or os_tag == .windows);
+    // macOS: Vulkan = MoltenVK (nel bundle, aperto a runtime); libav = dylib
+    // LGPL nel bundle, aperte a runtime anche dal plugin media (niente link).
+    const vulkan_enabled = b.option(bool, "vulkan", "Build the Vulkan mesh/text renderer (loader opened at runtime)") orelse
+        (os_tag == .linux or os_tag == .windows or os_tag == .macos);
+    const ffmpeg_enabled = b.option(bool, "ffmpeg", "Build the libav native video player") orelse
+        (os_tag == .linux or os_tag == .windows or os_tag == .macos);
     // libmpv (render API, EGL) per il video hardware-accelerato: percorso
     // Linux/Wayland-only (EGL + wl_display privato, vedi src/decoders/mpv_video.zig).
     const mpv_enabled = b.option(bool, "mpv", "Link libmpv render API for hw video (Linux only)") orelse
@@ -35,7 +37,7 @@ pub fn build(b: *std.Build) void {
     // al primo video) invece che dalla import table / DT_NEEDED, su entrambi gli OS
     // — così l'eseguibile non dipende dal soname di FFmpeg installato al momento
     // della build e un file non multimediale non tocca mai libavformat.
-    build_opts.addOption(bool, "av_runtime", os_tag == .windows or os_tag == .linux);
+    build_opts.addOption(bool, "av_runtime", os_tag == .windows or os_tag == .linux or os_tag == .macos);
     // Solo per zuer-gui: libmpv si risolve a runtime (dlopen al primo video con
     // mpv, vedi ensureMpv in src/decoders/mpv_video.zig) — così l'exe parte
     // anche senza mpv installato, ripiegando sul decoder FFmpeg esistente.
@@ -48,6 +50,13 @@ pub fn build(b: *std.Build) void {
     build_opts_linked.addOption(bool, "gpu", vulkan_enabled);
     build_opts_linked.addOption(bool, "video", ffmpeg_enabled);
     build_opts_linked.addOption(bool, "av_runtime", false);
+    // Plugin media su macOS: nessuna libav da linkare in cross-compilazione (e
+    // nessuna di sistema), quindi anche il plugin risolve i simboli a runtime
+    // dalle dylib del bundle — stessa tabella di zuer-gui (player.zig).
+    const build_opts_media_runtime = b.addOptions();
+    build_opts_media_runtime.addOption(bool, "gpu", vulkan_enabled);
+    build_opts_media_runtime.addOption(bool, "video", ffmpeg_enabled);
+    build_opts_media_runtime.addOption(bool, "av_runtime", true);
 
     // Il loader Vulkan NON si linka più: src/renderer/vk_loader.zig lo apre a
     // runtime (LoadLibrary/dlopen) alla prima init del renderer, così gli
@@ -83,10 +92,12 @@ pub fn build(b: *std.Build) void {
         /// su Linux quelli di sistema in /usr/include, già nel default search path del
         /// compilatore (nessun -I esplicito serve: pkg-config qui non è coinvolto).
         fn headersOnly(bld: *std.Build, m: *std.Build.Module, tgt: std.Build.ResolvedTarget) void {
+            // Windows e macOS: header vendorati (stessa ABI delle DLL/dylib distribuite).
+            const vendored = tgt.result.os.tag == .windows or tgt.result.os.tag == .macos;
             if (translateC(bld, m, "av_c", "src/c/av.h")) |tc| {
-                if (tgt.result.os.tag == .windows) tc.addIncludePath(bld.path("vendor/ffmpeg/include"));
+                if (vendored) tc.addIncludePath(bld.path("vendor/ffmpeg/include"));
             }
-            if (tgt.result.os.tag == .windows) {
+            if (vendored) {
                 m.addIncludePath(bld.path("vendor/ffmpeg/include"));
             }
         }
@@ -381,6 +392,33 @@ pub fn build(b: *std.Build) void {
     gpu_shot_run.addPassthruArgs();
     b.step("gpu-shot", "Screenshot headless PPM di una mesh (decode+VT)").dependOn(&gpu_shot_run.step);
 
+    // feature-probe: prove headless delle funzionalità (doc/pdf/office, video,
+    // audio, renderer GPU) con lo stesso codice e gli stessi plugin di zuer-gui.
+    // Per la CI: `zig build feature-probe` lo installa in zig-out/bin; NON fa parte
+    // dei pacchetti distribuiti.
+    const probe = b.addExecutable(.{
+        .name = "feature-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/feature_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    probe.root_module.addImport("zicro", dep_zicro.module("zicro"));
+    probe.root_module.addOptions("build_options", build_opts);
+    shaders.addTo(probe.root_module);
+    if (ffmpeg_enabled) LinkAv.headersOnly(b, probe.root_module, target);
+    if (os_tag == .linux) {
+        probe.root_module.linkSystemLibrary("asound", .{});
+        if (ffmpeg_enabled) {
+            probe.root_module.linkSystemLibrary("compute_vp9", .{});
+            addCvp9C(b, probe.root_module);
+        }
+    }
+    if (os_tag == .windows) probe.root_module.linkSystemLibrary("winmm", .{});
+    b.step("feature-probe", "Installa feature-probe (prove headless per la CI)").dependOn(&b.addInstallArtifact(probe, .{}).step);
+
     const decoder_mod = b.createModule(.{
         .root_source_file = b.path("src/decoder.zig"),
         .target = target,
@@ -412,15 +450,20 @@ pub fn build(b: *std.Build) void {
                 .flags = &.{ "-O2", "-fno-sanitize=undefined" },
             });
         }
-        // The media decoder needs FFmpeg (+ compute_vp9); pdf/office shell out to external
-        // tools and use POSIX temp dirs (mkdtemp). Both groups are Linux-only for now — on
-        // a CPU-only target they're simply not installed, so their libav/POSIX deps never
-        // reach the link. The core plugins (text/csv/markdown/mesh/image/glb/archive/tar) build
-        // everywhere.
+        // The media decoder needs FFmpeg (+ compute_vp9 on Linux). pdf rasterizes with
+        // poppler's tools (Linux: subprocess + POSIX temp dirs) or with CoreGraphics
+        // (macOS, system framework opened at runtime): not built for Windows, which has
+        // neither. office is pure Zig (ZIP + XML) and builds everywhere, like the core
+        // plugins (text/csv/markdown/mesh/image/glb/archive/tar).
         const needs_ffmpeg = comptime std.mem.eql(u8, name, "media");
-        const needs_tools = comptime (std.mem.eql(u8, name, "pdf") or std.mem.eql(u8, name, "office"));
+        const needs_tools = comptime std.mem.eql(u8, name, "pdf");
         if (needs_ffmpeg) {
-            if (ffmpeg_enabled) {
+            if (ffmpeg_enabled and os_tag == .macos) {
+                LinkAv.headersOnly(b, lib.root_module, target);
+                lib.root_module.addOptions("build_options", build_opts_media_runtime);
+                addTsf(b, lib.root_module);
+                b.installArtifact(lib);
+            } else if (ffmpeg_enabled) {
                 LinkAv.link(b, lib.root_module, target);
                 // media importa player.zig (poster): serve build_options per il
                 // gate cvp9 e il link della lib (il poster resta però su libav).
@@ -435,7 +478,7 @@ pub fn build(b: *std.Build) void {
                 b.installArtifact(lib);
             }
         } else if (needs_tools) {
-            if (os_tag == .linux) b.installArtifact(lib);
+            if (os_tag == .linux or os_tag == .macos) b.installArtifact(lib);
         } else {
             b.installArtifact(lib);
         }

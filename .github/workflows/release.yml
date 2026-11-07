@@ -4,7 +4,8 @@
 #
 # Riproducibilità: Zuer al commit del tag, Zicro al commit scritto in
 # .github/zicro.ref (dentro il tag stesso), Zig scaricato da ziglang.org con sha256
-# verificato, FFmpeg per Windows pinnato con sha256 in scripts/fetch-ffmpeg-dlls.sh.
+# verificato, FFmpeg per Windows pinnato con sha256 in scripts/fetch-ffmpeg-dlls.sh,
+# FFmpeg per macOS compilato dallo stesso commit (scripts/build-ffmpeg-macos.sh).
 # Pacchetti NON firmati (nessun certificato Apple/Windows configurato): vedi RELEASE.md.
 name: release
 
@@ -143,6 +144,7 @@ jobs:
         run: |
           uname -m; sw_vers
           [[ "$(uname -m)" == arm64 ]] || { echo "::error::runner non arm64"; exit 1; }
+          system_profiler SPDisplaysDataType | grep -E 'Chipset|Metal|Type' || true
       - name: Zig e strumenti
         run: |
           set -euo pipefail
@@ -150,75 +152,147 @@ jobs:
           echo "b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a  zig.tar.xz" | shasum -a 256 -c -
           mkdir -p "$RUNNER_TEMP/zig" && tar -xJf zig.tar.xz -C "$RUNNER_TEMP/zig" --strip-components=1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
-          brew install --quiet shaderc imagemagick
+          # shaderc: SPIR-V a build time; molten-vk: Vulkan su Metal, va NEL bundle;
+          # ffmpeg (CLI): solo per generare la clip di prova, non entra nel pacchetto.
+          brew install --quiet shaderc imagemagick molten-vk ffmpeg
+          brew info --json=v2 molten-vk | python3 -c 'import json,sys; f=json.load(sys.stdin)["formulae"][0]; print("molten-vk", f["installed"][0]["version"], f["license"])'
+      # FFmpeg LGPL per il bundle: ~5 min di compilazione, in cache per commit+flag.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/ffmpeg
+          key: ffmpeg-macos-arm64-${{ hashFiles('Zuer/scripts/build-ffmpeg-macos.sh') }}
+      - name: FFmpeg per il bundle (scripts/build-ffmpeg-macos.sh)
+        working-directory: Zuer
+        run: |
+          set -euo pipefail
+          ZUER_FFMPEG_WORK="$RUNNER_TEMP/ffmpeg-build" scripts/build-ffmpeg-macos.sh "$RUNNER_TEMP/ffmpeg"
+          cat "$RUNNER_TEMP/ffmpeg/share/zuer/FFmpeg-SOURCE.txt"
       - name: Build e bundle (scripts/build-macos-bundle.sh)
         working-directory: Zuer
         run: |
           set -euo pipefail
           zig version
+          MVK="$(brew --prefix molten-vk)"
+          export ZUER_FFMPEG_DIR="$RUNNER_TEMP/ffmpeg"
+          export ZUER_MOLTENVK="$MVK/lib/libMoltenVK.dylib"
+          export ZUER_MOLTENVK_LICENSE="$(find "$MVK/" -maxdepth 1 -iname 'LICENSE*' | head -1)"
+          [[ -n "$ZUER_MOLTENVK_LICENSE" ]] || { echo "::error::licenza MoltenVK non trovata in $MVK"; ls "$MVK"; exit 1; }
           ZUER_ICON_FONT="/System/Library/Fonts/Supplemental/Arial Bold.ttf" \
-            scripts/build-macos-bundle.sh --arch arm64 --build --out "$RUNNER_TEMP/macos"
+            scripts/build-macos-bundle.sh --arch arm64 --build --require-full --out "$RUNNER_TEMP/macos"
           mkdir -p "$RUNNER_TEMP/dist"
           mv "$RUNNER_TEMP/macos/Zuer-macos-arm64.tar.gz" "$RUNNER_TEMP/dist/zuer-$VERSION-macos-arm64.tar.gz"
+          # Strumento di prova headless (NON nel pacchetto): stessi plugin e librerie dell'app.
+          zig build feature-probe -Doptimize=ReleaseFast
       - name: Verifica del pacchetto (copia pulita)
         run: |
           set -euo pipefail
           C="$RUNNER_TEMP/clean"; rm -rf "$C"; mkdir -p "$C"
           tar -xzf "$RUNNER_TEMP/dist/zuer-$VERSION-macos-arm64.tar.gz" -C "$C"
-          APP="$C/Zuer.app"; EXE="$APP/Contents/MacOS/zuer-gui"
+          APP="$C/Zuer.app"; EXE="$APP/Contents/MacOS/zuer-gui"; FW="$APP/Contents/Frameworks"
           find "$APP" -type f | sed "s|$C/||" | sort
+          du -sh "$APP"; du -sh "$FW"
           # Niente file di sviluppo nel pacchetto.
-          if find "$APP" -type f \( -name '*.patch' -o -name '*.log' -o -name '*.pdb' -o -name '*.dSYM' -o -name '*.o' \) | grep -q .; then
+          if find "$APP" -type f \( -name '*.patch' -o -name '*.log' -o -name '*.pdb' -o -name '*.dSYM' -o -name '*.o' -o -name '*.a' -o -name '*.h' -o -name '*.pc' \) | grep -q .; then
             echo "::error::file di sviluppo nel bundle"; exit 1; fi
-          [[ -f "$APP/Contents/Resources/LICENSE" ]] || { echo "::error::LICENSE assente"; exit 1; }
+          for f in LICENSE FFmpeg-LICENSE.txt FFmpeg-SOURCE.txt MoltenVK-LICENSE.txt; do
+            [[ -f "$APP/Contents/Resources/$f" ]] || { echo "::error::$f assente"; exit 1; }; done
+          grep -q 'GNU LESSER GENERAL PUBLIC LICENSE' "$APP/Contents/Resources/FFmpeg-LICENSE.txt"
+          grep -q 'Apache License' "$APP/Contents/Resources/MoltenVK-LICENSE.txt"
           ls "$APP/Contents/MacOS/decoders/"libdecoder_*.dylib
+          for d in pdf office media; do [[ -f "$APP/Contents/MacOS/decoders/libdecoder_$d.dylib" ]] || { echo "::error::plugin $d assente"; exit 1; }; done
+          for n in avutil.61 swresample.7 swscale.10 avcodec.63 avformat.63 MoltenVK; do
+            [[ -f "$FW/lib$n.dylib" ]] || { echo "::error::Frameworks/lib$n.dylib assente"; exit 1; }; done
+          BINS=("$EXE" "$APP"/Contents/MacOS/decoders/*.dylib "$FW"/*.dylib)
           # Architettura: solo arm64, ovunque.
-          for f in "$EXE" "$APP"/Contents/MacOS/decoders/*.dylib; do
-            a="$(lipo -archs "$f")"; echo "$f: $a"
+          for f in "${BINS[@]}"; do
+            a="$(lipo -archs "$f")"; echo "$(basename "$f"): $a"
             [[ "$a" == arm64 ]] || { echo "::error::$f non è solo arm64 ($a)"; exit 1; }
           done
-          # Dipendenze dinamiche: solo librerie e framework di sistema, nessun percorso di build.
-          for f in "$EXE" "$APP"/Contents/MacOS/decoders/*.dylib; do
+          # Dipendenze dinamiche: sistema, oppure @rpath verso una dylib presente in
+          # Frameworks. Nessun percorso di build, Homebrew o /usr/local.
+          for f in "${BINS[@]}"; do
             ID="$(otool -D "$f" | tail -n +2)" # nome proprio di una dylib (non è una dipendenza)
             otool -L "$f" | tail -n +2 | awk '{print $1}' | while read -r d; do
               [[ -n "$ID" && "$d" == "$ID" ]] && continue
               case "$d" in
                 /usr/lib/*|/System/Library/*) ;;
-                *) echo "::error::$(basename "$f") dipende da $d (non di sistema)"; exit 1 ;;
+                @rpath/*) [[ -f "$FW/${d#@rpath/}" ]] || { echo "::error::$(basename "$f") dipende da $d, assente in Frameworks"; exit 1; } ;;
+                *) echo "::error::$(basename "$f") dipende da $d (non di sistema né nel bundle)"; exit 1 ;;
               esac
             done
+            if otool -l "$f" | grep -A2 LC_RPATH | grep -E 'path (/opt/homebrew|/usr/local|/Users|'"$GITHUB_WORKSPACE"'|'"$RUNNER_TEMP"')'; then
+              echo "::error::$(basename "$f"): rpath verso la macchina di build"; exit 1; fi
           done
-          otool -L "$EXE"
-          if otool -l "$EXE" | grep -A2 LC_RPATH | grep -q "$GITHUB_WORKSPACE"; then
-            echo "::error::rpath verso la cartella di build"; exit 1; fi
+          otool -L "$EXE" "$FW/libavcodec.63.dylib" "$FW/libMoltenVK.dylib"
+          # Nessuna dipendenza statica da Vulkan o libav nell'eseguibile: si aprono a runtime.
+          if otool -L "$EXE" | grep -qiE 'vulkan|moltenvk|libav|libsw'; then echo "::error::zuer-gui linka Vulkan/libav"; exit 1; fi
           # Metadati.
           plutil -lint "$APP/Contents/Info.plist"
           for k in CFBundleIdentifier CFBundleShortVersionString CFBundleExecutable CFBundleIconFile LSMinimumSystemVersion; do
             echo "$k = $(/usr/libexec/PlistBuddy -c "Print :$k" "$APP/Contents/Info.plist" 2>/dev/null || echo '(assente)')"
           done
+          for e in pdf docx xlsx pptx mp4 obj; do
+            grep -q "<string>$e</string>" "$APP/Contents/Info.plist" || { echo "::error::estensione $e non dichiarata"; exit 1; }; done
           # Firma: solo ad-hoc (nessun certificato). Su arm64 macOS esige almeno questa.
           codesign -dv "$APP" 2>&1 | grep -E 'Signature|Identifier|flags|Sealed' || true
-          codesign --verify --strict --verbose=2 "$APP"
+          codesign --verify --strict --deep --verbose=2 "$APP"
           [[ -f "$APP/Contents/Resources/zuer.icns" ]] || { echo "::error::icona assente"; exit 1; }
-      - name: Smoke test
+      - name: Prove delle funzionalità (feature-probe dentro una copia del bundle)
         run: |
           set -euo pipefail
-          EXE="$RUNNER_TEMP/clean/Zuer.app/Contents/MacOS/zuer-gui"
+          T="$RUNNER_TEMP/probe"; rm -rf "$T"; mkdir -p "$T"
+          cp -R "$RUNNER_TEMP/clean/Zuer.app" "$T/"
+          cp "$GITHUB_WORKSPACE/Zuer/zig-out/bin/feature-probe" "$T/Zuer.app/Contents/MacOS/"
+          P="$T/Zuer.app/Contents/MacOS/feature-probe"
+          D="$T/docs"; python3 "$GITHUB_WORKSPACE/Zuer/scripts/make-test-docs.py" "$D"
+          # Clip con traccia audio MUTA (anullsrc): nessuna prova è mai udibile.
+          ffmpeg -loglevel error -f lavfi -i testsrc2=size=1280x720:rate=30 -f lavfi -i anullsrc=r=48000:cl=stereo \
+            -t 8 -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest "$D/clip.mp4"
+          ffmpeg -loglevel error -f lavfi -i testsrc2=size=1280x720:rate=30 -t 4 -c:v hevc_videotoolbox -tag:v hvc1 "$D/clip-hevc.mp4" || true
+          cd "$T"
+          "$P" doc "$D"/prova.pdf "$D"/prova.docx "$D"/prova.xlsx "$D"/prova.pptx "$D"/prova.odt "$D"/prova.ods "$D"/cubo.obj "$D"/prova.txt "$D"/clip.mp4
+          "$P" page "$D/prova.pdf" 2 | tee page2.log
+          grep -q 'immagine 1650x1275' page2.log || { echo "::error::pagina ruotata di 90° non resa in orizzontale"; exit 1; }
+          "$P" page "$D/prova.pdf" 3
+          "$P" video "$D/clip.mp4" | tee video.log
+          grep -q 'decodifica hardware: sì' video.log && echo "VideoToolbox: attivo" || echo "::warning::decodifica hardware non attiva sul runner (software)"
+          [[ -f "$D/clip-hevc.mp4" ]] && "$P" video "$D/clip-hevc.mp4"
+          if ! "$P" audio "$D/clip.mp4"; then echo "::warning::audio: nessun dispositivo di uscita utilizzabile sul runner"; fi
+          # 3D: MoltenVK del bundle su Metal. Se il runner non espone Metal è un limite
+          # dell'hardware virtuale (dichiarato), non un esito positivo.
+          if "$P" gpu 2>&1 | tee gpu.log; then echo "3D: OK"
+          elif system_profiler SPDisplaysDataType | grep -q 'Metal'; then echo "::error::3D fallito con Metal disponibile"; exit 1
+          else echo "::warning::runner senza Metal: 3D non verificabile qui"; fi
+          # Ripiego: senza Vulkan il renderer si spegne con l'errore giusto, l'app no.
+          ZUER_VULKAN_LOADER=none "$P" gpu 2>&1 | tee nogpu.log || true
+          grep -q 'VulkanLoaderMissing' nogpu.log || { echo "::error::ripiego senza Vulkan non segnalato"; exit 1; }
+      - name: Smoke test della GUI
+        run: |
+          set -euo pipefail
+          EXE="$RUNNER_TEMP/clean/Zuer.app/Contents/MacOS/zuer-gui"; D="$RUNNER_TEMP/probe/docs"
           OUT="$("$EXE" --version 2>&1)"; echo "$OUT"
           [[ "$OUT" == "zuer-gui $VERSION" ]] || { echo "::error::--version: '$OUT'"; exit 1; }
-          # Avvio vero con un file di testo: deve restare vivo (finestra aperta) per 8 s.
-          printf 'Zuer %s smoke test\n' "$VERSION" > "$RUNNER_TEMP/smoke.txt"
           cd "$RUNNER_TEMP"
-          ZUER_NO_CRASH_REPORT=1 ZUER_TRACE=1 "$EXE" "$RUNNER_TEMP/smoke.txt" > smoke.log 2>&1 & P=$!
-          sleep 8
-          if kill -0 $P 2>/dev/null; then echo "vivo dopo 8 s"; kill $P; wait $P 2>/dev/null || true; cat smoke.log
-          else
-            RC=0; wait $P || RC=$?
-            echo "--- smoke.log"; cat smoke.log
-            echo "--- crash report"; ls -t ~/Library/Logs/DiagnosticReports/ 2>/dev/null | head -3
-            R="$(ls -t ~/Library/Logs/DiagnosticReports/zuer-gui* 2>/dev/null | head -1)"; [[ -n "$R" ]] && head -120 "$R"
-            echo "::error::zuer-gui uscito (rc=$RC) prima di 8 s"; exit 1
-          fi
+          run() { # $1 file, $2.. ambiente: la finestra deve restare aperta 6 s
+            local f=$1; shift
+            env ZUER_NO_CRASH_REPORT=1 ZUER_TRACE=1 "$@" "$EXE" "$f" > gui.log 2>&1 & local P=$!
+            sleep 6
+            if kill -0 $P 2>/dev/null; then echo "ok: $(basename "$f") $* — viva dopo 6 s"; kill $P; wait $P 2>/dev/null || true
+              grep -E 'zuer gpu: using|init renderer Vulkan fallita|libav non disponibile|zuer video' gui.log || true
+            else
+              RC=0; wait $P || RC=$?
+              echo "--- gui.log"; cat gui.log
+              R="$(ls -t ~/Library/Logs/DiagnosticReports/zuer-gui* 2>/dev/null | head -1)"; [[ -n "$R" ]] && head -120 "$R"
+              echo "::error::zuer-gui uscito (rc=$RC) con $(basename "$f")"; exit 1
+            fi
+          }
+          run "$D/prova.txt"
+          run "$D/prova.pdf"
+          run "$D/prova.docx"
+          run "$D/prova.xlsx"
+          run "$D/clip.mp4"
+          run "$D/cubo.obj"
+          run "$D/cubo.obj" ZUER_VULKAN_LOADER=none
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos-arm64
@@ -256,10 +330,11 @@ jobs:
           echo "b5663f69581dcf391293fbf16c06cb80d81d806545ce618b4d0bab7f0eb8c428  zig.zip" | sha256sum -c -
           unzip -q zig.zip -d "$RUNNER_TEMP"
           echo "$(cygpath -w "$RUNNER_TEMP/zig-x86_64-windows-$ZIG_VERSION")" >> "$GITHUB_PATH"
-          # glslc (shader), objdump (verifica import) e ImageMagick (icona) da MSYS2.
+          # glslc (shader), objdump (verifica import), ImageMagick (icona) da MSYS2; il
+          # loader Vulkan di MSYS2 serve SOLO alla prova "loader senza driver".
           /c/msys64/usr/bin/pacman.exe -S --noconfirm --needed --noprogressbar \
             mingw-w64-ucrt-x86_64-shaderc mingw-w64-ucrt-x86_64-binutils mingw-w64-ucrt-x86_64-imagemagick \
-            mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-vulkan-loader
+            mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-vulkan-loader mingw-w64-ucrt-x86_64-ffmpeg
       - name: Build e installer (scripts/build-windows-installer.sh)
         working-directory: Zuer
         run: |
@@ -276,6 +351,8 @@ jobs:
           zig version; glslc --version | head -1; makensis -VERSION
           mkdir -p "$RUNNER_TEMP/dist"
           scripts/build-windows-installer.sh --out "$(cygpath -w "$RUNNER_TEMP/dist/zuer-$VERSION-windows-x64-setup.exe")"
+          # Strumento di prova headless (NON nel pacchetto).
+          zig build feature-probe -Doptimize=ReleaseFast --prefix "$(cygpath -w "$RUNNER_TEMP/probe")"
       - name: Verifica binari e dipendenze
         working-directory: Zuer
         run: |
@@ -285,24 +362,22 @@ jobs:
           ls -la "$B"
           if find "$B" -type f \( -name '*.patch' -o -name '*.log' -o -name '*.pdb' -o -name '*.lib' \) | grep -q .; then
             echo "::error::file di sviluppo nella staging"; exit 1; fi
-          for f in LICENSE.txt FFmpeg-LICENSE.txt FFmpeg-SOURCE.txt; do [[ -f "$B/$f" ]] || { echo "::error::$f assente"; exit 1; }; done
+          for f in LICENSE.txt FFmpeg-LICENSE.txt FFmpeg-SOURCE.txt decoder_office.dll decoder_media.dll; do [[ -f "$B/$f" ]] || { echo "::error::$f assente"; exit 1; }; done
           objdump -f "$B/zuer-gui.exe" | grep -q 'file format pei-x86-64' || { echo "::error::zuer-gui.exe non è PE x86-64"; exit 1; }
-          # Ogni DLL importata: o è nel pacchetto, o è di sistema (System32). Niente
-          # librerie presenti solo sulla macchina che compila.
+          # Ogni DLL importata: o è nel pacchetto, o è di sistema (System32). Vulkan
+          # non è MAI importato: il loader si apre a runtime (src/renderer/vk_loader.zig).
           MISSING=0
           for f in "$B"/*.exe "$B"/*.dll; do
+            echo "$(basename "$f"): $(objdump -p "$f" | awk '/DLL Name/{printf "%s ", $3}')"
             for d in $(objdump -p "$f" | awk '/DLL Name/{print $3}'); do
+              if [[ "${d,,}" == vulkan-1.dll ]]; then echo "::error::$(basename "$f") importa vulkan-1.dll"; MISSING=1; continue; fi
               if [[ -f "$B/$d" ]]; then continue; fi
-              # Requisito di sistema dichiarato (RELEASE.md): il loader Vulkan arriva col
-              # driver della GPU; non si distribuisce con l'app.
-              if [[ "$d" == vulkan-1.dll ]]; then echo "requisito di sistema: $(basename "$f") -> $d"; continue; fi
               if [[ -f "/c/Windows/System32/$d" || -f "/c/Windows/System32/downlevel/$d" || "$d" == api-ms-win-* ]]; then continue; fi
               echo "::warning::$(basename "$f") importa $d, né nel pacchetto né in System32"; MISSING=1
             done
           done
-          echo "vulkan-1.dll su questo runner: $([[ -f /c/Windows/System32/vulkan-1.dll ]] && echo presente || echo ASSENTE)"
-          [[ $MISSING == 0 ]] || { echo "::error::dipendenze non risolte (sopra)"; exit 1; }
-      - name: Installazione, smoke test, disinstallazione (cartella pulita)
+          [[ $MISSING == 0 ]] || { echo "::error::dipendenze non risolte o Vulkan importato (sopra)"; exit 1; }
+      - name: Installazione, prove, disinstallazione (cartella pulita)
         env:
           MSYS_NO_PATHCONV: "1" # /S, /D=, _?= vanno all'installer così come sono
         run: |
@@ -312,28 +387,46 @@ jobs:
           rm -rf "$UDIR"
           "$SETUP" /S "/D=$DIR"
           ls -la "$UDIR"
-          for f in zuer-gui.exe uninstall.exe LICENSE.txt avformat-63.dll decoder_text.dll; do
+          for f in zuer-gui.exe uninstall.exe LICENSE.txt avformat-63.dll decoder_text.dll decoder_office.dll; do
             [[ -f "$UDIR/$f" ]] || { echo "::error::$f non installato"; exit 1; }; done
           reg query 'HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Zuer' | tee reg.txt
           grep -q "DisplayVersion.*$VERSION" reg.txt || { echo "::error::DisplayVersion errata"; exit 1; }
-          # Il runner non ha GPU né loader Vulkan (requisito di sistema, vedi sopra): per
-          # l'avvio si mette nel PATH il solo loader di MSYS2 come vulkan-1.dll, fuori dal
-          # pacchetto. Senza driver Vulkan: è il caso di una macchina senza GPU Vulkan.
-          VKL="$(find /c/msys64/ucrt64/bin -maxdepth 1 -iname '*vulkan-1*.dll' | head -1)"
-          [[ -n "$VKL" ]] || { echo "::error::loader Vulkan di MSYS2 non trovato"; ls /c/msys64/ucrt64/bin | grep -i vulkan; exit 1; }
-          mkdir -p "$RUNNER_TEMP/vk" && cp "$VKL" "$RUNNER_TEMP/vk/vulkan-1.dll"
-          /c/msys64/ucrt64/bin/objdump -p "$RUNNER_TEMP/vk/vulkan-1.dll" | awk '/DLL Name/{print "  loader importa: "$3}'
-          export PATH="$RUNNER_TEMP/vk:$PATH"
-          # --version dalla copia installata.
+          reg query 'HKCU\Software\Classes\.docx\OpenWithProgids' | grep -q Zuer.Viewer || { echo "::error::.docx non associato"; exit 1; }
+          # Il runner NON ha alcun loader Vulkan: è esattamente il caso "Windows senza
+          # Vulkan" che deve funzionare. Nulla viene aggiunto al PATH.
+          [[ ! -f /c/Windows/System32/vulkan-1.dll ]] || { echo "::error::il runner ha vulkan-1.dll: la prova senza loader non è valida"; exit 1; }
           OUT="$("$UDIR/zuer-gui.exe" --version 2>&1 | tr -d '\r')"; echo "$OUT"
           [[ "$OUT" == "zuer-gui $VERSION" ]] || { echo "::error::--version: '$OUT'"; exit 1; }
-          # Avvio vero con un file di testo: vivo dopo 8 s (finestra aperta).
-          printf 'Zuer %s smoke test\r\n' "$VERSION" > "$RUNNER_TEMP/smoke.txt"
-          "$UDIR/zuer-gui.exe" "$(cygpath -w "$RUNNER_TEMP/smoke.txt")" > smoke.log 2>&1 & P=$!
-          sleep 8
-          if kill -0 $P 2>/dev/null; then echo "vivo dopo 8 s"; taskkill /F /IM zuer-gui.exe || true
-          else RC=0; wait $P || RC=$?; cat smoke.log; echo "::error::zuer-gui uscito (rc=$RC) prima di 8 s"; exit 1; fi
-          sleep 1
+          D="$RUNNER_TEMP/docs"; python "$(cygpath -w "$GITHUB_WORKSPACE/Zuer/scripts/make-test-docs.py")" "$(cygpath -w "$D")"
+          /c/msys64/ucrt64/bin/ffmpeg.exe -loglevel error -f lavfi -i testsrc2=size=640x360:rate=30 -f lavfi -i anullsrc=r=48000:cl=stereo \
+            -t 6 -c:v mpeg4 -c:a aac -shortest "$(cygpath -w "$D/clip.mp4")"
+          # Prove headless dalla cartella installata (plugin e DLL FFmpeg del pacchetto).
+          cp "$RUNNER_TEMP/probe/bin/feature-probe.exe" "$UDIR/"
+          W() { cygpath -w "$1"; }
+          "$UDIR/feature-probe.exe" doc "$(W "$D/prova.docx")" "$(W "$D/prova.xlsx")" "$(W "$D/prova.pptx")" "$(W "$D/prova.odt")" "$(W "$D/prova.ods")" "$(W "$D/cubo.obj")" "$(W "$D/prova.txt")" "$(W "$D/clip.mp4")"
+          "$UDIR/feature-probe.exe" video "$(W "$D/clip.mp4")"
+          if ! "$UDIR/feature-probe.exe" audio "$(W "$D/clip.mp4")"; then echo "::warning::audio: nessun dispositivo di uscita utilizzabile sul runner"; fi
+          "$UDIR/feature-probe.exe" gpu > gpu-noloader.log 2>&1 || true; cat gpu-noloader.log
+          grep -q 'VulkanLoaderMissing' gpu-noloader.log || { echo "::error::senza loader: atteso VulkanLoaderMissing"; exit 1; }
+          rm -f "$UDIR/feature-probe.exe"
+          gui() { # $1 etichetta, $2 file: finestra aperta per 6 s
+            "$UDIR/zuer-gui.exe" "$(cygpath -w "$2")" > gui.log 2>&1 & local P=$!
+            sleep 6
+            if kill -0 $P 2>/dev/null; then echo "ok: $1 — viva dopo 6 s"; taskkill /F /IM zuer-gui.exe > /dev/null || true; sleep 1
+            else RC=0; wait $P || RC=$?; cat gui.log; echo "::error::zuer-gui uscito (rc=$RC): $1"; exit 1; fi
+          }
+          gui "senza loader Vulkan, testo" "$D/prova.txt"
+          gui "senza loader Vulkan, modello 3D" "$D/cubo.obj"
+          gui "senza loader Vulkan, docx" "$D/prova.docx"
+          gui "senza loader Vulkan, video (audio muto)" "$D/clip.mp4"
+          # Loader presente ma nessun driver: il loader di MSYS2, fuori dal pacchetto.
+          mkdir -p "$RUNNER_TEMP/vk"
+          cp "$(find /c/msys64/ucrt64/bin -maxdepth 1 -iname '*vulkan-1*.dll' | head -1)" "$RUNNER_TEMP/vk/vulkan-1.dll"
+          cp "$RUNNER_TEMP/probe/bin/feature-probe.exe" "$UDIR/"
+          PATH="$RUNNER_TEMP/vk:$PATH" "$UDIR/feature-probe.exe" gpu > gpu-nodriver.log 2>&1 || true; cat gpu-nodriver.log
+          grep -qE 'VulkanNoDriver|NoGpu' gpu-nodriver.log || { echo "::error::loader senza driver: atteso VulkanNoDriver/NoGpu"; exit 1; }
+          rm -f "$UDIR/feature-probe.exe"
+          PATH="$RUNNER_TEMP/vk:$PATH" gui "loader senza driver, modello 3D" "$D/cubo.obj"
           # Disinstallazione silenziosa (_?= la fa aspettare; lascia solo uninstall.exe).
           "$UDIR/uninstall.exe" /S "_?=$DIR"
           if reg query 'HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Zuer' >/dev/null 2>&1; then

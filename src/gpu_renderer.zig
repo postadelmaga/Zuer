@@ -483,14 +483,26 @@ pub const Renderer = struct {
         // Loader caricato a runtime (vk_loader.zig): senza loader né driver
         // l'errore torna al chiamante, che spegne solo il renderer GPU.
         try vk_loader.ensureLoaded();
+        // Driver "portability" (MoltenVK su macOS, via loader): vanno chiesti
+        // esplicitamente, se il loader offre l'estensione. MoltenVK aperto
+        // direttamente (senza loader) li espone comunque.
+        var inst_exts: std.ArrayList([*:0]const u8) = .empty;
+        defer inst_exts.deinit(gpa);
+        try inst_exts.appendSlice(gpa, opts.instance_extensions);
+        var inst_flags: u32 = 0;
+        if (instanceHasExtension(gpa, "VK_KHR_portability_enumeration")) {
+            try inst_exts.append(gpa, "VK_KHR_portability_enumeration");
+            inst_flags |= vk.INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+        }
         var instance: VkInstance = null;
         const inst_result = if (vk_loader.testFailure("instance"))
             vk.VK_ERROR_INITIALIZATION_FAILED
         else
             vkCreateInstance(&.{
+                .flags = inst_flags,
                 .pApplicationInfo = &app_info,
-                .enabledExtensionCount = @intCast(opts.instance_extensions.len),
-                .ppEnabledExtensionNames = if (opts.instance_extensions.len > 0) opts.instance_extensions.ptr else null,
+                .enabledExtensionCount = @intCast(inst_exts.items.len),
+                .ppEnabledExtensionNames = if (inst_exts.items.len > 0) inst_exts.items.ptr else null,
             }, null, &instance);
         switch (inst_result) {
             VK_SUCCESS => {},
@@ -602,6 +614,10 @@ pub const Renderer = struct {
             try dev_exts.append(gpa, "VK_EXT_external_memory_dma_buf");
             try dev_exts.append(gpa, "VK_KHR_external_memory_fd");
         }
+        // Implementazione "portability" (MoltenVK): se il device la dichiara,
+        // la specifica obbliga ad abilitarla.
+        if (deviceHasExtension(gpa, physical, "VK_KHR_portability_subset"))
+            try dev_exts.append(gpa, "VK_KHR_portability_subset");
         try dev_exts.appendSlice(gpa, opts.device_extensions);
 
         var device: VkDevice = null;
@@ -2108,6 +2124,18 @@ pub const Renderer = struct {
         vkDestroySampler(self.device, self.text_sampler, null);
     }
 };
+
+fn instanceHasExtension(gpa: std.mem.Allocator, name: []const u8) bool {
+    var count: u32 = 0;
+    if (vk.vkEnumerateInstanceExtensionProperties(null, &count, null) != VK_SUCCESS) return false;
+    const exts = gpa.alloc(VkExtensionProperties, count) catch return false;
+    defer gpa.free(exts);
+    if (vk.vkEnumerateInstanceExtensionProperties(null, &count, exts.ptr) != VK_SUCCESS) return false;
+    for (exts[0..count]) |ext| {
+        if (std.mem.eql(u8, std.mem.sliceTo(&ext.extensionName, 0), name)) return true;
+    }
+    return false;
+}
 
 fn deviceHasExtension(gpa: std.mem.Allocator, pd: VkPhysicalDevice, name: []const u8) bool {
     var count: u32 = 0;
