@@ -148,8 +148,8 @@ Due capacità native, ognuna con la sua import-lib, attivabili a parte:
 
 | Flag | Default | Cosa abilita |
 |------|---------|--------------|
-| `-Dvulkan` | Linux + Windows | renderer mesh/testo. Il loader (`libvulkan.so.1` / `vulkan-1.dll`) si apre a runtime: senza loader o driver Zuer parte e spegne solo il 3D |
-| `-Dffmpeg` | Linux + Windows | player video libav. Su Windows usa header + import-lib in `vendor/ffmpeg/` (le DLL si scaricano a parte) |
+| `-Dvulkan` | Linux + Windows + macOS | renderer mesh/testo. Il loader (`libvulkan.so.1` / `vulkan-1.dll` / MoltenVK nel bundle macOS) si apre a runtime: senza loader o driver Zuer parte e spegne solo il 3D |
+| `-Dffmpeg` | Linux + Windows + macOS | player video libav, risolto a runtime. Su Windows e macOS usa gli header in `vendor/ffmpeg/`; le DLL Windows si scaricano a parte (`scripts/fetch-ffmpeg-dlls.sh`), le dylib macOS si compilano sul Mac (`scripts/build-ffmpeg-macos.sh`) |
 
 > Le DLL FFmpeg (~130 MB) seguono il modello VLC: **spediscono con l'app, non con il
 > sorgente**. In git stanno solo header e import-lib (~2.3 MB) per compilare.
