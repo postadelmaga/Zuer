@@ -319,7 +319,9 @@ jobs:
           # Il runner non ha GPU né loader Vulkan (requisito di sistema, vedi sopra): per
           # l'avvio si mette nel PATH il solo loader di MSYS2 come vulkan-1.dll, fuori dal
           # pacchetto. Senza driver Vulkan: è il caso di una macchina senza GPU Vulkan.
-          mkdir -p "$RUNNER_TEMP/vk" && cp /c/msys64/ucrt64/bin/libvulkan-1.dll "$RUNNER_TEMP/vk/vulkan-1.dll"
+          VKL="$(find /c/msys64/ucrt64/bin -maxdepth 1 -iname '*vulkan-1*.dll' | head -1)"
+          [[ -n "$VKL" ]] || { echo "::error::loader Vulkan di MSYS2 non trovato"; ls /c/msys64/ucrt64/bin | grep -i vulkan; exit 1; }
+          mkdir -p "$RUNNER_TEMP/vk" && cp "$VKL" "$RUNNER_TEMP/vk/vulkan-1.dll"
           /c/msys64/ucrt64/bin/objdump -p "$RUNNER_TEMP/vk/vulkan-1.dll" | awk '/DLL Name/{print "  loader importa: "$3}'
           export PATH="$RUNNER_TEMP/vk:$PATH"
           # --version dalla copia installata.
