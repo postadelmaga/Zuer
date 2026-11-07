@@ -40,8 +40,8 @@ BrandingText "${APP} ${VERSION}"
 
 ; ── UI ──────────────────────────────────────────────────────────────────────
 !ifdef HAVE_ICON
-  !define MUI_ICON   "${STAGE}/zuer.ico"
-  !define MUI_UNICON "${STAGE}/zuer.ico"
+  !define MUI_ICON   "${STAGE}\zuer.ico"
+  !define MUI_UNICON "${STAGE}\zuer.ico"
 !endif
 !define MUI_ABORTWARNING
 !define MUI_FINISHPAGE_RUN "$INSTDIR\${APP_EXE}"
@@ -65,21 +65,21 @@ BrandingText "${APP} ${VERSION}"
 Section "Install"
   SetOutPath "$INSTDIR"
 
-  File "${STAGE}/zuer-gui.exe"
-  File "${STAGE}/decoder_*.dll"
-  File "${STAGE}/LICENSE.txt"
+  File "${STAGE}\zuer-gui.exe"
+  File "${STAGE}\decoder_*.dll"
+  File "${STAGE}\LICENSE.txt"
 !ifdef HAVE_FFMPEG
   ; DLL runtime FFmpeg (player video); versionate → wildcard.
-  File "${STAGE}/avformat-*.dll"
-  File "${STAGE}/avcodec-*.dll"
-  File "${STAGE}/avutil-*.dll"
-  File "${STAGE}/swscale-*.dll"
-  File "${STAGE}/swresample-*.dll"
-  File "${STAGE}/FFmpeg-LICENSE.txt"
-  File "${STAGE}/FFmpeg-SOURCE.txt"
+  File "${STAGE}\avformat-*.dll"
+  File "${STAGE}\avcodec-*.dll"
+  File "${STAGE}\avutil-*.dll"
+  File "${STAGE}\swscale-*.dll"
+  File "${STAGE}\swresample-*.dll"
+  File "${STAGE}\FFmpeg-LICENSE.txt"
+  File "${STAGE}\FFmpeg-SOURCE.txt"
 !endif
 !ifdef HAVE_ICON
-  File "${STAGE}/zuer.ico"
+  File "${STAGE}\zuer.ico"
 !endif
 
   ; ProgID: come Zuer apre un file (l'exe accetta il path come primo argomento).
