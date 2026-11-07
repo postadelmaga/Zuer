@@ -274,6 +274,7 @@ jobs:
           OUT="$("$EXE" --version 2>&1)"; echo "$OUT"
           [[ "$OUT" == "zuer-gui $VERSION" ]] || { echo "::error::--version: '$OUT'"; exit 1; }
           cd "$RUNNER_TEMP"
+          FAIL=0
           run() { # $1 file, $2.. ambiente: la finestra deve restare aperta 6 s
             local f=$1; shift
             env ZUER_NO_CRASH_REPORT=1 ZUER_TRACE=1 "$@" "$EXE" "$f" > gui.log 2>&1 & local P=$!
@@ -281,10 +282,12 @@ jobs:
             if kill -0 $P 2>/dev/null; then echo "ok: $(basename "$f") $* — viva dopo 6 s"; kill $P; wait $P 2>/dev/null || true
               grep -E 'zuer gpu: using|init renderer Vulkan fallita|libav non disponibile|zuer video' gui.log || true
             else
-              RC=0; wait $P || RC=$?
+              local RC=0; wait $P || RC=$?
+              echo "::error::zuer-gui uscito (rc=$RC) con $(basename "$f") $*"; FAIL=1
               echo "--- gui.log"; cat gui.log
-              R="$(ls -t ~/Library/Logs/DiagnosticReports/zuer-gui* 2>/dev/null | head -1)"; [[ -n "$R" ]] && head -120 "$R"
-              echo "::error::zuer-gui uscito (rc=$RC) con $(basename "$f")"; exit 1
+              # Stesso avvio sotto lldb: stack di tutti i thread al crash.
+              echo "--- lldb"
+              env ZUER_NO_CRASH_REPORT=1 "$@" perl -e 'alarm 90; exec @ARGV' lldb --batch -o "process launch -- '$f'" -k "thread backtrace all" -k "quit 1" "$EXE" 2>&1 | tail -150 || true
             fi
           }
           run "$D/prova.txt"
@@ -294,6 +297,7 @@ jobs:
           run "$D/clip.mp4"
           run "$D/cubo.obj"
           run "$D/cubo.obj" ZUER_VULKAN_LOADER=none
+          [[ $FAIL == 0 ]] || exit 1
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos-arm64
@@ -436,8 +440,13 @@ jobs:
           PATH="$VKPATH" ZUER_VULKAN_LOADER="$VKL" VK_DRIVER_FILES='C:\nessun-driver.json' gui "loader senza driver, modello 3D" "$D/cubo.obj"
           # 2. Vulkan funzionante: lavapipe (Mesa, rasterizzatore SOFTWARE). Prova il
           # percorso Vulkan completo su Windows vero, non una GPU fisica.
-          PATH="$VKPATH" ZUER_VULKAN_LOADER="$VKL" VK_DRIVER_FILES="$LVP" "$UDIR/feature-probe.exe" gpu 2>&1 | tee gpu-lvp.log
-          grep -q 'ok: gpu: cubo renderizzato' gpu-lvp.log || { echo "::error::render Vulkan (lavapipe) fallito"; exit 1; }
+          ls -la /c/msys64/ucrt64/share/vulkan/icd.d/ || true; cat /c/msys64/ucrt64/share/vulkan/icd.d/lvp_icd.x86_64.json || true
+          ls -la /c/msys64/ucrt64/bin/vulkan_lvp.dll || true
+          PATH="$VKPATH" ZUER_VULKAN_LOADER="$VKL" VK_DRIVER_FILES="$LVP" "$UDIR/feature-probe.exe" gpu > gpu-lvp.log 2>&1 || true; cat gpu-lvp.log
+          if ! grep -q 'ok: gpu: cubo renderizzato' gpu-lvp.log; then
+            PATH="$VKPATH" ZUER_VULKAN_LOADER="$VKL" VK_DRIVER_FILES="$LVP" VK_LOADER_DEBUG=error,warn,driver "$UDIR/feature-probe.exe" gpu 2>&1 | head -80 || true
+            echo "::error::render Vulkan (lavapipe) fallito"; exit 1
+          fi
           rm -f "$UDIR/feature-probe.exe"
           gvk() { # $1 etichetta, $2 secondi, $3.. ambiente in più: GUI con il cubo e lavapipe
             local label=$1 secs=$2; shift 2

@@ -126,6 +126,7 @@ fn libName(comptime base: []const u8, comptime major: u32) [:0]const u8 {
 /// Decodifica hardware: VideoToolbox su macOS, VAAPI altrove (su Windows il
 /// device VAAPI non si apre e si resta in software, come prima).
 const hw_device_type = if (builtin.os.tag == .macos) c.AV_HWDEVICE_TYPE_VIDEOTOOLBOX else c.AV_HWDEVICE_TYPE_VAAPI;
+const hw_name = if (builtin.os.tag == .macos) "VideoToolbox" else "VAAPI";
 const hw_pix_fmt = if (builtin.os.tag == .macos) c.AV_PIX_FMT_VIDEOTOOLBOX else c.AV_PIX_FMT_VAAPI;
 
 /// In ordine di dipendenza (avutil prima di tutti). File-scope: il nome deve
@@ -689,12 +690,12 @@ pub const Player = struct {
         if (vaapi_last_logged != use_hw) {
             vaapi_last_logged = use_hw;
             if (use_hw and hw_device_count > 0) {
-                std.log.info("zuer video: decodifica VAAPI attiva (codec {s}, device {s})", .{
+                std.log.info("zuer video: decodifica " ++ hw_name ++ " attiva (codec {s}, device {s})", .{
                     std.mem.span(codec.*.name),
                     std.mem.sliceTo(&hw_devices[hw_device_idx], 0),
                 });
             } else if (use_hw) {
-                std.log.info("zuer video: decodifica VAAPI attiva (codec {s})", .{std.mem.span(codec.*.name)});
+                std.log.info("zuer video: decodifica " ++ hw_name ++ " attiva (codec {s})", .{std.mem.span(codec.*.name)});
             } else {
                 std.log.info("zuer video: decodifica software (codec {s})", .{std.mem.span(codec.*.name)});
             }
