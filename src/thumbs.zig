@@ -495,18 +495,16 @@ const ClaimResult = union(enum) {
 /// porta il processo a 343 MB di RSS e 2,5 s di decode).
 pub const heavy_bytes: u64 = 8 * 1024 * 1024;
 
-/// Decode lenti o costosi in RAM: PDF (processo esterno), video (demuxer +
-/// decoder), immagini che passano da rsvg/ImageMagick (processi esterni a loro
-/// volta multi-thread), file oltre `heavy_bytes`.
+/// Decode lenti o costosi in RAM: PDF (processo esterno o motore non rientrante),
+/// video (demuxer + decoder), immagini che passano da rsvg, da un codec di sistema
+/// (WIC, ImageIO) o da ImageMagick, file oltre `heavy_bytes`. WebP e ICO no: sono
+/// decodificati in processo ovunque (libwebp, parser Zig).
 fn isHeavy(e: *const Entry) bool {
     if (e.size > heavy_bytes) return true;
     const ext = decoder_mod.getExtension(e.name);
-    inline for (.{ "pdf", "svg", "svgz", "tif", "tiff", "avif", "ico" }) |x| {
+    inline for (.{ "pdf", "svg", "svgz", "tif", "tiff", "avif", "heic", "heif" }) |x| {
         if (extEqCi(ext, x)) return true;
     }
-    // WebP: su Linux il plugin image lo decodifica in processo con libwebp;
-    // altrove passa ancora da ImageMagick.
-    if (builtin.os.tag != .linux and extEqCi(ext, "webp")) return true;
     return layout.winKindFromExt(e.name) == .video;
 }
 

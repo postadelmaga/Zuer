@@ -506,6 +506,17 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
     {
+        // Parser XML del plugin office (tag con prefisso di namespace, entity).
+        const t = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("src/decoders/office.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true, // getenv
+            .imports = &.{.{ .name = "decoder", .module = decoder_mod }},
+        }) });
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
+    {
         // Lo scroll delle griglie usa il passo e l'easing di zicro.
         const t = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path("src/card_grid.zig"),
@@ -824,7 +835,16 @@ fn addImageCodecs(b: *std.Build, mod: *std.Build.Module) void {
     mod.addIncludePath(webp.path(""));
     mod.addIncludePath(webp.path("src"));
     mod.addIncludePath(b.path("vendor/nanosvg"));
-    mod.addCSourceFiles(.{ .root = webp.path("src"), .files = &webp_dec_sources, .flags = flags });
+    // SSE4.1 come fa il CMake di libwebp: le sole varianti *_sse41.c compilate con
+    // -msse4.1, scelte a runtime da VP8GetCPUInfo (le CPU senza restano su SSE2).
+    const x86_64 = if (mod.resolved_target) |t| t.result.cpu.arch == .x86_64 else false;
+    const webp_flags: []const []const u8 = if (x86_64) &.{ "-O2", "-fno-sanitize=undefined", "-DWEBP_HAVE_SSE41" } else flags;
+    mod.addCSourceFiles(.{ .root = webp.path("src"), .files = &webp_dec_sources, .flags = webp_flags });
+    mod.addCSourceFiles(.{
+        .root = webp.path("src"),
+        .files = &webp_sse41_sources,
+        .flags = if (x86_64) &.{ "-O2", "-fno-sanitize=undefined", "-DWEBP_HAVE_SSE41", "-msse4.1" } else flags,
+    });
     mod.addCSourceFile(.{ .file = b.path("src/c/image_codecs.c"), .flags = flags });
     if (mod.resolved_target) |t| {
         if (t.result.os.tag != .windows) mod.linkSystemLibrary("m", .{});
@@ -840,28 +860,31 @@ fn addImageCodecs(b: *std.Build, mod: *std.Build.Module) void {
 /// libwebp 1.5.0) più il demux per i WebP animati. Le varianti SIMD di altre
 /// architetture si compilano vuote.
 const webp_dec_sources = [_][]const u8{
-    "dec/alpha_dec.c",            "dec/buffer_dec.c",             "dec/frame_dec.c",
-    "dec/idec_dec.c",             "dec/io_dec.c",                 "dec/quant_dec.c",
-    "dec/tree_dec.c",             "dec/vp8_dec.c",                "dec/vp8l_dec.c",
-    "dec/webp_dec.c",             "demux/demux.c",                "dsp/alpha_processing.c",
-    "dsp/cpu.c",                  "dsp/dec.c",                    "dsp/dec_clip_tables.c",
-    "dsp/filters.c",              "dsp/lossless.c",               "dsp/rescaler.c",
-    "dsp/upsampling.c",           "dsp/yuv.c",                    "dsp/alpha_processing_sse41.c",
-    "dsp/dec_sse41.c",            "dsp/lossless_sse41.c",         "dsp/upsampling_sse41.c",
-    "dsp/yuv_sse41.c",            "dsp/alpha_processing_sse2.c",  "dsp/dec_sse2.c",
-    "dsp/filters_sse2.c",         "dsp/lossless_sse2.c",          "dsp/rescaler_sse2.c",
-    "dsp/upsampling_sse2.c",      "dsp/yuv_sse2.c",               "dsp/alpha_processing_neon.c",
-    "dsp/dec_neon.c",             "dsp/filters_neon.c",           "dsp/lossless_neon.c",
-    "dsp/rescaler_neon.c",        "dsp/upsampling_neon.c",        "dsp/yuv_neon.c",
-    "dsp/dec_msa.c",              "dsp/filters_msa.c",            "dsp/lossless_msa.c",
-    "dsp/rescaler_msa.c",         "dsp/upsampling_msa.c",         "dsp/dec_mips32.c",
-    "dsp/rescaler_mips32.c",      "dsp/yuv_mips32.c",             "dsp/alpha_processing_mips_dsp_r2.c",
-    "dsp/dec_mips_dsp_r2.c",      "dsp/filters_mips_dsp_r2.c",    "dsp/lossless_mips_dsp_r2.c",
-    "dsp/rescaler_mips_dsp_r2.c", "dsp/upsampling_mips_dsp_r2.c", "dsp/yuv_mips_dsp_r2.c",
-    "utils/bit_reader_utils.c",   "utils/color_cache_utils.c",    "utils/filters_utils.c",
-    "utils/huffman_utils.c",      "utils/palette.c",              "utils/quant_levels_dec_utils.c",
-    "utils/rescaler_utils.c",     "utils/random_utils.c",         "utils/thread_utils.c",
-    "utils/utils.c",
+    "dec/alpha_dec.c",                    "dec/buffer_dec.c",           "dec/frame_dec.c",
+    "dec/idec_dec.c",                     "dec/io_dec.c",               "dec/quant_dec.c",
+    "dec/tree_dec.c",                     "dec/vp8_dec.c",              "dec/vp8l_dec.c",
+    "dec/webp_dec.c",                     "demux/demux.c",              "dsp/alpha_processing.c",
+    "dsp/cpu.c",                          "dsp/dec.c",                  "dsp/dec_clip_tables.c",
+    "dsp/filters.c",                      "dsp/lossless.c",             "dsp/rescaler.c",
+    "dsp/upsampling.c",                   "dsp/yuv.c",                  "dsp/alpha_processing_sse2.c",
+    "dsp/dec_sse2.c",                     "dsp/filters_sse2.c",         "dsp/lossless_sse2.c",
+    "dsp/rescaler_sse2.c",                "dsp/upsampling_sse2.c",      "dsp/yuv_sse2.c",
+    "dsp/alpha_processing_neon.c",        "dsp/dec_neon.c",             "dsp/filters_neon.c",
+    "dsp/lossless_neon.c",                "dsp/rescaler_neon.c",        "dsp/upsampling_neon.c",
+    "dsp/yuv_neon.c",                     "dsp/dec_msa.c",              "dsp/filters_msa.c",
+    "dsp/lossless_msa.c",                 "dsp/rescaler_msa.c",         "dsp/upsampling_msa.c",
+    "dsp/dec_mips32.c",                   "dsp/rescaler_mips32.c",      "dsp/yuv_mips32.c",
+    "dsp/alpha_processing_mips_dsp_r2.c", "dsp/dec_mips_dsp_r2.c",      "dsp/filters_mips_dsp_r2.c",
+    "dsp/lossless_mips_dsp_r2.c",         "dsp/rescaler_mips_dsp_r2.c", "dsp/upsampling_mips_dsp_r2.c",
+    "dsp/yuv_mips_dsp_r2.c",              "utils/bit_reader_utils.c",   "utils/color_cache_utils.c",
+    "utils/filters_utils.c",              "utils/huffman_utils.c",      "utils/palette.c",
+    "utils/quant_levels_dec_utils.c",     "utils/rescaler_utils.c",     "utils/random_utils.c",
+    "utils/thread_utils.c",               "utils/utils.c",
+};
+
+const webp_sse41_sources = [_][]const u8{
+    "dsp/alpha_processing_sse41.c", "dsp/dec_sse41.c", "dsp/lossless_sse41.c",
+    "dsp/upsampling_sse41.c",       "dsp/yuv_sse41.c",
 };
 
 /// Solo gli HEADER di stb_truetype: l'include path più il modulo translate-c

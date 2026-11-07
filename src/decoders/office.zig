@@ -373,23 +373,39 @@ fn xmlTextDupe(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
 /// l'OpenXML SDK di Microsoft scrive SpreadsheetML col prefisso `x:`).
 /// Restituisce l'indice del `<`.
 fn findTag(xml: []const u8, from: usize, comptime name: []const u8) ?usize {
+    // Si cerca il NOME (raro) invece di ogni `<` (frequentissimo), poi si guarda
+    // indietro: `<name` oppure `<ns:name`.
     var pos = from;
-    while (std.mem.indexOfScalarPos(u8, xml, pos, '<')) |at| {
+    while (std.mem.indexOfPos(u8, xml, pos, name)) |at| {
         pos = at + 1;
-        if (nameAt(xml, at + 1, name)) |after| {
-            if (after >= xml.len) return null;
-            const c = xml[after];
-            if (c == ' ' or c == '>' or c == '/' or c == '\t' or c == '\n' or c == '\r') return at;
+        const after = at + name.len;
+        if (after >= xml.len) return null;
+        const c = xml[after];
+        if (!(c == ' ' or c == '>' or c == '/' or c == '\t' or c == '\n' or c == '\r')) continue;
+        if (at == 0) continue;
+        if (xml[at - 1] == '<') {
+            if (at - 1 >= from) return at - 1;
+            continue;
         }
+        if (xml[at - 1] != ':') continue;
+        // Prefisso: caratteri di nome fino al `<` (al massimo 32).
+        var j = at - 1;
+        while (j > 0 and at - 1 - j < 32 and isNameChar(xml[j - 1])) j -= 1;
+        if (j == at - 1 or j == 0 or xml[j - 1] != '<') continue;
+        if (j - 1 >= from) return j - 1;
     }
     return null;
+}
+
+fn isNameChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '.';
 }
 
 /// `name` in `xml[i..]`, direttamente o dopo un prefisso `ns:`. Indice dopo il nome.
 fn nameAt(xml: []const u8, i: usize, comptime name: []const u8) ?usize {
     if (std.mem.startsWith(u8, xml[i..], name)) return i + name.len;
     var j = i;
-    while (j < xml.len and j - i < 32 and (std.ascii.isAlphanumeric(xml[j]) or xml[j] == '_' or xml[j] == '-' or xml[j] == '.')) j += 1;
+    while (j < xml.len and j - i < 32 and isNameChar(xml[j])) j += 1;
     if (j == i or j >= xml.len or xml[j] != ':') return null;
     if (std.mem.startsWith(u8, xml[j + 1 ..], name)) return j + 1 + name.len;
     return null;
@@ -397,27 +413,105 @@ fn nameAt(xml: []const u8, i: usize, comptime name: []const u8) ?usize {
 
 /// Prossimo tag di chiusura `</name>` o `</ns:name>` da `from`: [inizio, fine).
 fn findClose(xml: []const u8, from: usize, comptime name: []const u8) ?[2]usize {
+    // Come findTag: si cerca `name>` (memmem veloce) e si guarda indietro.
     var pos = from;
-    while (std.mem.indexOfPos(u8, xml, pos, "</")) |at| {
-        pos = at + 2;
-        if (nameAt(xml, at + 2, name)) |after| {
-            if (after < xml.len and xml[after] == '>') return .{ at, after + 1 };
-        }
+    while (std.mem.indexOfPos(u8, xml, pos, name ++ ">")) |at| {
+        pos = at + 1;
+        const end = at + name.len + 1;
+        if (at >= from + 2 and xml[at - 1] == '/' and xml[at - 2] == '<') return .{ at - 2, end };
+        if (at == 0 or xml[at - 1] != ':') continue;
+        var j = at - 1;
+        while (j > 0 and at - 1 - j < 32 and isNameChar(xml[j - 1])) j -= 1;
+        if (j == at - 1 or j < from + 2 or xml[j - 1] != '/' or xml[j - 2] != '<') continue;
+        return .{ j - 2, end };
     }
     return null;
 }
 
+/// Prefisso di namespace di un documento SpreadsheetML (`""` o `"x:"`), letto dal
+/// suo elemento `root`: tutti gli elementi dello schema usano lo stesso. Così le
+/// ricerche restano memmem su un ago esatto (`<x:row`), veloci come senza prefisso.
+const Ns = struct {
+    p: []const u8 = "",
+
+    fn of(xml: []const u8, comptime root: []const u8) Ns {
+        const at = findTag(xml, 0, root) orelse return .{};
+        const colon = std.mem.indexOfScalarPos(u8, xml, at + 1, ':') orelse return .{};
+        if (colon > at + 33 or !std.mem.startsWith(u8, xml[colon + 1 ..], root)) return .{};
+        return .{ .p = xml[at + 1 .. colon + 1] };
+    }
+
+    /// memchr (SIMD) sul primo byte, poi confronto: con un ago noto solo a runtime
+    /// `std.mem.indexOfPos` confronta byte per byte a ogni posizione.
+    fn find(hay: []const u8, from: usize, needle_: []const u8) ?usize {
+        var pos = from;
+        while (std.mem.indexOfScalarPos(u8, hay, pos, needle_[0])) |at| {
+            if (hay.len - at < needle_.len) return null;
+            if (std.mem.eql(u8, hay[at + 1 ..][0 .. needle_.len - 1], needle_[1..])) return at;
+            pos = at + 1;
+        }
+        return null;
+    }
+
+    /// `pre ++ p ++ name ++ post` in `buf` (p è al massimo 33 byte: vedi `of`).
+    fn build(ns: Ns, buf: []u8, comptime pre: []const u8, comptime name: []const u8, comptime post: []const u8) []const u8 {
+        @memcpy(buf[0..pre.len], pre);
+        @memcpy(buf[pre.len..][0..ns.p.len], ns.p);
+        const rest = pre.len + ns.p.len;
+        @memcpy(buf[rest..][0 .. name.len + post.len], name ++ post);
+        return buf[0 .. rest + name.len + post.len];
+    }
+
+    /// Prossimo `<p:name` seguito da un confine; indice del `<`.
+    fn tag(ns: Ns, xml: []const u8, from: usize, comptime name: []const u8) ?usize {
+        var buf: [40 + name.len]u8 = undefined;
+        // Senza prefisso (il caso comune) l'ago è comptime: memmem ottimizzato.
+        const needle = if (ns.p.len == 0) "<" ++ name else ns.build(&buf, "<", name, "");
+        var pos = from;
+        while (if (ns.p.len == 0) std.mem.indexOfPos(u8, xml, pos, "<" ++ name) else find(xml, pos, needle)) |at| {
+            const after = at + needle.len;
+            if (after >= xml.len) return null;
+            switch (xml[after]) {
+                ' ', '>', '/', '\t', '\n', '\r' => return at,
+                else => pos = at + 1,
+            }
+        }
+        return null;
+    }
+
+    /// Prossimo `</p:name>`: [inizio, fine).
+    fn close(ns: Ns, xml: []const u8, from: usize, comptime name: []const u8) ?[2]usize {
+        if (ns.p.len == 0) {
+            const at = std.mem.indexOfPos(u8, xml, from, "</" ++ name ++ ">") orelse return null;
+            return .{ at, at + name.len + 3 };
+        }
+        var buf: [40 + name.len]u8 = undefined;
+        const needle = ns.build(&buf, "</", name, ">");
+        const at = find(xml, from, needle) orelse return null;
+        return .{ at, at + needle.len };
+    }
+
+    /// Testo grezzo del primo `<p:name>` in `xml`.
+    fn text(ns: Ns, xml: []const u8, comptime name: []const u8) ?[]const u8 {
+        const at = ns.tag(xml, 0, name) orelse return null;
+        const open_end = std.mem.indexOfScalarPos(u8, xml, at, '>') orelse return null;
+        if (xml[open_end - 1] == '/') return null;
+        const c = ns.close(xml, open_end, name) orelse return null;
+        return xml[open_end + 1 .. c[0]];
+    }
+};
+
 /// Concatena il testo di tutti i `<t>` di `inner` (i run di una stringa ricca:
 /// `<si>` condivisa o `<is>` inline), con le entity decodificate.
-fn appendRuns(w: *std.Io.Writer, inner: []const u8) !void {
+fn appendRuns(w: *std.Io.Writer, ns: Ns, inner: []const u8) !void {
     var tpos: usize = 0;
-    while (findTag(inner, tpos, "t")) |t_at| {
+    while (ns.tag(inner, tpos, "t")) |t_at| {
         const t_open_end = std.mem.indexOfScalarPos(u8, inner, t_at, '>') orelse break;
         if (inner[t_open_end - 1] == '/') {
             tpos = t_open_end + 1;
             continue;
         }
-        const t_end = findClose(inner, t_open_end, "t") orelse break;
+        const t_end = ns.close(inner, t_open_end, "t") orelse break;
         try appendXmlText(w, inner[t_open_end + 1 .. t_end[0]]);
         tpos = t_end[1];
     }
@@ -733,9 +827,10 @@ fn zipPathFromTarget(target: []const u8, allocator: std.mem.Allocator) ?[]const 
 fn parseSheetRows(sheet_xml: []const u8, shared: []const []const u8, allocator: std.mem.Allocator) Decoded {
     var builder = RowsBuilder{};
     errdefer builder.deinitAll(allocator);
+    const ns = Ns.of(sheet_xml, "sheetData");
 
     var pos: usize = 0;
-    while (findTag(sheet_xml, pos, "row")) |r_at| {
+    while (ns.tag(sheet_xml, pos, "row")) |r_at| {
         if (builder.rows.items.len >= max_sheet_rows) break;
         const open_end = std.mem.indexOfScalarPos(u8, sheet_xml, r_at, '>') orelse break;
         if (sheet_xml[open_end - 1] == '/') {
@@ -744,7 +839,7 @@ fn parseSheetRows(sheet_xml: []const u8, shared: []const []const u8, allocator: 
             pos = open_end + 1;
             continue;
         }
-        const r_close = findClose(sheet_xml, open_end, "row") orelse break;
+        const r_close = ns.close(sheet_xml, open_end, "row") orelse break;
         const inner = sheet_xml[open_end + 1 .. r_close[0]];
 
         var cells = std.ArrayList([]const u8).empty;
@@ -754,7 +849,7 @@ fn parseSheetRows(sheet_xml: []const u8, shared: []const []const u8, allocator: 
         }
 
         var cpos: usize = 0;
-        while (findTag(inner, cpos, "c")) |c_at| {
+        while (ns.tag(inner, cpos, "c")) |c_at| {
             if (cells.items.len >= max_sheet_cols) break;
             const c_open_end = std.mem.indexOfScalarPos(u8, inner, c_at, '>') orelse break;
             const open_tag = inner[c_at..c_open_end];
@@ -772,14 +867,14 @@ fn parseSheetRows(sheet_xml: []const u8, shared: []const []const u8, allocator: 
 
             var value: []const u8 = allocator.dupe(u8, "") catch break;
             if (!self_closing) {
-                const c_close = findClose(inner, c_open_end, "c") orelse {
+                const c_close = ns.close(inner, c_open_end, "c") orelse {
                     allocator.free(value);
                     break;
                 };
                 const cell_inner = inner[c_open_end + 1 .. c_close[0]];
                 const cell_type = attrValue(open_tag, "t") orelse "";
 
-                if (extractTagText(cell_inner, "v")) |raw| {
+                if (ns.text(cell_inner, "v")) |raw| {
                     if (std.mem.eql(u8, cell_type, "s")) {
                         // indice nelle shared strings
                         if (std.fmt.parseInt(usize, raw, 10) catch null) |idx| {
@@ -796,7 +891,7 @@ fn parseSheetRows(sheet_xml: []const u8, shared: []const []const u8, allocator: 
                     // `<is>` con uno o più run (`<r><t>…</t></r>`): tutti, in ordine.
                     var buf: std.Io.Writer.Allocating = .init(allocator);
                     defer buf.deinit();
-                    if (appendRuns(&buf.writer, cell_inner)) |_| {
+                    if (appendRuns(&buf.writer, ns, cell_inner)) |_| {
                         if (buf.toOwnedSlice()) |txt| {
                             allocator.free(value);
                             value = txt;
@@ -821,26 +916,18 @@ fn parseSheetRows(sheet_xml: []const u8, shared: []const []const u8, allocator: 
     return builder.toCsv(allocator);
 }
 
-/// Contenuto testuale del primo tag `name` dentro `xml` (senza decodifica entity).
-fn extractTagText(xml: []const u8, comptime name: []const u8) ?[]const u8 {
-    const at = findTag(xml, 0, name) orelse return null;
-    const open_end = std.mem.indexOfScalarPos(u8, xml, at, '>') orelse return null;
-    if (xml[open_end - 1] == '/') return null;
-    const close = findClose(xml, open_end, name) orelse return null;
-    return xml[open_end + 1 .. close[0]];
-}
-
 /// Popola `out` con le stringhe condivise: ogni <si> concatena i suoi <t>.
 fn parseSharedStrings(xml: []const u8, allocator: std.mem.Allocator, out: *std.ArrayList([]const u8)) !void {
+    const ns = Ns.of(xml, "sst");
     var pos: usize = 0;
-    while (findTag(xml, pos, "si")) |si_at| {
+    while (ns.tag(xml, pos, "si")) |si_at| {
         const open_end = std.mem.indexOfScalarPos(u8, xml, si_at, '>') orelse break;
-        const si_close = findClose(xml, open_end, "si") orelse break;
+        const si_close = ns.close(xml, open_end, "si") orelse break;
         const inner = xml[open_end + 1 .. si_close[0]];
 
         var buf: std.Io.Writer.Allocating = .init(allocator);
         defer buf.deinit();
-        try appendRuns(&buf.writer, inner);
+        try appendRuns(&buf.writer, ns, inner);
 
         try out.append(allocator, try buf.toOwnedSlice());
         pos = si_close[1];
@@ -1017,4 +1104,67 @@ export fn zuer_extensions() callconv(.c) decoder.SliceC {
 /// confronta con la propria `decoder.abi_version` e scarta i mismatch.
 export fn zuer_abi_version() callconv(.c) u32 {
     return decoder.abi_version;
+}
+
+test "findTag: con e senza prefisso, confini del nome" {
+    const xml = "<sheetData><row r=\"1\"><x:row r=\"2\"/><rows/><ns.a-b:row>";
+    const a = findTag(xml, 0, "row").?;
+    try std.testing.expectEqualStrings("<row r", xml[a .. a + 6]);
+    const b = findTag(xml, a + 1, "row").?;
+    try std.testing.expectEqualStrings("<x:row", xml[b .. b + 6]);
+    const c = findTag(xml, b + 1, "row").?; // <rows/> saltato
+    try std.testing.expectEqualStrings("<ns.a-b:row>", xml[c..]);
+    try std.testing.expect(findTag(xml, c + 1, "row") == null);
+    try std.testing.expect(findTag("</row>", 0, "row") == null);
+    try std.testing.expect(findTag("a:row>", 0, "row") == null); // niente `<`
+}
+
+test "findClose: con e senza prefisso" {
+    const xml = "<c><v>1</v></x:c></c>";
+    const a = findClose(xml, 0, "c").?;
+    try std.testing.expectEqualStrings("</x:c>", xml[a[0]..a[1]]);
+    const b = findClose(xml, a[1], "c").?;
+    try std.testing.expectEqualStrings("</c>", xml[b[0]..b[1]]);
+    try std.testing.expect(findClose("</cc>", 0, "c") == null);
+}
+
+test "appendRuns e riferimenti numerici" {
+    var buf: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer buf.deinit();
+    try appendRuns(&buf.writer, .{ .p = "x:" }, "<x:r><x:t>a&amp;b </x:t></x:r><x:r><x:t xml:space=\"preserve\">&#x1F61C;&#10;&#233;</x:t></x:r><x:t/>&bogus;");
+    try std.testing.expectEqualStrings("a&b \u{1F61C}\n\u{e9}", buf.written());
+}
+
+test "riferimenti malformati passano letterali" {
+    var buf: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer buf.deinit();
+    try appendXmlText(&buf.writer, "&#xZZ; &#99999999; &#; & &amp");
+    try std.testing.expectEqualStrings("&#xZZ; &#99999999; &#; & &amp", buf.written());
+}
+
+test "Ns: prefisso dal tag radice" {
+    try std.testing.expectEqualStrings("x:", Ns.of("<?xml?><x:worksheet><x:sheetData><x:row>", "sheetData").p);
+    try std.testing.expectEqualStrings("", Ns.of("<worksheet><sheetData/>", "sheetData").p);
+    try std.testing.expectEqualStrings("", Ns.of("<worksheet>", "sheetData").p);
+    const xml = "<x:sheetData><x:rows/><x:row r=\"1\"><x:c><x:v>7</x:v></x:c></x:row>";
+    const ns = Ns.of(xml, "sheetData");
+    const r = ns.tag(xml, 0, "row").?;
+    try std.testing.expect(std.mem.startsWith(u8, xml[r..], "<x:row r"));
+    try std.testing.expectEqualStrings("7", ns.text(xml[r..], "v").?);
+    try std.testing.expectEqualStrings("</x:row>", blk: {
+        const c = ns.close(xml, r, "row").?;
+        break :blk xml[c[0]..c[1]];
+    });
+}
+
+test "Ns senza prefisso: stesso risultato del percorso comptime" {
+    const xml = "<sheetData><rows/><row r=\"1\"><c t=\"s\"><v>3</v></c></row><row/></sheetData>";
+    const ns = Ns.of(xml, "sheetData");
+    try std.testing.expectEqualStrings("", ns.p);
+    const r = ns.tag(xml, 0, "row").?;
+    try std.testing.expect(std.mem.startsWith(u8, xml[r..], "<row r"));
+    const c = ns.close(xml, r, "row").?;
+    try std.testing.expectEqualStrings("</row>", xml[c[0]..c[1]]);
+    try std.testing.expectEqualStrings("3", ns.text(xml[r..c[0]], "v").?);
+    try std.testing.expect(std.mem.startsWith(u8, xml[ns.tag(xml, c[1], "row").?..], "<row/>"));
 }

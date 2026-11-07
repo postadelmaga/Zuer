@@ -19,25 +19,30 @@
 
 void zuer_img_free(void *p) { free(p); }
 
-/* Copia in un buffer malloc (WebPFree non è free su ogni build). */
-static int webp_copy_out(uint8_t *px, int w, int h, unsigned char **out) {
-    size_t n = (size_t)w * (size_t)h * 4;
-    *out = (unsigned char *)malloc(n);
-    if (!*out) { WebPFree(px); return -2; }
-    memcpy(*out, px, n);
-    WebPFree(px);
+/* Decodifica direttamente in un buffer malloc (niente copia: un 4K RGBA sono
+ * 33 MB): RGB se il bitstream non ha alfa, RGBA altrimenti. */
+static int webp_into(const uint8_t *data, size_t len, int has_alpha, int w, int h, unsigned char **out, int *ch) {
+    int c = has_alpha ? 4 : 3;
+    size_t stride = (size_t)w * c, n = stride * (size_t)h;
+    unsigned char *buf = (unsigned char *)malloc(n);
+    if (!buf) return -2;
+    uint8_t *r = has_alpha ? WebPDecodeRGBAInto(data, len, buf, n, (int)stride)
+                           : WebPDecodeRGBInto(data, len, buf, n, (int)stride);
+    if (!r) { free(buf); return -1; }
+    *out = buf;
+    *ch = c;
     return 0;
 }
 
-int zuer_webp_rgba(const uint8_t *data, size_t len, int max_pixels, unsigned char **out, int *w, int *h) {
+int zuer_webp_decode(const uint8_t *data, size_t len, int max_pixels, unsigned char **out, int *w, int *h, int *ch) {
     *out = NULL;
     WebPBitstreamFeatures f;
     if (WebPGetFeatures(data, len, &f) != VP8_STATUS_OK) return -1;
     if (f.width <= 0 || f.height <= 0 || (int64_t)f.width * f.height > max_pixels) return -3;
     if (!f.has_animation) {
-        uint8_t *px = WebPDecodeRGBA(data, len, w, h);
-        if (!px) return -1;
-        return webp_copy_out(px, *w, *h, out);
+        *w = f.width;
+        *h = f.height;
+        return webp_into(data, len, f.has_alpha, f.width, f.height, out, ch);
     }
     /* Animato: il primo fotogramma, come per le GIF. */
     WebPData wd = { data, len };
@@ -46,8 +51,13 @@ int zuer_webp_rgba(const uint8_t *data, size_t len, int max_pixels, unsigned cha
     WebPIterator it;
     int rc = -1;
     if (WebPDemuxGetFrame(dmx, 1, &it)) {
-        uint8_t *px = WebPDecodeRGBA(it.fragment.bytes, it.fragment.size, w, h);
-        if (px) rc = webp_copy_out(px, *w, *h, out);
+        WebPBitstreamFeatures ff;
+        if (WebPGetFeatures(it.fragment.bytes, it.fragment.size, &ff) == VP8_STATUS_OK &&
+            ff.width > 0 && ff.height > 0 && (int64_t)ff.width * ff.height <= max_pixels) {
+            *w = ff.width;
+            *h = ff.height;
+            rc = webp_into(it.fragment.bytes, it.fragment.size, 1, ff.width, ff.height, out, ch);
+        }
         WebPDemuxReleaseIterator(&it);
     }
     WebPDemuxDelete(dmx);

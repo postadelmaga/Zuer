@@ -209,7 +209,7 @@ fn svgDim(max_dim: usize) usize {
 
 // ── Codec in C compilati nel plugin (src/c/image_codecs.c, src/c/wic_decode.c) ──
 extern fn zuer_img_free(p: ?*anyopaque) void;
-extern fn zuer_webp_rgba(data: [*]const u8, len: usize, max_pixels: c_int, out: *?[*]u8, w: *c_int, h: *c_int) c_int;
+extern fn zuer_webp_decode(data: [*]const u8, len: usize, max_pixels: c_int, out: *?[*]u8, w: *c_int, h: *c_int, ch: *c_int) c_int;
 extern fn zuer_svg_rgba(data: [*:0]u8, max_dim: c_int, out: *?[*]u8, w: *c_int, h: *c_int) c_int;
 const wic = if (is_windows) struct {
     extern fn zuer_wic_rgba(data: [*]const u8, len: usize, max_pixels: c_int, out: *?[*]u8, w: *c_int, h: *c_int) c_int;
@@ -218,6 +218,10 @@ const imageio = if (is_macos) @import("image_imageio.zig") else struct {};
 
 /// Pixel RGBA da un codec C (malloc): composti su bianco e ridimensionati.
 fn finishC(rc: c_int, px: ?[*]u8, w: c_int, h: c_int, filename: []const u8, max_dim: usize, allocator: std.mem.Allocator) !ImageData {
+    return finishCh(rc, px, 4, w, h, filename, max_dim, allocator);
+}
+
+fn finishCh(rc: c_int, px: ?[*]u8, ch: c_int, w: c_int, h: c_int, filename: []const u8, max_dim: usize, allocator: std.mem.Allocator) !ImageData {
     switch (rc) {
         0 => {},
         -2 => return error.OutOfMemory,
@@ -227,15 +231,17 @@ fn finishC(rc: c_int, px: ?[*]u8, w: c_int, h: c_int, filename: []const u8, max_
     const p = px orelse return error.UnsupportedImageFormat;
     defer zuer_img_free(p);
     if (w <= 0 or h <= 0) return error.InvalidImageSize;
-    return resizeToFit(p, 4, @intCast(w), @intCast(h), 1, filename, max_dim, allocator);
+    if (ch != 3 and ch != 4) return error.UnsupportedImageFormat;
+    return resizeToFit(p, @intCast(ch), @intCast(w), @intCast(h), 1, filename, max_dim, allocator);
 }
 
 fn decodeWebp(file_bytes: []const u8, filename: []const u8, max_dim: usize, allocator: std.mem.Allocator) !ImageData {
     var px: ?[*]u8 = null;
     var w: c_int = 0;
     var h: c_int = 0;
-    const rc = zuer_webp_rgba(file_bytes.ptr, file_bytes.len, @intCast(max_source_pixels), &px, &w, &h);
-    return finishC(rc, px, w, h, filename, max_dim, allocator);
+    var ch: c_int = 0;
+    const rc = zuer_webp_decode(file_bytes.ptr, file_bytes.len, @intCast(max_source_pixels), &px, &w, &h, &ch);
+    return finishCh(rc, px, ch, w, h, filename, max_dim, allocator);
 }
 
 /// nanosvg: il parser lavora sul posto, quindi su una copia terminata da NUL.
@@ -295,12 +301,15 @@ fn decodeNative(file_bytes: []const u8, filename: []const u8, max_dim: usize, al
     if (w <= 0 or h <= 0) return error.InvalidImageSize;
     if (@as(usize, @intCast(w)) * @as(usize, @intCast(h)) > max_source_pixels) return error.ImageTooLarge;
 
-    const data = stbi_load_from_memory(file_bytes.ptr, @intCast(file_bytes.len), &w, &h, &channels, 4) orelse
+    // Alfa solo se il file ce l'ha (grigio+alfa o RGBA): un JPEG o un PNG opaco a 3
+    // canali costa un quarto di memoria in meno e niente composizione su bianco.
+    const want: c_int = if (channels == 2 or channels == 4) 4 else 3;
+    const data = stbi_load_from_memory(file_bytes.ptr, @intCast(file_bytes.len), &w, &h, &channels, want) orelse
         return error.UnsupportedImageFormat;
     defer stbi_image_free(data);
 
     if (w <= 0 or h <= 0) return error.InvalidImageSize;
-    return resizeToFit(data, 4, @intCast(w), @intCast(h), exif.orientation(file_bytes), filename, max_dim, allocator);
+    return resizeToFit(data, @intCast(want), @intCast(w), @intCast(h), exif.orientation(file_bytes), filename, max_dim, allocator);
 }
 
 /// Contenitore ISO-BMFF d'immagine (`....ftyp<brand>`): AVIF o HEIF.
@@ -437,7 +446,7 @@ fn resizeToFit(src: [*]const u8, ch: usize, src_w: usize, src_h: usize, orient: 
             for (y0..y1) |sy| {
                 for (x0..x1) |sx| {
                     const s = (sy * src_w + sx) * ch;
-                    if (ch == 4) {
+                    if (ch == 4 and src[s + 3] != 255) {
                         // Composizione su bianco: c·a + 255·(255−a), in unità 1/255.
                         const a: u64 = src[s + 3];
                         inline for (0..3) |c| sum[c] += (@as(u64, src[s + c]) * a + 255 * (255 - a) + 127) / 255;

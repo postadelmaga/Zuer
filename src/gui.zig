@@ -1098,8 +1098,21 @@ fn installTermHandlers(win: *zrame.Window) void {
     inline for (.{ .TERM, .INT, .HUP }) |sig| std.posix.sigaction(sig, &act, null);
 }
 
+extern "c" fn mallopt(param: c_int, value: c_int) c_int;
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
+
+    // glibc alza da sé la soglia mmap dopo il primo buffer grande liberato (fino a
+    // 32 MB): da lì i buffer di decodifica (pixel, pagine, entry ZIP) finiscono
+    // nelle arene dei thread worker, frammentate da allocazioni piccole che restano
+    // vive, e la memoria liberata non torna al sistema. Misurato navigando una
+    // cartella mista: RSS a regime 88 MB invece di 52. Soglia fissa: i blocchi
+    // oltre 256 KB vanno sempre in mmap e tornano al sistema alla free.
+    if (comptime builtin.os.tag == .linux and builtin.abi.isGnu()) {
+        const M_MMAP_THRESHOLD = -3;
+        _ = mallopt(M_MMAP_THRESHOLD, 256 * 1024);
+    }
 
     // Ignora SIGPIPE (solo POSIX): la write libc verso un processo morto (es.
     // `wl-copy` della clipboard) altrimenti ucciderebbe l'intera GUI. Con
