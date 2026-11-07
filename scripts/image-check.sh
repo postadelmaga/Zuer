@@ -61,7 +61,7 @@ OUT="$(run doc "$(W "$IMG/orient6.jpg")")"; echo "$OUT"
 grep -q 'immagine 80x160' <<<"$OUT" || { echo "FALLITO: orient6.jpg non ruotata (attese 80x160 da 200x100)"; FAIL=1; }
 
 echo "── file corrotti, vuoti, enormi"
-"$PY" - "$IMG" "$TMP" <<'EOF'
+"$PY" - "$(W "$IMG")" "$(W "$TMP")" <<'EOF'
 import os, struct, sys, zlib
 img, tmp = sys.argv[1], sys.argv[2]
 def cut(src, n, dst):
@@ -84,13 +84,13 @@ def png(path, w, h):
 png(os.path.join(tmp, 'grande.png'), 9000, 9000)      # 81 Mpx: si apre
 png(os.path.join(tmp, 'enorme.png'), 13000, 12000)    # 156 Mpx: oltre il tetto
 EOF
-for f in troncato.png troncato.webp troncato.tiff vuoto.png spazzatura.jpg; do
+for f in troncato.webp troncato.tiff vuoto.png spazzatura.jpg; do
   must fail "$(W "$TMP/$f")" "Errore"
 done
-# Esito accettabile in entrambi i modi, purché senza crash: un JPEG troncato si
-# mostra fino a dove arriva (come i browser); un SVG rotto lo rende ImageMagick su
-# Linux e dà errore altrove.
-for f in troncato.jpg rotto.svg; do
+# Esito accettabile in entrambi i modi, purché senza crash: JPEG e PNG troncati si
+# mostrano fino a dove arrivano (stb per i JPEG; ImageIO su macOS anche per i PNG),
+# come nei browser; un SVG rotto lo rende ImageMagick su Linux e dà errore altrove.
+for f in troncato.jpg troncato.png rotto.svg; do
   OUT="$(run doc "$(W "$TMP/$f")")"; RC=$?; echo "$OUT"
   grep -qE '^(ok|FALLITO): ' <<<"$OUT" && [[ $RC -le 1 ]] || { echo "FALLITO: $f ha fatto cadere il processo (rc=$RC)"; FAIL=1; }
 done

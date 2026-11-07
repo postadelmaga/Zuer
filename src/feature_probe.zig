@@ -9,6 +9,15 @@
 //!   feature-probe audio <file>          audio decodificato e consegnato al dispositivo:
 //!                                       SOLO con un file a traccia muta (anullsrc),
 //!                                       la prova non deve mai essere udibile
+//!   feature-probe audio-devices         dispositivi di uscita (Windows: WASAPI), "*" = predefinito
+//!   feature-probe audio-tone <file> <Hz> [s]  SOLO CI, su un dispositivo VIRTUALE: riproduce
+//!                                       il file e cattura in loopback il mix del dispositivo
+//!                                       (WASAPI): il tono a <Hz> deve uscire davvero, e
+//!                                       l'orologio deve avanzare per <s> secondi (default 3)
+//!   feature-probe audio-survive <file> <s>  riproduce per <s> secondi stampando l'orologio
+//!                                       ogni secondo: la CI intanto disattiva e riattiva il
+//!                                       dispositivo; la riproduzione deve riprendere (ultimi
+//!                                       3 s: l'orologio avanza di almeno 2 s)
 //!   feature-probe gpu                   init renderer + render offscreen di un cubo
 //!   feature-probe pixel <file> <fx> <fy> <r> <g> <b>
 //!                                       colore del pixel in (fx, fy) ∈ [0,1]² entro
@@ -29,6 +38,7 @@ const player = @import("decoders/player.zig");
 const audio_player = @import("audio_player.zig");
 const gpu = @import("gpu_renderer.zig");
 const loader = @import("loader.zig");
+const zicro = @import("zicro");
 
 var failed = false;
 
@@ -58,6 +68,19 @@ pub fn main(init: std.process.Init) !u8 {
         probeVideo(gpa, args.next() orelse return usage());
     } else if (std.mem.eql(u8, cmd, "audio")) {
         probeAudio(io, gpa, args.next() orelse return usage());
+    } else if (std.mem.eql(u8, cmd, "audio-devices")) {
+        var buf: [4096]u8 = undefined;
+        const n = zicro.audio_device.listOutputs(&buf);
+        report(true, "dispositivi audio di uscita: {d}\n{s}", .{ n, std.mem.sliceTo(&buf, 0) });
+    } else if (std.mem.eql(u8, cmd, "audio-tone")) {
+        const path = args.next() orelse return usage();
+        const hz = std.fmt.parseFloat(f64, args.next() orelse return usage()) catch return usage();
+        const secs = if (args.next()) |a| std.fmt.parseFloat(f64, a) catch return usage() else 3.0;
+        probeTone(io, gpa, path, hz, secs);
+    } else if (std.mem.eql(u8, cmd, "audio-survive")) {
+        const path = args.next() orelse return usage();
+        const secs = std.fmt.parseInt(usize, args.next() orelse return usage(), 10) catch return usage();
+        probeSurvive(io, gpa, path, secs);
     } else if (std.mem.eql(u8, cmd, "gpu")) {
         probeGpu(gpa);
     } else if (std.mem.eql(u8, cmd, "pixel")) {
@@ -190,7 +213,84 @@ fn probeAudio(io: std.Io, gpa: std.mem.Allocator, path: []const u8) void {
     var t: usize = 0;
     while (t < 30 and ap.clockSeconds() < 0.5) : (t += 1) io.sleep(.fromMilliseconds(100), .awake) catch {};
     const clk = ap.clockSeconds();
-    report(clk >= 0.5, "audio: orologio di riproduzione a {d:.2}s dopo {d} ms (dispositivo che consuma campioni)", .{ clk, t * 100 });
+    // Latenza riportata dal backend (PipeWire, WASAPI, AudioQueue): null = stima fissa.
+    const lat = ap.dev.latencyFrames();
+    report(clk >= 0.5, "audio: orologio di riproduzione a {d:.2}s dopo {d} ms (dispositivo che consuma campioni), latenza dal dispositivo: {?d} frame", .{ clk, t * 100, lat });
+}
+
+/// Potenza (Goertzel) della frequenza `hz` in `x`, normalizzata sulla lunghezza.
+fn goertzel(x: []const f32, rate: f64, hz: f64) f64 {
+    const w = 2.0 * std.math.pi * hz / rate;
+    const k = 2.0 * @cos(w);
+    var s1: f64 = 0;
+    var s2: f64 = 0;
+    for (x) |v| {
+        const s0 = @as(f64, v) + k * s1 - s2;
+        s2 = s1;
+        s1 = s0;
+    }
+    const p = s1 * s1 + s2 * s2 - k * s1 * s2;
+    const n: f64 = @floatFromInt(@max(x.len, 1));
+    return p / (n * n);
+}
+
+fn probeTone(io: std.Io, gpa: std.mem.Allocator, path: []const u8, hz: f64, secs: f64) void {
+    if (comptime !build_options.video) return report(false, "audio non compilato", .{});
+    var loop = zicro.audio_device.Loopback.open() catch |e| return report(false, "audio-tone: loopback non disponibile: {s}", .{@errorName(e)});
+    defer loop.close();
+    const rate: f64 = @floatFromInt(loop.rate);
+    const cap: usize = @intFromFloat(rate * (secs + 2.0));
+    const cap_buf = gpa.alloc(f32, cap) catch return report(false, "memoria", .{});
+    defer gpa.free(cap_buf);
+    var got: usize = 0;
+
+    const pz = gpa.dupeSentinel(u8, path, 0) catch return report(false, "memoria", .{});
+    defer gpa.free(pz);
+    const ap = audio_player.AudioPlayer.start(pz.ptr, gpa) orelse
+        return report(false, "audio-tone: nessun player (libav, stream audio o dispositivo assenti)", .{});
+    defer ap.stopAndDestroy();
+    ap.setPlaying(true);
+    var last_clk: f64 = 0;
+    var steps: usize = 0;
+    var lat_max: u32 = 0;
+    const total_steps: usize = @intFromFloat(secs * 50);
+    while (steps < total_steps) : (steps += 1) {
+        io.sleep(.fromMilliseconds(20), .awake) catch {};
+        if (got < cap_buf.len) got += loop.read(cap_buf[got..]) orelse 0;
+        last_clk = ap.clockSeconds();
+        if (ap.dev.latencyFrames()) |l| lat_max = @max(lat_max, l);
+    }
+    // Analisi sull'ultimo tratto pieno (si salta il primo 0,5 s: avvio del flusso).
+    const skip: usize = @min(got, @as(usize, @intFromFloat(rate * 0.5)));
+    const x = cap_buf[skip..got];
+    var sq: f64 = 0;
+    for (x) |v| sq += @as(f64, v) * v;
+    const rms = @sqrt(sq / @as(f64, @floatFromInt(@max(x.len, 1))));
+    const p_on = goertzel(x, rate, hz);
+    const p_off = @max(goertzel(x, rate, hz * 1.37), goertzel(x, rate, hz * 0.73));
+    const ratio = p_on / @max(p_off, 1e-20);
+    report(x.len > @as(usize, @intFromFloat(rate)) and rms > 0.01 and ratio > 50, "audio-tone: catturati {d} campioni a {d} Hz dal mix, RMS {d:.4}, tono {d} Hz {d:.0}× sopra le frequenze vicine", .{ got, loop.rate, rms, hz, ratio });
+    report(last_clk >= secs - 0.6, "audio-tone: orologio a {d:.2}s dopo {d:.1}s, latenza riportata dal dispositivo fino a {d} frame ({d:.0} ms)", .{ last_clk, secs, lat_max, @as(f64, @floatFromInt(lat_max)) * 1000.0 / 48000.0 });
+}
+
+fn probeSurvive(io: std.Io, gpa: std.mem.Allocator, path: []const u8, secs: usize) void {
+    if (comptime !build_options.video) return report(false, "audio non compilato", .{});
+    const pz = gpa.dupeSentinel(u8, path, 0) catch return report(false, "memoria", .{});
+    defer gpa.free(pz);
+    const ap = audio_player.AudioPlayer.start(pz.ptr, gpa) orelse
+        return report(false, "audio-survive: nessun player", .{});
+    defer ap.stopAndDestroy();
+    ap.setPlaying(true);
+    var clocks: [600]f64 = undefined;
+    const n = @min(secs, clocks.len);
+    for (0..n) |i| {
+        io.sleep(.fromSeconds(1), .awake) catch {};
+        clocks[i] = ap.clockSeconds();
+        std.debug.print("  t={d}s orologio {d:.2}s latenza {?d} frame\n", .{ i + 1, clocks[i], ap.dev.latencyFrames() });
+    }
+    if (n < 4) return report(false, "audio-survive: servono almeno 4 s", .{});
+    const tail = clocks[n - 1] - clocks[n - 4];
+    report(tail >= 2.0, "audio-survive: negli ultimi 3 s l'orologio è avanzato di {d:.2}s (riproduzione ripresa)", .{tail});
 }
 
 fn probeGpu(gpa: std.mem.Allocator) void {

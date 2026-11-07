@@ -389,6 +389,23 @@ jobs:
             done
           done
           [[ $MISSING == 0 ]] || { echo "::error::dipendenze non risolte o Vulkan importato (sopra)"; exit 1; }
+      # Il runner non ha schede audio: Scream (MS-PL, driver firmato) è una scheda
+      # VIRTUALE che manda il mix in rete — niente di udibile. Serve a provare WASAPI
+      # davvero (apertura, riproduzione, latenza, loopback, rimozione del dispositivo).
+      # Su Windows Server il servizio audio è spento di default.
+      - name: Scheda audio virtuale (Scream 4.0)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest https://github.com/duncanthrax/scream/releases/download/4.0/Scream4.0.zip -OutFile "$env:RUNNER_TEMP\scream.zip"
+          if ((Get-FileHash "$env:RUNNER_TEMP\scream.zip" -Algorithm SHA256).Hash -ne 'FA33E25F9A46C61E4E0CD83362C51C3D2A45C6FE4091AAD7507E240E40F1A520') { throw 'sha256 di Scream4.0.zip non corrisponde' }
+          Expand-Archive "$env:RUNNER_TEMP\scream.zip" -DestinationPath "$env:RUNNER_TEMP\scream"
+          Set-Service AudioEndpointBuilder -StartupType Automatic; Start-Service AudioEndpointBuilder
+          Set-Service Audiosrv -StartupType Automatic; Start-Service Audiosrv
+          & "$env:RUNNER_TEMP\scream\Install\helpers\devcon-x64.exe" install "$env:RUNNER_TEMP\scream\Install\driver\x64\Scream.inf" '*Scream'
+          Start-Sleep 5
+          Get-PnpDevice -Class AudioEndpoint,MEDIA -ErrorAction SilentlyContinue | Format-Table -AutoSize Status,Class,FriendlyName,InstanceId
+          Get-Service Audiosrv,AudioEndpointBuilder | Format-Table -AutoSize Name,Status
       - name: Installazione, prove, disinstallazione (cartella pulita)
         env:
           MSYS_NO_PATHCONV: "1" # /S, /D=, _?= vanno all'installer così come sono
@@ -422,7 +439,21 @@ jobs:
           ZUER_PDFIUM=none "$UDIR/feature-probe.exe" fail "$(W "$D/prova.pdf")" "pdfium.dll"
           bash "$GITHUB_WORKSPACE/Zuer/scripts/image-check.sh" "$UDIR/feature-probe.exe" "$GITHUB_WORKSPACE/Zuer/tests/images"
           "$UDIR/feature-probe.exe" video "$(W "$D/clip.mp4")"
-          if ! "$UDIR/feature-probe.exe" audio "$(W "$D/clip.mp4")"; then echo "::warning::audio: nessun dispositivo di uscita utilizzabile sul runner"; fi
+          # Audio su WASAPI, sulla scheda virtuale Scream (il mix va in rete: inudibile).
+          "$UDIR/feature-probe.exe" audio-devices
+          "$UDIR/feature-probe.exe" audio "$(W "$D/clip.mp4")"
+          /c/msys64/ucrt64/bin/ffmpeg.exe -loglevel error -f lavfi -i sine=frequency=1000:sample_rate=48000:duration=25 -ac 2 -c:a aac "$(W "$D/tono.m4a")"
+          # Il tono deve USCIRE: catturato in loopback dal mix del dispositivo.
+          "$UDIR/feature-probe.exe" audio-tone "$(W "$D/tono.m4a")" 1000 3
+          # Ripiego waveOut (forzato): continua a funzionare.
+          ZICRO_AUDIO=waveout "$UDIR/feature-probe.exe" audio "$(W "$D/clip.mp4")"
+          # Dispositivo rimosso a metà riproduzione e poi rimesso: la riproduzione riprende.
+          SID="$(powershell -NoProfile -Command "(Get-PnpDevice -Class MEDIA | Where-Object FriendlyName -like '*Scream*' | Select-Object -First 1).InstanceId" | tr -d '\r')"
+          echo "Scream: $SID"; [[ -n "$SID" ]] || { echo "::error::dispositivo Scream non trovato"; exit 1; }
+          "$UDIR/feature-probe.exe" audio-survive "$(W "$D/tono.m4a")" 14 > survive.log 2>&1 & SP=$!
+          sleep 4; pnputil /disable-device "$SID"; sleep 3; pnputil /enable-device "$SID"
+          RC=0; wait $SP || RC=$?; tr -d '\r' < survive.log
+          [[ $RC == 0 ]] || { echo "::error::audio non ripreso dopo la rimozione del dispositivo"; exit 1; }
           "$UDIR/feature-probe.exe" gpu > gpu-noloader.log 2>&1 || true; cat gpu-noloader.log
           grep -q 'VulkanLoaderMissing' gpu-noloader.log || { echo "::error::senza loader: atteso VulkanLoaderMissing"; exit 1; }
           rm -f "$UDIR/feature-probe.exe"
