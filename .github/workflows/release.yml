@@ -439,7 +439,10 @@ jobs:
           grep -qE 'VulkanNoDriver|NoGpu' gpu-nodriver.log || { echo "::error::loader senza driver: atteso VulkanNoDriver/NoGpu"; exit 1; }
           PATH="$VKPATH" ZUER_VULKAN_LOADER="$VKL" VK_DRIVER_FILES='C:\nessun-driver.json' gui "loader senza driver, modello 3D" "$D/cubo.obj"
           # 2. Vulkan funzionante: lavapipe (Mesa, rasterizzatore SOFTWARE). Prova il
-          # percorso Vulkan completo su Windows vero, non una GPU fisica.
+          # percorso Vulkan completo su Windows vero, non una GPU fisica. Registrato come
+          # un driver vero (HKLM): il runner gira elevato e il loader lì ignora
+          # VK_DRIVER_FILES. Tolto subito dopo le prove.
+          reg add 'HKLM\SOFTWARE\Khronos\Vulkan\Drivers' /v "$LVP" /t REG_DWORD /d 0 /f
           ls -la /c/msys64/ucrt64/share/vulkan/icd.d/ || true; cat /c/msys64/ucrt64/share/vulkan/icd.d/lvp_icd.x86_64.json || true
           ls -la /c/msys64/ucrt64/bin/vulkan_lvp.dll || true
           PATH="$VKPATH" ZUER_VULKAN_LOADER="$VKL" VK_DRIVER_FILES="$LVP" "$UDIR/feature-probe.exe" gpu > gpu-lvp.log 2>&1 || true; cat gpu-lvp.log
@@ -463,6 +466,7 @@ jobs:
           grep -q 'device Vulkan perso, ricostruisco' gui.log && [[ $(grep -c 'zuer gpu: using' gui.log) -ge 2 ]] || { echo "::error::perdita del device non recuperata"; exit 1; }
           gvk "device perso sempre" 15 ZUER_TEST_VK_LOST_AFTER=3 ZUER_TEST_VK_LOST_REPEAT=1
           grep -q 'renderer GPU spento' gui.log || { echo "::error::nessun ripiego dopo perdite ripetute"; exit 1; }
+          reg delete 'HKLM\SOFTWARE\Khronos\Vulkan\Drivers' /v "$LVP" /f
           # Disinstallazione silenziosa (_?= la fa aspettare; lascia solo uninstall.exe).
           "$UDIR/uninstall.exe" /S "_?=$DIR"
           if reg query 'HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Zuer' >/dev/null 2>&1; then
