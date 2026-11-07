@@ -183,16 +183,26 @@ fn probeVideo(gpa: std.mem.Allocator, path: []const u8) void {
     defer p.deinit();
     var frames: usize = 0;
     var last_pts: f64 = -1;
+    var max_gap: f64 = 0;
+    var went_back = false;
     var w: usize = 0;
     var h: usize = 0;
     while (frames < 60) {
-        const f = (p.nextFrame(1920, gpa, null) catch |e| return report(false, "video: decode fallito dopo {d} frame: {s}", .{ frames, @errorName(e) })) orelse continue;
+        // null = fine del file: con meno di 60 frame la prova fallisce (non un ciclo infinito).
+        const f = (p.nextFrame(1920, gpa, null) catch |e| return report(false, "video: decode fallito dopo {d} frame: {s}", .{ frames, @errorName(e) })) orelse break;
         w = f.width;
         h = f.height;
+        if (frames > 0) {
+            max_gap = @max(max_gap, f.pts_s - last_pts);
+            if (f.pts_s <= last_pts) went_back = true;
+        }
         last_pts = f.pts_s;
         frames += 1;
     }
     report(frames == 60 and w > 0 and h > 0, "video: {d} frame {d}x{d}, ultimo pts {d:.3}s, decodifica hardware: {s}", .{ frames, w, h, last_pts, if (p.hw_active) "sì" else "no" });
+    // Pts strettamente crescenti e senza buchi oltre 3 frame: anche attraverso un
+    // eventuale ripiego hw→sw (ZUER_TEST_HWFAIL_AFTER) la riproduzione è continua.
+    report(max_gap < 0.11 and !went_back, "video: pts continui (salto massimo {d:.3}s{s})", .{ max_gap, if (went_back) ", ALL'INDIETRO" else "" });
     p.seek(last_pts + 2.0);
     var after: ?f64 = null;
     var tries: usize = 0;

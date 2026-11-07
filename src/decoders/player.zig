@@ -123,11 +123,26 @@ fn libName(comptime base: []const u8, comptime major: u32) [:0]const u8 {
     };
 }
 
-/// Decodifica hardware: VideoToolbox su macOS, VAAPI altrove (su Windows il
-/// device VAAPI non si apre e si resta in software, come prima).
-const hw_device_type = if (builtin.os.tag == .macos) c.AV_HWDEVICE_TYPE_VIDEOTOOLBOX else c.AV_HWDEVICE_TYPE_VAAPI;
-const hw_name = if (builtin.os.tag == .macos) "VideoToolbox" else "VAAPI";
-const hw_pix_fmt = if (builtin.os.tag == .macos) c.AV_PIX_FMT_VIDEOTOOLBOX else c.AV_PIX_FMT_VAAPI;
+/// Decodifica hardware: VideoToolbox su macOS, D3D11VA su Windows (adattatore di
+/// default; libavutil apre d3d11.dll a runtime), VAAPI su Linux. Stesso percorso
+/// ovunque: sonda sul primo frame (probeHwDevice), download GPU→CPU del frame
+/// (av_hwframe_transfer_data, NV12) e ripiego in software a metà stream se il
+/// device cede (device rimosso, reset del driver: vedi hwFail).
+const hw_device_type = switch (builtin.os.tag) {
+    .macos => c.AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+    .windows => c.AV_HWDEVICE_TYPE_D3D11VA,
+    else => c.AV_HWDEVICE_TYPE_VAAPI,
+};
+const hw_name = switch (builtin.os.tag) {
+    .macos => "VideoToolbox",
+    .windows => "D3D11VA",
+    else => "VAAPI",
+};
+const hw_pix_fmt = switch (builtin.os.tag) {
+    .macos => c.AV_PIX_FMT_VIDEOTOOLBOX,
+    .windows => c.AV_PIX_FMT_D3D11,
+    else => c.AV_PIX_FMT_VAAPI,
+};
 
 /// In ordine di dipendenza (avutil prima di tutti). File-scope: il nome deve
 /// essere comptime-known per la conversione UTF-16 nell'inline for (Windows).
@@ -539,6 +554,17 @@ pub const Player = struct {
     hw_devices: [max_hw_devices][max_hw_device_path]u8 = undefined,
     hw_device_count: u8 = 0,
     hw_device_idx: u8 = 0,
+    /// Prova del ripiego (`ZUER_TEST_HWFAIL_AFTER=N`): dopo N frame hardware il
+    /// download fallisce come per un device perso (GPU rimossa, reset del driver,
+    /// TDR su Windows). 0 = mai. Letta una volta all'apertura.
+    hw_fail_after: u32 = 0,
+    hw_frames: u32 = 0,
+    /// Pts dell'ultimo frame consegnato (-1 = nessuno) e, dopo un ripiego hw→sw,
+    /// la soglia sotto cui i frame si scartano: il decoder software riparte dal
+    /// keyframe PRECEDENTE (seek all'indietro) e si riallinea al punto esatto in
+    /// cui l'hardware ha ceduto, invece di restare fermo fino al keyframe dopo.
+    last_out_pts: f64 = -1,
+    resume_after_pts: f64 = -1,
 
     // Formato di uscita e buffer di scaling. Il player live (`Player.open`) emette
     // RGBA (il formato di presentazione) riusando `scratch`: niente malloc per-frame
@@ -759,6 +785,7 @@ pub const Player = struct {
             .hw_devices = hw_devices,
             .hw_device_count = hw_device_count,
             .hw_device_idx = hw_device_idx,
+            .hw_fail_after = testHwFailAfter(),
         };
     }
 
@@ -863,7 +890,7 @@ pub const Player = struct {
                 // metà stream perde lo stato dei frame di riferimento ed è
                 // difficile da recuperare su contenuti con keyframe rade.
                 if (self.hw_active) {
-                    if (!self.hwFail("errore VAAPI runtime")) return Error.NoFrameDecoded;
+                    if (!self.hwFail("errore " ++ hw_name ++ " runtime")) return Error.NoFrameDecoded;
                 }
                 continue; // errore vero: packet inservibile
             }
@@ -872,7 +899,7 @@ pub const Player = struct {
             if (r == c.AVERROR_EOF) return null;
             if (r < 0) {
                 if (self.hw_active) {
-                    if (!self.hwFail("errore VAAPI runtime")) return Error.NoFrameDecoded;
+                    if (!self.hwFail("errore " ++ hw_name ++ " runtime")) return Error.NoFrameDecoded;
                     continue;
                 }
                 return Error.NoFrameDecoded;
@@ -896,15 +923,20 @@ pub const Player = struct {
         if (skip_before_pts) |target| {
             if (pts < target) return null; // scartato: niente download/scale
         }
+        if (self.resume_after_pts >= 0) {
+            if (pts <= self.resume_after_pts) return null; // già mostrato prima del ripiego
+            self.resume_after_pts = -1;
+        }
         var src: [*c]c.AVFrame = self.frame;
         if (self.frame.*.format == hw_pix_fmt) {
-            var ok = self.sw_frame != null;
+            self.hw_frames +|= 1;
+            var ok = self.sw_frame != null and !(self.hw_fail_after != 0 and self.hw_frames > self.hw_fail_after);
             if (ok) {
                 av.av_frame_unref(self.sw_frame);
                 ok = av.av_hwframe_transfer_data(self.sw_frame, self.frame, 0) >= 0;
             }
             if (!ok) {
-                if (!self.hwFail("download frame VAAPI fallito")) return Error.NoFrameDecoded;
+                if (!self.hwFail("download frame " ++ hw_name ++ " fallito")) return Error.NoFrameDecoded;
                 return null;
             }
             src = self.sw_frame;
@@ -916,11 +948,18 @@ pub const Player = struct {
             // ritentare altri device (vedi commento in nextFrame).
             if (!self.hw_warned) {
                 self.hw_warned = true;
-                std.log.warn("zuer video: hwaccel VAAPI ricaduto in software a metà stream, degrado", .{});
+                std.log.warn("zuer video: hwaccel " ++ hw_name ++ " ricaduto in software a metà stream, degrado", .{});
             }
             if (!self.reopenSoftware()) return Error.NoFrameDecoded;
         }
-        return try self.scaleCurrent(src, max_dim, allocator, pts);
+        const out = try self.scaleCurrent(src, max_dim, allocator, pts);
+        self.last_out_pts = pts;
+        return out;
+    }
+
+    fn testHwFailAfter() u32 {
+        const v = std.c.getenv("ZUER_TEST_HWFAIL_AFTER") orelse return 0;
+        return std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0;
     }
 
     /// Logga (una sola volta) e degrada a software dopo un fallimento runtime
@@ -955,6 +994,13 @@ pub const Player = struct {
         self.codec_ctx.*.thread_count = 0;
         self.codec_ctx.*.thread_type = c.FF_THREAD_FRAME | c.FF_THREAD_SLICE;
         if (av.avcodec_open2(self.codec_ctx, codec, null) < 0) return false;
+        // Riparte dal keyframe che precede l'ultimo frame mostrato e scarta fino a
+        // lì (vedi `resume_after_pts`): niente immagine ferma fino al keyframe dopo.
+        if (self.last_out_pts >= 0) {
+            const at = self.last_out_pts;
+            self.seek(at);
+            self.resume_after_pts = at;
+        }
         return true;
     }
 
@@ -1079,6 +1125,7 @@ pub const Player = struct {
             const ts: i64 = @intFromFloat(seconds * @as(f64, c.AV_TIME_BASE));
             _ = av.av_seek_frame(self.fmt_ctx, -1, ts, c.AVSEEK_FLAG_BACKWARD);
         }
+        self.resume_after_pts = -1; // un seek esplicito annulla il riallineamento
         // Rimappa il contatore del PTS sintetico al punto di seek (per gli AVI
         // senza timestamp, così il pacing riprende coerente dalla nuova posizione).
         self.frame_index = @intFromFloat(@max(0, seconds) * self.frame_rate);
