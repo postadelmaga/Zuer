@@ -46,11 +46,12 @@ BIN="$STAGE/bin"
 [[ -f "$BIN/zuer-gui.exe" ]] || { echo "✗ zuer-gui.exe non prodotto"; exit 1; }
 cp "$ROOT/LICENSE" "$BIN/LICENSE.txt" # AGPL-3.0-or-later, installata accanto all'exe
 
-# makensis è un programma Windows: sotto Git Bash/MSYS gli servono percorsi Windows.
-NSIS_STAGE="$BIN"; NSIS_SCRIPT="$ROOT/installer/zuer.nsi"
-if command -v cygpath >/dev/null; then
-  NSIS_STAGE="$(cygpath -w "$BIN")"; NSIS_SCRIPT="$(cygpath -w "$NSIS_SCRIPT")"
-fi
+# makensis lavora nella cartella dello script .nsi: la staging gli arriva come percorso
+# RELATIVO a installer/, senza lettere di unità. Sotto Git Bash (runner Windows) il
+# percorso assoluto, anche convertito in D:\…, dava "File: … -> no files found".
+NSIS_STAGE="$(realpath --relative-to="$ROOT/installer" "$BIN")"
+NSIS_SCRIPT="$ROOT/installer/zuer.nsi"
+command -v cygpath >/dev/null && NSIS_SCRIPT="$(cygpath -w "$NSIS_SCRIPT")"
 NSIS_DEFS=(-DSTAGE="$NSIS_STAGE" -DVERSION="$VERSION" -DOUTFILE="$OUT")
 
 case "$FFMPEG" in
