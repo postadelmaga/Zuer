@@ -276,6 +276,12 @@ jobs:
           zig version; glslc --version | head -1; makensis -VERSION
           mkdir -p "$RUNNER_TEMP/dist"
           scripts/build-windows-installer.sh --out "$(cygpath -w "$RUNNER_TEMP/dist/zuer-$VERSION-windows-x64-setup.exe")"
+      - name: Diagnostica Defender (solo se la build fallisce)
+        if: failure()
+        shell: pwsh
+        run: |
+          Get-MpThreatDetection | Format-List ThreatID,Resources,InitialDetectionTime,ActionSuccess
+          Get-MpThreat | Format-List ThreatName,SeverityID,IsActive
       - name: Verifica binari e dipendenze
         working-directory: Zuer
         run: |

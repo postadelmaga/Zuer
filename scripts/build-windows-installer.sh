@@ -128,6 +128,8 @@ NSH="$ROOT/installer/associations.nsh"
 echo "  ✓ $(echo "$EXTS" | wc -w) estensioni"
 
 echo "→ [5/5] makensis"
+ls -la "$BIN"
+[[ -f "$BIN/zuer-gui.exe" ]] || { echo "✗ zuer-gui.exe sparito dalla staging prima di makensis (antivirus?)"; exit 1; }
 makensis -V2 "${NSIS_DEFS[@]}" "$NSIS_SCRIPT"
 
 echo
