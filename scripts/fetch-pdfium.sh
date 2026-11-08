@@ -24,7 +24,8 @@ EXPECTED_SHA256="3452d11031050ec65e57f180215b57b9e6d465e3fbedafa8a77ad90885c7d23
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 echo "→ scarico PDFium ($TAG, ~4 MB)…"
-curl -fsSL -o "$TMP/pdfium.tgz" "$URL"
+# GitHub dà a volte 504 sui file delle release: si riprova (lo sha256 è verificato sotto).
+curl -fsSL --retry 6 --retry-delay 20 --retry-all-errors -o "$TMP/pdfium.tgz" "$URL"
 echo "$EXPECTED_SHA256  $TMP/pdfium.tgz" | sha256sum -c - >/dev/null \
   || { echo "✗ sha256 non corrisponde: asset compromesso o cambiato ($URL)"; exit 1; }
 mkdir -p "$TMP/x"

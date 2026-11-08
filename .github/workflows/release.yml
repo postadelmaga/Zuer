@@ -102,7 +102,7 @@ jobs:
       - name: Zig
         run: |
           set -euo pipefail
-          curl -fsSL -o zig.tar.xz "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz"
+          curl -fsSL --retry 6 --retry-delay 20 --retry-all-errors -o zig.tar.xz "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz"
           echo "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026  zig.tar.xz" | sha256sum -c -
           mkdir -p "$RUNNER_TEMP/zig" && tar -xJf zig.tar.xz -C "$RUNNER_TEMP/zig" --strip-components=1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
@@ -148,7 +148,7 @@ jobs:
       - name: Zig e strumenti
         run: |
           set -euo pipefail
-          curl -fsSL -o zig.tar.xz "https://ziglang.org/download/$ZIG_VERSION/zig-aarch64-macos-$ZIG_VERSION.tar.xz"
+          curl -fsSL --retry 6 --retry-delay 20 --retry-all-errors -o zig.tar.xz "https://ziglang.org/download/$ZIG_VERSION/zig-aarch64-macos-$ZIG_VERSION.tar.xz"
           echo "b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a  zig.tar.xz" | shasum -a 256 -c -
           mkdir -p "$RUNNER_TEMP/zig" && tar -xJf zig.tar.xz -C "$RUNNER_TEMP/zig" --strip-components=1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
@@ -361,7 +361,7 @@ jobs:
       - name: Zig e strumenti
         run: |
           set -euo pipefail
-          curl -fsSL -o zig.zip "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-windows-$ZIG_VERSION.zip"
+          curl -fsSL --retry 6 --retry-delay 20 --retry-all-errors -o zig.zip "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-windows-$ZIG_VERSION.zip"
           echo "b5663f69581dcf391293fbf16c06cb80d81d806545ce618b4d0bab7f0eb8c428  zig.zip" | sha256sum -c -
           unzip -q zig.zip -d "$RUNNER_TEMP"
           echo "$(cygpath -w "$RUNNER_TEMP/zig-x86_64-windows-$ZIG_VERSION")" >> "$GITHUB_PATH"
