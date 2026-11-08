@@ -1,7 +1,7 @@
 # Prove manuali su hardware fisico
 
 La CI prova Windows e macOS su **macchine virtuali**: niente GPU fisica sul runner
-Windows, GPU paravirtuale sul Mac, scheda audio virtuale (Scream) su Windows, nessun
+Windows, GPU paravirtuale sul Mac, scheda audio virtuale (VB-CABLE) su Windows, nessun
 utente. Queste prove coprono quello che solo una macchina vera può dire. Ognuna ha un
 esito atteso preciso: se l'esito è diverso, annotare cosa si è visto e il log.
 

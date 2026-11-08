@@ -1,327 +1,277 @@
-# Zuer 1.0.0 — note di rilascio
+# Zuer 1.1.0 — note di rilascio
 
-Versione stabile, tag `v1.0.0`. Zicro al commit di `.github/zicro.ref` (`65cfc86`,
-`main` di Zicro). Ogni affermazione qui sotto dice **come** è stata verificata:
+Versione stabile, tag `v1.1.0`: parità funzionale di Windows x64 e macOS arm64 con Linux.
+Zicro al commit di `.github/zicro.ref` (`f5e0bac`, `main` di Zicro). Le note della 1.0.0
+sono in [RELEASE-1.0.0.md](RELEASE-1.0.0.md).
 
-- **verificato**: provato su questa macchina, con lo script indicato;
+Ogni affermazione dice come è stata verificata, con le stesse parole di RELEASE-1.0.0.md:
+
+- **verificato**: provato su questa macchina Linux, con lo script indicato;
 - **CI**: provato da GitHub Actions su un runner vero della piattaforma (macchina
-  virtuale: niente GPU fisica, niente utente), con le prove indicate;
-- **guasto iniettato / simulato**: la reazione di Zuer è provata, l'evento vero no;
-- **non verificato**: non provato; può funzionare, nessuna garanzia;
-- **non supportato**: non funziona o non è previsto.
+  **virtuale**: Windows senza GPU, Mac con GPU paravirtuale, nessun utente);
+- **guasto iniettato**: la reazione di Zuer è provata, l'evento vero no;
+- **non verificato**: non provato su quel sistema; può funzionare, nessuna garanzia.
 
-Macchina di prova Linux: Intel HD Graphics 520 (Skylake GT2), Mesa 26.2.6, VA-API
-(libva 2.24), mpv 0.41, FFmpeg 9.0, PipeWire, CachyOS (kernel 7.3), Zig 0.17.0.
-Compositor: sway 1.12 headless (GLES2), KWin 6.8.2 `--virtual`, Weston headless.
+Nessuna funzione è stata provata su un PC Windows o un Mac **fisico**: le prove per farlo
+sono in [docs/prove-hardware.md](docs/prove-hardware.md), con il kit scaricabile da ogni
+run della CI.
 
-## Novità rispetto a 1.0.0-rc.1
+## Cosa cambia rispetto a 1.0.0
 
-- **Vulkan facoltativo ovunque.** Nessun binario importa più `vulkan-1.dll` /
-  `libvulkan.so.1`: il loader si apre a runtime (`src/renderer/vk_loader.zig`; su
-  Windows solo dalla cartella dell'app e da System32, mai dalla cartella corrente)
-  e ogni condizione ha il suo errore: loader assente o non valido, nessun driver,
-  istanza, enumerazione, nessuna GPU, nessuna coda grafica, device. Senza Vulkan
-  Zuer parte e al posto di un modello 3D mostra il motivo. Device perso durante
-  l'uso: il renderer si ricostruisce e il file si ricarica; dopo 2 perdite resta
-  spento. In rc.1 su Windows senza loader l'app non partiva nemmeno per il testo.
-- **macOS arm64 completo**: PDF con CoreGraphics (di sistema), video con FFmpeg LGPL
-  nel bundle e decodifica VideoToolbox, audio con AudioQueue (Zicro), 3D con
-  MoltenVK nel bundle. Le librerie si aprono a runtime: se mancano, la funzione
-  si spegne con un messaggio, l'app no. In rc.1 il pacchetto macOS apriva solo
-  testo, tabelle, immagini e archivi.
-- **Office ovunque**: il plugin (DOCX, XLSX/XLSM, PPTX, ODT, ODS, ODP; Zig puro) è
-  ora anche nei pacchetti macOS e Windows, con le associazioni dei file.
-- **Correzioni trovate dalle prove sui runner veri**:
-  - macOS: aprendo un PDF, un video o un modello 3D l'app moriva (AppKit,
-    "transaction must be valid"): il ridimensionamento della finestra partiva dal
-    thread di decodifica. Ora va sempre sul main thread (Zicro `65cfc86`).
-  - Linux e Windows: con un guasto Vulkan dopo la creazione dell'istanza
-    (enumerazione, device) la GUI andava in SIGSEGV leggendo un'immagine vuota
-    nell'istante fra l'errore e il messaggio sostitutivo. Corretto.
-  - macOS: una pagina PDF Letter a 150 dpi usciva di una riga più alta (1651
-    invece di 1650 pixel) per un errore di arrotondamento.
-- **`feature-probe`** (strumento di prova, non distribuito) e prove reali nella CI
-  di macOS e Windows (sotto, "Verifiche").
+### PDF su Windows (prima: non supportato)
 
-## Già in rc.1, rispetto a `main` (1234c9e)
+- Motore **PDFium** (`pdfium.dll` nell'installer, build `bblanchon/pdfium-binaries`
+  `chromium/8111`, sha256 fissato in `scripts/fetch-pdfium.sh`, V8/XFA esclusi e
+  controllati). Caricata a runtime con `LoadLibraryExW` dalla cartella dell'app, mai
+  dalla cartella corrente; senza la DLL il PDF dice "pdfium.dll assente o non valida:
+  reinstalla Zuer" e il resto funziona. PDFium non è rientrante: ogni chiamata passa da
+  un lock.
+- Stesse prove sulle tre piattaforme (`scripts/pdf-check.sh`): pagine, pagina ruotata
+  (`/Rotate 90` → 1650×1275), pagina oltre la fine (clamp), percorso non ASCII, colore
+  di un pixel (ordine dei canali), JPEG dentro il PDF, file danneggiato, file non PDF,
+  pagina di 14 400 pt ("pagina troppo grande"). Un PDF cifrato dà "documento protetto
+  da password" (codice presente su PDFium e CoreGraphics, **non** coperto dalle prove).
+- PDFium contro poppler sullo stesso PDF (sotto Wine): stesse dimensioni, 0,2% di pixel
+  diversi (antialiasing).
+- `.pdf` associato all'installazione Windows.
+- Linux: poppler, su una pagina enorme, rendeva in silenzio un'immagine 1×1 (e la
+  metteva in cache): ora è l'errore "pagina troppo grande", e la cache ignora le voci 1×1.
 
-**Video**
-- Sorgenti malformate (MPEG-TS senza indice, troncati, rumore, vuoti): l'apertura
-  fallisce o parte in ~0,3 s invece di 20 s di attesa; la chiusura dopo un'apertura
-  fallita non aspetta più 1 s; un TS minuscolo in loop non gira più a vuoto (95% → 0,6%
-  di CPU). Il loop si spegne solo per il file che non si riposiziona.
-- Decoder hardware che cede a metà riproduzione: mpv passa al software e Zuer
-  riparte dall'ultimo keyframe; il blocco dell'immagine scende da 1,7 s a 0,6 s (GOP
-  1 s) e da 7,1 s a 0,9 s (GOP 5 s).
-- Contesto GPU perso (reset del driver): contesto EGL robusto dove il driver lo
-  offre; il motore perso viene distrutto e rifatto alla stessa posizione, play/pausa
-  conservati. Prima restava rotto per tutti i video successivi.
-- Controlli sopra il piano dmabuf: una ricomposizione costa 3,4 ms invece di 13,5;
-  CPU di Zuer a controlli visibili 33–35% → 27–29% (1080p60).
+### Immagini: stesso motore ovunque
 
-**Apertura dei file**
-- FIFO e file speciali rifiutati con un messaggio. Prima una FIFO bloccava il
-  decoder e, col nome di un video, impediva all'app di chiudersi.
-- Plugin cercati solo accanto all'eseguibile (`<exe>/decoders`, `<exe>`,
-  `<exe>/../lib`), mai nella cartella corrente.
+Prima WebP e SVG su Windows e macOS passavano da ImageMagick, che sul pacchetto non c'è
+(e su Windows `convert.exe` è un comando di sistema che converte i dischi).
 
-**Rilascio**
-- `zuer --version` e `zuer-gui --version`; `install.sh --uninstall`; il desktop
-  entry dichiara `StartupWMClass=it.zuer.gui`, uguale all'`app_id` della finestra.
-- Pacchetti macOS arm64 e Windows x64 costruiti e verificati da GitHub Actions
-  (`.github/workflows/release.yml`); FFmpeg per Windows su una build LGPL, con
-  licenza e riferimenti al sorgente nell'installer.
-
-## Dipendenze a runtime (Linux)
-
-Obbligatorie: `wayland-client`, EGL + OpenGL, GBM (Mesa), PipeWire, ALSA
-(`libasound`), harfbuzz, FFmpeg (libavformat/codec/util, swscale, swresample).
-
-Facoltative, caricate solo al bisogno:
-
-| Libreria / programma | Se manca |
-|---|---|
-| `libvulkan.so.1` (+ driver) | niente modelli 3D, con il motivo a schermo; il resto funziona |
-| `libmpv.so.2` | il video usa il decoder libav: niente piano dmabuf, frame copiati in CPU |
-| `libva` (+ driver VA-API) | niente sonda dei codec hardware; mpv decide da sé |
-| `pdftoppm`, `pdfinfo` (poppler) | i PDF non si aprono (i documenti office non hanno dipendenze) |
-| ImageMagick (`convert`) | i formati immagine rari (HEIC, AVIF, TIFF…) non si aprono |
-| `libwebp` | WebP non si apre |
-| `yt-dlp` | i link YouTube non si aprono |
-
-## Diagnostica
-
-- `ZUER_TRACE=1`: avvio e fine del motore video, contesto GL (robusto o no), percorso
-  di presentazione (dmabuf o readback) e perché, ricomposizioni dell'overlay al
-  secondo e quanto costano, riga "fine sessione" (frame, persi, pacing, A/V).
-- `zuer --json <file>`: decodifica col codice della GUI e stampa il risultato.
-- Vulkan: il motivo per cui il 3D è spento è a schermo e nel log
-  (`init renderer Vulkan fallita: <errore>`). `ZUER_VULKAN_LOADER=<percorso>` usa un
-  loader preciso; `ZUER_VULKAN_LOADER=none` simula un sistema senza Vulkan.
-- Crash: il log va in `~/.cache/zuer/crash.log`. Al **riavvio successivo** Zuer apre
-  il browser su una issue GitHub precompilata (`postadelmaga/Zuer`) con la coda del
-  log; l'utente la rivede e decide se inviarla. Nulla parte da solo, salvo un
-  endpoint configurato con `ZUER_CRASH_URL`. Disattivazione totale:
-  `ZUER_NO_CRASH_REPORT=1`; niente browser: `ZUER_CRASH_NO_BROWSER=1`.
-
-## Piattaforme
-
-| Piattaforma | Build | Prove dinamiche |
+| Formato | Come | Dove |
 |---|---|---|
-| Linux x86_64, Intel + Mesa, VA-API | ✅ | ✅ verificato: suite completa (sotto) |
-| Linux, decodifica solo software | ✅ | ✅ verificato: `ZUER_MPV_OPTS=hwdec=no`, ripiego hw→sw |
-| Linux senza piano dmabuf (readback) | ✅ | ✅ verificato: `ZUER_VIDEO_PLANE=0` |
-| Linux senza libmpv (solo libav) | ✅ | ⚠️ verificato solo in parte (`ZUER_NO_MPV=1`) |
-| Linux senza Vulkan / senza driver | ✅ | ✅ verificato: `scripts/vulkan-fallback-check.sh` |
-| sway (wlroots) | — | ✅ verificato, headless |
-| KWin (Plasma 6) | — | ⚠️ `--virtual`, 2 monitor, scala 1,25: verificato; sessione Plasma reale **non verificata** |
-| Weston | — | ⚠️ headless pixman/gl: si apre e riproduce; lento (GL software) |
-| GNOME/Mutter | — | ❓ non verificato |
-| GPU AMD | — | ❓ non verificato |
-| NVIDIA (driver proprietario) | — | ❓ **non verificato**: ripiego glFinish previsto, mai provato |
-| Windows x64 | ✅ nativo (CI `windows-2022`) | ✅ CI: installer, import dei binari, office, video (software, seek), GUI viva senza loader Vulkan e con loader senza driver, Vulkan funzionante (lavapipe, **software**), perdita del device, disinstallazione. ❓ **non verificati**: GPU fisica, decodifica hardware, audio (il runner non ha uscita audio), uso interattivo |
-| macOS arm64 | ✅ nativo (CI `macos-15`, Apple Silicon) | ✅ CI: bundle (arm64, dipendenze, rpath, licenze, firma ad-hoc), PDF con rotazione, office, VideoToolbox H.264/HEVC con seek, audio AudioQueue (orologio che avanza), 3D MoltenVK su Metal (GPU paravirtuale del runner), GUI viva con ogni tipo di file. ❓ **non verificati**: un Mac fisico, qualità audio e sincronia A/V, uso interattivo, Gatekeeper con un download vero |
-| macOS x86_64 | ✅ cross-compilato | ⛔ nessun pacchetto distribuito |
-| Android aarch64 (`libzuer.so`) | ✅ cross-compilato | ❓ non verificato |
-| Web | — | ⛔ non supportato (nessun target) |
+| PNG, JPEG, GIF, BMP, TGA, PSD, HDR, PIC, PNM | stb_image, in processo | ovunque |
+| WebP (anche il primo frame degli animati) | libwebp 1.5.0 compilata dal sorgente (dipendenza Zig) | ovunque |
+| SVG, SVGZ | `rsvg-convert` se c'è (Linux), altrimenti nanosvg | ovunque |
+| ICO (voci PNG e DIB con maschera) | parser in Zig | ovunque |
+| TIFF, HEIC/HEIF, AVIF | codec di sistema: ImageIO (macOS), WIC (Windows); ImageMagick su Linux | ovunque, con limiti sotto |
+
+- Orientamento EXIF dei JPEG (8 orientamenti), trasparenza composta su bianco, tetto di
+  150 megapixel letto dall'header **prima** di decodificare.
+- Windows: AVIF e HEIC richiedono le estensioni gratuite dello Store ("AV1 Video
+  Extension", "HEIF Image Extensions" + "HEVC Video Extensions"); senza, il messaggio
+  dice quale installare.
+- `scripts/image-check.sh` con un corpus nel repository (`tests/images`): dimensioni,
+  colore di pixel precisi (trasparenza, orientamento, ICO, SVG), file troncati, vuoti,
+  spazzatura, immagine oltre il tetto.
+
+### Audio
+
+- **Windows: WASAPI** (modo condiviso, conversione di formato di sistema, evento) al
+  posto di waveOut, che resta come ripiego (`ZICRO_AUDIO=waveout`). Latenza reale dal
+  dispositivo (padding + latenza del flusso); cambio del dispositivo predefinito seguito
+  (`IMMNotificationClient`); dispositivo perso o servizio riavviato → il flusso si
+  riapre; senza alcun dispositivo i blocchi si scartano dopo un'attesa limitata, il
+  player non si blocca.
+- **macOS: latenza reale anche da AudioQueue** (campioni inviati meno la posizione di
+  `AudioQueueGetCurrentTime`).
+- Effetto: l'orologio audio su cui si sincronizza il video. Prima Windows e macOS
+  usavano una stima fissa di 30 ms contro una coda reale fino a ~160 ms: il video andava
+  avanti rispetto all'audio. Sotto Wine, stessa traccia muta: WASAPI 31 ms **dietro** il
+  tempo reale (giusto: è la latenza hardware), waveOut 124 ms **avanti** (sbagliato).
+  `feature-probe audio` ora fallisce se l'orologio supera il tempo trascorso di oltre
+  50 ms dove il backend riporta la latenza.
+
+### Video
+
+- **Windows: decodifica hardware D3D11VA** (prima solo software), con la stessa sonda
+  del primo frame, lo stesso trasferimento GPU→CPU e lo stesso ripiego al software di
+  VideoToolbox su macOS.
+- **Ripiego hw→sw a metà riproduzione** (player libav: Windows, macOS, Linux senza mpv):
+  prima ripartiva da dove capitava; ora torna al keyframe precedente e scarta i frame
+  fino all'ultimo mostrato: nessun salto né frame ripetuto. Guasto iniettabile con
+  `ZUER_TEST_HWFAIL_AFTER=N`.
+- **macOS: AV1 in software** con dav1d 1.5.4 (BSD-2-Clause) collegato staticamente in
+  libavcodec; prima AV1 si apriva solo dove VideoToolbox lo decodifica (M3 e successivi).
+
+### Office
+
+Provato con documenti veri (`tests/office`: dai test di Apache POI e LibreOffice, più i
+casi dei loro fuzzer; vedi `tests/office/SOURCES.md`). Trovati e corretti:
+
+- fogli scritti col prefisso di namespace (`<x:row>`, come fa l'OpenXML SDK di
+  Microsoft): risultavano vuoti;
+- stringhe inline a più run: restava solo il primo;
+- riferimenti numerici (`&#10;`, `&#x1F61C;`) lasciati letterali in XLSX, DOCX, PPTX, ODT;
+- Office cifrato con password, o DOC/XLS/PPT rinominato (contenitore OLE): ora un
+  messaggio chiaro invece di "NotAZipFile".
+
+### Prestazioni e memoria
+
+- GUI su Linux: soglia `mmap` di glibc fissa a 256 KB. Quella dinamica mandava i buffer
+  di decodifica nelle arene dei thread worker, dove restavano frammentati: RSS di
+  navigazione 88 MB → 51 MB, in riproduzione 1080p60 282 → 226 MB.
+- Tre peggioramenti introdotti dal ramo e trovati dal confronto con 1.0.0 (canali alfa
+  sempre a 4, copia dei WebP, ricerca dei tag XLSX) sono stati tolti prima della fine:
+  tabella sotto.
+
+## Matrice di parità
+
+Legenda: **I** implementato · **C** compilato · **A** testato automaticamente (CI sulla
+piattaforma, o gate locale per Linux) · **H** testato su hardware fisico · **M**
+verificato manualmente. Linux: macchina di prova fisica (Intel HD 520), quindi H vale
+per quello che il gate esegue sul dispositivo vero.
+
+| Funzione | Linux | Windows x64 | macOS arm64 |
+|---|---|---|---|
+| Testo, codice, markdown, tabelle CSV | I C A H | I C A | I C A |
+| Office (DOCX, XLSX, PPTX, ODT, ODS) | I C A H | I C A | I C A |
+| PDF | I C A H (poppler) | I C A (PDFium) | I C A (CoreGraphics) |
+| Immagini comuni + WebP + SVG + ICO | I C A H | I C A | I C A |
+| HEIC, AVIF | I C A H (ImageMagick) | I C A (solo il messaggio senza estensioni Store; **con** le estensioni non provato) | I C A (ImageIO) |
+| Video, decodifica software | I C A H | I C A | I C A |
+| Video, decodifica hardware | I C A H (VA-API, mpv) | I C (D3D11VA: sul runner senza GPU si prova solo il ripiego) | I C A (VideoToolbox H.264/HEVC sul runner) |
+| Ripiego hw→sw a metà | I C A H (guasto iniettato) | I C A (guasto iniettato, software) | I C A (guasto iniettato su VideoToolbox) |
+| AV1 software | I C A H | I C A (FFmpeg BtbN) | I C A (dav1d) |
+| Audio: riproduzione e orologio | I C A H (PipeWire) | I C A (WASAPI su scheda virtuale) | I C A (AudioQueue) |
+| Audio: latenza reale nell'orologio | I C A H | I C A | I C A |
+| Audio: perdita del dispositivo / servizio | I C A H (in 1.0.0) | I C A (riavvio del servizio audio; rimozione fisica non provata) | I C (non provato) |
+| Audio: cambio del dispositivo predefinito | I C A H (in 1.0.0) | I C (non provato: una sola scheda sul runner) | I C (non provato) |
+| 3D (Vulkan) | I C A H | I C A (lavapipe, software) | I C A (MoltenVK su GPU paravirtuale) |
+| 3D senza Vulkan: messaggio, app viva | I C A H | I C A | I C A |
+| Installazione / disinstallazione | `install.sh` | I C A (installer per utente) | I C A (bundle, firma ad-hoc) |
+
+Nessuna cella è **M** o **H** per Windows e macOS: non c'è stato un PC o un Mac fisico.
 
 ## Verifiche
 
-### Linux (questa macchina)
+### Linux (questa macchina, gate finale sul codice del ramo)
 
-Gate sul codice di 1.0.0 (Zuer `platform-parity` + versione, Zicro `65cfc86`),
-sway headless, audio muto (sink nullo o `ao=null`). Fasi in serie, una build per
-volta (`-j1`): il gate precedente era stato fermato dalla memoria della macchina.
+Intel HD Graphics 520, Mesa 26.2, VA-API, mpv 0.41, FFmpeg 9.0, PipeWire, sway headless,
+audio muto. Test unitari con **cache vuota** (nessun "cached": eseguiti davvero).
 
-| Verifica | Esito | Cosa copre |
-|---|---|---|
-| build ReleaseFast | ok (picco 640 MB) | `zuer`, `zuer-gui`, plugin |
-| `zig build test` (Zuer) | ok | rilevamento formati, scheduler, miniature, cache mesh, scrim |
-| `zig build test` (Zicro) | ok | framework: paint, testo, audio, finestra |
-| `scripts/video-check.sh` | 36/36 | H.264/HEVC/VP9/senza audio/corto: apertura, pausa < 2% CPU, seek, thread giusti; TS malformati; hw→sw a metà; 100 cicli a caldo e 30 a freddo senza fd/thread in più |
-| `scripts/net-check.sh` | 24/24 | rete lenta, muta, che cade, che non risponde; chiusura con la rete ferma |
-| `scripts/video-sync-check.sh` | 300 schermate, 0 strappate | sincronia del piano dmabuf |
-| `scripts/gpu-reset-check.sh` | 5/5 | contesto perso (guasto iniettato): motore rifatto, video di nuovo a schermo, nessun fd/thread in più, protocollo Wayland pulito (`wayland_check.py`) |
-| `scripts/edge-check.sh` | 24/24 | 20 file limite in apertura, FIFO, plugin trovati da `/` |
-| `scripts/vulkan-fallback-check.sh` | 28/28 | Vulkan vero; loader assente, non valido, senza driver, guasti iniettati su istanza/enumerazione/nessuna GPU/device: errore distinto e GUI viva con cubo e testo; device perso una volta (ricostruito) e sempre (ripiego) |
-| `feature-probe` | ok | PDF (pagina ruotata 1650×1275), office, mesh, video (60 frame + seek, VA-API), render offscreen del cubo |
-| navigazione in GUI | 1000 cambi, nessuna crescita | ↓ ogni 250 ms in una cartella mista (testo, PDF, office, 3D, 3 video): RSS 50–54 MB, fd 18, thread 7 dal centesimo al millesimo cambio; Esc chiude in 329 ms |
+| Verifica | Esito |
+|---|---|
+| `zig build test` Zuer | 88/88 (nuovi: EXIF, parser XML office) |
+| `zig build test` Zicro | 172/172 |
+| `scripts/video-check.sh` | 36/36 |
+| `scripts/net-check.sh` | 24/24 |
+| `scripts/video-sync-check.sh` | 300 schermate, 0 strappate |
+| `scripts/gpu-reset-check.sh` | 5/5 |
+| `scripts/edge-check.sh` | 24/24 |
+| `scripts/vulkan-fallback-check.sh` | 28/28 |
+| `scripts/pdf-check.sh` | tutto ok (12 prove) |
+| `scripts/image-check.sh` | tutto ok (43 prove; 2 file corrotti nel gruppo "nessun crash, esito libero") |
+| `scripts/office-check.sh` | tutto ok (29 prove) |
+| `feature-probe` audio, video, hw→sw iniettato, gpu, pagine PDF | ok; hw→sw: 60 frame, pts continui (salto massimo 17 ms) |
+| navigazione GUI, 1000 cambi in cartella mista | RSS 51–52 MB costante, fd 18, thread 7; Esc chiude in 326 ms |
 
-Il primo giro del gate ha trovato il SIGSEGV dopo un guasto Vulkan (sopra,
-"Correzioni"), corretto prima del rilascio; la schermata del messaggio sostitutivo
-è stata controllata a vista.
+### macOS arm64 (CI, `macos-15`, Apple Silicon virtualizzato)
 
-**Già verificati in rc.1** (codice invariato da allora: video mpv, audio Linux):
-mutazioni di ogni correzione rc.1 (tolta di proposito, la sua verifica fallisce);
-audio sul dispositivo vero (Intel HDA, uscita muta con guardia e ripristino: 100 s
-misti e 280 s continui, nessun frame perso né duplicato, cambio e rimozione del
-dispositivo); 1000 aperture/chiusure a caldo, 100 a freddo, 200 con seek.
-
-### macOS arm64 (CI, runner `macos-15`, macOS 15.8, Apple Silicon virtualizzato)
-
-Pacchetto estratto in una cartella pulita; `feature-probe` dentro una copia del
-bundle (stessi plugin e librerie dell'app).
+Oltre alle prove di 1.0.0 (bundle, dipendenze, firma ad-hoc, office, 3D MoltenVK, GUI):
 
 | Prova | Esito |
 |---|---|
-| architettura di ogni binario e dylib | arm64 |
-| dipendenze dinamiche | solo `/usr/lib`, `/System/Library` o `@rpath` verso `Contents/Frameworks`; nessun rpath verso la macchina di build; `zuer-gui` non linka Vulkan né libav |
-| licenze nel bundle | `LICENSE`, `FFmpeg-LICENSE.txt` (LGPL), `FFmpeg-SOURCE.txt`, `MoltenVK-LICENSE.txt` (Apache-2.0) |
-| firma | ad-hoc, `codesign --verify --strict --deep` ok (nessun Developer ID, nessuna notarizzazione) |
-| PDF (CoreGraphics) | 3 pagine; pagina 2 con `/Rotate 90` resa 1650×1275 |
-| office | DOCX, XLSX (2 fogli), PPTX, ODT, ODS con il loro contenuto |
-| video | H.264 e HEVC: 60 frame 1280×720 con **VideoToolbox attivo**, seek |
-| audio | AudioQueue: orologio di riproduzione a 0,57 s dopo 400 ms (traccia muta) |
-| 3D | MoltenVK su "Apple Paravirtual device" (Metal): cubo renderizzato offscreen |
-| senza Vulkan | `ZUER_VULKAN_LOADER=none`: errore `VulkanLoaderMissing`, nessun crash |
-| GUI | finestra viva 6 s con testo, PDF, DOCX, XLSX, video, cubo, cubo senza Vulkan |
+| `pdf-check.sh` (CoreGraphics) | tutto ok, stessi valori di Linux; 3 aperture 122 ms |
+| `image-check.sh` (ImageIO per TIFF, HEIC, AVIF) | tutto ok, HEIC e AVIF compresi |
+| `office-check.sh` | tutto ok |
+| video H.264 e HEVC | VideoToolbox attivo, 60 frame, seek, pts continui |
+| AV1 (`libsvtav1`) | dav1d software, 60 frame, seek |
+| hw→sw iniettato su VideoToolbox | pts continui |
+| audio AudioQueue | orologio che avanza, latenza riportata ~7 700 frame (160 ms) |
 
-### Windows x64 (CI, runner `windows-2022`, nessuna GPU, nessun loader Vulkan)
+### Windows x64 (CI, `windows-2022`, nessuna GPU)
+
+Scheda audio: VB-CABLE, scheda **virtuale** installata solo sulla VM effimera della CI
+(vedi "Dipendenze").
 
 | Prova | Esito |
 |---|---|
-| import di `zuer-gui.exe` e di ogni DLL | nessuno importa `vulkan-1.dll`; ogni DLL importata è nel pacchetto o in System32 |
-| installazione silenziosa | file, voce di disinstallazione, `DisplayVersion`, associazione `.docx` |
-| office, mesh, testo | DOCX, XLSX, PPTX, ODT, ODS, OBJ, TXT con il loro contenuto |
-| video | decodifica software (il runner non ha GPU), 60 frame e seek |
-| senza loader Vulkan | GUI viva con testo, cubo, DOCX, video; il 3D dice `VulkanLoaderMissing` |
-| loader senza driver | `VulkanNoDriver`, GUI viva col cubo |
-| Vulkan funzionante (lavapipe, rasterizzatore **software** di Mesa) | cubo renderizzato offscreen e in GUI |
-| device perso (iniettato) | una volta: renderer ricostruito; sempre: ripiego, app viva |
-| disinstallazione | pulita (resta solo `uninstall.exe`, che si cancella dopo) |
-| audio | **non verificato**: il runner non ha un dispositivo di uscita |
+| file nel pacchetto | `pdfium.dll`, `PDFium-LICENSE.txt`, `decoder_pdf.dll`; `.pdf` associato |
+| `pdf-check.sh` (PDFium) | tutto ok, stessi valori di Linux; 3 aperture 250 ms |
+| `ZUER_PDFIUM=none` | messaggio "pdfium.dll assente o non valida" |
+| `image-check.sh` (WIC) | tutto ok; AVIF e HEIC: messaggio con l'estensione Store da installare (il runner non le ha) |
+| `office-check.sh` | tutto ok |
+| video | software (nessuna GPU: D3D11VA non provato), pts continui, seek |
+| WASAPI | dispositivo elencato; orologio che avanza, latenza 4 800 frame (100 ms) |
+| uscita reale | tono a 1 kHz catturato in loopback dal mix del dispositivo: RMS 0,062, tono 2·10¹⁰ volte sopra le frequenze vicine |
+| waveOut forzato | funziona |
+| orologio contro tempo reale | WASAPI +0,017 s (entro i 50 ms della latenza hardware non riportata); waveOut +0,12 s (stima fissa: solo avviso) |
+| riavvio del servizio audio durante la riproduzione | il flusso se ne accorge (7 tentativi di riapertura mentre il servizio riparte), ~0,2 s di vuoto, poi l'orologio riprende regolare |
+| rimozione fisica / cambio del predefinito | **non provati** (vedi "Prove non eseguibili") |
+| GUI con PDF e WebP, senza loader Vulkan, lavapipe, device perso | viva, come in 1.0.0 |
 
-### Benchmark (Linux, 1080p60 H.264, rc.1 contro 1.0.0)
+## Benchmark: 1.0.0 contro 1.1 (Linux)
 
-Build alternate, riscaldamento + 5 ripetizioni, due giri. **Carico di sistema alto
-durante le misure** (load average 3–5 per un'altra build sulla macchina, contro ~1
-delle misure di rc.1): i valori assoluti sono più rumorosi, il confronto fra le due
-build regge perché alternato.
+Stessa macchina, build `v1.0.0` (Zicro `65cfc86`) e `parity-1.1` alternate; mediane.
+Decodifica: processo `feature-probe` intero, 1 riscaldamento + 7 ripetizioni, cache su
+disco vuota a ogni giro. Carico medio ~1.
 
-| Misura | rc.1 | 1.0.0 |
+| Caso | 1.0.0 tempo / CPU / RSS | 1.1 tempo / CPU / RSS |
 |---|---|---|
-| CPU processo, piano dmabuf (media dei giri) | 11–14% | 11–22% |
-| CPU processo, readback | 72–92% | 90–91% |
-| RSS in riproduzione, dmabuf | 281 MB | 282 MB |
-| RSS in riproduzione, readback | 307–309 MB | 309–310 MB |
-| fd in riproduzione | 26 / 19 | 26 / 19 |
-| frame persi (slot dmabuf) | 0 | 0 |
-| seek (60 per build, alternate) | mediana 99 ms, media 110, p90 154 | mediana 107 ms, media 115, p90 152 |
-| apertura a caldo (mediana di 5 × 50) | 94 ms | 91 ms |
-| apertura a freddo (mediana di 5 × 10) | 242 ms | 242 ms |
+| JPEG 24 MP | 346 ms / 339 ms / 147 MB | 324 / 321 / 149 |
+| PNG 12 MP | 310 / 308 / 79 | 311 / 309 / 80 |
+| WebP 4K | 90 / 89 / 26 | 87 / 86 / 27 |
+| SVG | 16 / 16 / 18 | 16 / 16 / 18 |
+| HEIC 12 MP | non supportato | 2 934 / 3 462 / 212 (ImageMagick) |
+| PDF pagina 1, a freddo | 68 / 68 / 29 | 69 / 68 / 29 |
+| PDF con foto, a freddo | 69 / 68 / 30 | 69 / 68 / 30 |
+| XLSX 20 000 × 8 | 72 / 71 / 28 | 70 / 69 / 29 |
+| DOCX, ODT | 3 / 3 / 16 | 3 / 3 / 16 |
+| video 1080p60 libav: 60 frame + seek | 1 733 / 1 590 / 427 | 1 685 / 1 558 / 431 |
 
-Il percorso video Linux (mpv, piano dmabuf, audio) non è cambiato fra rc.1 e 1.0.0:
-le differenze stanno nel rumore del carico. Misure a macchina scarica: quelle di
-rc.1 (CPU dmabuf 25%, readback 70%, apertura a caldo 80 ms, a freddo 168 ms).
+GUI (`scripts/video-bench-gui.sh`, H.264 1080p60, 5 × 12 s per build, due giri):
 
-## Distribuzione
+| Misura | 1.0.0 | 1.1 |
+|---|---|---|
+| CPU processo, piano dmabuf | 25% | 25% |
+| CPU processo, readback | 75–77% | 74–76% |
+| RSS in riproduzione, dmabuf | 282 MB | 226 MB |
+| RSS in riproduzione, readback | 305–309 MB | 255 MB |
+| frame persi / scartati da mpv in 10 s | 0 / 0–1 | 0 / 0 |
+| seek (30 per build, zuer-video-bench) | mediana 90 ms, media 93 | mediana 82 ms, media 87 |
+| apertura a caldo / a freddo | 63–87 / 170–184 ms | 61–86 / 174–185 ms |
+| navigazione 300 cambi, stessa cartella | RSS 57–72 MB | RSS 51 MB |
 
-I pacchetti sono costruiti da GitHub Actions (`.github/workflows/release.yml`) al
-push del tag, e allegati alla GitHub Release del tag con `SHA256SUMS` e
-`manifest.json` (versione, commit di Zuer e Zicro, architettura, sha256). Il
-workflow pubblica solo se il tag punta al commit costruito e si chiama
-`v<versione di build.zig.zon>`; rilanciato sullo stesso tag aggiorna la release
-solo se è dello stesso commit.
+Su Windows e macOS non ci sono misure confrontabili: i runner sono virtuali e
+condivisi. I tempi PDF della CI (3 aperture, processo intero) sono indicativi.
 
-| Sistema | Architettura | Artefatto | Costruito su |
-|---|---|---|---|
-| macOS 13 o successivo | Apple Silicon (arm64) | `zuer-<versione>-macos-arm64.tar.gz` (`Zuer.app`, ~25 MB di cui 20 MB in `Contents/Frameworks`: FFmpeg, MoltenVK) | `macos-15`, arm64 nativo |
-| Windows 10/11 | x64 | `zuer-<versione>-windows-x64-setup.exe` | `windows-2022` |
-| Linux | x64 | dai sorgenti: `zig build` + `install.sh` | — |
+## Dipendenze nuove
 
-Non ci sono pacchetti macOS Intel, universali o Windows ARM.
+| Componente | Dove | Licenza | Peso | Note di sicurezza |
+|---|---|---|---|---|
+| PDFium `chromium/8111` (bblanchon/pdfium-binaries) | installer Windows | BSD-3-Clause + licenze dei componenti (FreeType, libjpeg-turbo, OpenJPEG, zlib, ICU…) in `PDFium-LICENSE.txt` | `pdfium.dll` 7,6 MB | sha256 fissato; build senza V8 né XFA (verificato da `args.gn`); caricata solo dalla cartella dell'app |
+| libwebp 1.5.0 | compilata nel plugin immagini, ogni piattaforma | BSD-3-Clause | plugin immagini senza simboli 142 KB → 573 KB (libwebp, nanosvg, formati stb in più insieme); `decoder_image.dll` 729 KB | tarball del tag ufficiale, hash Zig in `build.zig.zon` |
+| nanosvg (commit `5cefd98`) | `vendor/nanosvg`, plugin immagini | zlib | header-only | file e tetti di dimensione nel parser di Zuer (64 MB di testo, lato massimo del raster) |
+| dav1d 1.5.4 (`54706fc`) | statico in libavcodec, bundle macOS | BSD-2-Clause | non misurato a parte (dentro `libavcodec`; la libreria Homebrew intera è ~1 MB) | compilato dal sorgente al commit fissato; licenza in `FFmpeg-LICENSE.txt` |
+| VB-CABLE 4.3 | **solo CI Windows**, VM effimera | donationware (uso libero, ridistribuzione integrata vietata) | — | non è una dipendenza di Zuer e non entra nei pacchetti; zip fissato per sha256 |
+| devcon (dallo zip di Scream 4.0) | **solo CI Windows** | MS-PL | — | zip fissato per sha256 |
 
-**Verifica del download**: nella cartella dei file scaricati,
-`sha256sum -c SHA256SUMS --ignore-missing` (Linux/Git Bash) oppure
-`shasum -a 256 -c SHA256SUMS` (macOS); su Windows anche
-`Get-FileHash .\zuer-…-setup.exe -Algorithm SHA256` e confronto a mano.
+Tutte compatibili con AGPL-3.0-or-later per i componenti distribuiti (PDFium, libwebp,
+nanosvg, dav1d). Nessun servizio cloud.
 
-**macOS**: estrarre l'archivio e trascinare `Zuer.app` in Applicazioni. Il pacchetto
-**non è firmato con un Developer ID né notarizzato** (nessun certificato Apple
-Developer): al primo avvio Gatekeeper lo blocca; tasto destro → Apri, oppure
-`xattr -dr com.apple.quarantine /Applications/Zuer.app`. La firma è solo ad-hoc,
-obbligatoria su arm64 per avviarsi, e non identifica l'autore. Apre testo, codice,
-markdown, tabelle, immagini, archivi, PDF (CoreGraphics), documenti office, video e
-audio (FFmpeg LGPL e VideoToolbox) e modelli 3D (MoltenVK): le librerie stanno in
-`Zuer.app/Contents/Frameworks`, licenze e sorgente in `Contents/Resources`. Senza
-GPU Metal il 3D si spegne con un messaggio. Disinstallazione: cancellare
-`Zuer.app` (cache in `~/.cache/zuer`).
+## Prove non eseguibili qui, e perché
 
-**Windows**: eseguire l'installer. Installa per l'utente corrente (nessun permesso
-di amministratore) in `%LOCALAPPDATA%\Programs\Zuer`, aggiunge il menu Start e
-"Apri con" senza cambiare le app predefinite. L'installer **non è firmato**:
-SmartScreen avvisa ("Ulteriori informazioni" → "Esegui comunque").
-Disinstallazione da Impostazioni → App installate, o `uninstall.exe` nella
-cartella; in silenzio: `zuer-…-setup.exe /S`, `uninstall.exe /S`. Il video usa le
-DLL FFmpeg incluse (LGPL, build BtbN: vedi `FFmpeg-SOURCE.txt` nella cartella).
-Vulkan non è un requisito: senza loader o senza driver Zuer parte e solo i modelli
-3D non si vedono, con il motivo a schermo. **I PDF non sono supportati su Windows**
-(nessun motore PDF incluso); i documenti office sì.
+- **Qualsiasi cosa su un PC Windows o un Mac fisico**: nessuna macchina disponibile.
+  Procedura ripetibile: [docs/prove-hardware.md](docs/prove-hardware.md).
+- **D3D11VA vero**: il runner Windows non ha GPU; sotto Wine D3D11VA non c'è e Zuer
+  ripiega sul software (provato). Il codice condivide sonda e ripiego con VideoToolbox,
+  provato davvero sul runner macOS.
+- **Qualità audio e sincronia A/V percepita**: i runner non hanno altoparlanti; l'audio
+  della CI va su una scheda virtuale (Windows) o su quella del runner (macOS).
+- **3D su GPU vera** Windows e macOS: lavapipe (software) e GPU paravirtuale Apple.
+- **HEIC/AVIF su Windows con le estensioni Store**: il runner non le ha e non si
+  installano senza account Store.
+- **Rimozione fisica del dispositivo audio e cambio del predefinito su Windows**: la
+  scheda virtuale della CI non si rimuove né si disattiva senza riavvio (pnputil: 194), e
+  disattivare l'endpoint non invalida un flusso aperto (provato: 0 riaperture). Si prova
+  solo il riavvio del servizio audio, che il flusso vede e da cui riparte. Un primo
+  tentativo con la disattivazione dell'endpoint "passava" senza provare nulla: la prova
+  ora esige che la riapertura sia avvenuta.
+- **Rimozione del dispositivo audio su macOS**: nessun modo di simularla sul runner.
 
-**Licenze nei pacchetti**: `LICENSE` (AGPL-3.0-or-later) in entrambi; FFmpeg
-(LGPL) con `FFmpeg-LICENSE.txt` e `FFmpeg-SOURCE.txt` (commit FFmpeg
-`5d85b7bfb2b024fd367ae3a938b4ac46a39e3a26` e indirizzi del sorgente: su macOS
-compilato da quel commit con `scripts/build-ffmpeg-macos.sh`, librerie dinamiche
-sostituibili); su macOS MoltenVK (Apache-2.0) con `MoltenVK-LICENSE.txt`. Il
-sorgente di Zuer per ogni versione è il tag su GitHub; quello di Zicro è il commit
-in `.github/zicro.ref`.
+## Problemi residui
 
-### Fare una nuova versione
-
-1. Su `main`, aggiornare `.version` in `build.zig.zon` (es. `1.0.1`) e
-   `android:versionName`; se Zicro è cambiato, il suo commit (già su GitHub) in
-   `.github/zicro.ref`.
-2. Gate locale, una fase per volta: `zig build test` (Zuer e Zicro),
-   `scripts/video-check.sh`, `net-check.sh`, `video-sync-check.sh`,
-   `gpu-reset-check.sh`, `edge-check.sh`, `vulkan-fallback-check.sh`.
-3. Prova del workflow senza pubblicare, **con il workflow del ramo**:
-   `gh workflow run release.yml --ref main -f tag=main -f dry_run=true`.
-4. Tag annotato sul commit provato e push: `git tag -a v1.0.1 -m "…"`,
-   `git push origin v1.0.1`. Il workflow parte da solo e pubblica.
-5. Se serve rifarlo sullo stesso tag: `gh workflow run release.yml -f tag=v1.0.1`
-   (aggiorna la release solo se è dello stesso commit, senza duplicati).
-6. Se `fetch-ffmpeg-dlls.sh` dà 404, BtbN ha ritirato l'autobuild pinnato:
-   sceglierne uno recente come spiegato nello script, e portare lo stesso commit
-   in `scripts/build-ffmpeg-macos.sh` (le due piattaforme condividono l'ABI degli
-   header vendorati).
-
-## Limiti noti
-
-1. **Reset GPU e sospensione veri non provati.** La ripresa dopo un contesto perso
-   (video) e dopo un device Vulkan perso (3D) è provata solo per **guasto
-   iniettato**. Un reset vero del driver e un suspend/resume reale non sono stati
-   eseguiti. Senza contesto robusto (driver senza
-   `EGL_EXT_create_context_robustness` né EGL 1.5) la perdita non si vede: serve
-   riaprire il video.
-2. **Spegnendo il video col tasto `v`** l'audio passa dal motore mpv al player
-   Zicro. Sul dispositivo vero si ripete un tratto di 11–55 ms (un quanto del grafo
-   PipeWire), con un click. Riaccendendo il video la pausa è di ~85 ms.
-3. **Passaggio hw→sw a metà:** restano ~0,4 s di immagine ferma (mpv riprova i
-   backend hardware prima del software).
-4. **KWin importa i dmabuf in ritardo:** se rifiuta un buffer, il client non lo
-   sa e quel frame non compare. Su sway il rifiuto arriva e Zuer ripiega sul readback.
-5. **Readback a 1080p60** (senza piano dmabuf): ~70% di un core e ~2 frame scartati
-   da mpv ogni 10 s sulla HD 520.
-6. **Chiusura con la rete ferma:** fino a ~180 ms (attesa dell'interruzione di libav).
-7. **`install.sh`** rende Zuer l'applicazione predefinita per diversi tipi MIME e su
-   KDE prende Meta+Z. L'installer Windows invece non cambia i predefiniti.
-8. **Pacchetti non firmati**: nessun certificato Apple Developer ID né Windows
-   Authenticode. macOS: firma ad-hoc, nessuna notarizzazione (Gatekeeper chiede
-   conferma); Windows: SmartScreen avvisa. `manifest.json` dice `"signed": false`.
-9. **macOS e Windows provati su runner virtuali**, non su macchine fisiche: su
-   macOS la GPU è quella paravirtuale di Apple, su Windows il 3D è provato con
-   lavapipe (software). Mai provati con un utente, né su Windows l'audio e la
-   decodifica hardware.
-10. **macOS**: niente AV1 software (FFmpeg senza dav1d: solo dove VideoToolbox lo
-   decodifica, M3 e successivi); niente cache su disco delle pagine PDF né eviction
-   LRU delle cache (solo Linux); audio senza misura della latenza del dispositivo
-   (sincronia A/V meno precisa che su PipeWire, non misurata); 3D solo con una GPU
-   Metal.
-11. **Formati office binari** (DOC, XLS, PPT) non supportati su nessuna piattaforma;
-   **PDF non supportato su Windows**.
-12. **Aperture ~9 ms più lente di `main` 1234c9e** (misura di rc.1): costo del
-   caricare senza `start=0`, che rendeva inapribili i TS senza indice.
-
-## Licenza
-
-AGPL-3.0-or-later (`LICENSE`), come Zicro. Componenti di terze parti: vedi README.
+1. Su Windows **senza** le estensioni dello Store HEIC e AVIF non si aprono (messaggio
+   chiaro). Non c'è un decoder incluso per non aggiungere HEVC (brevetti) all'installer.
+2. waveOut (solo ripiego) resta con la latenza stimata: orologio ~0,1 s avanti.
+3. Su Linux HEIC passa da ImageMagick: 3 s per 12 MP.
+4. Cache su disco delle pagine PDF solo su Linux (su Windows e macOS il motore è in
+   processo e più veloce di poppler; non ce n'è bisogno per le prove fatte).
+5. Tutti i limiti di RELEASE-1.0.0.md restano, tranne quelli chiusi qui: PDF su Windows,
+   latenza audio su macOS, AV1 software su macOS, decodifica hardware su Windows
+   (implementata, non provata su GPU vera).

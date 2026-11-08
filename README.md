@@ -9,9 +9,8 @@ Gira su **Linux** (Wayland), **Windows** x64 (GDI) e **macOS** arm64 (Cocoa); il
 rendering 3D passa per Vulkan (MoltenVK su macOS), aperto a runtime e facoltativo; il
 video per **libmpv** su Linux (decodifica hardware, piano dmabuf del compositor) e per
 libav (FFmpeg) dove mpv manca, con VideoToolbox su macOS e D3D11VA su Windows. Versione
-**1.0.0**: cosa è verificato, cosa no e i limiti noti sono in [RELEASE.md](RELEASE.md);
-il lavoro per la 1.1.0 (parità Windows/macOS, non pubblicata) in
-[RELEASE-1.1.0.md](RELEASE-1.1.0.md). Le prove su macchine fisiche:
+**1.1.0**: cosa è verificato, cosa no e i limiti noti sono in [RELEASE.md](RELEASE.md)
+(la 1.0.0 in [RELEASE-1.0.0.md](RELEASE-1.0.0.md)). Le prove su macchine fisiche:
 [docs/prove-hardware.md](docs/prove-hardware.md).
 
 ---
@@ -146,7 +145,7 @@ in sync (office e PDF inclusi: il PDF usa `pdfium.dll`, installata accanto all'a
 | `ZUER_MPV_OPTS=k=v,…` | opzioni passate a mpv (es. `hwdec=no`, `ao=null` per i test muti) |
 | `ZUER_VIDEO_PLANE=0` | niente piano dmabuf: frame letti dalla GPU e composti in CPU |
 | `ZUER_NO_MPV=1` | video col solo decoder libav |
-| `ZUER_NO_CRASH_REPORT=1` | disattiva il report dei crash (vedi RELEASE.md) |
+| `ZUER_NO_CRASH_REPORT=1` | disattiva il report dei crash (vedi RELEASE-1.0.0.md) |
 | `ZUER_CRASH_NO_BROWSER=1` | report solo verso `ZUER_CRASH_URL`, mai il browser |
 | `ZUER_OPAQUE=1` | finestra **opaca** (BitBlt veloce) invece del vetro layered: utile per testare 3D/video fluidi **sotto Wine**, dove senza DWM il vetro va composto in software. Su Windows vero il DWM compone il vetro in GPU, quindi non serve |
 
