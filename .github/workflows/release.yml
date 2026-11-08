@@ -492,22 +492,13 @@ jobs:
           # Ripiego waveOut (forzato): continua a funzionare.
           ZICRO_AUDIO=waveout "$UDIR/feature-probe.exe" audio "$(W "$D/clip.mp4")"
           # Dispositivo rimosso a metà riproduzione e poi rimesso: la riproduzione riprende.
-          # Rimozione vera del dispositivo (come staccare una scheda USB) e nuovo arrivo:
-          # il flusso deve accorgersene (riaperture ≥ 1, lo esige audio-survive) e
-          # riprendere. Disattivare l'endpoint con pnputil NON basta: il flusso aperto
-          # continua (provato: 0 riaperture), e il device radice non si disattiva a caldo.
-          DEVCON="$(cygpath -u "$RUNNER_TEMP")/scream/Install/helpers/devcon-x64.exe"
-          VBINF="$(cygpath -w "$RUNNER_TEMP")\vbcable\vbMmeCable64_win7.inf"
-          RID="$(powershell -NoProfile -Command "(Get-PnpDevice -Class MEDIA | Where-Object FriendlyName -like '*VB-Audio*' | Select-Object -First 1).InstanceId" | tr -d '\r')"
-          echo "device VB-CABLE: $RID"; [[ -n "$RID" ]] || { echo "::error::device VB-CABLE non trovato"; exit 1; }
-          "$UDIR/feature-probe.exe" audio-survive "$(W "$D/tono.m4a")" 16 > survive.log 2>&1 & SP=$!
-          sleep 4
-          pnputil /remove-device "$RID" || { echo "::error::pnputil /remove-device fallito ($?)"; kill $SP; exit 1; }
-          sleep 3
-          "$DEVCON" install "$VBINF" VBAudioVACWDM || { echo "::error::reinstallazione VB-CABLE fallita"; kill $SP; exit 1; }
-          RC=0; wait $SP || RC=$?; tr -d '\r' < survive.log
-          [[ $RC == 0 ]] || { echo "::error::audio non ripreso dopo la rimozione del dispositivo"; exit 1; }
-          # Riavvio del servizio audio (aggiornamento driver, crash di audiodg).
+          # Perdita del dispositivo durante la riproduzione. Sul runner l'unico evento che
+          # invalida davvero il flusso è il riavvio del servizio audio: disattivare
+          # l'endpoint con pnputil lascia il flusso aperto (provato: 0 riaperture) e
+          # VB-CABLE non si rimuove né si disattiva senza riavvio (pnputil: 194). La
+          # rimozione fisica (USB, Bluetooth) è in docs/prove-hardware.md, sezione 2.
+          # Riavvio del servizio audio (aggiornamento driver, crash di audiodg): il flusso
+          # deve accorgersene (audio-survive esige almeno una riapertura) e riprendere.
           "$UDIR/feature-probe.exe" audio-survive "$(W "$D/tono.m4a")" 14 > survive2.log 2>&1 & SP=$!
           sleep 4
           powershell -NoProfile -Command "Restart-Service Audiosrv -Force" || { echo "::error::riavvio di Audiosrv fallito"; kill $SP; exit 1; }
