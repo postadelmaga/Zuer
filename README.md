@@ -9,7 +9,7 @@ Gira su **Linux** (Wayland), **Windows** x64 (GDI) e **macOS** arm64 (Cocoa); il
 rendering 3D passa per Vulkan (MoltenVK su macOS), aperto a runtime e facoltativo; il
 video per **libmpv** su Linux (decodifica hardware, piano dmabuf del compositor) e per
 libav (FFmpeg) dove mpv manca, con VideoToolbox su macOS e D3D11VA su Windows. Versione
-**1.1.1**: cosa cambia in [RELEASE.md](RELEASE.md); cosa è verificato, cosa no e i limiti noti in [RELEASE-1.1.0.md](RELEASE-1.1.0.md)
+**1.1.2**: cosa cambia in [RELEASE.md](RELEASE.md) (la 1.1.1 in [RELEASE-1.1.1.md](RELEASE-1.1.1.md)); cosa è verificato, cosa no e i limiti noti in [RELEASE-1.1.0.md](RELEASE-1.1.0.md)
 (la 1.0.0 in [RELEASE-1.0.0.md](RELEASE-1.0.0.md)). Le prove su macchine fisiche:
 [docs/prove-hardware.md](docs/prove-hardware.md).
 
