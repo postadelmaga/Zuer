@@ -62,6 +62,7 @@ mkdir -p "$APP/Contents/MacOS/decoders" "$APP/Contents/Resources"
 
 cp "$BIN/zuer-gui" "$APP/Contents/MacOS/"
 cp "$ROOT/LICENSE" "$APP/Contents/Resources/LICENSE" # AGPL-3.0-or-later
+cp "$ROOT/THIRD-PARTY-NOTICES.txt" "$APP/Contents/Resources/" # libwebp, nanosvg, TinySoundFont
 # I plugin accanto all'exe: il registro li scansiona in <exe_dir>/decoders.
 cp "$LIB"/libdecoder_*.dylib "$APP/Contents/MacOS/decoders/"
 

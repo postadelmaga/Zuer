@@ -46,6 +46,7 @@ find "$STAGE/bin" -name '*.pdb' -delete
 BIN="$STAGE/bin"
 [[ -f "$BIN/zuer-gui.exe" ]] || { echo "✗ zuer-gui.exe non prodotto"; exit 1; }
 cp "$ROOT/LICENSE" "$BIN/LICENSE.txt" # AGPL-3.0-or-later, installata accanto all'exe
+cp "$ROOT/THIRD-PARTY-NOTICES.txt" "$BIN/THIRD-PARTY-NOTICES.txt" # libwebp, nanosvg, TinySoundFont
 
 # makensis lavora nella cartella dello script .nsi: la staging gli arriva come percorso
 # RELATIVO a installer/, senza lettere di unità. Sotto Git Bash (runner Windows) il

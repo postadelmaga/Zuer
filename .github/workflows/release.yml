@@ -194,7 +194,7 @@ jobs:
           # Niente file di sviluppo nel pacchetto.
           if find "$APP" -type f \( -name '*.patch' -o -name '*.log' -o -name '*.pdb' -o -name '*.dSYM' -o -name '*.o' -o -name '*.a' -o -name '*.h' -o -name '*.pc' \) | grep -q .; then
             echo "::error::file di sviluppo nel bundle"; exit 1; fi
-          for f in LICENSE FFmpeg-LICENSE.txt FFmpeg-SOURCE.txt MoltenVK-LICENSE.txt; do
+          for f in LICENSE THIRD-PARTY-NOTICES.txt FFmpeg-LICENSE.txt FFmpeg-SOURCE.txt MoltenVK-LICENSE.txt; do
             [[ -f "$APP/Contents/Resources/$f" ]] || { echo "::error::$f assente"; exit 1; }; done
           grep -q 'GNU LESSER GENERAL PUBLIC LICENSE' "$APP/Contents/Resources/FFmpeg-LICENSE.txt"
           grep -q 'Apache License' "$APP/Contents/Resources/MoltenVK-LICENSE.txt"
@@ -396,8 +396,9 @@ jobs:
           ls -la "$B"
           if find "$B" -type f \( -name '*.patch' -o -name '*.log' -o -name '*.pdb' -o -name '*.lib' \) | grep -q .; then
             echo "::error::file di sviluppo nella staging"; exit 1; fi
-          for f in LICENSE.txt FFmpeg-LICENSE.txt FFmpeg-SOURCE.txt PDFium-LICENSE.txt pdfium.dll decoder_office.dll decoder_media.dll decoder_pdf.dll; do [[ -f "$B/$f" ]] || { echo "::error::$f assente"; exit 1; }; done
+          for f in LICENSE.txt THIRD-PARTY-NOTICES.txt FFmpeg-LICENSE.txt FFmpeg-SOURCE.txt PDFium-LICENSE.txt pdfium.dll decoder_office.dll decoder_media.dll decoder_pdf.dll; do [[ -f "$B/$f" ]] || { echo "::error::$f assente"; exit 1; }; done
           grep -q 'Copyright 2014 The PDFium Authors' "$B/PDFium-LICENSE.txt" || { echo "::error::licenza PDFium incompleta"; exit 1; }
+          grep -q 'Copyright (c) 2010, Google Inc' "$B/THIRD-PARTY-NOTICES.txt" || { echo "::error::nota di licenza di libwebp assente"; exit 1; }
           objdump -f "$B/zuer-gui.exe" | grep -q 'file format pei-x86-64' || { echo "::error::zuer-gui.exe non è PE x86-64"; exit 1; }
           # Ogni DLL importata: o è nel pacchetto, o è di sistema (System32). Vulkan
           # non è MAI importato: il loader si apre a runtime (src/renderer/vk_loader.zig).
@@ -459,7 +460,7 @@ jobs:
           rm -rf "$UDIR"
           "$SETUP" /S "/D=$DIR"
           ls -la "$UDIR"
-          for f in zuer-gui.exe uninstall.exe LICENSE.txt avformat-63.dll decoder_text.dll decoder_office.dll decoder_pdf.dll pdfium.dll PDFium-LICENSE.txt; do
+          for f in zuer-gui.exe uninstall.exe LICENSE.txt THIRD-PARTY-NOTICES.txt avformat-63.dll decoder_text.dll decoder_office.dll decoder_pdf.dll pdfium.dll PDFium-LICENSE.txt; do
             [[ -f "$UDIR/$f" ]] || { echo "::error::$f non installato"; exit 1; }; done
           reg query 'HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Zuer' | tee reg.txt
           grep -q "DisplayVersion.*$VERSION" reg.txt || { echo "::error::DisplayVersion errata"; exit 1; }
