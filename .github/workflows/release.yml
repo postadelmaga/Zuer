@@ -381,12 +381,17 @@ jobs:
           key: ffmpeg-windows-x64-${{ hashFiles('Zuer/scripts/build-ffmpeg.sh') }}
       - name: FFmpeg per l'installer (scripts/build-ffmpeg.sh)
         working-directory: Zuer
+        # Shell di MSYS2 come shell del passo: lanciata da Git Bash perderebbe
+        # l'ambiente (due runtime msys diversi).
+        shell: C:\msys64\usr\bin\bash.exe --login -eo pipefail {0}
+        env:
+          MSYSTEM: UCRT64
+          CHERE_INVOKING: "1"
         run: |
-          set -euo pipefail
           # Percorsi POSIX di MSYS2 (/d/a/…): configure e make non reggono "D:\…".
-          MSYSTEM=UCRT64 CHERE_INVOKING=1 /c/msys64/usr/bin/bash.exe -lc \
-            'R="$(cygpath -u "$RUNNER_TEMP")"; ZUER_FFMPEG_WORK="$R/ffmpeg-build" scripts/build-ffmpeg.sh windows "$R/ffmpeg"'
-          cat "$RUNNER_TEMP/ffmpeg/share/zuer/FFmpeg-SOURCE.txt"
+          R="$(cygpath -u "$RUNNER_TEMP")"
+          ZUER_FFMPEG_WORK="$R/ffmpeg-build" scripts/build-ffmpeg.sh windows "$R/ffmpeg"
+          cat "$R/ffmpeg/share/zuer/FFmpeg-SOURCE.txt"
       - name: Build e installer (scripts/build-windows-installer.sh)
         working-directory: Zuer
         run: |

@@ -25,6 +25,9 @@ FAIL=0; SKIP=0; N=0
 ENC=" $("$FF" -hide_banner -encoders 2>/dev/null | awk 'NR>10{print $2}' | tr '\n' ' ') "
 
 V="-f lavfi -i testsrc2=size=320x240:rate=30 -t 6"
+# Vorbis: libvorbis se c'è, altrimenti l'encoder nativo (sperimentale: -strict -2).
+pick() { local e; for e; do [[ "$ENC" == *" $e "* ]] && { echo "$e"; return; }; done; echo "$1"; }
+VORBIS="$(pick libvorbis vorbis)"
 A="-f lavfi -i anullsrc=r=48000:cl=stereo -t 6"
 
 gen() { # file encoder... -- argomenti ffmpeg
@@ -61,7 +64,7 @@ vid hevc10.mkv          libx265 -- $V -c:v libx265 -pix_fmt yuv420p10le -x265-pa
 vid av1-aac.mp4         libsvtav1 aac -- $V $A -c:v libsvtav1 -preset 12 -c:a aac -shortest
 vid av1-opus.webm       libsvtav1 libopus -- $V $A -c:v libsvtav1 -preset 12 -c:a libopus -shortest
 vid vp9-opus.webm       libvpx-vp9 libopus -- $V $A -c:v libvpx-vp9 -deadline realtime -c:a libopus -shortest
-vid vp8-vorbis.webm     libvpx libvorbis -- $V $A -c:v libvpx -deadline realtime -c:a libvorbis -shortest
+vid vp8-vorbis.webm     libvpx $VORBIS -- $V $A -c:v libvpx -deadline realtime -c:a $VORBIS -strict -2 -shortest
 vid h264-ac3.mkv        libx264 ac3 -- $V $A -c:v libx264 -pix_fmt yuv420p -c:a ac3 -shortest
 vid h264-eac3.mkv       libx264 eac3 -- $V $A -c:v libx264 -pix_fmt yuv420p -c:a eac3 -shortest
 vid h264-dts.mkv        libx264 dca -- $V $A -c:v libx264 -pix_fmt yuv420p -c:a dca -strict -2 -shortest
@@ -73,7 +76,9 @@ vid h264.m4v            libx264 -- $V -c:v libx264 -pix_fmt yuv420p -f mp4
 vid mpeg4-mp3.avi       mpeg4 libmp3lame -- $V $A -c:v mpeg4 -c:a libmp3lame -shortest
 vid divx3-mp3.avi       msmpeg4 libmp3lame -- $V $A -c:v msmpeg4 -c:a libmp3lame -shortest
 vid mjpeg-pcm.avi       mjpeg pcm_s16le -- $V $A -c:v mjpeg -c:a pcm_s16le -shortest
-vid theora-vorbis.ogv   libtheora libvorbis -- $V $A -c:v libtheora -c:a libvorbis -shortest
+# Theora non ha un encoder nativo (e la ffmpeg di Homebrew non ha libtheora): clip
+# fisso nel repository, generato con testsrc2 + anullsrc (tests/media/SOURCES.md).
+probe video "$(cd "$(dirname "${BASH_SOURCE[0]}")/../tests/media" && pwd)/theora-vorbis.ogv"
 # HLS (ripiego di yt-dlp): playlist e segmenti MPEG-TS, H.264 + AAC.
 mkdir -p "$D/hls"
 gen "$D/hls/playlist.m3u8" libx264 aac -- $V $A -c:v libx264 -pix_fmt yuv420p -g 30 -c:a aac -shortest \
@@ -89,7 +94,7 @@ aud mulaw.wav           pcm_mulaw -- $A -c:a pcm_mulaw -ar 8000 -ac 1
 aud ima.wav             adpcm_ima_wav -- $A -c:a adpcm_ima_wav
 aud msadpcm.wav         adpcm_ms -- $A -c:a adpcm_ms
 aud flac.flac           flac -- $A -c:a flac
-aud vorbis.ogg          libvorbis -- $A -c:a libvorbis
+aud vorbis.ogg          $VORBIS -- $A -c:a $VORBIS -strict -2
 aud flac.oga            flac -- $A -c:a flac -f ogg
 aud opus.opus           libopus -- $A -c:a libopus
 aud aac.m4a             aac -- $A -c:a aac
