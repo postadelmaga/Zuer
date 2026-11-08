@@ -544,6 +544,10 @@ fn renderWorker(
                 if (vs.decoder) |dec| {
                     const tf = videomod.videoFitRect(cur_w, cur_h, state.shared.static_w, state.shared.static_h);
                     dec.setTargetSize(tf.w, tf.h);
+                    // Video che riempie la finestra: i suoi angoli sono quelli della
+                    // finestra, da arrotondare come per ogni altro contenuto.
+                    const fills = tf.w + 1 >= cur_w and tf.h + 1 >= cur_h;
+                    dec.setCornerRadius(if (fills) win.contentCornerPx() else 0);
                 }
             }
             const new_frame = if (audio_only) blk: {
@@ -1046,6 +1050,11 @@ fn presentGpuFrame(ctx: *anyopaque, f: *const videomod.GpuFrame) bool {
     return w.presentDmabuf(4 + f.slot, f.fd, f.width, f.height, f.stride, f.fourcc, f.modifier);
 }
 
+fn gpuSupports(ctx: *anyopaque, fourcc: u32, modifier: u64) bool {
+    const w: *zrame.Window = @ptrCast(@alignCast(ctx));
+    return w.dmabufSupported(fourcc, modifier);
+}
+
 fn gpuSlotFree(ctx: *anyopaque, slot: u8) bool {
     const w: *zrame.Window = @ptrCast(@alignCast(ctx));
     return w.videoSlotFree(4 + slot);
@@ -1376,16 +1385,17 @@ pub fn main(init: std.process.Init) !void {
         .on_mouse = input.mouseCallback,
         .user = &gui_state,
         .style = gui_state_mod.minimalFrame(zrame.Style.fluent()),
-        // Il piano video (dmabuf) arriva già alla taglia del fit-rect: centrato a
-        // quella, coincide col frame che la GUI compone sopra (controlli, overlay).
-        .video_fit = .native,
+        // Il piano video (dmabuf) è scalato dal compositor al fit-rect, centrato:
+        // coincide col frame che la GUI compone sopra (controlli, overlay) anche
+        // quando la sua taglia di render è minore (sorgente piccola a schermo intero).
+        .video_fit = .contain,
     });
     defer win.deinit();
     // `ZUER_VIDEO_PLANE=0`: niente piano dmabuf, frame video sul percorso CPU
     // (diagnostica, o un compositor che lo accetta ma lo mostra male).
     if (comptime has_video) {
         const off = if (getenv("ZUER_VIDEO_PLANE")) |v| v[0] == '0' else false;
-        if (!off) videomod.setPresenter(.{ .ctx = win, .present = presentGpuFrame, .slot_free = gpuSlotFree, .hide = hideGpuVideo });
+        if (!off) videomod.setPresenter(.{ .ctx = win, .present = presentGpuFrame, .slot_free = gpuSlotFree, .hide = hideGpuVideo, .supports = gpuSupports });
     }
     // La navigazione con le frecce usa la finestra per animare il resize sul
     // contenuto. Impostata prima di `win.run()` (dove partono le callback).

@@ -94,6 +94,8 @@ pub const Presenter = struct {
     present: *const fn (ctx: *anyopaque, frame: *const GpuFrame) bool,
     slot_free: *const fn (ctx: *anyopaque, slot: u8) bool,
     hide: *const fn (ctx: *anyopaque) void,
+    /// Il compositor accetta un dmabuf di questo formato e modifier.
+    supports: *const fn (ctx: *anyopaque, fourcc: u32, modifier: u64) bool,
 };
 
 /// Contatori di una sessione GPU, stampati a fine sessione (`logSession`):
@@ -167,6 +169,9 @@ pub const VideoDecoder = struct {
     // il produttore scala i frame direttamente a questa dimensione (0 = ignota).
     target_w: std.atomic.Value(u32) = .init(0),
     target_h: std.atomic.Value(u32) = .init(0),
+    /// Raggio degli angoli della finestra sul rettangolo `target` (pixel fisici, bit
+    /// di un f32): il piano video li ritaglia da sé (vedi `setCornerRadius`).
+    corner_bits: std.atomic.Value(u32) = .init(0),
     // Seek richiesto (ms, -1 = nessuno). Il consumatore bumpa `gen` e lo imposta;
     // il thread riposiziona il motore e adotta la nuova `gen`.
     seek_ms: std.atomic.Value(i64) = .init(-1),
@@ -380,6 +385,14 @@ pub const VideoDecoder = struct {
         self.target_w.store(w, .monotonic);
         self.target_h.store(h, .monotonic);
         self.cmd_wake.notify(); // mpv: in pausa rende di nuovo il frame alla taglia nuova
+    }
+
+    /// Raggio degli angoli arrotondati da ritagliare sul piano video, in pixel fisici
+    /// della finestra (0 = angoli vivi: schermo intero, o video che non tocca gli
+    /// angoli della finestra). Il piano sta sotto la finestra e la sua maschera non
+    /// lo ritaglia: lo fa mpv_video sul buffer, scalato alla taglia di render.
+    pub fn setCornerRadius(self: *VideoDecoder, px: f32) void {
+        self.corner_bits.store(@bitCast(px), .monotonic);
     }
 
     pub fn setPlaying(self: *VideoDecoder, playing: bool) void {
@@ -736,7 +749,12 @@ pub const VideoDecoder = struct {
     fn presentGpu(self: *VideoDecoder, m: *mpv_video.MpvVideo, sz: [2]u32, prod_gen: u32) GpuPresent {
         const p = self.presenter orelse return .unavailable;
         if (m.gpuDisabled()) return .unavailable;
-        const g = switch (m.renderGpu(sz[0], sz[1], p.ctx, p.slot_free)) {
+        // Raggio in pixel del buffer: il piano è scalato da `sz` al rettangolo target.
+        const tw = self.target_w.load(.monotonic);
+        const corner_win: f32 = @bitCast(self.corner_bits.load(.monotonic));
+        const corner = if (tw > 0) corner_win * @as(f32, @floatFromInt(sz[0])) / @as(f32, @floatFromInt(tw)) else 0;
+        const alpha_ok = p.supports(p.ctx, mpv_video.drm_abgr8888, mpv_video.drm_mod_linear);
+        const g = switch (m.renderGpu(sz[0], sz[1], alpha_ok, corner, p.ctx, p.slot_free)) {
             .frame => |f| f,
             .busy => return .busy,
             .unavailable => return .unavailable,

@@ -166,6 +166,10 @@ fn trace(comptime what: []const u8) void {
 
 /// DRM_FORMAT_XBGR8888 ('XB24'): byte R,G,B,X in memoria, come GL_RGBA8.
 pub const drm_xbgr8888: u32 = 0x34324258;
+/// DRM_FORMAT_ABGR8888 ('AB24'): come XBGR8888 ma con alfa (premoltiplicato, come
+/// ogni buffer Wayland). Serve per ritagliare gli angoli arrotondati del piano: dove
+/// il compositor lo annuncia si usa questo, altrimenti XBGR8888 ad angoli vivi.
+pub const drm_abgr8888: u32 = 0x34324241;
 pub const drm_mod_linear: u64 = 0;
 const GBM_BO_USE_RENDERING: u32 = 1 << 2;
 const GBM_BO_USE_LINEAR: u32 = 1 << 4;
@@ -212,6 +216,116 @@ const EglExt = struct {
     }
 };
 
+/// Angoli arrotondati del piano video: dopo il render di mpv il frame è moltiplicato
+/// per la copertura di un rettangolo arrotondato (SDF, antialiasing di 1 px come la
+/// maschera di zrame sul resto della finestra: lì pannello × contenuto, due coperture
+/// uguali sullo stesso rettangolo, da cui il quadrato), solo nei quattro quadrati
+/// d'angolo.
+/// Il buffer è premoltiplicato: color *= copertura e alpha *= copertura con una
+/// sola funzione di blend. Fuori dagli angoli il frame resta com'è (alfa 1 da mpv).
+const CornerMask = struct {
+    prog: c.GLuint = 0,
+    vao: c.GLuint = 0,
+    loc_size: c.GLint = -1,
+    loc_r: c.GLint = -1,
+    failed: bool = false,
+
+    const vs_src =
+        \\#version 330 core
+        \\void main() {
+        \\    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+        \\    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+        \\}
+    ;
+    const fs_src =
+        \\#version 330 core
+        \\uniform vec2 size;
+        \\uniform float r;
+        \\out vec4 color;
+        \\void main() {
+        \\    vec2 q = abs(gl_FragCoord.xy - size * 0.5) - (size * 0.5 - vec2(r));
+        \\    float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+        \\    float a = clamp(0.5 - d, 0.0, 1.0);
+        \\    color = vec4(0.0, 0.0, 0.0, a * a);
+        \\}
+    ;
+
+    fn compile(kind: c.GLenum, src: [:0]const u8) c.GLuint {
+        const sh = c.glCreateShader(kind);
+        const ptr: [*c]const u8 = src.ptr;
+        c.glShaderSource(sh, 1, &ptr, null);
+        c.glCompileShader(sh);
+        var ok: c.GLint = 0;
+        c.glGetShaderiv(sh, c.GL_COMPILE_STATUS, &ok);
+        if (ok == 0) {
+            c.glDeleteShader(sh);
+            return 0;
+        }
+        return sh;
+    }
+
+    fn init(m: *CornerMask) bool {
+        if (m.prog != 0) return true;
+        if (m.failed) return false;
+        m.failed = true; // fino a prova contraria: un fallimento non si ritenta
+        const vs = compile(c.GL_VERTEX_SHADER, vs_src);
+        if (vs == 0) return false;
+        defer c.glDeleteShader(vs);
+        const fs = compile(c.GL_FRAGMENT_SHADER, fs_src);
+        if (fs == 0) return false;
+        defer c.glDeleteShader(fs);
+        const prog = c.glCreateProgram();
+        c.glAttachShader(prog, vs);
+        c.glAttachShader(prog, fs);
+        c.glLinkProgram(prog);
+        var ok: c.GLint = 0;
+        c.glGetProgramiv(prog, c.GL_LINK_STATUS, &ok);
+        if (ok == 0) {
+            c.glDeleteProgram(prog);
+            std.log.warn("zuer video: maschera degli angoli non compilata: angoli vivi", .{});
+            return false;
+        }
+        m.prog = prog;
+        m.loc_size = c.glGetUniformLocation(prog, "size");
+        m.loc_r = c.glGetUniformLocation(prog, "r");
+        c.glGenVertexArrays(1, &m.vao); // il core profile non disegna senza VAO
+        m.failed = false;
+        return true;
+    }
+
+    fn apply(m: *CornerMask, fbo: c.GLuint, w: u32, h: u32, r_px: f32) void {
+        const r = @min(r_px, @as(f32, @floatFromInt(@min(w, h))) / 2.0);
+        if (r < 0.5 or !m.init()) return;
+        const ri: c.GLint = @intFromFloat(@ceil(r));
+        const wi: c.GLint = @intCast(w);
+        const hi: c.GLint = @intCast(h);
+        c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
+        c.glViewport(0, 0, wi, hi);
+        c.glUseProgram(m.prog);
+        c.glUniform2f(m.loc_size, @floatFromInt(w), @floatFromInt(h));
+        c.glUniform1f(m.loc_r, r);
+        c.glBindVertexArray(m.vao);
+        c.glEnable(c.GL_BLEND);
+        c.glBlendFunc(c.GL_ZERO, c.GL_SRC_ALPHA);
+        c.glEnable(c.GL_SCISSOR_TEST);
+        for ([4][2]c.GLint{ .{ 0, 0 }, .{ wi - ri, 0 }, .{ 0, hi - ri }, .{ wi - ri, hi - ri } }) |o| {
+            c.glScissor(o[0], o[1], ri, ri);
+            c.glDrawArrays(c.GL_TRIANGLES, 0, 3);
+        }
+        // Stato come lo lascia mpv: niente blend né scissor, nessun programma.
+        c.glDisable(c.GL_SCISSOR_TEST);
+        c.glDisable(c.GL_BLEND);
+        c.glBindVertexArray(0);
+        c.glUseProgram(0);
+    }
+
+    fn deinit(m: *CornerMask) void {
+        if (m.prog != 0) c.glDeleteProgram(m.prog);
+        if (m.vao != 0) c.glDeleteVertexArrays(1, &m.vao);
+        m.* = .{};
+    }
+};
+
 const GpuTargets = struct {
     ext: EglExt,
     drm_fd: c_int,
@@ -224,6 +338,9 @@ const GpuTargets = struct {
     retired: [2 * gpu_slots]GpuSlot = @splat(.{}),
     /// `glFinish` invece di `glFlush` prima di consegnare un frame (vedi `syncMode`).
     finish: bool = false,
+    /// Formato dei buffer: ABGR8888 se il compositor lo accetta (angoli arrotondati).
+    fourcc: u32 = drm_xbgr8888,
+    mask: CornerMask = .{},
 
     /// Il dispositivo GBM sulla stessa GPU del display EGL (quella del compositor).
     fn init(egl_display: c.EGLDisplay) !GpuTargets {
@@ -266,14 +383,14 @@ const GpuTargets = struct {
     fn createSlot(t: *GpuTargets, display: c.EGLDisplay, w: u32, h: u32) !GpuSlot {
         var sl: GpuSlot = .{};
         errdefer t.freeSlot(display, &sl);
-        sl.bo = c.gbm_bo_create(t.gbm, w, h, drm_xbgr8888, GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR) orelse return error.GbmAlloc;
+        sl.bo = c.gbm_bo_create(t.gbm, w, h, t.fourcc, GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR) orelse return error.GbmAlloc;
         sl.fd = c.gbm_bo_get_fd(sl.bo);
         if (sl.fd < 0) return error.GbmExport;
         sl.stride = c.gbm_bo_get_stride(sl.bo);
         const attrs = [_]c.EGLint{
             c.EGL_WIDTH,                          @intCast(w),
             c.EGL_HEIGHT,                         @intCast(h),
-            c.EGL_LINUX_DRM_FOURCC_EXT,           @bitCast(drm_xbgr8888),
+            c.EGL_LINUX_DRM_FOURCC_EXT,           @bitCast(t.fourcc),
             c.EGL_DMA_BUF_PLANE0_FD_EXT,          sl.fd,
             c.EGL_DMA_BUF_PLANE0_OFFSET_EXT,      0,
             c.EGL_DMA_BUF_PLANE0_PITCH_EXT,       @intCast(sl.stride),
@@ -329,6 +446,7 @@ const GpuTargets = struct {
     }
 
     fn deinit(t: *GpuTargets, display: c.EGLDisplay) void {
+        t.mask.deinit();
         for (&t.slots) |*sl| t.freeSlot(display, sl);
         t.reap(display, true);
         c.gbm_device_destroy(t.gbm);
@@ -904,7 +1022,9 @@ pub const MpvVideo = struct {
     /// Rende il frame corrente a w×h nel primo slot dmabuf libero (`slot_free`:
     /// il compositor l'ha rilasciato e non è in coda) e lo restituisce, pronto per
     /// il compositor. Mai in uno slot che il compositor può ancora leggere.
-    pub fn renderGpu(self: *MpvVideo, w: u32, h: u32, ctx: *anyopaque, slot_free: *const fn (*anyopaque, u8) bool) GpuResult {
+    /// `alpha_ok`: il compositor accetta ABGR8888 (letto alla prima chiamata).
+    /// `corner_px`: raggio degli angoli del piano in pixel del buffer (0 = vivi).
+    pub fn renderGpu(self: *MpvVideo, w: u32, h: u32, alpha_ok: bool, corner_px: f32, ctx: *anyopaque, slot_free: *const fn (*anyopaque, u8) bool) GpuResult {
         if (self.gpu_off) return .unavailable;
         if (self.gpu == null) {
             self.gpu = GpuTargets.init(self.egl_display) catch |e| {
@@ -912,6 +1032,7 @@ pub const MpvVideo = struct {
                 self.gpu_off = true;
                 return .unavailable;
             };
+            if (alpha_ok) self.gpu.?.fourcc = drm_abgr8888;
         }
         const t = &self.gpu.?;
         if (t.w != w or t.h != h) t.resize(self.egl_display, w, h);
@@ -928,12 +1049,13 @@ pub const MpvVideo = struct {
         }
         const sl = &t.slots[i];
         if (!self.renderTo(sl.fbo, w, h)) return .busy;
+        if (t.fourcc == drm_abgr8888) t.mask.apply(sl.fbo, w, h, corner_px);
         // Consegna: sottomesso (Mesa, sincronia implicita) o finito (vedi `syncMode`).
         if (t.finish) c.glFinish() else c.glFlush();
         t.next = @intCast((i + 1) % gpu_slots);
         t.presents += 1;
         t.reap(self.egl_display, false);
-        return .{ .frame = .{ .slot = i, .fd = sl.fd, .width = w, .height = h, .stride = sl.stride, .fourcc = drm_xbgr8888, .modifier = drm_mod_linear } };
+        return .{ .frame = .{ .slot = i, .fd = sl.fd, .width = w, .height = h, .stride = sl.stride, .fourcc = t.fourcc, .modifier = drm_mod_linear } };
     }
 
     /// Il percorso GPU ha fallito e non verrà ritentato.
