@@ -4,8 +4,8 @@
 #
 # Riproducibilità: Zuer al commit del tag, Zicro al commit scritto in
 # .github/zicro.ref (dentro il tag stesso), Zig scaricato da ziglang.org con sha256
-# verificato, FFmpeg per Windows pinnato con sha256 in scripts/fetch-ffmpeg-dlls.sh,
-# FFmpeg per macOS compilato dallo stesso commit (scripts/build-ffmpeg-macos.sh).
+# verificato, FFmpeg compilato dal sorgente a commit fissato con i soli componenti
+# che Zuer usa, uguale su macOS e Windows (scripts/build-ffmpeg.sh).
 # Pacchetti NON firmati (nessun certificato Apple/Windows configurato): vedi RELEASE.md.
 name: release
 
@@ -160,12 +160,12 @@ jobs:
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/ffmpeg
-          key: ffmpeg-macos-arm64-${{ hashFiles('Zuer/scripts/build-ffmpeg-macos.sh') }}
-      - name: FFmpeg per il bundle (scripts/build-ffmpeg-macos.sh)
+          key: ffmpeg-macos-arm64-${{ hashFiles('Zuer/scripts/build-ffmpeg.sh') }}
+      - name: FFmpeg per il bundle (scripts/build-ffmpeg.sh)
         working-directory: Zuer
         run: |
           set -euo pipefail
-          ZUER_FFMPEG_WORK="$RUNNER_TEMP/ffmpeg-build" scripts/build-ffmpeg-macos.sh "$RUNNER_TEMP/ffmpeg"
+          ZUER_FFMPEG_WORK="$RUNNER_TEMP/ffmpeg-build" scripts/build-ffmpeg.sh macos "$RUNNER_TEMP/ffmpeg"
           cat "$RUNNER_TEMP/ffmpeg/share/zuer/FFmpeg-SOURCE.txt"
       - name: Build e bundle (scripts/build-macos-bundle.sh)
         working-directory: Zuer
@@ -259,6 +259,8 @@ jobs:
           bash "$GITHUB_WORKSPACE/Zuer/scripts/pdf-check.sh" "$P" "$D"
           bash "$GITHUB_WORKSPACE/Zuer/scripts/image-check.sh" "$P" "$GITHUB_WORKSPACE/Zuer/tests/images"
           bash "$GITHUB_WORKSPACE/Zuer/scripts/office-check.sh" "$P" "$GITHUB_WORKSPACE/Zuer/tests/office"
+          # Ogni formato che la FFmpeg ridotta del bundle deve aprire (audio muto).
+          FFMPEG_CHECK_STRICT=1 bash "$GITHUB_WORKSPACE/Zuer/scripts/ffmpeg-check.sh" "$P" "$T/ffcheck"
           # Ripiego hw→sw a metà stream (guasto iniettato): il video prosegue senza buchi.
           ZUER_TEST_HWFAIL_AFTER=10 "$P" video "$D/clip.mp4" 2>&1 | tee hwfail.log
           grep -q 'pts continui' hwfail.log || { echo "::error::video interrotto dopo il ripiego hw→sw"; exit 1; }
@@ -368,7 +370,23 @@ jobs:
           /c/msys64/usr/bin/pacman.exe -S --noconfirm --needed --noprogressbar \
             mingw-w64-ucrt-x86_64-shaderc mingw-w64-ucrt-x86_64-binutils mingw-w64-ucrt-x86_64-imagemagick \
             mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-vulkan-loader mingw-w64-ucrt-x86_64-ffmpeg \
-            mingw-w64-ucrt-x86_64-mesa
+            mingw-w64-ucrt-x86_64-mesa \
+            make git mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-nasm \
+            mingw-w64-ucrt-x86_64-meson mingw-w64-ucrt-x86_64-ninja
+      # FFmpeg LGPL per l'installer, compilata in MSYS2 UCRT64 (stessa CRT di zuer-gui):
+      # in cache per commit+configurazione.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/ffmpeg
+          key: ffmpeg-windows-x64-${{ hashFiles('Zuer/scripts/build-ffmpeg.sh') }}
+      - name: FFmpeg per l'installer (scripts/build-ffmpeg.sh)
+        working-directory: Zuer
+        run: |
+          set -euo pipefail
+          # Percorsi POSIX di MSYS2 (/d/a/…): configure e make non reggono "D:\…".
+          MSYSTEM=UCRT64 CHERE_INVOKING=1 /c/msys64/usr/bin/bash.exe -lc \
+            'R="$(cygpath -u "$RUNNER_TEMP")"; ZUER_FFMPEG_WORK="$R/ffmpeg-build" scripts/build-ffmpeg.sh windows "$R/ffmpeg"'
+          cat "$RUNNER_TEMP/ffmpeg/share/zuer/FFmpeg-SOURCE.txt"
       - name: Build e installer (scripts/build-windows-installer.sh)
         working-directory: Zuer
         run: |
@@ -384,6 +402,7 @@ jobs:
           export ZUER_ICON_FONT='C:\Windows\Fonts\arialbd.ttf' 
           zig version; glslc --version | head -1; makensis -VERSION
           mkdir -p "$RUNNER_TEMP/dist"
+          export ZUER_FFMPEG_DIR="$RUNNER_TEMP/ffmpeg"
           scripts/build-windows-installer.sh --out "$(cygpath -w "$RUNNER_TEMP/dist/zuer-$VERSION-windows-x64-setup.exe")"
           # Strumento di prova headless (NON nel pacchetto).
           zig build feature-probe -Doptimize=ReleaseFast --prefix "$(cygpath -w "$RUNNER_TEMP/probe")"
@@ -483,6 +502,10 @@ jobs:
           ZUER_PDFIUM=none "$UDIR/feature-probe.exe" fail "$(W "$D/prova.pdf")" "pdfium.dll"
           bash "$GITHUB_WORKSPACE/Zuer/scripts/image-check.sh" "$UDIR/feature-probe.exe" "$GITHUB_WORKSPACE/Zuer/tests/images"
           bash "$GITHUB_WORKSPACE/Zuer/scripts/office-check.sh" "$UDIR/feature-probe.exe" "$GITHUB_WORKSPACE/Zuer/tests/office"
+          # Ogni formato che la FFmpeg ridotta del pacchetto deve aprire (audio muto, sulla
+          # scheda virtuale): i clip li genera la ffmpeg completa di MSYS2.
+          FFMPEG_CLI=/c/msys64/ucrt64/bin/ffmpeg.exe FFMPEG_CHECK_STRICT=1 \
+            bash "$GITHUB_WORKSPACE/Zuer/scripts/ffmpeg-check.sh" "$UDIR/feature-probe.exe" "$RUNNER_TEMP/ffcheck"
           "$UDIR/feature-probe.exe" video "$(W "$D/clip.mp4")"
           # Audio su WASAPI, sulla scheda virtuale VB-CABLE (inudibile).
           "$UDIR/feature-probe.exe" audio-devices

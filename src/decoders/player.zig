@@ -1117,7 +1117,13 @@ pub const Player = struct {
     pub fn seek(self: *Player, seconds: f64) void {
         if (self.time_base > 0) {
             const ts: i64 = @intFromFloat(seconds / self.time_base);
-            _ = av.av_seek_frame(self.fmt_ctx, self.video_stream, ts, c.AVSEEK_FLAG_BACKWARD);
+            // HLS: il seek "all'indietro" di libavformat (hls.c del commit in uso) torna
+            // all'inizio del segmento e poi di un altro segmento ancora, cioè fino a
+            // 2 segmenti prima del punto chiesto (6-12 s su YouTube). Senza il flag
+            // riparte dal primo keyframe DOPO il punto: al massimo un GOP più avanti.
+            const fmt = self.fmt_ctx.*.iformat;
+            const hls = fmt != null and fmt.*.name != null and std.mem.eql(u8, std.mem.span(fmt.*.name), "hls");
+            _ = av.av_seek_frame(self.fmt_ctx, self.video_stream, ts, if (hls) 0 else c.AVSEEK_FLAG_BACKWARD);
         } else {
             // Senza time_base il ts è in unità AV_TIME_BASE: va passato con stream
             // index -1 (default), altrimenti verrebbe interpretato nella time_base

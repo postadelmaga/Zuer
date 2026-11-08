@@ -95,24 +95,25 @@ esattamente come su Linux il blur richiede KWin).
 # zuer-gui.exe + i plugin decoder come .dll — SEMPRE in ReleaseFast (vedi sotto)
 zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast
 
-# DLL runtime di FFmpeg (per il video) accanto all'eseguibile — NON sono in git
-scripts/fetch-ffmpeg-dlls.sh          # → zig-out/bin/
+# DLL di FFmpeg (video e audio), compilate dal sorgente in MSYS2 UCRT64 — NON in git
+scripts/build-ffmpeg.sh windows       # → zig-out/ffmpeg-windows/bin/
 ```
 
 ### Installer (`.exe`)
 
-Un unico setup Windows, compilabile **da Linux** con NSIS (`makensis`):
+Un unico setup Windows con NSIS (`makensis`):
 
 ```sh
-scripts/build-windows-installer.sh                  # → Zuer-Setup.exe (FFmpeg full BtbN, ~38 MB)
-scripts/build-windows-installer.sh --ffmpeg-trimmed # FFmpeg minimale stile VLC (installer ~pochi MB)
-scripts/build-windows-installer.sh --no-ffmpeg      # installer minuscolo, senza video
+ZUER_FFMPEG_DIR=zig-out/ffmpeg-windows scripts/build-windows-installer.sh  # → Zuer-Setup.exe
+scripts/build-windows-installer.sh --no-ffmpeg                            # senza video né audio
 ```
 
-`--ffmpeg-trimmed` compila (`scripts/build-ffmpeg-trimmed.sh`) un FFmpeg
-`--disable-everything` con solo i demuxer/decoder che servono a zuer: le DLL
-passano da ~131 MB a pochi MB. Compila lo **stesso commit** delle import-lib
-vendored (avformat 63) → header e `vendor/ffmpeg/lib` restano validi as-is.
+FFmpeg è compilata da `scripts/build-ffmpeg.sh` (stesso script per Windows e macOS)
+con `--disable-everything` più **solo** i demuxer, decoder, parser e protocolli che
+Zuer usa (elenco commentato nello script), D3D11VA/VideoToolbox e dav1d statico:
+niente encoder, muxer, filtri o dispositivi. Stesso commit degli header in
+`vendor/ffmpeg` (avformat 63), quindi stessa ABI. `scripts/ffmpeg-check.sh` prova
+ogni formato dell'elenco col player di Zuer.
 
 > `mingw-w64` (e opzionalmente `nasm` per le SIMD x86) servono **solo qui, sul
 > PC che costruisce l'installer**, per compilare le DLL una volta. **L'utente
@@ -154,7 +155,7 @@ Due capacità native, ognuna con la sua import-lib, attivabili a parte:
 | Flag | Default | Cosa abilita |
 |------|---------|--------------|
 | `-Dvulkan` | Linux + Windows + macOS | renderer mesh/testo. Il loader (`libvulkan.so.1` / `vulkan-1.dll` / MoltenVK nel bundle macOS) si apre a runtime: senza loader o driver Zuer parte e spegne solo il 3D |
-| `-Dffmpeg` | Linux + Windows + macOS | player video libav, risolto a runtime. Su Windows e macOS usa gli header in `vendor/ffmpeg/`; le DLL Windows si scaricano a parte (`scripts/fetch-ffmpeg-dlls.sh`), le dylib macOS si compilano sul Mac (`scripts/build-ffmpeg-macos.sh`) |
+| `-Dffmpeg` | Linux + Windows + macOS | player video libav, risolto a runtime. Su Windows e macOS usa gli header in `vendor/ffmpeg/`; DLL Windows e dylib macOS si compilano con `scripts/build-ffmpeg.sh` |
 
 > Le DLL FFmpeg (~130 MB) seguono il modello VLC: **spediscono con l'app, non con il
 > sorgente**. In git stanno solo header e import-lib (~2.3 MB) per compilare.

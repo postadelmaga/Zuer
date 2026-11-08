@@ -3,7 +3,7 @@ Zuer — componenti di terze parti compilati nei binari
 
 Zuer è distribuito sotto AGPL-3.0-or-later (file LICENSE). I binari contengono anche
 il codice seguente, con le sue licenze. Le librerie distribuite come file separati
-hanno la loro licenza accanto: FFmpeg (FFmpeg-LICENSE.txt, comprende dav1d su macOS),
+hanno la loro licenza accanto: FFmpeg (FFmpeg-LICENSE.txt, comprende dav1d),
 PDFium su Windows (PDFium-LICENSE.txt), MoltenVK su macOS (MoltenVK-LICENSE.txt).
 
 -------------------------------------------------------------------------------

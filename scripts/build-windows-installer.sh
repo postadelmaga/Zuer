@@ -2,30 +2,27 @@
 # Costruisce l'installer Windows di zuer-gui partendo da Linux:
 #   1. cross-compila `zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast`
 #      in una staging dir pulita (solo exe + DLL, niente .pdb);
-#   2. scarica pdfium.dll (PDF) e, salvo --no-ffmpeg, le DLL runtime FFmpeg (player
-#      video) accanto all'exe;
+#   2. scarica pdfium.dll (PDF) e, salvo --no-ffmpeg, copia accanto all'exe le DLL
+#      FFmpeg compilate da scripts/build-ffmpeg.sh (prefisso in ZUER_FFMPEG_DIR);
 #   3. genera un'icona .ico (se ImageMagick è presente);
 #   4. genera `installer/associations.nsh` con le estensioni note ai decoder
 #      effettivamente inclusi nel build Windows (text/csv/markdown/mesh/image/
 #      glb/archive/media/office/pdf);
 #   5. compila `installer/zuer.nsi` con `makensis` → un unico Zuer-Setup.exe.
 #
-# Uso:  scripts/build-windows-installer.sh [--no-ffmpeg] [--out FILE.exe]
-#   --no-ffmpeg   installer minuscolo senza le DLL FFmpeg (i video non si aprono
-#                 finché l'utente non esegue scripts/fetch-ffmpeg-dlls.sh a mano).
+# Uso:  ZUER_FFMPEG_DIR=<prefisso> scripts/build-windows-installer.sh [--no-ffmpeg] [--out FILE.exe]
+#   ZUER_FFMPEG_DIR  prefisso di `scripts/build-ffmpeg.sh windows` (in MSYS2 UCRT64)
+#   --no-ffmpeg      installer senza FFmpeg: video e audio non si aprono.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-# FFmpeg: full = DLL "gpl-shared" di BtbN (~131 MB, scaricate); trimmed = build
-# minimale stile VLC (pochi MB, compilata); none = niente video.
-FFMPEG=full
+FFMPEG=yes
 OUT="$ROOT/Zuer-Setup.exe"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --no-ffmpeg)       FFMPEG=none;    shift ;;
-    --ffmpeg-trimmed)  FFMPEG=trimmed; shift ;;
     --out) OUT="$2"; shift 2 ;;
     *) echo "opzione sconosciuta: $1" >&2; exit 2 ;;
   esac
@@ -60,16 +57,18 @@ echo "→ [2/5] PDFium (motore PDF)"
 "$ROOT/scripts/fetch-pdfium.sh" "$BIN"
 
 case "$FFMPEG" in
-  full)
-    echo "→ [2/5] FFmpeg: scarico le DLL LGPL di BtbN (~76 MB)"
-    "$ROOT/scripts/fetch-ffmpeg-dlls.sh" "$BIN"
-    NSIS_DEFS+=(-DHAVE_FFMPEG=1) ;;
-  trimmed)
-    echo "→ [2/5] FFmpeg trimmed: compilo un FFmpeg minimale (stile VLC)"
-    "$ROOT/scripts/build-ffmpeg-trimmed.sh" "$BIN"
+  yes)
+    FF="${ZUER_FFMPEG_DIR:?ZUER_FFMPEG_DIR: prefisso di scripts/build-ffmpeg.sh windows (oppure --no-ffmpeg)}"
+    echo "→ [2/5] FFmpeg da $FF"
+    # Solo le librerie che Zuer apre, con i major degli header in vendor/ffmpeg.
+    for dll in avformat-63 avcodec-63 avutil-61 swscale-10 swresample-7; do
+      [[ -f "$FF/bin/$dll.dll" ]] || { echo "✗ $FF/bin/$dll.dll assente: major diverso dagli header vendorati?"; exit 1; }
+      cp "$FF/bin/$dll.dll" "$BIN/"
+    done
+    cp "$FF/share/zuer/FFmpeg-LICENSE.txt" "$FF/share/zuer/FFmpeg-SOURCE.txt" "$BIN/"
     NSIS_DEFS+=(-DHAVE_FFMPEG=1) ;;
   none)
-    echo "→ [2/5] --no-ffmpeg: salto le DLL FFmpeg (i video non si apriranno)" ;;
+    echo "→ [2/5] --no-ffmpeg: niente FFmpeg (video e audio non si apriranno)" ;;
 esac
 
 echo "→ [3/5] icona"

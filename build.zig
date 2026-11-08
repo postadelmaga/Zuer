@@ -64,7 +64,7 @@ pub fn build(b: *std.Build) void {
 
     // Link libav (native video). Linux uses the system FFmpeg (pkg-config names have the
     // `lib` prefix); Windows uses the vendored headers + import libs under vendor/ffmpeg
-    // (unversioned names → the versioned runtime DLLs fetched by scripts/fetch-ffmpeg-dlls.sh).
+    // (unversioned names → the versioned runtime DLLs built by scripts/build-ffmpeg.sh).
     // zuer-gui NON linka mai le lib/import lib, su nessun OS: player.zig risolve i
     // simboli a RUNTIME (LoadLibrary/dlopen al primo video) così l'exe parte anche
     // senza FFmpeg installato — usare `headersOnly` lì. I plugin (decoder_media) e i

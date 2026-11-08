@@ -14,7 +14,7 @@
 #   --require-full  errore se mancano FFmpeg o MoltenVK (build di release)
 #
 # Librerie native opzionali, copiate in Contents/Frameworks e aperte a runtime:
-#   ZUER_FFMPEG_DIR  prefix di scripts/build-ffmpeg-macos.sh (video/audio)
+#   ZUER_FFMPEG_DIR  prefix di `scripts/build-ffmpeg.sh macos` (video/audio)
 #   ZUER_MOLTENVK    percorso di libMoltenVK.dylib (renderer 3D Vulkan su Metal)
 #   ZUER_MOLTENVK_LICENSE  sua licenza (Apache-2.0)
 # Senza, il bundle funziona lo stesso: video e 3D dicono perché non partono.
