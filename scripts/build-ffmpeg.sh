@@ -74,7 +74,9 @@ case "$PLATFORM" in
       # Decodifica hardware e TLS di sistema (Schannel): nessuna DLL in più.
       --enable-d3d11va --enable-schannel
       --enable-hwaccel=h264_d3d11va,h264_d3d11va2,hevc_d3d11va,hevc_d3d11va2,vp9_d3d11va,vp9_d3d11va2,av1_d3d11va,av1_d3d11va2
-      # Nessuna DLL di runtime di gcc accanto a quelle di FFmpeg.
+      # Thread nativi di Windows: con i pthread di mingw avutil importerebbe
+      # libwinpthread-1.dll. Nessuna DLL di runtime di gcc accanto a quelle di FFmpeg.
+      --disable-pthreads --enable-w32threads
       --extra-ldflags=-static-libgcc
     ) ;;
   macos)
