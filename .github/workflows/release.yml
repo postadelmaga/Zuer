@@ -113,6 +113,14 @@ jobs:
             libwayland-dev libxkbcommon-dev libpipewire-0.3-dev libasound2-dev \
             libharfbuzz-dev libfreetype-dev libvulkan-dev libegl-dev libgl-dev libgbm-dev \
             libsystemd-dev wayland-protocols
+      # Dipendenze Zig (libwebp da GitHub): a volte 503/504, si riprova prima della build.
+      - name: Dipendenze Zig
+        shell: bash
+        run: |
+          for d in Zicro Zuer; do
+            for i in 1 2 3 4 5 6; do (cd "$d" && zig build --fetch=all) && break
+              [ $i = 6 ] && exit 1; echo "fetch $d: tentativo $i fallito, riprovo"; sleep $((20 * i)); done
+          done
       - name: Test Zicro
         working-directory: Zicro
         run: zig build test --summary all
@@ -157,6 +165,14 @@ jobs:
           brew install --quiet shaderc imagemagick molten-vk ffmpeg meson ninja
           brew info --json=v2 molten-vk | python3 -c 'import json,sys; f=json.load(sys.stdin)["formulae"][0]; print("molten-vk", f["installed"][0]["version"], f["license"])'
       # FFmpeg LGPL per il bundle: ~5 min di compilazione, in cache per commit+flag.
+      # Dipendenze Zig (libwebp da GitHub): a volte 503/504, si riprova prima della build.
+      - name: Dipendenze Zig
+        shell: bash
+        run: |
+          for d in Zicro Zuer; do
+            for i in 1 2 3 4 5 6; do (cd "$d" && zig build --fetch=all) && break
+              [ $i = 6 ] && exit 1; echo "fetch $d: tentativo $i fallito, riprovo"; sleep $((20 * i)); done
+          done
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/ffmpeg
@@ -373,6 +389,14 @@ jobs:
             mingw-w64-ucrt-x86_64-mesa \
             make git mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-nasm \
             mingw-w64-ucrt-x86_64-meson mingw-w64-ucrt-x86_64-ninja
+      # Dipendenze Zig (libwebp da GitHub): a volte 503/504, si riprova prima della build.
+      - name: Dipendenze Zig
+        shell: bash
+        run: |
+          for d in Zicro Zuer; do
+            for i in 1 2 3 4 5 6; do (cd "$d" && zig build --fetch=all) && break
+              [ $i = 6 ] && exit 1; echo "fetch $d: tentativo $i fallito, riprovo"; sleep $((20 * i)); done
+          done
       # FFmpeg LGPL per l'installer, compilata in MSYS2 UCRT64 (stessa CRT di zuer-gui):
       # in cache per commit+configurazione.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
