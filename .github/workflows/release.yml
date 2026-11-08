@@ -447,18 +447,39 @@ jobs:
       # (certificato Sectigo successivo al 2015, firma incrociata non accettata).
       # Procedura di LABSN/sound-ci-helpers; devcon dallo zip di Scream 4.0, fissato.
       # Su Windows Server il servizio audio è spento di default.
+      # Gli zip, fissati per sha256, restano nella cache di Actions: un download lento o
+      # in errore (GitHub ha dato 504 per ore sullo zip di Scream) non ferma la CI.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ runner.temp }}/ci-zips
+          key: ci-zips-vbcable43-scream40
       - name: Scheda audio virtuale (VB-CABLE)
         shell: pwsh
-        timeout-minutes: 6
+        timeout-minutes: 10
         run: |
           $ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'
           $T = $env:RUNNER_TEMP
-          Invoke-WebRequest https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip -OutFile "$T\vbcable.zip"
-          if ((Get-FileHash "$T\vbcable.zip" -Algorithm SHA256).Hash -ne '66FD0A4D9F4896FF41632B7E3D53892C085C4561F53E8AE8D0F0BC10EEDD1CDD') { throw 'sha256 di VBCABLE_Driver_Pack43.zip non corrisponde' }
-          Expand-Archive "$T\vbcable.zip" -DestinationPath "$T\vbcable"
-          Invoke-WebRequest https://github.com/duncanthrax/scream/releases/download/4.0/Scream4.0.zip -OutFile "$T\scream.zip"
-          if ((Get-FileHash "$T\scream.zip" -Algorithm SHA256).Hash -ne 'FA33E25F9A46C61E4E0CD83362C51C3D2A45C6FE4091AAD7507E240E40F1A520') { throw 'sha256 di Scream4.0.zip non corrisponde' }
-          Expand-Archive "$T\scream.zip" -DestinationPath "$T\scream"
+          $Z = "$T\ci-zips"; New-Item -ItemType Directory -Force $Z | Out-Null
+          # Dalla cache se c'è e lo sha256 torna; altrimenti download con 6 tentativi.
+          function Get-Zip($url, $out, $sha) {
+            if ((Test-Path $out) -and (Get-FileHash $out -Algorithm SHA256).Hash -eq $sha) { "dalla cache: $out"; return }
+            for ($i = 1; ; $i++) {
+              try { Invoke-WebRequest $url -OutFile $out; break }
+              catch { if ($i -ge 6) { throw }; "tentativo $i fallito ($($_.Exception.Message)), riprovo"; Start-Sleep (15 * $i) }
+            }
+            if ((Get-FileHash $out -Algorithm SHA256).Hash -ne $sha) { throw "sha256 di $url non corrisponde" }
+          }
+          Get-Zip https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip "$Z\vbcable.zip" '66FD0A4D9F4896FF41632B7E3D53892C085C4561F53E8AE8D0F0BC10EEDD1CDD'
+          Expand-Archive "$Z\vbcable.zip" -DestinationPath "$T\vbcable"
+          # devcon: quello del WDK se il runner lo ha, altrimenti dallo zip di Scream 4.0.
+          $devcon = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Tools" -Recurse -Filter devcon.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $devcon) {
+            Get-Zip https://github.com/duncanthrax/scream/releases/download/4.0/Scream4.0.zip "$Z\scream.zip" 'FA33E25F9A46C61E4E0CD83362C51C3D2A45C6FE4091AAD7507E240E40F1A520'
+            Expand-Archive "$Z\scream.zip" -DestinationPath "$T\scream"
+            $devcon = "$T\scream\Install\helpers\devcon-x64.exe"
+          }
+          "devcon: $devcon"
           # Editore del catalogo (Vincent Burel) tra quelli attendibili, solo su questa VM:
           # senza, devcon aspetta una conferma che sul runner non arriva mai.
           $sig = Get-AuthenticodeSignature "$T\vbcable\vbaudio_cable64_win7.cat"
@@ -468,7 +489,7 @@ jobs:
           Import-Certificate -FilePath "$T\vbcable.cer" -CertStoreLocation Cert:\LocalMachine\TrustedPublisher | Out-Null
           Set-Service AudioEndpointBuilder -StartupType Automatic; Start-Service AudioEndpointBuilder
           Set-Service Audiosrv -StartupType Automatic; Start-Service Audiosrv
-          $p = Start-Process "$T\scream\Install\helpers\devcon-x64.exe" -ArgumentList 'install',"$T\vbcable\vbMmeCable64_win7.inf",'VBAudioVACWDM' -NoNewWindow -PassThru
+          $p = Start-Process $devcon -ArgumentList 'install',"$T\vbcable\vbMmeCable64_win7.inf",'VBAudioVACWDM' -NoNewWindow -PassThru
           if (-not $p.WaitForExit(120000)) { $p.Kill(); throw 'devcon bloccato (richiesta di conferma?)' }
           "devcon: exit $($p.ExitCode)"
           Start-Sleep 5
