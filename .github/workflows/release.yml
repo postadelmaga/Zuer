@@ -492,17 +492,27 @@ jobs:
           # Ripiego waveOut (forzato): continua a funzionare.
           ZICRO_AUDIO=waveout "$UDIR/feature-probe.exe" audio "$(W "$D/clip.mp4")"
           # Dispositivo rimosso a metà riproduzione e poi rimesso: la riproduzione riprende.
-          # Si disattiva l'ENDPOINT di uscita (SWD\MMDEVAPI\…): il device radice
-          # ROOT\MEDIA non si spegne a caldo (pnputil: riavvio richiesto, 194).
-          SID="$(powershell -NoProfile -Command "(Get-PnpDevice -Class AudioEndpoint | Where-Object FriendlyName -like 'Speakers (VB-Audio*' | Select-Object -First 1).InstanceId" | tr -d '\r')"
-          echo "endpoint VB-CABLE: $SID"; [[ -n "$SID" ]] || { echo "::error::endpoint VB-CABLE non trovato"; exit 1; }
-          "$UDIR/feature-probe.exe" audio-survive "$(W "$D/tono.m4a")" 14 > survive.log 2>&1 & SP=$!
+          # Rimozione vera del dispositivo (come staccare una scheda USB) e nuovo arrivo:
+          # il flusso deve accorgersene (riaperture ≥ 1, lo esige audio-survive) e
+          # riprendere. Disattivare l'endpoint con pnputil NON basta: il flusso aperto
+          # continua (provato: 0 riaperture), e il device radice non si disattiva a caldo.
+          DEVCON="$(cygpath -u "$RUNNER_TEMP")/scream/Install/helpers/devcon-x64.exe"
+          VBINF="$(cygpath -w "$RUNNER_TEMP")\vbcable\vbMmeCable64_win7.inf"
+          RID="$(powershell -NoProfile -Command "(Get-PnpDevice -Class MEDIA | Where-Object FriendlyName -like '*VB-Audio*' | Select-Object -First 1).InstanceId" | tr -d '\r')"
+          echo "device VB-CABLE: $RID"; [[ -n "$RID" ]] || { echo "::error::device VB-CABLE non trovato"; exit 1; }
+          "$UDIR/feature-probe.exe" audio-survive "$(W "$D/tono.m4a")" 16 > survive.log 2>&1 & SP=$!
           sleep 4
-          pnputil /disable-device "$SID" || { echo "::error::pnputil /disable-device fallito ($?)"; kill $SP; exit 1; }
+          pnputil /remove-device "$RID" || { echo "::error::pnputil /remove-device fallito ($?)"; kill $SP; exit 1; }
           sleep 3
-          pnputil /enable-device "$SID" || { echo "::error::pnputil /enable-device fallito ($?)"; kill $SP; exit 1; }
+          "$DEVCON" install "$VBINF" VBAudioVACWDM || { echo "::error::reinstallazione VB-CABLE fallita"; kill $SP; exit 1; }
           RC=0; wait $SP || RC=$?; tr -d '\r' < survive.log
           [[ $RC == 0 ]] || { echo "::error::audio non ripreso dopo la rimozione del dispositivo"; exit 1; }
+          # Riavvio del servizio audio (aggiornamento driver, crash di audiodg).
+          "$UDIR/feature-probe.exe" audio-survive "$(W "$D/tono.m4a")" 14 > survive2.log 2>&1 & SP=$!
+          sleep 4
+          powershell -NoProfile -Command "Restart-Service Audiosrv -Force" || { echo "::error::riavvio di Audiosrv fallito"; kill $SP; exit 1; }
+          RC=0; wait $SP || RC=$?; tr -d '\r' < survive2.log
+          [[ $RC == 0 ]] || { echo "::error::audio non ripreso dopo il riavvio del servizio audio"; exit 1; }
           "$UDIR/feature-probe.exe" gpu > gpu-noloader.log 2>&1 || true; cat gpu-noloader.log
           grep -q 'VulkanLoaderMissing' gpu-noloader.log || { echo "::error::senza loader: atteso VulkanLoaderMissing"; exit 1; }
           rm -f "$UDIR/feature-probe.exe"

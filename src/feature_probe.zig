@@ -251,13 +251,23 @@ fn probeAudio(io: std.Io, gpa: std.mem.Allocator, path: []const u8) void {
     const ap = audio_player.AudioPlayer.start(pz.ptr, gpa) orelse
         return report(false, "audio: nessun player (libav, stream audio o dispositivo assenti)", .{});
     defer ap.stopAndDestroy();
+    const t0 = std.Io.Clock.awake.now(io).nanoseconds;
     ap.setPlaying(true);
     var t: usize = 0;
     while (t < 30 and ap.clockSeconds() < 0.5) : (t += 1) io.sleep(.fromMilliseconds(100), .awake) catch {};
     const clk = ap.clockSeconds();
+    const wall: f64 = @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).nanoseconds - t0)) / 1e9;
     // Latenza riportata dal backend (PipeWire, WASAPI, AudioQueue): null = stima fissa.
     const lat = ap.dev.latencyFrames();
-    report(clk >= 0.5, "audio: orologio di riproduzione a {d:.2}s dopo {d} ms (dispositivo che consuma campioni), latenza dal dispositivo: {?d} frame", .{ clk, t * 100, lat });
+    report(clk >= 0.5, "audio: orologio di riproduzione a {d:.2}s dopo {d:.2}s reali (dispositivo che consuma campioni), latenza dal dispositivo: {?d} frame", .{ clk, wall, lat });
+    // Il dispositivo suona in tempo reale: l'orologio (campioni inviati meno latenza)
+    // non può superare il tempo trascorso, salvo la latenza hardware non inclusa.
+    // Avanti di più = latenza sottostimata = video in anticipo sull'audio.
+    if (lat != null) {
+        report(clk <= wall + 0.05, "audio: orologio non in anticipo sul tempo reale (scarto {d:.3}s)", .{clk - wall});
+    } else if (clk > wall + 0.05) {
+        std.debug.print("avviso: orologio in anticipo di {d:.3}s sul tempo reale (backend senza latenza misurata)\n", .{clk - wall});
+    }
 }
 
 /// Potenza (Goertzel) della frequenza `hz` in `x`, normalizzata sulla lunghezza.
