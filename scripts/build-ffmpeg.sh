@@ -74,10 +74,12 @@ case "$PLATFORM" in
       # Decodifica hardware e TLS di sistema (Schannel): nessuna DLL in più.
       --enable-d3d11va --enable-schannel
       --enable-hwaccel=h264_d3d11va,h264_d3d11va2,hevc_d3d11va,hevc_d3d11va2,vp9_d3d11va,vp9_d3d11va2,av1_d3d11va,av1_d3d11va2
-      # Thread nativi di Windows: con i pthread di mingw avutil importerebbe
-      # libwinpthread-1.dll. Nessuna DLL di runtime di gcc accanto a quelle di FFmpeg.
+      # Thread nativi di Windows. clock_gettime e nanosleep di mingw-w64 stanno però
+      # in libwinpthread: collegata statica (in coda, dopo gli oggetti), come libgcc,
+      # così accanto alle DLL di FFmpeg non serve nessuna DLL di runtime di gcc.
       --disable-pthreads --enable-w32threads
       --extra-ldflags=-static-libgcc
+      "--extra-libs=-Wl,-Bstatic -lwinpthread -Wl,-Bdynamic"
     ) ;;
   macos)
     [[ "$(uname -s)" == Darwin ]] || { echo "✗ da eseguire su macOS (serve l'SDK per VideoToolbox)"; exit 1; }
