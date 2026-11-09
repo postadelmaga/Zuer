@@ -10,6 +10,9 @@
 //! lo stream). Tutto via dlopen: nessuna dipendenza di build, e senza libva le
 //! capacità risultano vuote (= nessun codec in hardware).
 //!
+//! Su macOS niente rilevamento: H.264 e HEVC, che VideoToolbox decodifica su ogni
+//! Mac (vedi `mac_caps`). Su Windows nessuna preferenza.
+//!
 //! `ZUER_HWDEC_CAPS` sostituisce il rilevamento (diagnostica e test): `none`, oppure
 //! un elenco come `h264,hevc` (altezza massima 4320) o `h264:1080,vp9:2160`.
 
@@ -66,7 +69,7 @@ var lock: std.atomic.Mutex = .unlocked;
 /// `null` fuori da Linux: lì la decodifica non passa da mpv/VA-API e la scelta
 /// del formato resta quella predefinita di yt-dlp.
 pub fn get() ?Caps {
-    if (comptime builtin.os.tag != .linux) return null;
+    if (comptime builtin.os.tag != .linux) return override() orelse if (comptime builtin.os.tag == .macos) mac_caps else null;
     while (!lock.tryLock()) std.Thread.yield() catch {};
     defer lock.unlock();
     if (state == .ready) return cached;
@@ -89,6 +92,11 @@ fn log(caps: Caps) void {
     }
     std.log.info("zuer video: decodifica hardware (VA-API):{s}", .{buf[0..n]});
 }
+
+/// macOS: VideoToolbox decodifica H.264 e HEVC su ogni Mac che macOS 11 supporta;
+/// AV1 solo da M3 in poi, VP9 non su tutti. Senza dichiararlo yt-dlp sceglierebbe AV1
+/// o VP9, che su Intel e M1/M2 finiscono in software (libdav1d: CPU piena).
+const mac_caps: Caps = parseOverride("h264,hevc");
 
 fn override() ?Caps {
     const raw = std.c.getenv("ZUER_HWDEC_CAPS") orelse return null;
@@ -202,6 +210,12 @@ test "preferred: il codec più efficiente che la GPU decodifica a quell'altezza"
     // Niente VA-API: H.264, il più leggero in software.
     try std.testing.expectEqual(Codec.h264, preferred(.{}, 720));
     try std.testing.expectEqual(Codec.h264, preferred(parseOverride("none"), 720));
+}
+
+test "macOS: H.264/HEVC dichiarati, yt-dlp evita AV1 e VP9" {
+    var buf: [48]u8 = undefined;
+    try std.testing.expectEqual(Codec.hevc, preferred(mac_caps, 2160));
+    try std.testing.expectEqualStrings("res,fps,vcodec:h265", ytdlpSort(&buf, mac_caps, 720));
 }
 
 test "ytdlpSort: risoluzione e fps prima del codec" {
