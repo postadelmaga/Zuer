@@ -86,6 +86,8 @@ pub const GuiAppState = struct {
         // Barra delle linguette dei fogli (solo workbook multi-foglio).
         tab_bar: TabBarState = .{},
         file_changed: bool = false,
+        /// Guida dei tasti visibile (tasto `h` tenuto premuto).
+        help: bool = false,
         // Vero mentre il decoder del file iniziale gira su un thread di background:
         // il worker mostra lo spinner di caricamento invece del contenuto.
         loading: bool = false,

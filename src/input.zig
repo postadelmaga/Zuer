@@ -53,6 +53,7 @@ const KEY_O: u32 = 24;
 const KEY_D: u32 = 32;
 const KEY_R: u32 = 19;
 const KEY_N: u32 = 49;
+const KEY_H: u32 = 35;
 
 // Stato per il rilevamento del doppio-click sinistro (solo thread finestra).
 var last_click_ms: i64 = -1000;
@@ -576,6 +577,17 @@ pub fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) 
         app_state.shared.yt.bs_held = false;
         app_state.shared.mutex.unlock(app_state.io);
     }
+    // Guida dei tasti: visibile finché `h` è premuto. Il rilascio si prende
+    // sempre, anche se nel frattempo si è aperto un overlay.
+    if (key == KEY_H and !pressed) {
+        app_state.shared.mutex.lockUncancelable(app_state.io);
+        if (app_state.shared.help) {
+            app_state.shared.help = false;
+            app_state.shared.file_changed = true;
+        }
+        app_state.shared.mutex.unlock(app_state.io);
+        return;
+    }
     if (pressed) {
         // Overlay ricerca YouTube: ha priorità su tutto (col pannello aperto la
         // tastiera è sua; da chiuso `y` lo apre).
@@ -583,6 +595,13 @@ pub fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) 
         // Esploratore file: da chiuso `e` lo apre, da aperto la tastiera è sua
         // (Esc/e chiudono, frecce/Invio navigano, Backspace sale di cartella).
         if (file_explorer.handleKey(app_state, key)) return;
+        if (key == KEY_H and !app_state.ctrl_down) {
+            app_state.shared.mutex.lockUncancelable(app_state.io);
+            app_state.shared.help = true;
+            app_state.shared.file_changed = true;
+            app_state.shared.mutex.unlock(app_state.io);
+            return;
+        }
         // Snapshot sotto lock: `current_file_path` è liberato/riassegnato e i
         // flag di tipo (is_text/is_mesh) riscritti da `applyDecoded` (thread
         // loader) sotto `mutex` — mai leggerli a nudo.

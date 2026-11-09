@@ -34,6 +34,7 @@ const nav = @import("nav.zig");
 const input = @import("input.zig");
 // Ricerca YouTube (overlay tasto `y`): stato in Shared, ricerca/streaming yt-dlp.
 const yt_search = @import("yt_search.zig");
+const help_popup = @import("help_popup.zig");
 const file_explorer = @import("file_explorer.zig");
 const crash_log = @import("crash_log.zig");
 const crash_report = @import("crash_report.zig");
@@ -596,7 +597,7 @@ fn renderWorker(
             // ricomponeva l'intera finestra trasparente (~30% di un core a controlli
             // visibili, misurato).
             const only_tick = ovl_tick and !(new_frame or size_ch or ctrl_ch or vs.scrubbing or yt_ch or yt_anim or label_ch or gpu_ch);
-            const band_only = only_tick and !yt_active and !state.shared.yt.subs_on and !state.shared.fx.active;
+            const band_only = only_tick and !yt_active and !state.shared.yt.subs_on and !state.shared.fx.active and !state.shared.help;
             var pres_dirty: ?zrame.Rect = null;
             if (do_present) last_label_alpha = label_alpha;
             var pres_w: u32 = 0;
@@ -647,6 +648,9 @@ fn renderWorker(
                 if (yt_active) {
                     if (name_raster) |*r| yt_search.drawOverlay(composited_rgba.*, fr.w, fr.h, state, r, @as(f32, @floatFromInt(spin_frame)) / 60.0);
                     spin_frame +%= 1;
+                }
+                if (state.shared.help) {
+                    if (name_raster) |*r| help_popup.draw(composited_rgba.*, fr.w, fr.h, r);
                 }
                 vid_pw = cur_w;
                 vid_ph = cur_h;
@@ -909,6 +913,9 @@ fn renderWorker(
                     if (name_raster) |*r| yt_search.drawOverlay(composited_rgba.*, cur_w, cur_h, state, r, @as(f32, @floatFromInt(spin_frame)) / 60.0);
                     spin_frame +%= 1;
                 }
+                if (state.shared.help) {
+                    if (name_raster) |*r| help_popup.draw(composited_rgba.*, cur_w, cur_h, r);
+                }
                 did_compose = true;
             }
         }
@@ -999,6 +1006,9 @@ fn renderWorker(
                 if (state.shared.yt.active) {
                     if (name_raster) |*r| yt_search.drawOverlay(composited_rgba.*, cur_w, cur_h, state, r, @as(f32, @floatFromInt(spin_frame)) / 60.0);
                     spin_frame +%= 1;
+                }
+                if (state.shared.help) {
+                    if (name_raster) |*r| help_popup.draw(composited_rgba.*, cur_w, cur_h, r);
                 }
                 state.shared.mutex.unlock(state.io);
                 did_compose = true;
