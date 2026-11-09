@@ -142,6 +142,10 @@ pub fn clearCurrentStream(state: *GuiAppState) void {
 pub fn invalidateResults(state: *GuiAppState) void {
     const yt = &state.shared.yt;
     yt.gen +%= 1;
+    // Una ricerca in corso ora è superata: il suo worker scarterà il risultato
+    // (gen diversa) senza toccare lo stato, quindi si spegne qui. Altrimenti
+    // `searching` restava vero per sempre e nessuna ricerca successiva partiva.
+    yt.searching = false;
     freeResults(state.gpa, yt.results);
     yt.results = &.{};
     yt.sel = -1;
