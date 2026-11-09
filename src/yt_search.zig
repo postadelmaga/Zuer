@@ -26,6 +26,7 @@ const layout_mod = @import("layout.zig");
 const crash_report = @import("crash_report.zig");
 const hwdec_caps = @import("hwdec_caps.zig");
 const ytdlp = @import("ytdlp.zig");
+const yt_queue = @import("yt_queue.zig");
 
 /// Un risultato di ricerca (stringhe e miniatura possedute, vedi `freeResults`).
 pub const Result = struct {
@@ -43,8 +44,9 @@ pub const Result = struct {
 };
 
 /// Altezze video selezionabili (chips nell'overlay); indice in `YtState.quality`.
-pub const quality_heights = [_]u32{ 360, 480, 720, 1080 };
-pub const quality_labels = [_][]const u8{ "360p", "480p", "720p", "1080p" };
+/// 0 = Auto: l'altezza la sceglie `yt_queue.autoHeight` dalla vista.
+pub const quality_heights = [_]u32{ 0, 360, 480, 720, 1080 };
+pub const quality_labels = [_][]const u8{ "Auto", "360p", "480p", "720p", "1080p" };
 
 /// Un sottotitolo: intervallo in secondi e testo (posseduto).
 pub const SubCue = struct { start: f64, end: f64, text: []u8 };
@@ -79,9 +81,24 @@ pub const YtState = struct {
     /// La selezione è appena cambiata da tastiera: al prossimo draw lo scroll
     /// la insegue (l'hover del mouse e la rotella NON la inseguono).
     follow_sel: bool = false,
-    /// Qualità stream selezionata (indice in `quality_heights`). Con uno stream
-    /// YT attivo, cambiarla riapre il video alla stessa posizione.
-    quality: u8 = 2,
+    /// Qualità stream selezionata (indice in `quality_heights`, 0 = Auto). Con
+    /// uno stream YT attivo, cambiarla riapre il video alla stessa posizione.
+    quality: u8 = 0,
+    /// Altezza chiesta per lo stream corrente (0 = nessuno): Auto la alza quando
+    /// la vista cresce (`autoTick`).
+    stream_h: u32 = 0,
+    /// Secondi da cui la vista giustifica un'altezza maggiore (vedi `raise_after_s`).
+    raise_s: f32 = 0,
+    raise_view_h: u32 = 0,
+    /// Coda "guarda dopo" (posseduta, come i risultati), salvata su disco a ogni
+    /// modifica e letta alla prima apertura dell'overlay o al primo video.
+    queue: std.ArrayList(Result) = .empty,
+    queue_loaded: bool = false,
+    /// La griglia mostra la coda invece dei risultati (chip "Coda").
+    show_queue: bool = false,
+    /// Posizione del video corrente al tick precedente: un salto da fine video a
+    /// zero senza seek è il video finito (FFmpeg e mpv lo fanno ricominciare).
+    prev_pos: f64 = -1,
     /// Id (posseduto) del video YouTube attualmente in riproduzione: serve al
     /// tasto `o` (apri la pagina), ai sottotitoli e al cambio qualità.
     /// null = il player corrente non viene da YouTube.
@@ -95,14 +112,16 @@ pub const YtState = struct {
     sub_idx: usize = 0,
 };
 
+fn freeResult(gpa: std.mem.Allocator, r: Result) void {
+    gpa.free(r.id);
+    gpa.free(r.title);
+    gpa.free(r.duration);
+    gpa.free(r.channel);
+    gpa.free(r.thumb_rgba);
+}
+
 pub fn freeResults(gpa: std.mem.Allocator, results: []Result) void {
-    for (results) |r| {
-        gpa.free(r.id);
-        gpa.free(r.title);
-        gpa.free(r.duration);
-        gpa.free(r.channel);
-        gpa.free(r.thumb_rgba);
-    }
+    for (results) |r| freeResult(gpa, r);
     gpa.free(results);
 }
 
@@ -114,7 +133,14 @@ pub fn deinit(state: *GuiAppState) void {
     yt.results = &.{};
     if (yt.err) |e| state.gpa.free(e);
     yt.err = null;
+    for (yt.queue.items) |r| freeResult(state.gpa, r);
+    yt.queue.deinit(state.gpa);
     clearCurrentStream(state);
+}
+
+/// Le card della griglia: la coda o i risultati della ricerca.
+pub fn shown(yt: *YtState) []Result {
+    return if (yt.show_queue) yt.queue.items else yt.results;
 }
 
 /// Libera i sottotitoli caricati. Con `shared.mutex` acquisito.
@@ -132,6 +158,8 @@ pub fn clearCurrentStream(state: *GuiAppState) void {
     const yt = &state.shared.yt;
     if (yt.current_id) |cid| state.gpa.free(cid);
     yt.current_id = null;
+    yt.stream_h = 0;
+    yt.prev_pos = -1;
     freeSubs(state);
     yt.subs_on = false;
 }
@@ -173,6 +201,7 @@ pub fn insertText(state: *GuiAppState, bytes: []const u8) void {
     }
     if (yt.query.items.len + bytes.len > 256) return; // query oltre ogni ragionevolezza
     yt.query.appendSlice(state.gpa, bytes) catch return;
+    yt.show_queue = false;
     invalidateResults(state);
     state.shared.file_changed = true;
 }
@@ -197,6 +226,7 @@ pub fn backspaceOnce(state: *GuiAppState) void {
         while (i > 0 and (q.items[i] & 0xC0) == 0x80) i -= 1;
         q.shrinkRetainingCapacity(i);
     }
+    yt.show_queue = false;
     invalidateResults(state);
     state.shared.file_changed = true;
 }
@@ -219,8 +249,8 @@ pub fn copyQuery(state: *GuiAppState) void {
 /// risultati copia la query. Con `shared.mutex` acquisito.
 pub fn copyQueryOrLink(state: *GuiAppState) void {
     const yt = &state.shared.yt;
-    if (!yt.sel_all and yt.sel >= 0 and yt.sel < @as(i32, @intCast(yt.results.len))) {
-        const r = yt.results[@intCast(yt.sel)];
+    if (!yt.sel_all and yt.sel >= 0 and yt.sel < @as(i32, @intCast(shown(yt).len))) {
+        const r = shown(yt)[@intCast(yt.sel)];
         const link = std.fmt.allocPrint(state.gpa, "https://www.youtube.com/watch?v={s}", .{r.id}) catch return;
         const t = std.Thread.spawn(.{}, copyWorker, .{ state, link }) catch {
             state.gpa.free(link);
@@ -388,7 +418,7 @@ fn searchWorker(state: *GuiAppState, query: []u8, gen: u32) void {
         const n_workers = @min(owned.len, 4);
         var wi: usize = 0;
         while (wi < n_workers) : (wi += 1) {
-            const t = std.Thread.spawn(.{}, thumbWorker, .{ state, gen }) catch break;
+            const t = std.Thread.spawn(.{}, thumbWorker, .{ state, gen, ThumbList.results }) catch break;
             t.detach();
         }
     }
@@ -406,6 +436,27 @@ fn finishSearchErr(state: *GuiAppState, gen: u32, msg: []const u8) void {
 
 // ── Miniature ────────────────────────────────────────────────────────────────
 
+/// Le miniature si scaricano per i risultati (validi entro una generazione) o
+/// per la coda (voci ritrovate per id: possono sparire, mai cambiare id).
+const ThumbList = enum { results, queue };
+
+fn thumbList(yt: *YtState, which: ThumbList) []Result {
+    return if (which == .queue) yt.queue.items else yt.results;
+}
+
+/// Avvia i worker delle miniature mancanti della coda. Con `shared.mutex` acquisito.
+fn startQueueThumbs(state: *GuiAppState) void {
+    var missing: usize = 0;
+    for (state.shared.yt.queue.items) |r| {
+        if (r.thumb_w == 0 and !r.claimed) missing += 1;
+    }
+    var wi: usize = 0;
+    while (wi < @min(missing, 4)) : (wi += 1) {
+        const t = std.Thread.spawn(.{}, thumbWorker, .{ state, @as(u32, 0), ThumbList.queue }) catch break;
+        t.detach();
+    }
+}
+
 /// Directory cache delle miniature (`…/zuer/ytthumb`), creata al volo.
 fn thumbCacheDir(gpa: std.mem.Allocator) ?[]u8 {
     return vtcache.appCacheDir(gpa, "ytthumb");
@@ -416,7 +467,7 @@ fn thumbCacheDir(gpa: std.mem.Allocator) ?[]u8 {
 /// scarica la `mqdefault.jpg` di YouTube (curl, con cache su disco), la
 /// decodifica col plugin immagini e la installa. Ogni installazione ricontrolla
 /// la generazione sotto lock: se l'utente ha già cambiato query non tocca nulla.
-fn thumbWorker(state: *GuiAppState, gen: u32) void {
+fn thumbWorker(state: *GuiAppState, gen: u32, which: ThumbList) void {
     // `appCacheDir` crea già la catena di directory (niente subprocess: su
     // Windows `mkdir` non esiste come eseguibile).
     const dir = thumbCacheDir(state.gpa) orelse return;
@@ -426,12 +477,12 @@ fn thumbWorker(state: *GuiAppState, gen: u32) void {
         // Reclama la prossima miniatura mancante sotto lock; download/decode fuori.
         state.shared.mutex.lockUncancelable(state.io);
         const yt = &state.shared.yt;
-        if (gen != yt.gen) {
+        if (which == .results and gen != yt.gen) {
             state.shared.mutex.unlock(state.io);
             return;
         }
         var id_opt: ?[]u8 = null;
-        for (yt.results) |*r| {
+        for (thumbList(yt, which)) |*r| {
             if (r.thumb_w == 0 and !r.claimed) {
                 r.claimed = true;
                 id_opt = state.gpa.dupe(u8, r.id) catch null;
@@ -464,7 +515,7 @@ fn thumbWorker(state: *GuiAppState, gen: u32) void {
 
         state.shared.mutex.lockUncancelable(state.io);
         const yt2 = &state.shared.yt;
-        if (gen != yt2.gen) {
+        if (which == .results and gen != yt2.gen) {
             state.shared.mutex.unlock(state.io);
             state.gpa.free(rgba);
             return;
@@ -472,7 +523,7 @@ fn thumbWorker(state: *GuiAppState, gen: u32) void {
         // Riaggancio per id (l'array non cambia entro la stessa generazione,
         // ma il controllo tiene il worker onesto).
         var installed = false;
-        for (yt2.results) |*r| {
+        for (thumbList(yt2, which)) |*r| {
             if (std.mem.eql(u8, r.id, id)) {
                 if (r.thumb_w == 0) {
                     r.thumb_rgba = rgba;
@@ -544,17 +595,33 @@ fn validVideoId(rest: []const u8) ?[]const u8 {
 /// apertura. Da chiamare con `shared.mutex` acquisito.
 pub fn openById(state: *GuiAppState, id: []const u8) void {
     if (comptime !has_video) return;
-    const yt = &state.shared.yt;
-    if (yt.opening) return;
+    if (state.shared.yt.opening) return;
     const id_owned = state.gpa.dupe(u8, id) catch return;
+    startOpen(state, id_owned, null, 0, streamHeight(state));
+}
+
+/// Altezza da chiedere a yt-dlp: quella del chip o, con Auto, quella adatta alla
+/// vista corrente. Con `shared.mutex` acquisito.
+fn streamHeight(state: *GuiAppState) u32 {
+    const h = quality_heights[state.shared.yt.quality];
+    if (h != 0) return h;
+    const view_h: u32 = if (state.win) |w| w.contentPx().h else 0;
+    return yt_queue.autoHeight(view_h);
+}
+
+/// Avvia il thread di apertura (prende possesso di `id` e `title`). Con
+/// `shared.mutex` acquisito e nessuna apertura in corso.
+fn startOpen(state: *GuiAppState, id: []u8, title: ?[]u8, resume_s: f64, height: u32) void {
+    const yt = &state.shared.yt;
     yt.opening = true;
     if (yt.err) |e| {
         state.gpa.free(e);
         yt.err = null;
     }
     state.shared.file_changed = true;
-    const t = std.Thread.spawn(.{}, openWorker, .{ state, id_owned, @as(?[]u8, null), @as(f64, 0), quality_heights[yt.quality] }) catch {
-        state.gpa.free(id_owned);
+    const t = std.Thread.spawn(.{}, openWorker, .{ state, id, title, resume_s, height }) catch {
+        state.gpa.free(id);
+        if (title) |tt| state.gpa.free(tt);
         yt.opening = false;
         setErr(state, "impossibile avviare l'apertura");
         return;
@@ -569,27 +636,19 @@ pub fn openSelected(state: *GuiAppState) void {
     if (comptime !has_video) return;
     const yt = &state.shared.yt;
     if (yt.opening) return;
-    if (yt.sel < 0 or yt.sel >= @as(i32, @intCast(yt.results.len))) return;
-    const r = yt.results[@intCast(yt.sel)];
+    const cards = shown(yt);
+    if (yt.sel < 0 or yt.sel >= @as(i32, @intCast(cards.len))) return;
+    openResult(state, cards[@intCast(yt.sel)]);
+}
+
+/// Apre una card (risultato o voce della coda). Con `shared.mutex` acquisito.
+fn openResult(state: *GuiAppState, r: Result) void {
     const id = state.gpa.dupe(u8, r.id) catch return;
     const title = state.gpa.dupe(u8, r.title) catch {
         state.gpa.free(id);
         return;
     };
-    yt.opening = true;
-    if (yt.err) |e| {
-        state.gpa.free(e);
-        yt.err = null;
-    }
-    state.shared.file_changed = true;
-    const t = std.Thread.spawn(.{}, openWorker, .{ state, id, @as(?[]u8, title), @as(f64, 0), quality_heights[yt.quality] }) catch {
-        state.gpa.free(id);
-        state.gpa.free(title);
-        yt.opening = false;
-        setErr(state, "impossibile avviare l'apertura");
-        return;
-    };
-    t.detach();
+    startOpen(state, id, title, 0, streamHeight(state));
 }
 
 /// Imposta la qualità (indice di `quality_heights`, dai chip dell'overlay).
@@ -600,7 +659,15 @@ pub fn setQuality(state: *GuiAppState, idx: u8) void {
     if (idx >= quality_heights.len or yt.quality == idx) return;
     yt.quality = idx;
     state.shared.file_changed = true;
+    const h = streamHeight(state);
+    if (h != yt.stream_h) reopenCurrent(state, h);
+}
+
+/// Riapre lo stream YouTube corrente alla stessa posizione con altezza `height`.
+/// Con `shared.mutex` acquisito.
+fn reopenCurrent(state: *GuiAppState, height: u32) void {
     if (comptime !has_video) return;
+    const yt = &state.shared.yt;
     if (yt.opening or yt.current_id == null or !state.video.isActive()) return;
     const r_id = state.gpa.dupe(u8, yt.current_id.?) catch return;
     // Il titolo corrente È current_file_path (installato all'apertura).
@@ -608,15 +675,165 @@ pub fn setQuality(state: *GuiAppState, idx: u8) void {
         state.gpa.free(r_id);
         return;
     };
-    yt.opening = true;
-    state.shared.file_changed = true;
-    const t = std.Thread.spawn(.{}, openWorker, .{ state, r_id, @as(?[]u8, r_title), state.video.pos_s, quality_heights[idx] }) catch {
-        state.gpa.free(r_id);
-        state.gpa.free(r_title);
-        yt.opening = false;
+    startOpen(state, r_id, r_title, state.video.pos_s, height);
+}
+
+/// Da chiamare a ogni tick del player (render worker, con `shared.mutex`):
+/// con Auto alza la qualità quando la vista (alta `view_h` pixel) è cresciuta ed
+/// è rimasta ferma `raise_after_s`; a fine video passa al primo della coda.
+pub fn tickStream(state: *GuiAppState, view_h: u32, dt: f32) void {
+    if (comptime !has_video) return;
+    const yt = &state.shared.yt;
+    if (yt.current_id == null or yt.opening) {
+        yt.prev_pos = -1;
+        yt.raise_s = 0;
         return;
-    };
-    t.detach();
+    }
+    const vs = &state.video;
+
+    // Fine video: FFmpeg e mpv lo fanno ricominciare, quindi la posizione torna
+    // a zero dall'ultimo secondo senza un seek. Con l'overlay aperto (anche per
+    // un errore d'apertura del prossimo) si lascia ricominciare.
+    const pos = vs.pos_s;
+    const ended = yt.prev_pos >= 0 and vs.dur_s > 2 and yt.prev_pos > vs.dur_s - 1.0 and
+        pos < 1.0 and !vs.settle_seek and vs.seek_to < 0;
+    yt.prev_pos = pos;
+    if (ended and !yt.active and yt.queue.items.len > 0) {
+        playNext(state);
+        return;
+    }
+
+    if (quality_heights[yt.quality] == 0 and view_h == yt.raise_view_h and yt_queue.shouldRaise(yt.stream_h, view_h)) {
+        yt.raise_s += dt;
+        if (yt.raise_s >= yt_queue.raise_after_s) {
+            yt.raise_s = 0;
+            reopenCurrent(state, yt_queue.autoHeight(view_h));
+        }
+    } else yt.raise_s = 0;
+    yt.raise_view_h = view_h;
+}
+
+// ── Coda "guarda dopo" ───────────────────────────────────────────────────────
+
+fn queuePath(state: *GuiAppState) ?[]u8 {
+    const home = vtcache.getEnvAlloc(state.gpa, if (builtin.os.tag == .windows) "APPDATA" else "HOME") orelse return null;
+    defer state.gpa.free(home);
+    return yt_queue.filePath(state.gpa, home) catch null;
+}
+
+fn queueIndex(yt: *YtState, id: []const u8) ?usize {
+    for (yt.queue.items, 0..) |r, i| {
+        if (std.mem.eql(u8, r.id, id)) return i;
+    }
+    return null;
+}
+
+/// Accoda una copia dei campi (la miniatura, se c'è, si copia: niente download).
+fn appendQueue(state: *GuiAppState, f: yt_queue.Fields, thumb: []const u8, tw: u32, th: u32) !void {
+    const gpa = state.gpa;
+    var r: Result = .{ .id = try gpa.dupe(u8, f.id), .title = &.{}, .duration = &.{}, .channel = &.{} };
+    errdefer freeResult(gpa, r);
+    r.title = try gpa.dupe(u8, f.title);
+    r.duration = try gpa.dupe(u8, f.duration);
+    r.channel = try gpa.dupe(u8, f.channel);
+    if (tw != 0) {
+        const px = try gpa.alignedAlloc(u8, .@"4", thumb.len);
+        @memcpy(px, thumb);
+        r.thumb_rgba = px;
+        r.thumb_w = tw;
+        r.thumb_h = th;
+    }
+    try state.shared.yt.queue.append(gpa, r);
+}
+
+fn removeQueueAt(state: *GuiAppState, i: usize) void {
+    const yt = &state.shared.yt;
+    freeResult(state.gpa, yt.queue.orderedRemove(i));
+    if (yt.show_queue) {
+        const n: i32 = @intCast(yt.queue.items.len);
+        if (yt.sel >= n) yt.sel = n - 1;
+    }
+}
+
+/// Legge la coda dal disco la prima volta che serve. Con `shared.mutex` acquisito.
+pub fn ensureQueueLoaded(state: *GuiAppState) void {
+    const yt = &state.shared.yt;
+    if (yt.queue_loaded) return;
+    yt.queue_loaded = true;
+    const path = queuePath(state) orelse return;
+    defer state.gpa.free(path);
+    const bytes = std.Io.Dir.cwd().readFileAlloc(state.io, path, state.gpa, .limited(1 << 20)) catch return;
+    defer state.gpa.free(bytes);
+    var it = std.mem.splitScalar(u8, bytes, '\n');
+    while (it.next()) |line| {
+        const f = yt_queue.parseLine(line) orelse continue;
+        if (queueIndex(yt, f.id) != null) continue;
+        appendQueue(state, f, &.{}, 0, 0) catch break;
+    }
+    startQueueThumbs(state);
+}
+
+/// Riscrive il file della coda (su un temporaneo, poi rinominato: un'uscita a
+/// metà non lascia un file troncato). Con `shared.mutex` acquisito.
+fn saveQueue(state: *GuiAppState) void {
+    const path = queuePath(state) orelse return;
+    defer state.gpa.free(path);
+    var aw: std.Io.Writer.Allocating = .init(state.gpa);
+    defer aw.deinit();
+    const w = &aw.writer;
+    w.writeAll(yt_queue.header ++ "\n") catch return;
+    for (state.shared.yt.queue.items) |r| {
+        yt_queue.writeLine(w, .{ .id = r.id, .title = r.title, .duration = r.duration, .channel = r.channel }) catch return;
+    }
+    vtcache.makeDirs(path);
+    const tmp = std.fmt.allocPrint(state.gpa, "{s}.tmp", .{path}) catch return;
+    defer state.gpa.free(tmp);
+    const cwd = std.Io.Dir.cwd();
+    cwd.writeFile(state.io, .{ .sub_path = tmp, .data = aw.written() }) catch return;
+    cwd.rename(tmp, cwd, path, state.io) catch {};
+}
+
+/// Aggiunge alla coda la card `i` della griglia, o la toglie se c'è già.
+/// Con `shared.mutex` acquisito.
+pub fn toggleQueueAt(state: *GuiAppState, i: i32) void {
+    const yt = &state.shared.yt;
+    ensureQueueLoaded(state);
+    const cards = shown(yt);
+    if (i < 0 or i >= @as(i32, @intCast(cards.len))) return;
+    const r = cards[@intCast(i)];
+    if (queueIndex(yt, r.id)) |qi| {
+        removeQueueAt(state, qi);
+    } else {
+        appendQueue(state, .{ .id = r.id, .title = r.title, .duration = r.duration, .channel = r.channel }, r.thumb_rgba, r.thumb_w, r.thumb_h) catch return;
+    }
+    saveQueue(state);
+    state.shared.file_changed = true;
+}
+
+/// La griglia passa dai risultati alla coda e viceversa (chip "Coda").
+/// Con `shared.mutex` acquisito.
+pub fn toggleQueueView(state: *GuiAppState) void {
+    const yt = &state.shared.yt;
+    ensureQueueLoaded(state);
+    yt.show_queue = !yt.show_queue;
+    yt.sel = if (shown(yt).len > 0) 0 else -1;
+    yt.scroll = .{};
+    state.shared.file_changed = true;
+}
+
+/// Apre il primo video della coda (che ne esce quando parte). Tasto `n` e fine
+/// video. Con `shared.mutex` acquisito.
+pub fn playNext(state: *GuiAppState) void {
+    if (comptime !has_video) return;
+    const yt = &state.shared.yt;
+    ensureQueueLoaded(state);
+    if (yt.opening or yt.queue.items.len == 0) return;
+    openResult(state, yt.queue.items[0]);
+}
+
+/// Posizione nella coda (da 1) del video `id`, o 0 se non c'è.
+fn queuePos(yt: *YtState, id: []const u8) usize {
+    return if (queueIndex(yt, id)) |i| i + 1 else 0;
 }
 
 /// Apre nel browser la pagina YouTube del video: la card selezionata (overlay
@@ -625,8 +842,8 @@ pub fn setQuality(state: *GuiAppState, idx: u8) void {
 pub fn openPageLocked(state: *GuiAppState) void {
     const yt = &state.shared.yt;
     const id: []const u8 = blk: {
-        if (yt.active and yt.sel >= 0 and yt.sel < @as(i32, @intCast(yt.results.len)))
-            break :blk yt.results[@intCast(yt.sel)].id;
+        if (yt.active and yt.sel >= 0 and yt.sel < @as(i32, @intCast(shown(yt).len)))
+            break :blk shown(yt)[@intCast(yt.sel)].id;
         break :blk yt.current_id orelse return;
     };
     const url = std.fmt.allocPrint(state.gpa, "https://www.youtube.com/watch?v={s}", .{id}) catch return;
@@ -654,6 +871,11 @@ fn missingShown(yt: anytype) bool {
 }
 
 /// Il punto è sulla riga di stato (errore / "apertura stream…") del pannello.
+/// Riga di stato sotto i chip: errore, apertura in corso o coda vuota.
+fn hasStatus(yt: *YtState) bool {
+    return yt.err != null or yt.opening or (yt.show_queue and yt.queue.items.len == 0);
+}
+
 fn statusHit(lay: anytype, mx: f32, my: f32) bool {
     const sy = lay.yp + pad + input_h + qual_h;
     return mx >= @as(f32, @floatFromInt(lay.xp)) and mx < @as(f32, @floatFromInt(lay.xp + lay.wp)) and
@@ -776,6 +998,9 @@ fn openWorker(state: *GuiAppState, id: []u8, title_opt: ?[]u8, resume_s: f64, he
         if (ch.* == '/') ch.* = '-';
     }
 
+    // Riaperture dello stesso video (qualità) tengono la finestra com'è: Auto
+    // riapre proprio perché l'utente l'ha ingrandita.
+    var same_vid = false;
     {
         state.shared.mutex.lockUncancelable(state.io);
         defer state.shared.mutex.unlock(state.io);
@@ -811,12 +1036,21 @@ fn openWorker(state: *GuiAppState, id: []u8, title_opt: ?[]u8, resume_s: f64, he
         // Id corrente (tasto `o`, sottotitoli, cambio qualità). Se è lo STESSO
         // video (riapertura per qualità) i sottotitoli già caricati restano
         // validi; per un video nuovo si riparte da zero (il toggle `c` riscarica).
-        const same_vid = if (yt.current_id) |cid| std.mem.eql(u8, cid, id) else false;
+        same_vid = if (yt.current_id) |cid| std.mem.eql(u8, cid, id) else false;
         if (!same_vid) {
             if (yt.current_id) |cid| state.gpa.free(cid);
             yt.current_id = state.gpa.dupe(u8, id) catch null;
             freeSubs(state);
             yt.subs_on = false;
+        }
+        yt.stream_h = height;
+        yt.raise_s = 0;
+        yt.prev_pos = -1;
+        // Un video aperto esce dalla coda "guarda dopo" (da lì o dai risultati).
+        ensureQueueLoaded(state);
+        if (queueIndex(yt, id)) |qi| {
+            removeQueueAt(state, qi);
+            saveQueue(state);
         }
         yt.opening = false;
         yt.active = false; // overlay chiuso: si riapre con `y` (query/risultati restano)
@@ -827,11 +1061,11 @@ fn openWorker(state: *GuiAppState, id: []u8, title_opt: ?[]u8, resume_s: f64, he
     // La finestra si adatta alle proporzioni reali del video appena aperto
     // (stessa euristica di `nav.resizeToContent`). Fuori dal lock: `requestResize`
     // è thread-safe (differisce al thread finestra) e no-op in fullscreen.
-    if (state.win) |w| {
+    if (state.win) |w| if (!same_vid) {
         const az = layout_mod.autoZoomForContent(.video, first.w, first.h);
         const size = layout_mod.initialWindowSize(.video, layout_mod.scaleDim(first.w, az), layout_mod.scaleDim(first.h, az));
         w.requestResize(size.w, size.h);
-    }
+    };
 }
 
 // ── Sottotitoli ──────────────────────────────────────────────────────────────
@@ -1129,6 +1363,18 @@ fn chipRect(lay: Layout, i: usize) [4]i32 {
     return .{ x, y, chip_w, chip_h };
 }
 
+/// Rettangolo del chip "Coda (N)", dopo quelli della qualità.
+const queue_chip_w: i32 = 84;
+fn queueChipRect(lay: Layout) [4]i32 {
+    const rc = chipRect(lay, quality_heights.len);
+    return .{ rc[0] + 8, rc[1], queue_chip_w, rc[3] };
+}
+
+fn rectHit(rc: [4]i32, x: f32, y: f32) bool {
+    return x >= @as(f32, @floatFromInt(rc[0])) and x < @as(f32, @floatFromInt(rc[0] + rc[2])) and
+        y >= @as(f32, @floatFromInt(rc[1])) and y < @as(f32, @floatFromInt(rc[1] + rc[3]));
+}
+
 /// Geometria verticale della griglia, per lo scroll.
 fn geom(lay: Layout) card_grid.Geom {
     return .{
@@ -1198,8 +1444,7 @@ pub fn handleMouse(state: *GuiAppState, win: *zrame.Window, event: zrame.MouseEv
     if (!yt.active) return false;
 
     const dims = overlayDims(state, win);
-    const status = yt.err != null or yt.opening;
-    const lay = layoutFor(dims[0], dims[1], yt.results.len, status);
+    const lay = layoutFor(dims[0], dims[1], shown(yt).len, hasStatus(yt));
 
     switch (event.kind) {
         .motion => {
@@ -1208,7 +1453,7 @@ pub fn handleMouse(state: *GuiAppState, win: *zrame.Window, event: zrame.MouseEv
             const m = yt.scroll.onMotion(geom(lay), event.x, event.y);
             if (m.redraw) state.shared.file_changed = true;
             if (m.consumed) return true; // sulla scrollbar o in drag
-            for (yt.results, 0..) |_, i| {
+            for (shown(yt), 0..) |_, i| {
                 if (cardHit(lay, yt.scroll.pos(), i, event.x, event.y)) {
                     if (yt.sel != @as(i32, @intCast(i))) {
                         yt.sel = @intCast(i);
@@ -1220,6 +1465,18 @@ pub fn handleMouse(state: *GuiAppState, win: *zrame.Window, event: zrame.MouseEv
             return true;
         },
         .press, .release => {
+            // Tasto destro su una card: in coda / fuori dalla coda.
+            if (event.button == 0x111) {
+                if (event.kind == .press) {
+                    for (shown(yt), 0..) |_, i| {
+                        if (cardHit(lay, yt.scroll.pos(), i, state.last_x, state.last_y)) {
+                            toggleQueueAt(state, @intCast(i));
+                            break;
+                        }
+                    }
+                }
+                return true;
+            }
             if (event.button != 0x110) return true;
             if (event.kind != .press) {
                 if (yt.scroll.onRelease()) state.shared.file_changed = true; // fine del drag
@@ -1235,15 +1492,16 @@ pub fn handleMouse(state: *GuiAppState, win: *zrame.Window, event: zrame.MouseEv
             // Click su un chip qualità: seleziona (e con uno stream attivo riapre
             // il video alla stessa posizione con la nuova qualità).
             for (0..quality_heights.len) |qi| {
-                const rc = chipRect(lay, qi);
-                if (mx >= @as(f32, @floatFromInt(rc[0])) and mx < @as(f32, @floatFromInt(rc[0] + rc[2])) and
-                    my >= @as(f32, @floatFromInt(rc[1])) and my < @as(f32, @floatFromInt(rc[1] + rc[3])))
-                {
+                if (rectHit(chipRect(lay, qi), mx, my)) {
                     setQuality(state, @intCast(qi));
                     return true;
                 }
             }
-            for (yt.results, 0..) |_, i| {
+            if (rectHit(queueChipRect(lay), mx, my)) {
+                toggleQueueView(state);
+                return true;
+            }
+            for (shown(yt), 0..) |_, i| {
                 if (cardHit(lay, yt.scroll.pos(), i, mx, my)) {
                     yt.sel = @intCast(i);
                     openSelected(state);
@@ -1376,8 +1634,8 @@ pub fn drawOverlay(buf: []u8, W: u32, H: u32, state: *GuiAppState, raster: *glyp
     if (W < 160 or H < 160) return;
     const yt = &state.shared.yt;
 
-    const status = yt.err != null or yt.opening;
-    const lay = layoutFor(W, H, yt.results.len, status);
+    const status = hasStatus(yt);
+    const lay = layoutFor(W, H, shown(yt).len, status);
 
     // Scroll a inseguimento della selezione SOLO quando è cambiata da tastiera:
     // rotella e drag della scrollbar sfogliano liberamente (l'hover non c'entra,
@@ -1436,7 +1694,15 @@ pub fn drawOverlay(buf: []u8, W: u32, H: u32, state: *GuiAppState, raster: *glyp
             const tx = rc[0] + @divTrunc(rc[2] - tw, 2);
             _ = drawText(buf, W, H, raster, tx, chip_tb, lab, if (selq) [3]u8{ 14, 17, 26 } else text_dim, rc[2]);
         }
-        const hint = "c sottotitoli · Ctrl+O YouTube";
+        {
+            const rc = queueChipRect(lay);
+            var lab_buf: [24]u8 = undefined;
+            const lab = std.fmt.bufPrint(&lab_buf, "Coda ({d})", .{yt.queue.items.len}) catch "Coda";
+            canvas.fillRoundedRect(@floatFromInt(rc[0]), @floatFromInt(rc[1]), @floatFromInt(rc[2]), @floatFromInt(rc[3]), 6.0, if (yt.show_queue) sel_accent else input_bg);
+            const tw = @as(i32, @intCast(lab.len)) * raster.advance;
+            _ = drawText(buf, W, H, raster, rc[0] + @divTrunc(rc[2] - tw, 2), chip_tb, lab, if (yt.show_queue) [3]u8{ 14, 17, 26 } else text_dim, rc[2]);
+        }
+        const hint = "tasto destro: coda · Ctrl+O YouTube";
         var cols: i32 = 0;
         if (std.unicode.Utf8View.init(hint)) |v| {
             var hit = v.iterator();
@@ -1444,7 +1710,7 @@ pub fn drawOverlay(buf: []u8, W: u32, H: u32, state: *GuiAppState, raster: *glyp
         } else |_| {}
         const hw = cols * raster.advance;
         const hx = lay.xp + lay.wp - pad - hw;
-        if (hx > chipRect(lay, quality_labels.len - 1)[0] + chip_w + 16) {
+        if (hx > queueChipRect(lay)[0] + queue_chip_w + 16) {
             _ = drawText(buf, W, H, raster, hx, chip_tb, hint, text_dim, hw + 4);
         }
     }
@@ -1455,6 +1721,8 @@ pub fn drawOverlay(buf: []u8, W: u32, H: u32, state: *GuiAppState, raster: *glyp
         const sbase = sy + @divTrunc(status_h - line_h, 2) + raster.ascent;
         if (yt.opening) {
             _ = drawText(buf, W, H, raster, in_x, sbase, "apertura stream…", text_dim, lay.wp - pad * 2 - 24);
+        } else if (yt.err == null) {
+            _ = drawText(buf, W, H, raster, in_x, sbase, "Coda vuota: tasto destro (o Ctrl+Invio) su un video per aggiungerlo", text_dim, lay.wp - pad * 2 - 24);
         } else if (yt.err) |e| {
             const used = drawText(buf, W, H, raster, in_x, sbase, e, text_err, lay.wp - pad * 2 - 24);
             // Il link per esteso dopo il messaggio, se c'è posto: si legge anche
@@ -1475,7 +1743,7 @@ pub fn drawOverlay(buf: []u8, W: u32, H: u32, state: *GuiAppState, raster: *glyp
     const clip_y1 = lay.grid_y + geom(lay).bandH() + 3;
     const saved_clip = canvas.setClip(0, @intCast(@max(clip_y0, 0)), W, @intCast(@max(clip_y1 - @max(clip_y0, 0), 0)));
     defer canvas.clip = saved_clip;
-    for (yt.results, 0..) |r, i| {
+    for (shown(yt), 0..) |r, i| {
         const rc = cardRect(lay, yt.scroll.pos(), i) orelse continue;
         const x = rc[0];
         const y = rc[1];
@@ -1506,6 +1774,17 @@ pub fn drawOverlay(buf: []u8, W: u32, H: u32, state: *GuiAppState, raster: *glyp
             const by = y + lay.thumb_h - bh - 6;
             canvas.fillRoundedRect(@floatFromInt(bx), @floatFromInt(by), @floatFromInt(bw), @floatFromInt(bh), 4.0, badge_bg);
             _ = drawTextClip(buf, W, H, raster, bx + 5, by + 2 + raster.ascent, r.duration, text_fg, bw, clip_y0, clip_y1);
+        }
+
+        // Badge "in coda" in alto a sinistra (nella vista coda solo il numero).
+        const qn = queuePos(yt, r.id);
+        if (qn > 0) {
+            var qb: [24]u8 = undefined;
+            const qlab = (if (yt.show_queue) std.fmt.bufPrint(&qb, "#{d}", .{qn}) else std.fmt.bufPrint(&qb, "in coda #{d}", .{qn})) catch "in coda";
+            const bw = @as(i32, @intCast(qlab.len)) * raster.advance + 10;
+            const bh = line_h + 4;
+            canvas.fillRoundedRect(@floatFromInt(x + 6), @floatFromInt(y + 6), @floatFromInt(bw), @floatFromInt(bh), 4.0, sel_accent);
+            _ = drawTextClip(buf, W, H, raster, x + 11, y + 8 + raster.ascent, qlab, .{ 14, 17, 26 }, bw, clip_y0, clip_y1);
         }
 
         // Striscia titolo sotto la miniatura.

@@ -204,7 +204,7 @@ fn mkdirOne(prefix: []const u8) void {
 }
 
 /// Crea la catena di directory di `dir` (best-effort, come `mkdir -p`).
-fn makeDirs(dir: []const u8) void {
+pub fn makeDirs(dir: []const u8) void {
     for (dir, 0..) |c, i| {
         if ((c == '/' or c == '\\') and i > 0) mkdirOne(dir[0..i]);
     }

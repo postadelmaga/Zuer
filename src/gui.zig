@@ -561,6 +561,8 @@ fn renderWorker(
                 .w = &state.shared.static_w,
                 .h = &state.shared.static_h,
             }, vs, frame_dt);
+            // Stream YouTube: qualità Auto che sale con la vista, coda a fine video.
+            yt_search.tickStream(state, cur_h, frame_dt);
             // Auto-hide: controlli visibili in pausa, durante lo scrubbing o entro
             // 2.5 s dall'ultimo movimento del mouse; poi sfumano (fade ~8/s).
             vs.idle_s += frame_dt;

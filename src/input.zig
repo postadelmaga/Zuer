@@ -52,6 +52,7 @@ const KEY_A: u32 = 30;
 const KEY_O: u32 = 24;
 const KEY_D: u32 = 32;
 const KEY_R: u32 = 19;
+const KEY_N: u32 = 49;
 
 // Stato per il rilevamento del doppio-click sinistro (solo thread finestra).
 var last_click_ms: i64 = -1000;
@@ -451,6 +452,7 @@ fn handleYtKey(app_state: *GuiAppState, key: u32) bool {
     if (!yt.active) {
         if (key == KEY_Y and !app_state.ctrl_down) {
             yt.active = true;
+            yt_search.ensureQueueLoaded(app_state);
             // Il 'y' di apertura genera anche un evento testo (on_text è
             // additivo a on_key): non deve finire nella query.
             yt.swallow_text = true;
@@ -478,6 +480,8 @@ fn handleYtKey(app_state: *GuiAppState, key: u32) bool {
             // Ctrl+O: apri nel browser la pagina YouTube della card selezionata
             // (la `o` nuda è testo per la query, quindi serve il modificatore).
             KEY_O => yt_search.openPageLocked(app_state),
+            // Ctrl+Invio: la card selezionata entra nella coda (o ne esce).
+            KEY_ENTER => yt_search.toggleQueueAt(app_state, yt.sel),
             else => {},
         }
         return true;
@@ -492,7 +496,7 @@ fn handleYtKey(app_state: *GuiAppState, key: u32) bool {
         KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT => {
             // Navigazione a griglia: ←/→ di una card, ↑/↓ di una riga. Lo
             // scroll insegue la selezione (solo per la tastiera: follow_sel).
-            const n: i32 = @intCast(yt.results.len);
+            const n: i32 = @intCast(yt_search.shown(yt).len);
             if (n > 0) {
                 const step: i32 = switch (key) {
                     KEY_LEFT => -1,
@@ -506,7 +510,7 @@ fn handleYtKey(app_state: *GuiAppState, key: u32) bool {
             }
         },
         KEY_PGUP, KEY_PGDOWN => {
-            const n: i32 = @intCast(yt.results.len);
+            const n: i32 = @intCast(yt_search.shown(yt).len);
             if (n > 0) {
                 const step: i32 = 3 * yt_search.grid_cols;
                 yt.sel = std.math.clamp(yt.sel + (if (key == KEY_PGDOWN) step else -step), 0, n - 1);
@@ -519,7 +523,7 @@ fn handleYtKey(app_state: *GuiAppState, key: u32) bool {
             // senza passare dalla ricerca.
             if (yt_search.videoIdFromUrl(yt.query.items)) |vid| {
                 yt_search.openById(app_state, vid);
-            } else if (yt.results.len > 0 and yt.sel >= 0) {
+            } else if (yt_search.shown(yt).len > 0 and yt.sel >= 0) {
                 yt_search.openSelected(app_state);
             } else {
                 yt_search.startSearch(app_state);
@@ -616,6 +620,12 @@ pub fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) 
                 // li scarica yt-dlp su un thread. No-op sui video non-YouTube.
                 app_state.shared.mutex.lockUncancelable(app_state.io);
                 yt_search.toggleSubs(app_state);
+                app_state.shared.mutex.unlock(app_state.io);
+                return;
+            } else if (key == KEY_N and !app_state.ctrl_down) {
+                // Prossimo video della coda "guarda dopo".
+                app_state.shared.mutex.lockUncancelable(app_state.io);
+                yt_search.playNext(app_state);
                 app_state.shared.mutex.unlock(app_state.io);
                 return;
             } else if (key == KEY_O and !app_state.ctrl_down) {
