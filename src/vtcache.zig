@@ -212,7 +212,7 @@ fn makeDirs(dir: []const u8) void {
 }
 
 /// Valore di una variabile d'ambiente, duplicato (chiamante libera). null se assente.
-fn getEnvAlloc(gpa: std.mem.Allocator, name: [:0]const u8) ?[]u8 {
+pub fn getEnvAlloc(gpa: std.mem.Allocator, name: [:0]const u8) ?[]u8 {
     if (is_win) {
         var wname: [64]u16 = undefined;
         const wn = toW(name, &wname) orelse return null;

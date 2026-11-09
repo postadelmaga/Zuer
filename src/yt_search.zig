@@ -25,6 +25,7 @@ const vtcache = @import("vtcache.zig");
 const layout_mod = @import("layout.zig");
 const crash_report = @import("crash_report.zig");
 const hwdec_caps = @import("hwdec_caps.zig");
+const ytdlp = @import("ytdlp.zig");
 
 /// Un risultato di ricerca (stringhe e miniatura possedute, vedi `freeResults`).
 pub const Result = struct {
@@ -300,8 +301,13 @@ fn searchWorker(state: *GuiAppState, query: []u8, gen: u32) void {
     const spec = std.fmt.allocPrint(state.gpa, "ytsearch{d}:{s}", .{ search_max, query }) catch return;
     defer state.gpa.free(spec);
 
+    const exe = ytdlp.find(state.gpa, state.io) orelse {
+        finishSearchErr(state, gen, ytdlp.missing_msg);
+        return;
+    };
+    defer state.gpa.free(exe);
     var res = decoder_mod.runCaptureTimeout(state.gpa, &.{
-        "yt-dlp",
+        exe,
         "--no-warnings",
         "--flat-playlist",
         "--print",
@@ -627,6 +633,29 @@ pub fn openPageLocked(state: *GuiAppState) void {
     t.detach();
 }
 
+/// Apre `url` nel browser su un thread (subprocess). Con `shared.mutex` acquisito o no.
+fn openUrl(state: *GuiAppState, url: []const u8) void {
+    const owned = state.gpa.dupe(u8, url) catch return;
+    const t = std.Thread.spawn(.{}, browserWorker, .{ state, owned }) catch {
+        state.gpa.free(owned);
+        return;
+    };
+    t.detach();
+}
+
+/// L'errore mostrato è "yt-dlp non trovato" (la riga di stato porta al download).
+fn missingShown(yt: anytype) bool {
+    const e = yt.err orelse return false;
+    return !yt.opening and std.mem.eql(u8, e, ytdlp.missing_msg);
+}
+
+/// Il punto è sulla riga di stato (errore / "apertura stream…") del pannello.
+fn statusHit(lay: anytype, mx: f32, my: f32) bool {
+    const sy = lay.yp + pad + input_h + qual_h;
+    return mx >= @as(f32, @floatFromInt(lay.xp)) and mx < @as(f32, @floatFromInt(lay.xp + lay.wp)) and
+        my >= @as(f32, @floatFromInt(sy)) and my < @as(f32, @floatFromInt(sy + status_h));
+}
+
 fn browserWorker(state: *GuiAppState, url: []u8) void {
     _ = crash_report.openBrowser(state.gpa, url);
     state.gpa.free(url);
@@ -658,6 +687,12 @@ fn openWorker(state: *GuiAppState, id: []u8, title_opt: ?[]u8, resume_s: f64, he
         return;
     }
 
+    const exe = ytdlp.find(state.gpa, state.io) orelse {
+        if (title_opt) |t| state.gpa.free(t);
+        finishOpenErr(state, ytdlp.missing_msg);
+        return;
+    };
+    defer state.gpa.free(exe);
     const url = std.fmt.allocPrint(state.gpa, "https://www.youtube.com/watch?v={s}", .{id}) catch {
         if (title_opt) |t| state.gpa.free(t);
         return;
@@ -676,7 +711,7 @@ fn openWorker(state: *GuiAppState, id: []u8, title_opt: ?[]u8, resume_s: f64, he
     // prima riga nella stessa estrazione (una sola chiamata yt-dlp).
     var argv_buf: [14][]const u8 = undefined;
     var argc: usize = 0;
-    const head = [_][]const u8{ "yt-dlp", "--no-warnings", "--no-playlist" };
+    const head = [_][]const u8{ exe, "--no-warnings", "--no-playlist" };
     for (head) |a| {
         argv_buf[argc] = a;
         argc += 1;
@@ -861,12 +896,14 @@ fn fetchSubs(state: *GuiAppState, id: []const u8) ![]SubCue {
     // Cache su disco: un VTT già scaricato per questo id evita yt-dlp.
     var vtt_path = findSubFile(gpa, state.io, dir, id);
     if (vtt_path == null) {
+        const exe = ytdlp.find(gpa, state.io) orelse return error.YtDlpMissing;
+        defer gpa.free(exe);
         const url = try std.fmt.allocPrint(gpa, "https://www.youtube.com/watch?v={s}", .{id});
         defer gpa.free(url);
         const out_tpl = try std.fmt.allocPrint(gpa, "{s}/%(id)s.%(ext)s", .{dir});
         defer gpa.free(out_tpl);
         var res = try decoder_mod.runCaptureTimeout(gpa, &.{
-            "yt-dlp",       "--no-warnings",     "--no-playlist", "--skip-download",
+            exe,            "--no-warnings",     "--no-playlist", "--skip-download",
             "--write-subs", "--write-auto-subs", "--sub-langs",   "it,en,en-orig",
             "--sub-format", "vtt/best",          "-o",            out_tpl,
             url,
@@ -1209,6 +1246,11 @@ pub fn handleMouse(state: *GuiAppState, win: *zrame.Window, event: zrame.MouseEv
                     return true;
                 }
             }
+            // Click sul messaggio "yt-dlp non trovato": apre la pagina di download.
+            if (missingShown(yt) and statusHit(lay, mx, my)) {
+                openUrl(state, ytdlp.download_url);
+                return true;
+            }
             // Click fuori dal pannello: chiudi l'overlay (dentro ma non su una
             // card — campo, bordi — non fa nulla).
             const inside = mx >= @as(f32, @floatFromInt(lay.xp)) and mx < @as(f32, @floatFromInt(lay.xp + lay.wp)) and
@@ -1238,6 +1280,7 @@ const badge_bg = paint.Color.rgba(0, 0, 0, 0.72);
 const text_fg = [3]u8{ 235, 238, 245 };
 const text_dim = [3]u8{ 150, 158, 175 };
 const text_err = [3]u8{ 240, 120, 110 };
+const text_link = [3]u8{ 120, 160, 255 };
 
 /// Testo monospazio troncato a `max_w` px; ritorna la larghezza usata.
 /// Pubblica: riusata dall'esploratore file (stesso stile di overlay).
@@ -1409,7 +1452,15 @@ pub fn drawOverlay(buf: []u8, W: u32, H: u32, state: *GuiAppState, raster: *glyp
         if (yt.opening) {
             _ = drawText(buf, W, H, raster, in_x, sbase, "apertura stream…", text_dim, lay.wp - pad * 2 - 24);
         } else if (yt.err) |e| {
-            _ = drawText(buf, W, H, raster, in_x, sbase, e, text_err, lay.wp - pad * 2 - 24);
+            const used = drawText(buf, W, H, raster, in_x, sbase, e, text_err, lay.wp - pad * 2 - 24);
+            // Il link per esteso dopo il messaggio, se c'è posto: si legge anche
+            // senza cliccare (e si copia a mano).
+            if (missingShown(yt)) {
+                const lx = in_x + used + 12;
+                const room = lay.xp + lay.wp - pad - 24 - lx;
+                const lw = @as(i32, @intCast(ytdlp.download_url.len)) * raster.advance;
+                if (room >= lw) _ = drawText(buf, W, H, raster, lx, sbase, ytdlp.download_url, text_link, room);
+            }
         }
     }
 
