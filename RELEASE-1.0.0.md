@@ -324,4 +324,4 @@ in `.github/zicro.ref`.
 
 ## Licenza
 
-AGPL-3.0-or-later (`LICENSE`), come Zicro. Componenti di terze parti: vedi README.
+AGPL-3.0-or-later (`LICENSE`), come Zicro. Componenti di terze parti: vedi docs/sviluppo.md, "Componenti di terze parti".
