@@ -1,83 +1,35 @@
-# Zuer 1.1.4 — note di rilascio
+# Zuer 1.1.5 — note di rilascio
 
-Versione di correzione, tag `v1.1.4`. Zicro al commit di `.github/zicro.ref` (`main`
+Versione di correzione, tag `v1.1.5`. Zicro al commit di `.github/zicro.ref` (`main`
 di Zicro). Le funzioni, la matrice di parità, le verifiche e i limiti sono quelli della
-1.1.0, in [RELEASE-1.1.0.md](RELEASE-1.1.0.md); cosa è cambiato nelle versioni 1.1.1,
-1.1.2 e 1.1.3 in [RELEASE-1.1.1.md](RELEASE-1.1.1.md), [RELEASE-1.1.2.md](RELEASE-1.1.2.md)
-e [RELEASE-1.1.3.md](RELEASE-1.1.3.md); qui solo cosa cambia. Stesse parole per come è
-stato verificato: **verificato** (questa macchina Linux), **CI** (runner GitHub
-virtuale), **non verificato**. Su macOS c'è un livello in più: **sotto Darling** (la
-build x86_64 eseguita su Linux da Darling, con il suo AppKit Cocotron sopra X11), che
-prova il codice di Zuer e Zicro ma non l'AppKit di Apple.
+1.1.0, in [RELEASE-1.1.0.md](RELEASE-1.1.0.md); cosa è cambiato nelle versioni dalla
+1.1.1 alla 1.1.4 in [RELEASE-1.1.1.md](RELEASE-1.1.1.md), [RELEASE-1.1.2.md](RELEASE-1.1.2.md),
+[RELEASE-1.1.3.md](RELEASE-1.1.3.md) e [RELEASE-1.1.4.md](RELEASE-1.1.4.md); qui solo
+cosa cambia. Stesse parole per come è stato verificato: **verificato** (questa macchina
+Linux), **CI** (runner GitHub virtuale), **non verificato**, e **sotto Darling** (la
+build macOS x86_64 eseguita su Linux da Darling).
 
-## Cosa cambia rispetto a 1.1.3
+## Cosa cambia rispetto a 1.1.4
 
-### macOS: pacchetto per i Mac Intel
+### macOS: i pacchetti girano davvero da macOS 13
 
-Oltre a quello per Apple Silicon c'è `zuer-1.1.4-macos-x86_64.tar.gz` per i Mac Intel,
-con lo stesso contenuto (FFmpeg con VideoToolbox e dav1d, MoltenVK). È compilato e
-provato su un runner Intel, con le stesse verifiche del pacchetto arm64 tranne il 3D
-con Vulkan: sulla GPU paravirtuale di quella macchina virtuale Metal chiude il processo
-mentre MoltenVK ne sonda le capacità, prima che Zuer disegni qualcosa. Sui Mac Intel
-veri (GPU Intel o AMD) il 3D non è verificato; in una macchina virtuale macOS su Intel
-aprire un modello 3D può chiudere Zuer. (CI; sotto Darling, che esegue proprio la build
-x86_64: PDF, immagini e documenti office)
+La 1.1.4 dichiarava macOS 13 come minimo (`LSMinimumSystemVersion`), ma tutti i suoi
+binari erano compilati per macOS 15.0: Zig 0.17 senza una versione nel target compila
+per il 15, e FFmpeg con dav1d prendeva quella del runner. Su macOS 13 e 14 Zuer poteva
+non partire, o fermarsi alla prima funzione di sistema assente prima del 15. Ora
+`zuer-gui`, i plugin, FFmpeg e dav1d sono compilati per macOS 13.0, e il pacchetto non
+si costruisce se un suo binario richiede un macOS più recente di quello dichiarato.
+(CI: versione minima di ogni binario; avvio su macOS 13 e 14 non verificato: non ci sono
+runner con quelle versioni)
 
-### macOS: istruzioni per il primo avvio
+### Video: la prova del seek misura quello che si vede
 
-Da macOS 15 il clic destro → Apri non scavalca più il blocco di Gatekeeper sulle app non
-notarizzate: le istruzioni qui sotto ("Distribuzione") ora dicono come aprire Zuer da
-Impostazioni di Sistema → Privacy e sicurezza → Apri comunque.
-
-### macOS: più formati, con i componenti del sistema
-
-- **Immagini** con ImageIO: HEIC, JPEG 2000, JPEG XL, OpenEXR, DDS, ICNS, PICT e i RAW
-  delle fotocamere (DNG, CR2/CR3, NEF, ARW, ORF, RW2, RAF e altri). Le foto escono
-  dritte: ImageIO ne applica l'orientamento EXIF, e decodifica un RAW già ridotto al
-  lato che serve. (HEIC e JPEG 2000: CI; gli altri dipendono dalla versione di macOS:
-  CI quando il runner li sa generare; orientamento TIFF: sotto Darling)
-- **Archivi** col `tar` di sistema (bsdtar): 7z, RAR, ISO, CPIO, XAR/PKG, CAB, RPM, LHA.
-  Un archivio danneggiato dà un errore leggibile. (7z, ISO, CPIO, XAR e l'archivio
-  danneggiato: CI; 7z, ISO e CPIO anche sotto Darling; RAR, CAB, RPM e LHA: non
-  verificato)
-- **Documenti** Word `.doc`, RTF e `.webarchive` come testo, con `textutil` di sistema.
-  (CI)
-
-### Video e audio: più formati su macOS e Windows
-
-La FFmpeg compilata per i pacchetti apre ora anche WMV/ASF (WMV 1-3, VC-1), FLV, MPEG
-program stream (`.mpg`, `.vob`), DV, ProRes, DNxHD, VP6, Cinepak, Indeo, HuffYUV, FFV1,
-e in audio WMA, AIFF, CAF, W64, AC-3/E-AC-3, DTS, TrueHD, AMR, WavPack, Monkey's Audio,
-Musepack e TTA. (verificato con la stessa configurazione su Linux: 53 casi di
-`scripts/ffmpeg-check.sh`; CI su macOS e Windows)
-
-### Archivi `.tar.zst` e `.tar.xz` su tutti i sistemi
-
-zstd e xz si decomprimono dentro Zuer; gli altri formati d'archivio passano dal `tar`
-di sistema quando è bsdtar (macOS, Windows 10+; su Linux il pacchetto
-`libarchive-tools`). (verificato; test unitario)
-
-### Spostare la finestra col tasto destro
-
-Tenendo premuto il tasto destro in qualunque punto del contenuto la finestra si sposta:
-senza bordi né barra del titolo era scomodo su macOS e Windows. Il destro sulle card
-della ricerca YouTube e nell'esploratore file fa ancora quello che faceva. (macOS: sotto
-Darling; Linux e Windows: non verificato)
-
-### YouTube: qualità Auto e coda "guarda dopo"
-
-- Qualità **Auto** (predefinita): l'altezza segue la finestra, almeno 720p; sale dopo
-  1,5 s a una vista più grande (schermo intero) e non scende mai.
-- **Coda**: tasto destro o Ctrl+Invio su una card la mette in coda (chip "Coda (N)",
-  badge "in coda #n"); a fine video parte il prossimo, `n` lo salta. Si salva fra una
-  sessione e l'altra.
-
-(non verificato per questa nota)
-
-### Guida dei tasti
-
-Tenendo premuto `h` compare l'elenco dei tasti sopra qualunque contenuto, su due colonne
-se c'è posto; si chiude al rilascio. (non verificato per questa nota)
+La prova automatica del seek (`feature-probe video`) guardava dove atterra il salto di
+FFmpeg, cioè il keyframe precedente, e non il primo frame mostrato: con video dai
+keyframe radi (uno ogni 3-12 secondi) segnalava un errore che nell'app non c'è. Ora
+segue lo stesso percorso della finestra e pretende il frame del punto chiesto. Zuer
+non cambia: il seek era già preciso. (verificato con due video H.264 a 1080p e 4K;
+sotto Darling)
 
 ## Distribuzione
 
@@ -87,9 +39,9 @@ Zuer e Zicro, architettura, sha256).
 
 | Sistema | Architettura | Artefatto |
 |---|---|---|
-| macOS 13 o successivo | Apple Silicon (arm64) | `zuer-1.1.4-macos-arm64.tar.gz` (`Zuer.app`, con FFmpeg e MoltenVK in `Contents/Frameworks`) |
-| macOS 13 o successivo | Intel (x86_64) | `zuer-1.1.4-macos-x86_64.tar.gz` (stesso contenuto, compilato e provato su un Mac Intel) |
-| Windows 10/11 | x64 | `zuer-1.1.4-windows-x64-setup.exe` |
+| macOS 13 o successivo | Apple Silicon (arm64) | `zuer-1.1.5-macos-arm64.tar.gz` (`Zuer.app`, con FFmpeg e MoltenVK in `Contents/Frameworks`) |
+| macOS 13 o successivo | Intel (x86_64) | `zuer-1.1.5-macos-x86_64.tar.gz` (stesso contenuto, compilato e provato su un Mac Intel) |
+| Windows 10/11 | x64 | `zuer-1.1.5-windows-x64-setup.exe` |
 | Linux | x64 | dai sorgenti: `zig build` + `install.sh` |
 
 Quale pacchetto macOS: menu Apple → Informazioni su questo Mac. "Chip Apple M…" →
@@ -100,7 +52,7 @@ sono pacchetti universali né Windows ARM.
 **Verifica del download**: nella cartella dei file scaricati,
 `sha256sum -c SHA256SUMS --ignore-missing` (Linux/Git Bash) oppure
 `shasum -a 256 -c SHA256SUMS` (macOS); su Windows
-`Get-FileHash .\zuer-1.1.4-windows-x64-setup.exe -Algorithm SHA256` e confronto a mano.
+`Get-FileHash .\zuer-1.1.5-windows-x64-setup.exe -Algorithm SHA256` e confronto a mano.
 
 **macOS**: estrarre l'archivio e trascinare `Zuer.app` in Applicazioni. Il pacchetto
 **non è firmato con un Developer ID né notarizzato** (la firma è solo ad-hoc): al primo
@@ -135,7 +87,7 @@ i modelli 3D non si vedono, con il motivo a schermo.
 (commit e opzioni di configure: la build si ripete con `scripts/build-ffmpeg.sh`);
 `THIRD-PARTY-NOTICES.txt` (libwebp, nanosvg, TinySoundFont, stb);
 su Windows PDFium con `PDFium-LICENSE.txt`; su macOS MoltenVK (Apache-2.0) con
-`MoltenVK-LICENSE.txt`. Il sorgente di Zuer è il tag `v1.1.4`, quello di Zicro il commit
+`MoltenVK-LICENSE.txt`. Il sorgente di Zuer è il tag `v1.1.5`, quello di Zicro il commit
 in `.github/zicro.ref`. La procedura per una nuova versione è in RELEASE-1.0.0.md,
 "Fare una nuova versione".
 
