@@ -296,7 +296,12 @@ pub const AudioPlayer = struct {
             if (self.skip_until_s >= 0) {
                 const pts_s = self.framePtsSeconds();
                 if (pts_s >= 0 and pts_s < self.skip_until_s) continue;
-                const base_s: f64 = if (pts_s >= 0) pts_s else self.skip_until_s;
+                // Dall'inizio (avvio, riavvolgimento, seek a 0) vale l'inizio dello
+                // stream secondo il demuxer, cioè il pts del primo packet: un decoder
+                // con ritardo dà al suo primo frame (che contiene l'audio da 0) il pts
+                // di un packet successivo (WMA: 0,086 s), e l'orologio partiva avanti.
+                const start_s = if (self.skip_until_s == 0) self.streamStartSeconds() else -1;
+                const base_s: f64 = if (start_s >= 0) start_s else if (pts_s >= 0) pts_s else self.skip_until_s;
                 submitted = @intFromFloat(base_s * @as(f64, @floatFromInt(OUT_RATE)));
                 self.skip_until_s = -1;
             }
@@ -334,6 +339,14 @@ pub const AudioPlayer = struct {
 
     /// Pts del frame corrente in secondi, -1 se il container non lo fornisce
     /// (in quel caso il filtro post-seek non può scartare: si ripiega sulla soglia).
+    /// Inizio dello stream audio secondo il demuxer (pts del primo packet), in
+    /// secondi, mai negativo (un edit list AAC lo porta poco sotto 0); -1 se ignoto.
+    fn streamStartSeconds(self: *const AudioPlayer) f64 {
+        const ts = self.fmt_ctx.*.streams[@intCast(self.stream_idx)].*.start_time;
+        if (ts == c.AV_NOPTS_VALUE or self.time_base <= 0) return -1;
+        return @max(0, @as(f64, @floatFromInt(ts)) * self.time_base);
+    }
+
     fn framePtsSeconds(self: *const AudioPlayer) f64 {
         const ts = self.frame.*.best_effort_timestamp;
         if (ts == c.AV_NOPTS_VALUE or self.time_base <= 0) return -1;
