@@ -27,9 +27,11 @@ runner con quelle versioni)
 La prova automatica del seek (`feature-probe video`) guardava dove atterra il salto di
 FFmpeg, cioè il keyframe precedente, e non il primo frame mostrato: con video dai
 keyframe radi (uno ogni 3-12 secondi) segnalava un errore che nell'app non c'è. Ora
-segue lo stesso percorso della finestra e pretende il frame del punto chiesto. Zuer
-non cambia: il seek era già preciso. (verificato con due video H.264 a 1080p e 4K;
-sotto Darling)
+segue lo stesso percorso della finestra e controlla che il primo frame mostrato non
+venga prima del punto chiesto (MPEG-TS e HLS possono atterrare sul keyframe
+successivo, al più un GOP dopo). Zuer non cambia: il seek era già preciso.
+(verificato: i 53 formati di `ffmpeg-check` e due video H.264 a 1080p e 4K; sotto
+Darling)
 
 ## Distribuzione
 

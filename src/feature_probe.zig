@@ -237,10 +237,11 @@ fn probeVideo(gpa: std.mem.Allocator, path: []const u8) void {
     // Pts strettamente crescenti e senza buchi oltre 3 frame: anche attraverso un
     // eventuale ripiego hw→sw (ZUER_TEST_HWFAIL_AFTER) la riproduzione è continua.
     report(max_gap < 0.11 and !went_back, "video: pts continui (salto massimo {d:.3}s{s})", .{ max_gap, if (went_back) ", ALL'INDIETRO" else "" });
-    // Come la GUI (video_decoder.zig): il seek atterra sul keyframe PRECEDENTE e
-    // nextFrame scarta i frame prima del target. Senza la soglia si misurerebbe il
-    // keyframe, che nei file con GOP lunghi (uno ogni 3-12 s) sta secondi prima.
-    const target = last_pts + 2.0;
+    // Come la GUI (video_decoder.zig): il seek atterra su un keyframe e nextFrame
+    // scarta i frame prima del target. Senza la soglia si misurerebbe il keyframe,
+    // che nei file con GOP lunghi (uno ogni 3-12 s) sta secondi prima. Target a
+    // +1 s: dentro anche i clip di ffmpeg-check (il DV dura 4 s, 60 frame a 2,4 s).
+    const target = last_pts + 1.0;
     p.seek(target);
     var after: ?f64 = null;
     var tries: usize = 0;
@@ -250,8 +251,10 @@ fn probeVideo(gpa: std.mem.Allocator, path: []const u8) void {
             if (!p.reuse) gpa.free(f.pixels);
         }
     }
-    // Primo frame mostrato: quello che copre il target (entro un frame a 24 fps).
-    report(after != null and after.? >= target - 0.05 and after.? < target + 1.0, "video: seek a {d:.3}s → primo frame a {d:.3}s", .{ target, after orelse -1 });
+    // Il primo frame mostrato non viene prima del target (entro un frame a 24 fps).
+    // Può venire dopo: HLS (apposta, vedi Player.seek) e MPEG-TS atterrano sul
+    // keyframe successivo, al più un GOP più avanti.
+    report(after != null and after.? >= target - 0.05 and after.? < target + 2.0, "video: seek a {d:.3}s → primo frame a {d:.3}s", .{ target, after orelse -1 });
 }
 
 fn probeAudio(io: std.Io, gpa: std.mem.Allocator, path: []const u8) void {
