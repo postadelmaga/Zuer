@@ -827,6 +827,15 @@ pub fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopa
             // 0x110 = BTN_LEFT (click sinistro), 0x111 = BTN_RIGHT (click destro)
             if (event.button != 0x110 and event.button != 0x111) return false;
             const down = (event.kind == .press);
+            // Tasto destro tenuto premuto: trascina la finestra da qualunque punto.
+            // Senza bordi né barra del titolo è l'unico modo comodo su macOS/Windows
+            // (su Linux resta anche Meta+trascina del compositore). Il sinistro
+            // continua a fare pan/selezione/controlli; gli overlay (esploratore,
+            // ricerca YouTube) hanno già consumato il loro destro qui sopra.
+            if (event.button == 0x111) {
+                if (down) win.beginMove();
+                return true;
+            }
             // Snapshot dei flag di tipo sotto lock (pattern `is_pdf` del key
             // handler): sono riscritti da `applyDecoded` sui thread loader.
             app_state.shared.mutex.lockUncancelable(app_state.io);
