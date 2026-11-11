@@ -107,8 +107,14 @@ case "$PLATFORM" in
       x86_64) command -v nasm >/dev/null || { echo "✗ su Intel serve nasm (brew install nasm)"; exit 1; } ;;
       *) echo "✗ architettura macOS non supportata: $MAC_ARCH"; exit 2 ;;
     esac
+    # Versione minima di macOS: la stessa di LSMinimumSystemVersion in
+    # build-macos-bundle.sh, che verifica il minos di ogni binario del bundle. Senza,
+    # clang (e meson per dav1d) prende quella del sistema che compila (15 sui runner).
+    export MACOSX_DEPLOYMENT_TARGET=13.0
     PLAT=(
       --arch="$MAC_ARCH" --cc=clang
+      --extra-cflags=-mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET
+      --extra-ldflags=-mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET
       --enable-videotoolbox --enable-securetransport --enable-zlib
       --enable-hwaccel=h264_videotoolbox,hevc_videotoolbox,vp9_videotoolbox,av1_videotoolbox
       # Install name `@rpath/…` più LC_RPATH `@loader_path`: le dylib si trovano fra
@@ -145,7 +151,9 @@ echo "→ FFmpeg @ $FF_COMMIT"
 fetch https://github.com/FFmpeg/FFmpeg.git "$FF_COMMIT" "$SRC"
 
 # dav1d statico (meson + ninja), installato in un prefisso di lavoro solo per il link.
-DAV1D_SRC="$WORK/dav1d"; DAV1D_PREFIX="$WORK/dav1d-prefix"
+# Su macOS il prefisso porta la versione minima: un dav1d compilato per un altro
+# macOS non va riusato (il controllo del minos nel bundle lo rifiuterebbe).
+DAV1D_SRC="$WORK/dav1d"; DAV1D_PREFIX="$WORK/dav1d-prefix${MACOSX_DEPLOYMENT_TARGET:+-macos$MACOSX_DEPLOYMENT_TARGET}"
 command -v meson >/dev/null && command -v ninja >/dev/null || { echo "✗ servono meson e ninja"; exit 1; }
 if [[ ! -f "$DAV1D_PREFIX/lib/libdav1d.a" ]]; then
   echo "→ dav1d $DAV1D_TAG @ $DAV1D_COMMIT"

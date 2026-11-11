@@ -37,9 +37,15 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Versione minima di macOS: la dichiara l'Info.plist (LSMinimumSystemVersion) e la
+# devono rispettare TUTTI i binari del bundle (LC_BUILD_VERSION minos), controllati
+# sotto. Senza versione nel target Zig 0.17 compila per macOS 15.0; FFmpeg la prende
+# da scripts/build-ffmpeg.sh (MACOSX_DEPLOYMENT_TARGET, stesso valore).
+MACOS_MIN=13.0
+
 case "$ARCH" in
-  arm64)  ZIG_TARGET=aarch64-macos; BIN="$ROOT/zig-out/bin"; LIB="$ROOT/zig-out/lib" ;;
-  x86_64) ZIG_TARGET=x86_64-macos; BIN="$ROOT/zig-out/macos-x64/bin"; LIB="$ROOT/zig-out/macos-x64/lib" ;;
+  arm64)  ZIG_TARGET=aarch64-macos.$MACOS_MIN; BIN="$ROOT/zig-out/bin"; LIB="$ROOT/zig-out/lib" ;;
+  x86_64) ZIG_TARGET=x86_64-macos.$MACOS_MIN; BIN="$ROOT/zig-out/macos-x64/bin"; LIB="$ROOT/zig-out/macos-x64/lib" ;;
   *) echo "arch non supportata: $ARCH (arm64|x86_64)" >&2; exit 2 ;;
 esac
 
@@ -171,7 +177,7 @@ PLIST="$APP/Contents/Info.plist"
 PL
   [[ $HAVE_ICON -eq 1 ]] && printf '\t<key>CFBundleIconFile</key><string>zuer</string>\n'
   cat <<PL
-	<key>LSMinimumSystemVersion</key><string>13.0</string>
+	<key>LSMinimumSystemVersion</key><string>$MACOS_MIN</string>
 	<key>NSPrincipalClass</key><string>NSApplication</string>
 	<key>CFBundleDocumentTypes</key>
 	<array>
@@ -199,6 +205,25 @@ PL
 PL
 } > "$PLIST"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
+
+# Ogni binario deve girare dal macOS dichiarato: un minos più alto (es. il 15.0 di
+# default di Zig 0.17, o di un clang che non riceve la versione) promette macOS 13
+# e consegna binari che possono chiamare API assenti prima del 15.
+OTOOL="$(command -v otool || command -v llvm-otool || true)"
+if [[ -n "$OTOOL" ]]; then
+  ver_gt() { [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" == "$1" && "$1" != "$2" ]]; }
+  BAD=0
+  while IFS= read -r -d '' f; do
+    file -b "$f" | grep -q Mach-O || continue
+    MINOS="$("$OTOOL" -l "$f" | awk '/LC_BUILD_VERSION/{b=1} b&&/minos/{print $2; exit} /LC_VERSION_MIN_MACOSX/{v=1} v&&/ version/{print $2; exit}')"
+    if [[ -z "$MINOS" ]]; then echo "  ✗ ${f#$APP/}: versione minima assente"; BAD=1
+    elif ver_gt "$MINOS" "$MACOS_MIN"; then echo "  ✗ ${f#$APP/}: minos $MINOS > $MACOS_MIN dichiarato"; BAD=1; fi
+  done < <(find "$APP/Contents" -type f -print0)
+  [[ $BAD -eq 0 ]] || { echo "✗ binari che richiedono un macOS più recente di $MACOS_MIN"; exit 1; }
+  echo "  ✓ tutti i binari girano da macOS $MACOS_MIN (minos ≤ $MACOS_MIN)"
+else
+  echo "  · otool assente: controllo della versione minima saltato"
+fi
 
 # Firma ad-hoc dell'intero bundle (prima le dylib, poi l'app), dove c'è codesign:
 # il linker firma ad-hoc il solo eseguibile, e un bundle con risorse non sigillate
