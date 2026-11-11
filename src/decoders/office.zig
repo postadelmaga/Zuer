@@ -4,6 +4,8 @@
 //!
 //! - docx, pptx, odt, odp → estrazione testo (XML spogliato dai tag)
 //! - xlsx, xlsm, ods → foglio attivo come tabella CSV
+//! - solo macOS: doc (Word 97-2003), rtf, webarchive, wordml → testo via
+//!   `/usr/bin/textutil` di sistema (il convertitore di TextEdit)
 //!
 //! Fogli xlsx PIGRI: si decodifica per intero SOLO il foglio attivo; degli altri
 //! si tiene il nome (serve alla barra delle linguette) e i dati restano vuoti.
@@ -18,6 +20,27 @@
 const std = @import("std");
 const decoder = @import("decoder");
 const Decoded = decoder.Decoded;
+const builtin = @import("builtin");
+
+/// Formati che su macOS converte `textutil` (vedi `decodeTextutil`).
+const textutil_exts = [_][]const u8{ ".doc", ".dot", ".rtf", ".webarchive", ".wordml" };
+
+/// Testo di un documento convertito da `textutil` (macOS). Il percorso è
+/// l'ultimo argomento: un nome che inizia per `-` passa come `./-nome`.
+fn decodeTextutil(path: []const u8, allocator: std.mem.Allocator) Decoded {
+    const arg = if (std.mem.startsWith(u8, path, "-"))
+        std.mem.concat(allocator, u8, &.{ "./", path }) catch return errMsg(allocator, "Memoria esaurita", .{})
+    else
+        path;
+    defer if (arg.ptr != path.ptr) allocator.free(arg);
+    var run = decoder.runCapture(allocator, &.{ "/usr/bin/textutil", "-convert", "txt", "-encoding", "UTF-8", "-stdout", arg }) catch |err|
+        return errMsg(allocator, "Conversione con textutil fallita: {s}", .{@errorName(err)});
+    if (run.exit_code != 0 or std.mem.trim(u8, run.stdout, " \t\r\n").len == 0) {
+        run.deinit(allocator);
+        return errMsg(allocator, "Documento non convertibile da textutil (danneggiato, cifrato o formato non riconosciuto)", .{});
+    }
+    return .{ .text = run.stdout };
+}
 
 /// Foglio richiesto dal frammento `#sheet=N` del percorso (N 1-based). Null se
 /// il frammento manca o non è un riferimento a foglio: allora si mostra il primo.
@@ -1084,6 +1107,13 @@ export fn zuer_decode(
     const want_sheet = sheetFromPath(path_slice);
     const clean_path = if (std.mem.indexOfScalar(u8, path_slice, '#')) |h| path_slice[0..h] else path_slice;
     const filename = std.fs.path.basename(clean_path);
+    if (comptime builtin.os.tag == .macos) {
+        inline for (textutil_exts) |e| if (hasExtension(filename, e)) {
+            allocator.free(content.toSlice()); // contratto: il plugin libera `content`
+            const d = decodeTextutil(clean_path, allocator);
+            return d.toDecodedC(allocator) catch .{ .tag = .err, .payload = .{ .err = decoder.SliceC.fromSlice("") } };
+        };
+    }
     const decoded = decode(content.toSlice(), filename, want_sheet, allocator);
     return decoded.toDecodedC(allocator) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "";
@@ -1094,7 +1124,8 @@ export fn zuer_decode(
     };
 }
 
-pub const extensions = "docx,pptx,odt,odp,xlsx,xlsm,ods";
+/// Su macOS anche i formati di `textutil`. Stessa lista del manifest in decoder.zig.
+pub const extensions = "docx,pptx,odt,odp,xlsx,xlsm,ods" ++ (if (builtin.os.tag == .macos) ",doc,dot,rtf,webarchive,wordml" else "");
 
 export fn zuer_extensions() callconv(.c) decoder.SliceC {
     return decoder.SliceC.fromSlice(extensions);

@@ -4,6 +4,11 @@
 //! ImageIO, CoreGraphics e CoreFoundation si aprono a runtime alla prima immagine
 //! (come in pdf_coregraphics.zig), quindi nessun link e nessun SDK in cross-build.
 //!
+//! Si chiede a ImageIO una miniatura del lato richiesto con la trasformazione EXIF
+//! applicata (`CGImageSourceCreateThumbnailAtIndex`): le foto HEIC/RAW escono dritte e
+//! un RAW da 50 MP si decodifica già ridotto. Se la miniatura fallisce si ripiega
+//! sull'immagine intera.
+//!
 //! I pixel escono già composti su bianco (la bitmap è riempita di bianco prima di
 //! disegnarci l'immagine): RGBA con alpha 255, allocati con `gpa`.
 
@@ -16,7 +21,8 @@ const CGFloat = f64;
 const CGRect = extern struct { x: CGFloat, y: CGFloat, w: CGFloat, h: CGFloat };
 const kCGImageAlphaPremultipliedLast: u32 = 1;
 
-const Api = struct {
+/// Simboli indispensabili: se ne manca uno ImageIO è inutilizzabile.
+const Core = struct {
     CFDataCreate: *const fn (CFTypeRef, [*]const u8, isize) callconv(.c) CFTypeRef,
     CFRelease: *const fn (CFTypeRef) callconv(.c) void,
     CGImageSourceCreateWithData: *const fn (CFTypeRef, CFTypeRef) callconv(.c) CFTypeRef,
@@ -33,6 +39,25 @@ const Api = struct {
     CGContextFillRect: *const fn (CFTypeRef, CGRect) callconv(.c) void,
     CGContextDrawImage: *const fn (CFTypeRef, CGRect, CFTypeRef) callconv(.c) void,
 };
+
+/// Miniatura con orientamento: facoltativa (Darling non ha
+/// `CGImageSourceCreateThumbnailAtIndex`), senza si decodifica l'immagine intera.
+const Thumb = struct {
+    CGImageSourceCreateThumbnailAtIndex: *const fn (CFTypeRef, usize, CFTypeRef) callconv(.c) CFTypeRef,
+    CFDictionaryCreate: *const fn (CFTypeRef, [*]const CFTypeRef, [*]const CFTypeRef, isize, *const anyopaque, *const anyopaque) callconv(.c) CFTypeRef,
+    CFNumberCreate: *const fn (CFTypeRef, isize, *const anyopaque) callconv(.c) CFTypeRef,
+    // Costanti (simboli di DATI: `lookup` dà il loro indirizzo).
+    kCFTypeDictionaryKeyCallBacks: *const anyopaque,
+    kCFTypeDictionaryValueCallBacks: *const anyopaque,
+    kCFBooleanTrue: *const CFTypeRef,
+    kCGImageSourceCreateThumbnailFromImageAlways: *const CFTypeRef,
+    kCGImageSourceCreateThumbnailWithTransform: *const CFTypeRef,
+    kCGImageSourceThumbnailMaxPixelSize: *const CFTypeRef,
+};
+
+const Api = struct { core: Core, thumb: ?Thumb };
+
+const kCFNumberSInt64Type: isize = 4;
 
 const libs = [_][]const u8{
     "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation",
@@ -52,30 +77,55 @@ fn getApi() !*const Api {
     api_failed = true;
     var handles: [libs.len]std.DynLib = undefined;
     for (libs, 0..) |p, i| handles[i] = std.DynLib.open(p) catch return error.ImageIoUnavailable;
-    var a: Api = undefined;
-    inline for (@typeInfo(Api).@"struct".field_names, @typeInfo(Api).@"struct".field_types) |name, T| {
-        const lib = if (comptime std.mem.startsWith(u8, name, "CF"))
-            &handles[0]
-        else if (comptime std.mem.startsWith(u8, name, "CGImageSource"))
-            &handles[1]
-        else
-            &handles[2];
-        @field(a, name) = lib.lookup(T, name) orelse return error.ImageIoUnavailable;
-    }
-    api = a;
+    api = .{
+        .core = lookupAll(Core, &handles) orelse return error.ImageIoUnavailable,
+        .thumb = lookupAll(Thumb, &handles),
+    };
     api_failed = false;
     return &api.?;
 }
 
-/// Primo fotogramma di `bytes`. `max_pixels` è verificato PRIMA di allocare.
-pub fn decode(gpa: std.mem.Allocator, bytes: []const u8, max_pixels: usize) !Raster {
-    const a = try getApi();
+/// Tutti i simboli di `S` (null se ne manca anche uno solo).
+fn lookupAll(comptime S: type, handles: *[libs.len]std.DynLib) ?S {
+    var out: S = undefined;
+    inline for (@typeInfo(S).@"struct".field_names, @typeInfo(S).@"struct".field_types) |name, T| {
+        const lib = if (comptime std.mem.startsWith(u8, name, "CF") or std.mem.startsWith(u8, name, "kCF"))
+            &handles[0]
+        else if (comptime std.mem.startsWith(u8, name, "CGImageSource") or std.mem.startsWith(u8, name, "kCGImageSource"))
+            &handles[1]
+        else
+            &handles[2];
+        @field(out, name) = lib.lookup(T, name) orelse return null;
+    }
+    return out;
+}
+
+/// Miniatura ImageIO di lato massimo `max_dim`, orientamento EXIF applicato.
+fn thumbnail(c: *const Core, a: *const Thumb, src: CFTypeRef, max_dim: usize) CFTypeRef {
+    const side: i64 = @intCast(@max(max_dim, 1));
+    const num = a.CFNumberCreate(null, kCFNumberSInt64Type, &side) orelse return null;
+    defer c.CFRelease(num);
+    const yes = a.kCFBooleanTrue.*;
+    const keys = [_]CFTypeRef{ a.kCGImageSourceCreateThumbnailFromImageAlways.*, a.kCGImageSourceCreateThumbnailWithTransform.*, a.kCGImageSourceThumbnailMaxPixelSize.* };
+    const vals = [_]CFTypeRef{ yes, yes, num };
+    const opts = a.CFDictionaryCreate(null, &keys, &vals, keys.len, a.kCFTypeDictionaryKeyCallBacks, a.kCFTypeDictionaryValueCallBacks) orelse return null;
+    defer c.CFRelease(opts);
+    return a.CGImageSourceCreateThumbnailAtIndex(src, 0, opts);
+}
+
+/// Primo fotogramma di `bytes`, lato massimo `max_dim` (orientamento applicato).
+/// `max_pixels` è verificato PRIMA di allocare.
+pub fn decode(gpa: std.mem.Allocator, bytes: []const u8, max_dim: usize, max_pixels: usize) !Raster {
+    const api_ = try getApi();
+    const a = &api_.core;
     const data = a.CFDataCreate(null, bytes.ptr, @intCast(bytes.len)) orelse return error.OutOfMemory;
     defer a.CFRelease(data);
     const src = a.CGImageSourceCreateWithData(data, null) orelse return error.UnsupportedImageFormat;
     defer a.CFRelease(src);
     if (a.CGImageSourceGetCount(src) == 0) return error.UnsupportedImageFormat;
-    const img = a.CGImageSourceCreateImageAtIndex(src, 0, null) orelse return error.UnsupportedImageFormat;
+    const thumb = if (api_.thumb) |*t| thumbnail(a, t, src, max_dim) else null;
+    const img = thumb orelse
+        a.CGImageSourceCreateImageAtIndex(src, 0, null) orelse return error.UnsupportedImageFormat;
     defer a.CGImageRelease(img);
     const w = a.CGImageGetWidth(img);
     const h = a.CGImageGetHeight(img);

@@ -283,7 +283,7 @@ fn decodeSystem(file_bytes: []const u8, filename: []const u8, max_dim: usize, al
         const rc = wic.zuer_wic_rgba(file_bytes.ptr, file_bytes.len, @intCast(max_source_pixels), &px, &w, &h);
         return finishC(rc, px, w, h, filename, max_dim, allocator);
     } else if (comptime is_macos) {
-        const r = try imageio.decode(allocator, file_bytes, max_source_pixels);
+        const r = try imageio.decode(allocator, file_bytes, max_dim, max_source_pixels);
         defer allocator.free(r.rgba);
         return resizeToFit(r.rgba.ptr, 4, r.width, r.height, 1, filename, max_dim, allocator);
     } else return error.UnsupportedImageFormat;
@@ -579,7 +579,11 @@ fn zuer_decode_coarse(
 // In processo su ogni piattaforma: stb_image (PNG/JPEG/GIF/BMP/TGA/PSD/HDR/PIC/PNM),
 // libwebp (WebP), nanosvg (SVG/SVGZ), il parser ICO. TIFF e AVIF passano dal codec
 // di sistema (ImageIO su macOS, WIC su Windows) o da ImageMagick su Linux.
-pub const extensions = "png,jpg,jpeg,gif,bmp,tga,psd,hdr,pic,pnm,pbm,pgm,ppm,svg,svgz,webp,tif,tiff,ico,avif,heic,heif";
+/// Le ultime due righe vanno al codec di sistema (vedi `decodeSystem`): su macOS
+/// ImageIO le apre tutte. Stessa lista del manifest in decoder.zig.
+pub const extensions = "png,jpg,jpeg,jpe,jfif,gif,bmp,dib,tga,psd,hdr,pic,pnm,pbm,pgm,ppm,svg,svgz,webp,tif,tiff,ico,avif," ++
+    "heic,heif,hif,jxl,jp2,j2k,jpf,jpx,exr,dds,ktx,astc,icns,pct,pict,sgi," ++
+    "dng,cr2,cr3,crw,nef,nrw,arw,srf,sr2,orf,rw2,raf,pef,srw,x3f,erf,3fr,mos,mrw,dcr,kdc,rwl,iiq";
 
 fn zuer_extensions() callconv(.c) decoder.SliceC {
     return decoder.SliceC.fromSlice(extensions);

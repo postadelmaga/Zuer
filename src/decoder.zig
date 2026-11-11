@@ -777,15 +777,21 @@ const plugin_manifest = [_]ManifestEntry{
         "xml,html,htm,xhtml,css,scss,sass,less," ++
         "sh,bash,zsh,fish,ps1,bat,cmd,mk,make,cmake,gradle,dockerfile," ++
         "rs,py,pyi,js,mjs,cjs,jsx,ts,tsx,c,h,cc,cpp,cxx,hpp,hh,cs,java,kt,kts,go,rb,php,swift,scala,lua,pl,pm,r,sql,dart,ex,exs,erl,hrl,hs,clj,cljs,vim,asm,s,zig,jl,nim,proto,graphql,gql" },
-    .{ .name = "image", .exts = "png,jpg,jpeg,gif,bmp,tga,psd,hdr,pic,pnm,pbm,pgm,ppm,svg,svgz,webp,tif,tiff,ico,avif" },
-    .{ .name = "media", .exts = "mp3,wav,flac,ogg,oga,ogv,opus,m4a,mp4,m4v,mov,mkv,webm,avi,mid,midi" },
+    // Oltre ai formati in processo, quelli del codec di sistema (ImageIO su macOS;
+    // WIC o ImageMagick altrove, secondo i codec installati): HEIC, JPEG XL, JPEG
+    // 2000, OpenEXR, DDS/KTX, ICNS e i RAW delle fotocamere.
+    .{ .name = "image", .exts = "png,jpg,jpeg,jpe,jfif,gif,bmp,dib,tga,psd,hdr,pic,pnm,pbm,pgm,ppm,svg,svgz,webp,tif,tiff,ico,avif," ++
+        "heic,heif,hif,jxl,jp2,j2k,jpf,jpx,exr,dds,ktx,astc,icns,pct,pict,sgi," ++
+        "dng,cr2,cr3,crw,nef,nrw,arw,srf,sr2,orf,rw2,raf,pef,srw,x3f,erf,3fr,mos,mrw,dcr,kdc,rwl,iiq" },
+    .{ .name = "media", .exts = "mp3,wav,w64,flac,ogg,oga,ogv,opus,m4a,m4b,mka,aac,ac3,eac3,dts,wma,aif,aiff,aifc,caf,amr,awb,wv,ape,mpc,tta," ++
+        "mp4,m4v,mov,qt,mkv,webm,avi,divx,wmv,asf,flv,f4v,mpg,mpeg,mpe,m1v,m2v,vob,mts,m2ts,m2t,3gp,3g2,dv,mid,midi" },
     .{ .name = "csv", .exts = "csv,tsv" },
     .{ .name = "markdown", .exts = "md,markdown" },
     .{ .name = "archive", .exts = "zip,jar,apk,cbz,epub,xpi,whl" },
-    .{ .name = "tar", .exts = "tar,tgz,tar.gz" },
+    .{ .name = "tar", .exts = "tar,tgz,tar.gz,7z,rar,xz,txz,bz2,tbz,tbz2,zst,tzst,lz,lzma,tlz,iso,cab,cpio,xar,pkg,rpm,lha,lzh" },
     .{ .name = "glb", .exts = "glb" },
     .{ .name = "mesh", .exts = "obj,stl" },
-    .{ .name = "office", .exts = "docx,pptx,odt,odp,xlsx,xlsm,ods" },
+    .{ .name = "office", .exts = "docx,pptx,odt,odp,xlsx,xlsm,ods" ++ (if (builtin.os.tag == .macos) ",doc,dot,rtf,webarchive,wordml" else "") },
     .{ .name = "pdf", .exts = "pdf" },
 };
 

@@ -39,17 +39,29 @@ DAV1D_TAG="1.5.4"
 DAV1D_COMMIT="54706fc6bc0cdecab7e9593974a4039cc038fca7"
 
 # ── Componenti ────────────────────────────────────────────────────────────────
-DEMUXERS="mov,matroska,avi,mp3,flac,wav,ogg,aac,hls,mpegts"
+# Contenitori: MP4/MOV/3GP, MKV/WebM, AVI, MPEG-TS/PS (mpg, vob, m2ts), WMV/ASF, FLV,
+# DV, e quelli solo audio (MP3, FLAC, WAV/W64, Ogg, AAC, AIFF, CAF, AC-3, DTS, AMR,
+# WavPack, Monkey's Audio, Musepack, TTA) più HLS per yt-dlp.
+DEMUXERS="mov,matroska,avi,mp3,flac,wav,w64,ogg,aac,hls,mpegts,mpegps,mpegvideo,\
+asf,flv,dv,aiff,caf,ac3,eac3,dts,amr,wv,ape,mpc,mpc8,tta"
 # Video: i formati moderni (H.264, HEVC, VP8/9, AV1) e quelli che si trovano nei
-# vecchi mp4/avi/mov/ogv (MPEG-4 Part 2 e DivX 3, MPEG-1/2, Theora, MJPEG).
+# vecchi mp4/avi/mov/ogv/wmv/flv (MPEG-4 Part 2 e DivX, MPEG-1/2, Theora, MJPEG,
+# WMV 1-3/VC-1, Sorenson/H.263, VP6, Cinepak, Indeo, SVQ) e i formati di
+# produzione (ProRes, DNxHD, DV, HuffYUV, FFV1).
 # `av1` è il decoder che usa l'hardware; `libdav1d` quello software.
-DECODERS_VIDEO="h264,hevc,vp8,vp9,av1,libdav1d,mpeg4,msmpeg4v3,mpeg1video,mpeg2video,theora,mjpeg"
-# Audio: quelli dei contenitori sopra (AAC, AC-3/E-AC-3/DTS dei film mkv, MP3/MP2,
-# FLAC, Vorbis, Opus, ALAC) e i PCM/ADPCM dei wav.
-DECODERS_AUDIO="aac,ac3,eac3,dca,mp2,mp3,mp3float,flac,vorbis,opus,alac,\
-pcm_s16le,pcm_s16be,pcm_s24le,pcm_s24be,pcm_s32le,pcm_f32le,pcm_f64le,pcm_u8,\
-pcm_mulaw,pcm_alaw,adpcm_ima_wav,adpcm_ms"
-PARSERS="h264,hevc,mpeg4video,mpegvideo,vp8,vp9,av1,aac,ac3,dca,flac,mpegaudio,opus,vorbis,mjpeg"
+DECODERS_VIDEO="h264,hevc,vp8,vp9,av1,libdav1d,mpeg4,msmpeg4v1,msmpeg4v2,msmpeg4v3,\
+mpeg1video,mpeg2video,theora,mjpeg,wmv1,wmv2,wmv3,vc1,flv,h263,vp6,vp6f,vp6a,\
+svq1,svq3,cinepak,indeo3,indeo5,prores,dnxhd,dvvideo,huffyuv,ffv1"
+# Audio: quelli dei contenitori sopra (AAC, AC-3/E-AC-3/DTS/TrueHD dei film, MP3/MP2,
+# FLAC, Vorbis, Opus, ALAC, WMA, AMR, WavPack, APE, Musepack, TTA, QDesign) e i
+# PCM/ADPCM di wav/aiff/caf/mov.
+DECODERS_AUDIO="aac,ac3,eac3,dca,truehd,mlp,mp2,mp3,mp3float,flac,vorbis,opus,alac,\
+wmav1,wmav2,wmapro,wmalossless,amrnb,amrwb,wavpack,ape,tta,mpc7,mpc8,qdm2,gsm,gsm_ms,\
+pcm_s8,pcm_u8,pcm_s16le,pcm_s16be,pcm_s24le,pcm_s24be,pcm_s32le,pcm_s32be,\
+pcm_f32le,pcm_f32be,pcm_f64le,pcm_f64be,pcm_mulaw,pcm_alaw,\
+adpcm_ima_wav,adpcm_ima_qt,adpcm_ms"
+PARSERS="h264,hevc,mpeg4video,mpegvideo,vp8,vp9,av1,aac,ac3,dca,flac,mpegaudio,opus,\
+vorbis,mjpeg,vc1,h263,mlp,dvaudio,amr"
 PROTOCOLS="file,http,https,tcp,tls,crypto"
 
 COMMON=(
@@ -84,8 +96,19 @@ case "$PLATFORM" in
   macos)
     [[ "$(uname -s)" == Darwin ]] || { echo "✗ da eseguire su macOS (serve l'SDK per VideoToolbox)"; exit 1; }
     NCPU="$(sysctl -n hw.ncpu)"
+    # Architettura della macchina che compila: arm64 su Apple Silicon, x86_64 su un
+    # Mac Intel. Niente cross-compilazione: ogni pacchetto si compila e si prova sul
+    # suo hardware (release.yml usa un runner per architettura).
+    MAC_ARCH="$(uname -m)"
+    case "$MAC_ARCH" in
+      arm64) ;;
+      # L'assembly x86 di FFmpeg e dav1d (SIMD, essenziale per AV1 in software) si
+      # assembla con nasm: senza, dav1d non si configura.
+      x86_64) command -v nasm >/dev/null || { echo "✗ su Intel serve nasm (brew install nasm)"; exit 1; } ;;
+      *) echo "✗ architettura macOS non supportata: $MAC_ARCH"; exit 2 ;;
+    esac
     PLAT=(
-      --arch=arm64 --cc=clang
+      --arch="$MAC_ARCH" --cc=clang
       --enable-videotoolbox --enable-securetransport --enable-zlib
       --enable-hwaccel=h264_videotoolbox,hevc_videotoolbox,vp9_videotoolbox,av1_videotoolbox
       # Install name `@rpath/…` più LC_RPATH `@loader_path`: le dylib si trovano fra

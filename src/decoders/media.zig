@@ -544,7 +544,9 @@ export fn zuer_decode_coarse(
     return decodeExport(path, content, allocator_ptr, true);
 }
 
-pub const extensions = "mp3,wav,flac,ogg,oga,ogv,opus,m4a,mp4,m4v,mov,mkv,webm,avi,mid,midi";
+/// Stessa lista del manifest in decoder.zig. `.ts` resta al testo (TypeScript).
+pub const extensions = "mp3,wav,w64,flac,ogg,oga,ogv,opus,m4a,m4b,mka,aac,ac3,eac3,dts,wma,aif,aiff,aifc,caf,amr,awb,wv,ape,mpc,tta," ++
+    "mp4,m4v,mov,qt,mkv,webm,avi,divx,wmv,asf,flv,f4v,mpg,mpeg,mpe,m1v,m2v,vob,mts,m2ts,m2t,3gp,3g2,dv,mid,midi";
 
 export fn zuer_extensions() callconv(.c) decoder.SliceC {
     return decoder.SliceC.fromSlice(extensions);

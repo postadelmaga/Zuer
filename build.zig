@@ -507,11 +507,24 @@ pub fn build(b: *std.Build) void {
     }
     {
         // Parser XML del plugin office (tag con prefisso di namespace, entity).
+        const t = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/decoders/office.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true, // getenv
+                .imports = &.{.{ .name = "decoder", .module = decoder_mod }},
+            }),
+        });
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
+    {
+        // Elenco mtree di bsdtar nel plugin tar (7z, RAR, tar.xz…).
         const t = b.addTest(.{ .root_module = b.createModule(.{
-            .root_source_file = b.path("src/decoders/office.zig"),
+            .root_source_file = b.path("src/decoders/tar.zig"),
             .target = target,
             .optimize = optimize,
-            .link_libc = true, // getenv
+            .link_libc = true,
             .imports = &.{.{ .name = "decoder", .module = decoder_mod }},
         }) });
         test_step.dependOn(&b.addRunArtifact(t).step);

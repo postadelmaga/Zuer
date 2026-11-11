@@ -29,6 +29,11 @@ pub const Format = enum {
     hdr,
     avif,
     heif,
+    jxl,
+    jp2,
+    exr,
+    dds,
+    cr3,
     // documenti
     pdf,
     // archivi
@@ -98,15 +103,23 @@ fn info(f: Format) Info {
         // HEIF/HEIC: nessun codec in processo, decide il codec di sistema del plugin
         // immagini (ImageIO su macOS, WIC su Windows, ImageMagick su Linux).
         .heif => .{ .plugin = "image", .mime = "image/heif", .label = "HEIF/HEIC" },
+        // Senza codec in processo anche questi: codec di sistema del plugin immagini
+        // (ImageIO li apre tutti su macOS; WIC/ImageMagick secondo i codec installati).
+        .jxl => .{ .plugin = "image", .mime = "image/jxl", .label = "JPEG XL" },
+        .jp2 => .{ .plugin = "image", .mime = "image/jp2", .label = "JPEG 2000" },
+        .exr => .{ .plugin = "image", .mime = "image/x-exr", .label = "OpenEXR" },
+        .dds => .{ .plugin = "image", .mime = "image/vnd-ms.dds", .label = "DirectDraw Surface", .min_len = 128 },
+        .cr3 => .{ .plugin = "image", .mime = "image/x-canon-cr3", .label = "Canon RAW (CR3)" },
         .pdf => .{ .plugin = "pdf", .mime = "application/pdf", .label = "PDF" },
         .zip => .{ .plugin = "archive", .mime = "application/zip", .label = "ZIP" },
         .tar => .{ .plugin = "tar", .mime = "application/x-tar", .label = "tar" },
         .gzip => .{ .plugin = "tar", .mime = "application/gzip", .label = "gzip" },
-        .sevenz => .{ .plugin = null, .mime = "application/x-7z-compressed", .label = "7-Zip" },
-        .rar => .{ .plugin = null, .mime = "application/vnd.rar", .label = "RAR" },
-        .xz => .{ .plugin = null, .mime = "application/x-xz", .label = "xz" },
-        .zstd => .{ .plugin = null, .mime = "application/zstd", .label = "Zstandard" },
-        .bzip2 => .{ .plugin = null, .mime = "application/x-bzip2", .label = "bzip2" },
+        // 7z, RAR e i tar compressi non-gzip: li elenca bsdtar (vedi tar.zig).
+        .sevenz => .{ .plugin = "tar", .mime = "application/x-7z-compressed", .label = "7-Zip" },
+        .rar => .{ .plugin = "tar", .mime = "application/vnd.rar", .label = "RAR" },
+        .xz => .{ .plugin = "tar", .mime = "application/x-xz", .label = "xz" },
+        .zstd => .{ .plugin = "tar", .mime = "application/zstd", .label = "Zstandard" },
+        .bzip2 => .{ .plugin = "tar", .mime = "application/x-bzip2", .label = "bzip2" },
         .glb => .{ .plugin = "glb", .mime = "model/gltf-binary", .label = "glTF binario", .min_len = 20 },
         .mp4 => .{ .plugin = "media", .mime = "video/mp4", .label = "MP4/QuickTime" },
         .matroska => .{ .plugin = "media", .mime = "video/x-matroska", .label = "Matroska/WebM" },
@@ -174,6 +187,13 @@ fn classify(b: []const u8) Format {
     if (at(b, 0, "8BPS")) return .psd;
     if (at(b, 0, "#?RADIANCE") or at(b, 0, "#?RGBE")) return .hdr;
     if (isIco(b)) return .ico;
+    // JPEG XL: contenitore ISO-BMFF dedicato o codestream nudo (0xFF non è UTF-8).
+    if (at(b, 0, "\x00\x00\x00\x0cJXL \x0d\x0a\x87\x0a") or at(b, 0, "\xff\x0a")) return .jxl;
+    // JPEG 2000: contenitore JP2 o codestream J2K (SOC + SIZ).
+    if (at(b, 0, "\x00\x00\x00\x0cjP  \x0d\x0a\x87\x0a") or at(b, 0, "\xff\x4f\xff\x51")) return .jp2;
+    if (at(b, 0, "\x76\x2f\x31\x01")) return .exr;
+    // DDS: magic + dimensione dell'header (sempre 124).
+    if (at(b, 0, "DDS \x7c\x00\x00\x00")) return .dds;
     if (at(b, 4, "ftyp")) return classifyFtyp(b);
 
     // --- documenti: la specifica PDF ammette spazzatura prima di `%PDF-`
@@ -262,6 +282,7 @@ fn classifyFtyp(b: []const u8) Format {
     while (off + 4 <= end) : (off += 4) {
         if (off == 12) continue; // minor_version, non un brand
         const brand = b[off..][0..4];
+        if (off == 8 and std.mem.eql(u8, brand, "crx ")) return .cr3;
         if (std.mem.eql(u8, brand, "avif") or std.mem.eql(u8, brand, "avis")) return .avif;
         for ([_]*const [4]u8{ "heic", "heix", "hevc", "hevx", "heim", "heis", "mif1", "msf1" }) |h| {
             if (std.mem.eql(u8, brand, h)) heif = true;
@@ -275,6 +296,17 @@ fn classifyFtyp(b: []const u8) Format {
 
 fn expectFormat(bytes: []const u8, f: Format) !void {
     try std.testing.expectEqual(f, detect(bytes, bytes.len).format);
+}
+
+test "firme immagine dei codec di sistema" {
+    try expectFormat("\x00\x00\x00\x0cJXL \x0d\x0a\x87\x0a\x00\x00", .jxl);
+    try expectFormat("\xff\x0a\xfa\x7f", .jxl);
+    try expectFormat("\x00\x00\x00\x0cjP  \x0d\x0a\x87\x0a\x00\x00", .jp2);
+    try expectFormat("\xff\x4f\xff\x51\x00\x2f", .jp2);
+    try expectFormat("\x76\x2f\x31\x01\x02\x00\x00\x00", .exr);
+    try expectFormat("DDS \x7c\x00\x00\x00\x07\x10", .dds);
+    try expectFormat("\x00\x00\x00\x18ftypcrx \x00\x00\x00\x01crx isom", .cr3);
+    try std.testing.expectEqualStrings("image", detect("\x00\x00\x00\x18ftypcrx \x00\x00\x00\x01crx isom", 24).plugin.?);
 }
 
 test "firme immagine" {

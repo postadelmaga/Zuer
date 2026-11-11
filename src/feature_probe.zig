@@ -222,6 +222,8 @@ fn probeVideo(gpa: std.mem.Allocator, path: []const u8) void {
     while (frames < 60) {
         // null = fine del file: con meno di 60 frame la prova fallisce (non un ciclo infinito).
         const f = (p.nextFrame(1920, gpa, null) catch |e| return report(false, "video: decode fallito dopo {d} frame: {s}", .{ frames, @errorName(e) })) orelse break;
+        // Senza `reuse` ogni frame è del chiamante.
+        defer if (!p.reuse) gpa.free(f.pixels);
         w = f.width;
         h = f.height;
         if (frames > 0) {
@@ -239,7 +241,10 @@ fn probeVideo(gpa: std.mem.Allocator, path: []const u8) void {
     var after: ?f64 = null;
     var tries: usize = 0;
     while (after == null and tries < 200) : (tries += 1) {
-        if (p.nextFrame(1920, gpa, null) catch null) |f| after = f.pts_s;
+        if (p.nextFrame(1920, gpa, null) catch null) |f| {
+            after = f.pts_s;
+            if (!p.reuse) gpa.free(f.pixels);
+        }
     }
     report(after != null and after.? >= last_pts + 1.0, "video: seek a {d:.3}s → primo frame a {d:.3}s", .{ last_pts + 2.0, after orelse -1 });
 }
