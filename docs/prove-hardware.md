@@ -10,9 +10,10 @@ versione del sistema, commit di Zuer (`zuer-gui --version`), data.
 
 ## Materiale
 
-- Il pacchetto (`zuer-<versione>-windows-x64-setup.exe` o `…-macos-arm64.tar.gz`) e il
-  **kit di prova** dallo stesso run della CI (artefatto `prove-windows-x64` o
-  `prove-macos-arm64`): `feature-probe`, gli script `*-check.sh`, i corpus
+- Il pacchetto (`zuer-<versione>-windows-x64-setup.exe`, `…-macos-arm64.tar.gz` o
+  `…-macos-x86_64.tar.gz`) e il **kit di prova** dallo stesso run della CI (artefatto
+  `prove-windows-x64`, `prove-macos-arm64` o `prove-macos-x86_64`, della stessa
+  architettura del Mac): `feature-probe`, gli script `*-check.sh`, i corpus
   `images/` e `office/`, `make-test-docs.py`.
 - Windows: Git Bash (per gli script), Python 3, FFmpeg da riga di comando (solo per
   generare i clip). macOS: Python 3, FFmpeg (`brew install ffmpeg`).

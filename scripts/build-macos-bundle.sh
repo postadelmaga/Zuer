@@ -140,15 +140,19 @@ rs py pyi js mjs cjs jsx ts tsx c h cc cpp cxx hpp hh cs java kt kts go rb php s
 csv tsv
 md markdown
 obj stl
-png jpg jpeg gif bmp tga psd hdr pic pnm pbm pgm ppm svg svgz webp tif tiff ico avif heic heif
+png jpg jpeg jpe jfif gif bmp dib tga psd hdr pic pnm pbm pgm ppm svg svgz webp tif tiff ico avif
+heic heif hif jxl jp2 j2k jpf jpx exr dds ktx astc icns pct pict sgi
+dng cr2 cr3 crw nef nrw arw srf sr2 orf rw2 raf pef srw x3f erf 3fr mos mrw dcr kdc rwl iiq
 glb
 zip jar apk cbz epub xpi whl
-docx pptx odt odp xlsx xlsm ods
+tar tgz 7z rar xz txz bz2 tbz tbz2 zst tzst lz lzma tlz iso cab cpio xar pkg rpm lha lzh
+docx pptx odt odp xlsx xlsm ods doc dot rtf webarchive wordml
 pdf
 LIST
 )"
 [[ $HAVE_FFMPEG -eq 1 ]] && EXTS="$EXTS
-mp3 wav flac ogg oga ogv opus m4a mp4 m4v mov mkv webm avi mid midi"
+mp3 wav w64 flac ogg oga ogv opus m4a m4b mka aac ac3 eac3 dts wma aif aiff aifc caf amr awb wv ape mpc tta
+mp4 m4v mov qt mkv webm avi divx wmv asf flv f4v mpg mpeg mpe m1v m2v vob mts m2ts m2t 3gp 3g2 dv mid midi"
 
 PLIST="$APP/Contents/Info.plist"
 {
@@ -223,8 +227,10 @@ echo "✓ Archivio:      $TARBALL ($(du -h "$TARBALL" | cut -f1))"
 echo
 echo "Su macOS: copia Zuer.app in /Applications. Le associazioni \"Apri con\""
 echo "sono registrate da LaunchServices automaticamente. Il binario ha firma"
-echo "ad-hoc (cross-compile): al primo avvio Gatekeeper chiede conferma"
-echo "(tasto destro → Apri), oppure: xattr -dr com.apple.quarantine /Applications/Zuer.app"
+echo "ad-hoc (nessun Developer ID): al primo avvio Gatekeeper lo blocca. Per aprirlo:"
+echo "  macOS 15+:   apri Zuer, Fine, poi Impostazioni di Sistema → Privacy e sicurezza → Apri comunque"
+echo "  macOS 13-14: clic destro su Zuer.app → Apri → Apri"
+echo "  ovunque:     xattr -dr com.apple.quarantine /Applications/Zuer.app"
 echo
 echo "Scorciatoia globale (manuale, macOS non permette di auto-installarla):"
 echo "  Impostazioni di Sistema → Tastiera → Abbreviazioni → App → aggiungi"
