@@ -5,11 +5,11 @@ documenti, tabelle, immagini, mesh 3D e video — sia nel **terminale** (`zuer`)
 in una **finestra** (`zuer-gui`) — costruito sui framework [zicro](../Zicro) (UI/paint
 in stile egui) e [zrame](../Zicro/zrame) (finestra + input cross-platform).
 
-Gira su **Linux** (Wayland), **Windows** x64 (GDI) e **macOS** arm64 (Cocoa); il
+Gira su **Linux** (Wayland), **Windows** x64 (GDI) e **macOS** arm64 e x86_64 (Cocoa); il
 rendering 3D passa per Vulkan (MoltenVK su macOS), aperto a runtime e facoltativo; il
 video per **libmpv** su Linux (decodifica hardware, piano dmabuf del compositor) e per
 libav (FFmpeg) dove mpv manca, con VideoToolbox su macOS e D3D11VA su Windows. Versione
-**1.1.3**: cosa cambia in [RELEASE.md](RELEASE.md) (la 1.1.2 in [RELEASE-1.1.2.md](RELEASE-1.1.2.md), la 1.1.1 in [RELEASE-1.1.1.md](RELEASE-1.1.1.md)); cosa è verificato, cosa no e i limiti noti in [RELEASE-1.1.0.md](RELEASE-1.1.0.md)
+**1.1.4**: cosa cambia in [RELEASE.md](RELEASE.md) (la 1.1.3 in [RELEASE-1.1.3.md](RELEASE-1.1.3.md), la 1.1.2 in [RELEASE-1.1.2.md](RELEASE-1.1.2.md), la 1.1.1 in [RELEASE-1.1.1.md](RELEASE-1.1.1.md)); cosa è verificato, cosa no e i limiti noti in [RELEASE-1.1.0.md](RELEASE-1.1.0.md)
 (la 1.0.0 in [RELEASE-1.0.0.md](RELEASE-1.0.0.md)). Le prove su macchine fisiche:
 [docs/prove-hardware.md](docs/prove-hardware.md).
 
@@ -21,16 +21,18 @@ libav (FFmpeg) dove mpv manca, con VideoToolbox su macOS e D3D11VA su Windows. V
 |-----------|-----------|------|
 | **Testo / codice / markdown** | `.txt`, sorgenti, `.md`, … | rasterizzazione nativa (stb_truetype), selezione + copia |
 | **Tabelle** | `.csv`, `.tsv`, `.xlsx`, `.xls`, `.ods`, `.zip`, `.jar`, `.cbz`, `.epub`, … | griglia con header fisso; workbook multi-foglio con linguette |
-| **Immagini** | `.png`, `.jpg`, `.gif`, `.bmp`, `.webp`, `.svg`, `.svgz`, `.ico`, `.tga`, `.psd`, `.hdr`, `.ppm`, `.tif`, `.avif`, `.heic` | in processo ovunque: stb_image, libwebp (anche il primo frame dei WebP animati), nanosvg, ICO in Zig; orientamento EXIF dei JPEG. TIFF/AVIF/HEIC dal codec di sistema (ImageIO su macOS, WIC su Windows: AVIF e HEIC richiedono le estensioni gratuite dello Store) o ImageMagick su Linux |
+| **Archivi** | `.zip`, `.tar`, `.tar.gz`/`.xz`/`.bz2`/`.zst`, `.7z`, `.rar`, `.iso`, `.cab`, `.cpio`, `.xar`/`.pkg`, `.rpm`, `.lha` | elenco del contenuto. zip, tar, gzip, xz e zstd in processo; il resto dal `tar` di sistema quando è bsdtar (macOS, Windows 10+; su Linux il pacchetto `libarchive-tools`) |
+| **Immagini** | `.png`, `.jpg`, `.gif`, `.bmp`, `.webp`, `.svg`, `.svgz`, `.ico`, `.tga`, `.psd`, `.hdr`, `.ppm`, `.tif`, `.avif`, `.heic` | in processo ovunque: stb_image, libwebp (anche il primo frame dei WebP animati), nanosvg, ICO in Zig; orientamento EXIF dei JPEG. TIFF/AVIF/HEIC, JPEG XL, JPEG 2000, OpenEXR, DDS e i RAW delle fotocamere (`.dng`, `.cr2`/`.cr3`, `.nef`, `.arw`, `.orf`, `.rw2`, `.raf`, …) dal codec di sistema: ImageIO su macOS (orientamento EXIF applicato), WIC su Windows (AVIF, HEIC, JPEG XL e RAW con le estensioni gratuite dello Store), ImageMagick su Linux |
 | **Mesh 3D** | `.obj`, `.stl`, `.glb`, `.gltf`, `.ply`, `.fbx`, `.dae`, `.3ds` | renderer Vulkan (PBR-ish, shadow pass), orbita col mouse |
-| **Video** | `.mp4`, `.mkv`, `.webm`, `.mov`, `.avi`, `.m4v`, `.ts`, … | libmpv (Linux) o libav, timeline/scrubbing stile YouTube; audio: oscilloscopio |
+| **Video** | `.mp4`, `.mkv`, `.webm`, `.mov`, `.avi`, `.m4v`, `.wmv`, `.flv`, `.mpg`/`.vob`, `.m2ts`, `.3gp`, `.dv`, … | libmpv (Linux) o libav, timeline/scrubbing stile YouTube. La FFmpeg di macOS/Windows include anche WMV/VC-1, ProRes, DNxHD, DV, VP6, Cinepak |
+| **Audio** | `.mp3`, `.flac`, `.wav`, `.ogg`/`.opus`, `.m4a`, `.aac`, `.aiff`, `.caf`, `.wma`, `.ac3`, `.dts`, `.wv`, `.ape`, `.mpc`, `.tta`, `.mka`, `.mid` | oscilloscopio; MIDI col synth integrato |
 | **Documenti** | `.pdf` | pagina resa come immagine: poppler (`pdftoppm`) su Linux, CoreGraphics su macOS, PDFium (incluso nell'installer) su Windows |
-| **Office** | `.docx`, `.xlsx`, `.xlsm`, `.pptx`, `.odt`, `.ods`, `.odp` | decoder Zig, nessuna dipendenza, tutte le piattaforme; `.doc`/`.xls`/`.ppt` non supportati |
+| **Office** | `.docx`, `.xlsx`, `.xlsm`, `.pptx`, `.odt`, `.ods`, `.odp`; su macOS anche `.doc`, `.rtf`, `.webarchive` | decoder Zig, nessuna dipendenza, tutte le piattaforme; su macOS `.doc`/`.rtf` come testo via `textutil` di sistema; `.xls`/`.ppt` non supportati |
 
 Il formato si riconosce anche **senza estensione o con quella sbagliata**:
 `src/detect.zig` legge i byte magici dai primi 8 KB (immagini, PDF, ZIP/tar/gzip,
 glb, MP4/MKV/WebM/AVI, MP3/FLAC/Ogg/WAV/MIDI) e carica solo il plugin che serve.
-I formati riconosciuti ma senza decoder (ELF, PE, 7z, RAR, SQLite, HEIC, …) e gli
+I formati riconosciuti ma senza decoder (ELF, PE, SQLite, …) e gli
 header troncati danno un errore esplicito. Test: `zig build test`.
 
 Aprendo una **cartella** si apre il primo file e si passa agli altri con le frecce
