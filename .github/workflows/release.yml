@@ -311,8 +311,16 @@ jobs:
           # 3D: MoltenVK del bundle su Metal. Se il runner non espone Metal è un limite
           # dell'hardware virtuale (dichiarato), non un esito positivo.
           if "$P" gpu 2>&1 | tee gpu.log; then echo "3D: OK"
-          elif system_profiler SPDisplaysDataType | grep -q 'Metal'; then echo "::error::3D fallito con Metal disponibile"; exit 1
-          else echo "::warning::runner senza Metal: 3D non verificabile qui"; fi
+          else
+            # Diagnosi prima dell'esito: stack di tutti i thread al crash (lldb, con i log
+            # di MoltenVK) e l'ultimo rapporto di crash di macOS.
+            echo "--- lldb: feature-probe gpu"
+            MVK_CONFIG_LOG_LEVEL=3 ZUER_TRACE=1 perl -e 'alarm 120; exec @ARGV' lldb --batch -o "process launch -- gpu" -k "thread backtrace all" -k "quit 1" "$P" 2>&1 | tail -150 || true
+            R="$(ls -t ~/Library/Logs/DiagnosticReports/feature-probe* 2>/dev/null | head -1 || true)"
+            [[ -n "$R" ]] && { echo "--- $R"; head -c 6000 "$R"; echo; }
+            if system_profiler SPDisplaysDataType | grep -q 'Metal'; then echo "::error::3D fallito con Metal disponibile"; exit 1
+            else echo "::warning::runner senza Metal: 3D non verificabile qui"; fi
+          fi
           # Ripiego: senza Vulkan il renderer si spegne con l'errore giusto, l'app no.
           ZUER_VULKAN_LOADER=none "$P" gpu 2>&1 | tee nogpu.log || true
           grep -q 'VulkanLoaderMissing' nogpu.log || { echo "::error::ripiego senza Vulkan non segnalato"; exit 1; }
