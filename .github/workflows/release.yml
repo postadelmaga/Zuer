@@ -318,7 +318,14 @@ jobs:
             MVK_CONFIG_LOG_LEVEL=3 ZUER_TRACE=1 perl -e 'alarm 120; exec @ARGV' lldb --batch -o "process launch -- gpu" -k "thread backtrace all" -k "quit 1" "$P" 2>&1 | tail -150 || true
             R="$(ls -t ~/Library/Logs/DiagnosticReports/feature-probe* 2>/dev/null | head -1 || true)"
             [[ -n "$R" ]] && { echo "--- $R"; head -c 6000 "$R"; echo; }
-            if system_profiler SPDisplaysDataType | grep -q 'Metal'; then echo "::error::3D fallito con Metal disponibile"; exit 1
+            if [[ "$ARCH" == x86_64 ]] && system_profiler SPDisplaysDataType | grep -q 'Apple Paravirtualized Graphics'; then
+              # GPU paravirtuale della VM Intel: Metal chiude il processo (abort in
+              # -[MTLIOAccelDevice newIndirectArgumentEncoderWithLayout:]) mentre
+              # MoltenVK ne sonda le capacità dentro vkCreateInstance. Limite della VM:
+              # i Mac Intel veri (GPU Intel o AMD) gli argument encoder li hanno, e la
+              # GPU paravirtuale del runner arm64 supera questa prova.
+              echo "::warning::3D non verificabile sul runner Intel: Metal della GPU paravirtuale si chiude dentro vkCreateInstance di MoltenVK"
+            elif system_profiler SPDisplaysDataType | grep -q 'Metal'; then echo "::error::3D fallito con Metal disponibile"; exit 1
             else echo "::warning::runner senza Metal: 3D non verificabile qui"; fi
           fi
           # Ripiego: senza Vulkan il renderer si spegne con l'errore giusto, l'app no.
@@ -354,7 +361,13 @@ jobs:
           run "$D/prova.docx"
           run "$D/prova.xlsx"
           run "$D/clip.mp4"
-          run "$D/cubo.obj"
+          # 3D con Vulkan: non sul runner Intel con GPU paravirtuale, dove Metal chiude il
+          # processo dentro MoltenVK (vedi le prove delle funzionalità). Senza Vulkan sì.
+          if [[ "$ARCH" == x86_64 ]] && system_profiler SPDisplaysDataType | grep -q 'Apple Paravirtualized Graphics'; then
+            echo "::warning::smoke 3D con Vulkan saltato: GPU paravirtuale del runner Intel"
+          else
+            run "$D/cubo.obj"
+          fi
           run "$D/cubo.obj" ZUER_VULKAN_LOADER=none
           run "$RUNNER_TEMP/probe/sysformats/rose.heic"
           run "$RUNNER_TEMP/probe/sysformats/t.7z"

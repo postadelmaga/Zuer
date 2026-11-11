@@ -16,8 +16,12 @@ prova il codice di Zuer e Zicro ma non l'AppKit di Apple.
 
 Oltre a quello per Apple Silicon c'è `zuer-1.1.4-macos-x86_64.tar.gz` per i Mac Intel,
 con lo stesso contenuto (FFmpeg con VideoToolbox e dav1d, MoltenVK). È compilato e
-provato su un runner Intel, con le stesse verifiche del pacchetto arm64. (CI; sotto
-Darling, che esegue proprio la build x86_64: PDF, immagini e documenti office)
+provato su un runner Intel, con le stesse verifiche del pacchetto arm64 tranne il 3D
+con Vulkan: sulla GPU paravirtuale di quella macchina virtuale Metal chiude il processo
+mentre MoltenVK ne sonda le capacità, prima che Zuer disegni qualcosa. Sui Mac Intel
+veri (GPU Intel o AMD) il 3D non è verificato; in una macchina virtuale macOS su Intel
+aprire un modello 3D può chiudere Zuer. (CI; sotto Darling, che esegue proprio la build
+x86_64: PDF, immagini e documenti office)
 
 ### macOS: istruzioni per il primo avvio
 
