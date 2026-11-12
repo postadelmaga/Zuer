@@ -1,37 +1,38 @@
-# Zuer 1.1.5 — note di rilascio
+# Zuer 0.1.0 — note di rilascio
 
-Versione di correzione, tag `v1.1.5`. Zicro al commit di `.github/zicro.ref` (`main`
-di Zicro). Le funzioni, la matrice di parità, le verifiche e i limiti sono quelli della
-1.1.0, in [RELEASE-1.1.0.md](RELEASE-1.1.0.md); cosa è cambiato nelle versioni dalla
-1.1.1 alla 1.1.4 in [RELEASE-1.1.1.md](RELEASE-1.1.1.md), [RELEASE-1.1.2.md](RELEASE-1.1.2.md),
-[RELEASE-1.1.3.md](RELEASE-1.1.3.md) e [RELEASE-1.1.4.md](RELEASE-1.1.4.md); qui solo
-cosa cambia. Stesse parole per come è stato verificato: **verificato** (questa macchina
-Linux), **CI** (runner GitHub virtuale), **non verificato**, e **sotto Darling** (la
-build macOS x86_64 eseguita su Linux da Darling).
+Prima release con la nuova numerazione, tag `v0.1.0`: le release e i tag da 1.0.0 a
+1.1.5 sono stati ritirati da GitHub e la numerazione riparte da 0.1. Il codice prosegue
+dalla 1.1.5; la sua storia resta nei file RELEASE-1.x.md (l'ultima è
+[RELEASE-1.1.5.md](RELEASE-1.1.5.md); funzioni, matrice di parità, verifiche e limiti
+in [RELEASE-1.1.0.md](RELEASE-1.1.0.md)). Zicro al commit di
+`.github/zicro.ref`. Stesse parole per come è stato verificato: **verificato** (questa
+macchina Linux), **CI** (runner GitHub virtuale), **non verificato**, e **sotto Darling**
+(la build macOS x86_64 eseguita su Linux da Darling).
 
-## Cosa cambia rispetto a 1.1.4
+## Cosa cambia rispetto a 1.1.5
 
-### macOS: i pacchetti girano davvero da macOS 13
+### macOS: i file si aprono dal Finder
 
-La 1.1.4 dichiarava macOS 13 come minimo (`LSMinimumSystemVersion`), ma tutti i suoi
-binari erano compilati per macOS 15.0: Zig 0.17 senza una versione nel target compila
-per il 15, e FFmpeg con dav1d prendeva quella del runner. Su macOS 13 e 14 Zuer poteva
-non partire, o fermarsi alla prima funzione di sistema assente prima del 15. Ora
-`zuer-gui`, i plugin, FFmpeg e dav1d sono compilati per macOS 13.0, e il pacchetto non
-si costruisce se un suo binario richiede un macOS più recente di quello dichiarato.
-(CI: versione minima di ogni binario; avvio su macOS 13 e 14 non verificato: non ci sono
-runner con quelle versioni)
+Doppio clic su un file associato, "Apri con → Zuer" o un file trascinato sull'icona nel
+Dock: macOS rispondeva "The document … could not be opened. Zuer cannot open files in
+the "Documento Zuer" format." Il Finder avvia l'app senza il percorso del file sulla riga
+di comando e glielo consegna dopo, come Apple Event; Zuer non lo riceveva. Ora lo
+riceve (`application:openURLs:`) e apre il file come se fosse passato da riga di
+comando: chiude la ricerca YouTube che compare all'avvio senza file, aggancia le frecce
+alla cartella, e una cartella apre il suo primo file. Funziona anche con Zuer già aperto.
+(CI: `open -a Zuer.app` con un PDF, poi un'immagine nella stessa istanza, su arm64 e
+Intel; sotto Darling, con `-NSOpen`, un'immagine e una cartella)
 
-### Video: la prova del seek misura quello che si vede
+### Guida dei tasti: niente lampeggio tenendo premuto `h`
 
-La prova automatica del seek (`feature-probe video`) guardava dove atterra il salto di
-FFmpeg, cioè il keyframe precedente, e non il primo frame mostrato: con video dai
-keyframe radi (uno ogni 3-12 secondi) segnalava un errore che nell'app non c'è. Ora
-segue lo stesso percorso della finestra e controlla che il primo frame mostrato non
-venga prima del punto chiesto (MPEG-TS e HLS possono atterrare sul keyframe
-successivo, al più un GOP dopo). Zuer non cambia: il seek era già preciso.
-(verificato: i 53 formati di `ffmpeg-check` e due video H.264 a 1080p e 4K; sotto
-Darling)
+Su un Mac la guida (visibile finché si tiene premuto `h`) si apriva e chiudeva a
+intermittenza. Ora si chiude solo se `h` resta rilasciato per 150 ms, e le ripetizioni
+del tasto non ridisegnano più la finestra. (non verificato su un Mac: sotto Darling la
+tastiera non arriva all'app)
+
+### Log: un caricamento fallito si legge anche su stderr
+
+Oltre al messaggio nella finestra, `[gui] caricamento fallito: <file>: <motivo>`.
 
 ## Distribuzione
 
@@ -41,9 +42,9 @@ Zuer e Zicro, architettura, sha256).
 
 | Sistema | Architettura | Artefatto |
 |---|---|---|
-| macOS 13 o successivo | Apple Silicon (arm64) | `zuer-1.1.5-macos-arm64.tar.gz` (`Zuer.app`, con FFmpeg e MoltenVK in `Contents/Frameworks`) |
-| macOS 13 o successivo | Intel (x86_64) | `zuer-1.1.5-macos-x86_64.tar.gz` (stesso contenuto, compilato e provato su un Mac Intel) |
-| Windows 10/11 | x64 | `zuer-1.1.5-windows-x64-setup.exe` |
+| macOS 13 o successivo | Apple Silicon (arm64) | `zuer-0.1.0-macos-arm64.tar.gz` (`Zuer.app`, con FFmpeg e MoltenVK in `Contents/Frameworks`) |
+| macOS 13 o successivo | Intel (x86_64) | `zuer-0.1.0-macos-x86_64.tar.gz` (stesso contenuto, compilato e provato su un Mac Intel) |
+| Windows 10/11 | x64 | `zuer-0.1.0-windows-x64-setup.exe` |
 | Linux | x64 | dai sorgenti: `zig build` + `install.sh` |
 
 Quale pacchetto macOS: menu Apple → Informazioni su questo Mac. "Chip Apple M…" →
@@ -54,7 +55,7 @@ sono pacchetti universali né Windows ARM.
 **Verifica del download**: nella cartella dei file scaricati,
 `sha256sum -c SHA256SUMS --ignore-missing` (Linux/Git Bash) oppure
 `shasum -a 256 -c SHA256SUMS` (macOS); su Windows
-`Get-FileHash .\zuer-1.1.5-windows-x64-setup.exe -Algorithm SHA256` e confronto a mano.
+`Get-FileHash .\zuer-0.1.0-windows-x64-setup.exe -Algorithm SHA256` e confronto a mano.
 
 **macOS**: estrarre l'archivio e trascinare `Zuer.app` in Applicazioni. Il pacchetto
 **non è firmato con un Developer ID né notarizzato** (la firma è solo ad-hoc): al primo
@@ -89,7 +90,7 @@ i modelli 3D non si vedono, con il motivo a schermo.
 (commit e opzioni di configure: la build si ripete con `scripts/build-ffmpeg.sh`);
 `THIRD-PARTY-NOTICES.txt` (libwebp, nanosvg, TinySoundFont, stb);
 su Windows PDFium con `PDFium-LICENSE.txt`; su macOS MoltenVK (Apache-2.0) con
-`MoltenVK-LICENSE.txt`. Il sorgente di Zuer è il tag `v1.1.5`, quello di Zicro il commit
+`MoltenVK-LICENSE.txt`. Il sorgente di Zuer è il tag `v0.1.0`, quello di Zicro il commit
 in `.github/zicro.ref`. La procedura per una nuova versione è in RELEASE-1.0.0.md,
 "Fare una nuova versione".
 
