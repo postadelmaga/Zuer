@@ -1145,6 +1145,7 @@ pub fn decodeInitial(state: *GuiAppState, path: []const u8) void {
         return;
     }
     if (d == .err) {
+        std.debug.print("[gui] caricamento fallito: {s}: {s}\n", .{ path, d.err });
         const msg: []const u8 = std.fmt.allocPrint(state.gpa, "Errore nel caricamento del file:\n{s}", .{d.err}) catch "";
         d.deinit(state.gpa);
         applyDecoded(state, .{ .text = msg }, .{}, path, gen) catch {};
@@ -1228,6 +1229,7 @@ pub fn loadWorker(state: *GuiAppState) void {
         }
 
         if (d == .err) {
+            std.debug.print("[gui] caricamento fallito: {s}: {s}\n", .{ path, d.err });
             const msg: []const u8 = std.fmt.allocPrint(gpa, "Errore nel caricamento del file:\n{s}", .{d.err}) catch "";
             d.deinit(gpa);
             applyDecoded(state, .{ .text = msg }, .{}, path, gen) catch {};

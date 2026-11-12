@@ -88,6 +88,11 @@ pub const GuiAppState = struct {
         file_changed: bool = false,
         /// Guida dei tasti visibile (tasto `h` tenuto premuto).
         help: bool = false,
+        /// Secondi dal rilascio di `h` mentre la guida è visibile (< 0: nessun rilascio
+        /// in sospeso). Il render worker la chiude dopo `help_release_grace_s` senza una
+        /// nuova pressione: un autorepeat che arriva come coppie rilascio/pressione
+        /// (segnalato su macOS) la faceva aprire e chiudere a intermittenza.
+        help_release_s: f32 = -1,
         // Vero mentre il decoder del file iniziale gira su un thread di background:
         // il worker mostra lo spinner di caricamento invece del contenuto.
         loading: bool = false,

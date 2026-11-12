@@ -312,6 +312,27 @@ fn openFile(state: *GuiAppState, full_path: []const u8) void {
     nav.postLoad(state, full_path);
 }
 
+/// Percorso chiesto dal sistema (macOS: doppio clic nel Finder, "Apri con", drop
+/// sull'icona del Dock — l'app parte senza argv e il file arriva dopo, come Apple
+/// Event): come lanciare `zuer-gui <percorso>`. Chiude gli overlay (anche la ricerca
+/// YouTube, aperta da sé all'avvio senza file); una cartella apre il suo primo file.
+pub fn openFromSystem(state: *GuiAppState, path: []const u8) void {
+    state.shared.mutex.lockUncancelable(state.io);
+    const yt = &state.shared.yt;
+    if (yt.active) {
+        yt.active = false;
+        yt.bs_held = false;
+        _ = yt.scroll.onRelease();
+        state.shared.file_changed = true;
+    }
+    state.shared.mutex.unlock(state.io);
+    const st = std.Io.Dir.cwd().statFile(state.io, path, .{}) catch |e| {
+        std.debug.print("[gui] file dal sistema illeggibile: {s} ({s})\n", .{ path, @errorName(e) });
+        return;
+    };
+    if (st.kind == .directory) previewFolder(state, path) else openFile(state, path);
+}
+
 /// Anteprima di una CARTELLA (click destro): apre il suo primo file e aggancia
 /// le frecce alla cartella, come lanciare `zuer-gui <cartella>`.
 fn previewFolder(state: *GuiAppState, dir_path: []const u8) void {

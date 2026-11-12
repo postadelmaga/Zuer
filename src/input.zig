@@ -579,12 +579,11 @@ pub fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) 
     }
     // Guida dei tasti: visibile finché `h` è premuto. Il rilascio si prende
     // sempre, anche se nel frattempo si è aperto un overlay.
+    // La chiusura la fa il render worker dopo un breve margine (`help_release_s`):
+    // una nuova pressione nel frattempo la annulla.
     if (key == KEY_H and !pressed) {
         app_state.shared.mutex.lockUncancelable(app_state.io);
-        if (app_state.shared.help) {
-            app_state.shared.help = false;
-            app_state.shared.file_changed = true;
-        }
+        if (app_state.shared.help and app_state.shared.help_release_s < 0) app_state.shared.help_release_s = 0;
         app_state.shared.mutex.unlock(app_state.io);
         return;
     }
@@ -597,8 +596,12 @@ pub fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) 
         if (file_explorer.handleKey(app_state, key)) return;
         if (key == KEY_H and !app_state.ctrl_down) {
             app_state.shared.mutex.lockUncancelable(app_state.io);
-            app_state.shared.help = true;
-            app_state.shared.file_changed = true;
+            app_state.shared.help_release_s = -1;
+            // Le ripetizioni del tasto tenuto giù non ricompongono nulla.
+            if (!app_state.shared.help) {
+                app_state.shared.help = true;
+                app_state.shared.file_changed = true;
+            }
             app_state.shared.mutex.unlock(app_state.io);
             return;
         }

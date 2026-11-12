@@ -363,6 +363,11 @@ fn drawFilenameLabel(buf: []u8, W: u32, H: u32, raster: *glyph.Raster, name: []c
     }
 }
 
+/// Margine fra il rilascio di `h` e la chiusura della guida (vedi `help_release_s`):
+/// più lungo del passo fra rilascio e ripressione di un autorepeat a coppie, abbastanza
+/// corto da non far sembrare la guida in ritardo.
+const help_release_grace_s: f32 = 0.15;
+
 fn renderWorker(
     win: *zrame.Window,
     state: *GuiAppState,
@@ -461,6 +466,18 @@ fn renderWorker(
         }
 
         state.shared.mutex.lockUncancelable(state.io);
+
+        // Guida dei tasti: chiusa solo se `h` resta su per `help_release_grace_s`.
+        if (state.shared.help_release_s >= 0) {
+            state.shared.help_release_s += frame_dt;
+            if (!state.shared.help) {
+                state.shared.help_release_s = -1;
+            } else if (state.shared.help_release_s >= help_release_grace_s) {
+                state.shared.help = false;
+                state.shared.help_release_s = -1;
+                state.shared.file_changed = true;
+            }
+        }
 
         // Autorepeat Backspace dell'overlay (vale per ogni ramo: testo, video…).
         if (state.shared.yt.active and state.shared.yt.bs_held) {
@@ -1055,6 +1072,12 @@ fn renderWorker(
     }
 }
 
+/// `on_open_file` di zrame (macOS: Finder/Dock, vedi `file_explorer.openFromSystem`).
+fn openFileFromSystem(_: *zrame.Window, path: []const u8, user: ?*anyopaque) void {
+    const state: *GuiAppState = @ptrCast(@alignCast(user orelse return));
+    file_explorer.openFromSystem(state, path);
+}
+
 /// Presenter dei frame video GPU: il piano dmabuf della finestra. Gli slot 4..7 di
 /// zicro (lo 0 è della mesh). Chiamato dal thread del motore video.
 fn presentGpuFrame(ctx: *anyopaque, f: *const videomod.GpuFrame) bool {
@@ -1185,6 +1208,12 @@ pub fn main(init: std.process.Init) !void {
             return;
         } else if (std.mem.eql(u8, a, "-f") or std.mem.eql(u8, a, "--follow")) {
             follow = true;
+        } else if (builtin.os.tag == .macos and std.mem.startsWith(u8, a, "-psn_")) {
+            // Numero di processo che i macOS più vecchi passano ai lanci dal Finder.
+        } else if (builtin.os.tag == .macos and std.mem.startsWith(u8, a, "-NS")) {
+            // `-NSChiave valore`: dominio argomenti di NSUserDefaults, letto da AppKit
+            // (`-NSOpen <file>` arriva poi a `on_open_file`), non un file da aprire.
+            _ = args.next();
         } else if (arg_path_opt == null) {
             arg_path_opt = a;
         }
@@ -1395,6 +1424,7 @@ pub fn main(init: std.process.Init) !void {
         .on_key = input.keyCallback,
         .on_text = input.textCallback,
         .on_mouse = input.mouseCallback,
+        .on_open_file = openFileFromSystem,
         .user = &gui_state,
         .style = gui_state_mod.minimalFrame(zrame.Style.fluent()),
         // Il piano video (dmabuf) è scalato dal compositor al fit-rect, centrato:

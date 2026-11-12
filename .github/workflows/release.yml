@@ -372,6 +372,30 @@ jobs:
           run "$RUNNER_TEMP/probe/sysformats/rose.heic"
           run "$RUNNER_TEMP/probe/sysformats/t.7z"
           run "$RUNNER_TEMP/probe/sysformats/prova.doc"
+          # Apertura dal Finder (doppio clic, "Apri con", Dock): LaunchServices avvia
+          # l'app SENZA argomenti e le consegna il file come Apple Event
+          # (`application:openURLs:`); `open -a` passa di lì. Poi un secondo file
+          # all'istanza già aperta. Fino alla 1.1.5 macOS rispondeva "Zuer cannot open
+          # files in the 'Documento Zuer' format".
+          APP="$RUNNER_TEMP/clean/Zuer.app"; OLOG="$RUNNER_TEMP/open.log"; : > "$OLOG"
+          wait_for() { for _ in $(seq 1 40); do grep -q "$1" "$OLOG" && return 0; sleep 0.5; done; return 1; }
+          OK=1
+          open -n -a "$APP" --env ZUER_NO_CRASH_REPORT=1 --env ZUER_TRACE=1 --env ZICRO_COCOA_TRACE=1 \
+            --stdout "$OLOG" --stderr "$OLOG" "$D/prova.pdf"
+          wait_for 'file=prova.pdf' || OK=0
+          if [[ $OK == 1 ]]; then
+            open -a "$APP" "$GITHUB_WORKSPACE/Zuer/tests/images/logo.webp"
+            wait_for 'file=logo.webp' || OK=0
+          fi
+          grep -E 'open file:|caricamento fallito|panic' "$OLOG" || true
+          if grep -q 'caricamento fallito' "$OLOG"; then OK=0; fi
+          pkill -x zuer-gui || true
+          if [[ $OK == 1 ]]; then echo "ok: file aperti dal Finder (open -a), anche nell'istanza già aperta"
+          else
+            echo "::error::file aperto con open -a (Finder) non mostrato"
+            echo "--- open.log"; grep -vE 'drawRect|: frame [0-9]' "$OLOG" | tail -60
+            FAIL=1
+          fi
           [[ $FAIL == 0 ]] || exit 1
       # Kit per le prove manuali su hardware fisico (docs/prove-hardware.md): non
       # è un pacchetto, non va nella release.
