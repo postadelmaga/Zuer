@@ -288,28 +288,37 @@ fn setFileListForDir(state: *GuiAppState, dir_path: []const u8, cur_name: []cons
         }
     }.lt);
 
+    // Fuori dal lock: col nome in un'altra forma Unicode il confronto fa stat.
+    const cur_idx = nav.indexOfFile(state.io, dir_path, names.items, cur_name);
+
     state.shared.mutex.lockUncancelable(state.io);
     for (state.file_list.items) |n| state.gpa.free(n);
     state.file_list.deinit(state.gpa);
     state.file_list = names;
-    state.current_file_index = null;
-    for (state.file_list.items, 0..) |f, idx| {
-        if (std.mem.eql(u8, f, cur_name)) {
-            state.current_file_index = idx;
-            break;
-        }
-    }
+    state.current_file_index = cur_idx;
     state.shared.mutex.unlock(state.io);
 }
 
 /// Anteprima di un file: chiude l'overlay, aggancia le frecce alla sua cartella
 /// e posta il caricamento asincrono (spinner + decode su thread loader).
 fn openFile(state: *GuiAppState, full_path: []const u8) void {
-    setFileListForDir(state, std.fs.path.dirname(full_path) orelse ".", std.fs.path.basename(full_path));
+    const dir = std.fs.path.dirname(full_path) orelse ".";
+    const base = std.fs.path.basename(full_path);
+    setFileListForDir(state, dir, base);
+    // Si apre il nome come lo elenca la cartella: se il percorso aveva gli accenti in
+    // un'altra forma Unicode (vedi `nav.indexOfFile`) è lo stesso file, ma la forma del
+    // disco è quella giusta per l'etichetta e per le frecce.
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
     state.shared.mutex.lockUncancelable(state.io);
+    const path = blk: {
+        const idx = state.current_file_index orelse break :blk full_path;
+        const listed = state.file_list.items[idx];
+        if (std.mem.eql(u8, listed, base)) break :blk full_path;
+        break :blk std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, listed }) catch full_path;
+    };
     closeOverlay(state);
     state.shared.mutex.unlock(state.io);
-    nav.postLoad(state, full_path);
+    nav.postLoad(state, path);
 }
 
 /// Percorso chiesto dal sistema (macOS: doppio clic nel Finder, "Apri con", drop

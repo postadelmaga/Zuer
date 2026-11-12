@@ -862,15 +862,10 @@ pub fn initFileList(state: *GuiAppState) !void {
         }
     }.compare);
 
-    const cur_filename = std.fs.path.basename(state.shared.current_file_path);
-    state.current_file_index = null;
-    for (state.file_list.items, 0..) |f, idx| {
-        if (std.mem.eql(u8, f, cur_filename)) {
-            state.current_file_index = idx;
-            break;
-        }
-    }
+    state.current_file_index = indexOfFile(state.io, dir_path, state.file_list.items, std.fs.path.basename(state.shared.current_file_path));
 }
+
+pub const indexOfFile = @import("dir_match.zig").indexOfFile;
 
 pub fn navigate(state: *GuiAppState, direction: i2) void {
     // Direttiva UX: mentre un modello sta caricando (spinner, non ancora

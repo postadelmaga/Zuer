@@ -530,6 +530,15 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
     {
+        // Il file aperto ritrovato nella sua cartella (anche con gli accenti in NFD).
+        const t = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("src/dir_match.zig"),
+            .target = target,
+            .optimize = optimize,
+        }) });
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
+    {
         // Lo scroll delle griglie usa il passo e l'easing di zicro.
         const t = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path("src/card_grid.zig"),

@@ -383,9 +383,12 @@ jobs:
           open -n -a "$APP" --env ZUER_NO_CRASH_REPORT=1 --env ZUER_TRACE=1 --env ZICRO_COCOA_TRACE=1 \
             --stdout "$OLOG" --stderr "$OLOG" "$D/prova.pdf"
           wait_for 'file=prova.pdf' || OK=0
+          # Il secondo con accenti e spazi: arriva dal Finder magari in forma Unicode
+          # decomposta, ma Zuer deve mostrarlo col nome com'è sul disco.
           if [[ $OK == 1 ]]; then
-            open -a "$APP" "$GITHUB_WORKSPACE/Zuer/tests/images/logo.webp"
-            wait_for 'file=logo.webp' || OK=0
+            ACC="$RUNNER_TEMP/perché è così.webp"; cp "$GITHUB_WORKSPACE/Zuer/tests/images/logo.webp" "$ACC"
+            open -a "$APP" "$ACC"
+            wait_for 'file=perché è così.webp' || OK=0
           fi
           grep -E 'open file:|caricamento fallito|panic' "$OLOG" || true
           if grep -q 'caricamento fallito' "$OLOG"; then OK=0; fi
