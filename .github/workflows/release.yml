@@ -128,6 +128,75 @@ jobs:
         working-directory: Zuer
         run: zig build test --summary all
 
+  deb:
+    name: Ubuntu 26.04 LTS (.deb)
+    needs: meta
+    # Costruito sulla LTS di destinazione: soname di FFmpeg e Depends (dpkg-shlibdeps)
+    # sono quelli di Ubuntu 26.04.
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.meta.outputs.commit }}
+          path: Zuer
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: postadelmaga/zicro
+          ref: ${{ needs.meta.outputs.zicro }}
+          path: Zicro
+          persist-credentials: false
+      - name: Zig
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 6 --retry-delay 20 --retry-all-errors -o zig.tar.xz "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz"
+          echo "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026  zig.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/zig" && tar -xJf zig.tar.xz -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+      - name: Dipendenze
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends glslc pkg-config dpkg-dev \
+            desktop-file-utils imagemagick fonts-dejavu-core \
+            libwayland-dev libxkbcommon-dev libpipewire-0.3-dev libasound2-dev \
+            libharfbuzz-dev libfreetype-dev libvulkan-dev libegl-dev libgl-dev libgbm-dev \
+            libsystemd-dev wayland-protocols \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev libmpv-dev
+      - name: Dipendenze Zig
+        working-directory: Zuer
+        run: |
+          for i in 1 2 3 4 5 6; do zig build --fetch=all && break
+            [ $i = 6 ] && exit 1; echo "fetch: tentativo $i fallito, riprovo"; sleep $((20 * i)); done
+      - name: Pacchetto
+        working-directory: Zuer
+        run: scripts/build-deb.sh --out "$RUNNER_TEMP/dist"
+      - name: Installazione e avvio
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          DEB="$(ls "$RUNNER_TEMP"/dist/zuer_*_amd64.deb)"
+          sudo apt-get install -y -q "$DEB"
+          for b in zuer zuer-gui; do
+            OUT="$($b --version)"
+            [[ "$OUT" == "$b $VERSION" ]] || { echo "::error::$b --version: '$OUT'"; exit 1; }
+          done
+          ls /usr/lib/zuer/decoders/libdecoder_media.so /usr/lib/zuer/decoders/libdecoder_image.so
+          if ldd /usr/lib/zuer/zuer /usr/lib/zuer/zuer-gui /usr/lib/zuer/decoders/*.so | grep "not found"; then
+            echo "::error::librerie mancanti dopo l'installazione"; exit 1
+          fi
+          sudo apt-get remove -y -q zuer
+          [[ ! -e /usr/lib/zuer ]] || { echo "::error::/usr/lib/zuer resta dopo la rimozione"; exit 1; }
+          mv "$DEB" "$RUNNER_TEMP/dist/zuer-$VERSION-ubuntu26.04-amd64.deb"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ubuntu-amd64
+          path: ${{ runner.temp }}/dist/zuer-${{ needs.meta.outputs.version }}-ubuntu26.04-amd64.deb
+          if-no-files-found: error
+          retention-days: 14
+
   macos:
     name: macOS ${{ matrix.arch }}
     needs: meta
@@ -739,7 +808,7 @@ jobs:
 
   publish:
     name: GitHub Release
-    needs: [meta, linux, macos, windows]
+    needs: [meta, linux, deb, macos, windows]
     if: needs.meta.outputs.publish == 'true'
     runs-on: ubuntu-24.04
     permissions:
@@ -773,15 +842,19 @@ jobs:
         with:
           name: windows-x64
           path: dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ubuntu-amd64
+          path: dist
       - name: Artefatti, checksum e manifest
         run: |
           set -euo pipefail
           cd dist
           MAC="zuer-$VERSION-macos-arm64.tar.gz"; MACX="zuer-$VERSION-macos-x86_64.tar.gz"
-          WIN="zuer-$VERSION-windows-x64-setup.exe"
-          for f in "$MAC" "$MACX" "$WIN"; do [[ -s "$f" ]] || { echo "::error::$f mancante"; exit 1; }; done
-          [[ "$(ls | wc -l)" == 3 ]] || { echo "::error::artefatti inattesi: $(ls)"; exit 1; }
-          sha256sum "$MAC" "$MACX" "$WIN" > SHA256SUMS
+          WIN="zuer-$VERSION-windows-x64-setup.exe"; DEB="zuer-$VERSION-ubuntu26.04-amd64.deb"
+          for f in "$MAC" "$MACX" "$WIN" "$DEB"; do [[ -s "$f" ]] || { echo "::error::$f mancante"; exit 1; }; done
+          [[ "$(ls | wc -l)" == 4 ]] || { echo "::error::artefatti inattesi: $(ls)"; exit 1; }
+          sha256sum "$MAC" "$MACX" "$WIN" "$DEB" > SHA256SUMS
           cat > manifest.json <<JSON
           {
             "name": "zuer",
@@ -794,7 +867,8 @@ jobs:
             "artifacts": [
               {"file": "$MAC", "os": "macos", "arch": "arm64", "sha256": "$(sha256sum "$MAC" | cut -d' ' -f1)", "signed": false},
               {"file": "$MACX", "os": "macos", "arch": "x86_64", "sha256": "$(sha256sum "$MACX" | cut -d' ' -f1)", "signed": false},
-              {"file": "$WIN", "os": "windows", "arch": "x86_64", "sha256": "$(sha256sum "$WIN" | cut -d' ' -f1)", "signed": false}
+              {"file": "$WIN", "os": "windows", "arch": "x86_64", "sha256": "$(sha256sum "$WIN" | cut -d' ' -f1)", "signed": false},
+              {"file": "$DEB", "os": "ubuntu-26.04", "arch": "x86_64", "sha256": "$(sha256sum "$DEB" | cut -d' ' -f1)", "signed": false}
             ]
           }
           JSON

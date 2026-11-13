@@ -3,7 +3,7 @@
 Un visualizzatore di file veloce, scritto in Zig. Apri un file, o una cartella, e lo vedi
 subito: documenti, tabelle, immagini, video, audio, modelli 3D e archivi.
 
-Funziona su **Linux**, **Windows** e **macOS** (Apple Silicon e Intel). Versione **0.1.0**:
+Funziona su **Linux**, **Windows** e **macOS** (Apple Silicon e Intel). Versione **0.1.1**:
 le novità sono in [RELEASE.md](RELEASE.md).
 
 ## Cosa apre
@@ -28,7 +28,8 @@ I pacchetti pronti sono nelle [Release su GitHub](https://github.com/postadelmag
 | macOS con chip Apple (M1, M2…) | `zuer-<versione>-macos-arm64.tar.gz` |
 | macOS con processore Intel | `zuer-<versione>-macos-x86_64.tar.gz` |
 | Windows 10/11 | `zuer-<versione>-windows-x64-setup.exe` |
-| Linux | dai sorgenti (vedi sotto) |
+| Ubuntu 26.04 LTS | `zuer-<versione>-ubuntu26.04-amd64.deb` (`sudo apt install ./zuer-…deb`) |
+| Altre distribuzioni Linux | dai sorgenti (vedi sotto) |
 
 I pacchetti non sono firmati da Apple o Microsoft, quindi al primo avvio il sistema
 avvisa. Come aprirli comunque: [RELEASE.md, sezione "Distribuzione"](RELEASE.md#distribuzione).

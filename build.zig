@@ -25,6 +25,11 @@ pub fn build(b: *std.Build) void {
     // Linux/Wayland-only (EGL + wl_display privato, vedi src/decoders/mpv_video.zig).
     const mpv_enabled = b.option(bool, "mpv", "Link libmpv render API for hw video (Linux only)") orelse
         (os_tag == .linux);
+    // compute_vp9 (decoder VP9 su GPU compute, libreria di sistema): solo Linux. Senza,
+    // il VP9 passa da libav come su macOS e Windows: è così che si costruisce il .deb,
+    // che dipende solo dai pacchetti della distribuzione.
+    const cvp9_enabled = os_tag == .linux and ffmpeg_enabled and
+        (b.option(bool, "cvp9", "Link compute_vp9 for GPU VP9 decode (Linux only)") orelse true);
     const build_opts = b.addOptions();
     // Versione unica, da build.zig.zon: `zuer --version`, `zuer-gui --version`.
     const version: []const u8 = @import("build.zig.zon").version;
@@ -32,6 +37,7 @@ pub fn build(b: *std.Build) void {
     // gui.zig/player.zig read `gpu` as "Vulkan renderer available"; `video` as "libav available".
     build_opts.addOption(bool, "gpu", vulkan_enabled);
     build_opts.addOption(bool, "video", ffmpeg_enabled);
+    build_opts.addOption(bool, "cvp9", cvp9_enabled);
     build_opts.addOption(bool, "mpv", mpv_enabled);
     // Solo per zuer-gui: i simboli libav si risolvono a runtime (LoadLibrary/dlopen
     // al primo video) invece che dalla import table / DT_NEEDED, su entrambi gli OS
@@ -49,6 +55,7 @@ pub fn build(b: *std.Build) void {
     const build_opts_linked = b.addOptions();
     build_opts_linked.addOption(bool, "gpu", vulkan_enabled);
     build_opts_linked.addOption(bool, "video", ffmpeg_enabled);
+    build_opts_linked.addOption(bool, "cvp9", cvp9_enabled);
     build_opts_linked.addOption(bool, "av_runtime", false);
     // Plugin media su macOS: nessuna libav da linkare in cross-compilazione (e
     // nessuna di sistema), quindi anche il plugin risolve i simboli a runtime
@@ -56,6 +63,7 @@ pub fn build(b: *std.Build) void {
     const build_opts_media_runtime = b.addOptions();
     build_opts_media_runtime.addOption(bool, "gpu", vulkan_enabled);
     build_opts_media_runtime.addOption(bool, "video", ffmpeg_enabled);
+    build_opts_media_runtime.addOption(bool, "cvp9", cvp9_enabled);
     build_opts_media_runtime.addOption(bool, "av_runtime", true);
 
     // Il loader Vulkan NON si linka più: src/renderer/vk_loader.zig lo apre a
@@ -250,8 +258,7 @@ pub fn build(b: *std.Build) void {
         // Decoder VP9 su GPU compute (Vulkan): Linux-only (compute_vp9 non è portato su
         // Windows). Altrove player.zig ripiega sul decoder VP9 di libav (gate cvp9 in player).
         if (os_tag == .linux) {
-            gui_exe.root_module.linkSystemLibrary("compute_vp9", .{});
-            addCvp9C(b, gui_exe.root_module);
+            if (cvp9_enabled) addCvp9(b, gui_exe.root_module);
         }
     }
     if (target.result.os.tag == .linux) {
@@ -319,8 +326,7 @@ pub fn build(b: *std.Build) void {
         vbench.root_module.addImport("zrame", dep_zicro.module("zrame"));
         vbench.root_module.addOptions("build_options", build_opts);
         LinkAv.headersOnly(b, vbench.root_module, target);
-        vbench.root_module.linkSystemLibrary("compute_vp9", .{});
-        addCvp9C(b, vbench.root_module);
+        if (cvp9_enabled) addCvp9(b, vbench.root_module);
         vbench.root_module.linkSystemLibrary("wayland-client", .{});
         vbench.root_module.linkSystemLibrary("asound", .{});
         if (mpv_enabled) {
@@ -412,8 +418,7 @@ pub fn build(b: *std.Build) void {
     if (os_tag == .linux) {
         probe.root_module.linkSystemLibrary("asound", .{});
         if (ffmpeg_enabled) {
-            probe.root_module.linkSystemLibrary("compute_vp9", .{});
-            addCvp9C(b, probe.root_module);
+            if (cvp9_enabled) addCvp9(b, probe.root_module);
         }
     }
     if (os_tag == .windows) probe.root_module.linkSystemLibrary("winmm", .{});
@@ -471,8 +476,7 @@ pub fn build(b: *std.Build) void {
                 // gate cvp9 e il link della lib (il poster resta però su libav).
                 lib.root_module.addOptions("build_options", build_opts_linked);
                 if (os_tag == .linux) {
-                    lib.root_module.linkSystemLibrary("compute_vp9", .{});
-                    addCvp9C(b, lib.root_module);
+                    if (cvp9_enabled) addCvp9(b, lib.root_module);
                 }
                 // TinyMidiLoader (vendor/tsf): la scheda MIDI mostra la durata
                 // reale parsando il file con tml (vedi parseMidi in media.zig).
@@ -636,8 +640,7 @@ pub fn build(b: *std.Build) void {
         LinkAv.link(b, player_dbg.root_module, target);
         player_dbg.root_module.addOptions("build_options", build_opts_linked);
         if (os_tag == .linux) {
-            player_dbg.root_module.linkSystemLibrary("compute_vp9", .{});
-            addCvp9C(b, player_dbg.root_module);
+            if (cvp9_enabled) addCvp9(b, player_dbg.root_module);
         }
         const player_run = b.addRunArtifact(player_dbg);
         player_run.addPassthruArgs();
@@ -835,7 +838,8 @@ fn translateC(
 }
 
 /// compute_vp9 (src/decoders/cvp9.zig): header del decoder VP9 su GPU compute.
-fn addCvp9C(b: *std.Build, mod: *std.Build.Module) void {
+fn addCvp9(b: *std.Build, mod: *std.Build.Module) void {
+    mod.linkSystemLibrary("compute_vp9", .{});
     _ = translateC(b, mod, "cvp9_c", "src/c/cvp9.h");
 }
 

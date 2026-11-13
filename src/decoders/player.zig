@@ -20,7 +20,7 @@ pub const c = @import("av_c");
 // Windows) e solo con il renderer Vulkan attivo. Altrove `cvp9` è uno struct vuoto e il
 // suo @cImport non viene mai analizzato — così player.zig compila senza la libreria, e i
 // VP9 li decodifica libav.
-const cvp9_enabled = builtin.os.tag == .linux and @import("build_options").gpu;
+const cvp9_enabled = builtin.os.tag == .linux and @import("build_options").gpu and @import("build_options").cvp9;
 const cvp9 = if (cvp9_enabled) @import("cvp9.zig") else struct {};
 
 // ── libav a runtime ──────────────────────────────────────────────────────────
