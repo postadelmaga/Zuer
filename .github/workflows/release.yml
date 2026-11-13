@@ -180,7 +180,7 @@ jobs:
           DEB="$(ls "$RUNNER_TEMP"/dist/zuer_*_amd64.deb)"
           sudo apt-get install -y -q "$DEB"
           for b in zuer zuer-gui; do
-            OUT="$($b --version)"
+            OUT="$($b --version 2>&1)"; echo "$OUT"
             [[ "$OUT" == "$b $VERSION" ]] || { echo "::error::$b --version: '$OUT'"; exit 1; }
           done
           ls /usr/lib/zuer/decoders/libdecoder_media.so /usr/lib/zuer/decoders/libdecoder_image.so
