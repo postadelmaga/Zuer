@@ -75,6 +75,7 @@ def make_files(d):
     add("dir", NFC("cartella è/dentro ò.png"), 304, 204)  # cartella e file accentati
     add("ja", NFC("データ.png"), 305, 205)  # デ = テ + U+3099 in NFD
     add("ko", NFC("한국어.png"), 306, 206)  # Hangul: decomposizione algoritmica
+    add("greek", "domanda\u037e.png", 318, 218)  # U+037E: la sua NFD è ";", ASCII
     add("multi_a", "multi a.png", 307, 207)
     add("multi_b", NFC("multi è.png"), 308, 208)
     add("multi_c", "multi c.png", 309, 209)
@@ -86,6 +87,12 @@ def make_files(d):
     add("amb1", "x ậ.png", 312, 212)
     add("amb2", "x ậ.png", 313, 213)
     files["missing"] = (os.path.join(d, NFC("manca è.png")), None)
+    # Cache degli errori: in ogni cartella un solo file (nessun vicino, quindi il
+    # prefetch non svuota la cache); il secondo file si crea durante la prova.
+    add("cache_a", "cache/a.png", 314, 214)
+    files["cache_z"] = (os.path.join(d, "cache", "z.png"), (315, 215))
+    add("cacheu_a", "cache-u/a.png", 316, 216)
+    files["cacheu_z"] = (os.path.join(d, "cache-u", NFD("zeta è.png")), (317, 217))
     return files
 
 
@@ -217,7 +224,12 @@ def main():
             record(name, False, f"open -a: {r.returncode} {r.stderr.decode(errors='replace').strip()}")
             return start
         ok = wait_trace(log, start, shown(files, expect), timeout)
-        record(name, ok, "" if ok else f"atteso {os.path.basename(files[expect][0])!r} {files[expect][1]}")
+        detail = ""
+        if not ok:
+            text = log_since(log, start)
+            detail = (f"atteso {os.path.basename(files[expect][0])!r} {files[expect][1]}; open -a rc={r.returncode}, "
+                      f"consegne={text.count(b'open file:')}, righe di traccia={text.count(b'[trace]')}, processi={len(zuer_pids())}")
+        record(name, ok, detail)
         return start
 
     only = set(filter(None, args.only.split(",")))
@@ -235,6 +247,9 @@ def main():
     if want("ko"):
         open_case("nome coreano (Hangul)", ["ko"], expect="ko")
 
+    if want("greek"):
+        open_case("punto interrogativo greco (NFD in ASCII)", ["greek"], expect="greek")
+
     if want("missing"):
         ensure_running()
         start = os.path.getsize(log)
@@ -247,6 +262,42 @@ def main():
         msg = b"file dal sistema illeggibile" in log_since(log, start) and b"FileNotFound" in log_since(log, start)
         record("file inesistente: messaggio d'errore al posto del contenuto", got and msg)
 
+    def cache_case(name, a, z):
+        """Errore su `z` (inesistente), poi un altro file, poi `z` creato e riaperto: si
+        deve vedere `z`, non l'errore di prima rimasto in cache."""
+        zpath, zdims = files[z]
+        if os.path.exists(zpath):
+            os.remove(zpath)
+        # Istanza fresca: con la cache di prefetch già piena (4 voci) l'errore non
+        # verrebbe parcheggiato comunque e la prova passerebbe anche col difetto.
+        kill_zuer()
+        if not ensure_running():
+            record(name, False, "Zuer non parte")
+            return
+        sizes = {v[1] for v in files.values() if v[1]}
+        zname = NFC(os.path.basename(zpath))
+        start = os.path.getsize(log)
+        darling_open(tapp, [zpath])
+        err = wait_trace(log, start, lambda r, w, h, n: NFC(n.decode(errors="replace")) == zname and r > 0 and (w, h) not in sizes, 30)
+        start = os.path.getsize(log)
+        darling_open(tapp, [files[a][0]])
+        other = wait_trace(log, start, shown(files, a), 30)
+        png(zpath, *zdims, (40, 160, 90))
+        start = os.path.getsize(log)
+        darling_open(tapp, [zpath])
+        ok = wait_trace(log, start, shown({"z": (zpath, zdims)}, "z"), 30)
+        # E ci resta: nessuna riga successiva torna al messaggio.
+        time.sleep(3)
+        lines = [TRACE.search(l) for l in log_since(log, start).splitlines()]
+        dims = [(int(m[2]), int(m[3])) for m in lines if m]
+        stays = zdims in dims and all(d == zdims for d in dims[dims.index(zdims):])
+        record(name, err and other and ok and stays, "" if ok else "si vede ancora l'errore di prima")
+
+    if want("cache"):
+        cache_case("errore in cache: file creato dopo e riaperto si vede", "cache_a", "cache_z")
+    if want("cacheu"):
+        cache_case("errore in cache, nome Unicode: file creato dopo e riaperto si vede", "cacheu_a", "cacheu_z")
+
     if want("amb"):
         ensure_running()
         start = os.path.getsize(log)
@@ -257,11 +308,27 @@ def main():
         record("nomi equivalenti ambigui: nessuna scelta, errore", b"AmbiguousName" in text and no_pick)
 
     if want("multi"):
-        start = open_case("tre documenti in un solo evento: si vede l'ultimo", ["multi_a", "multi_b", "multi_c"], expect="multi_c")
+        # Zuer mostra un documento alla volta: di un evento con più file li apre tutti
+        # in ordine (ognuno passa da `openFromSystem`, il caricamento è latest-wins) e
+        # resta sull'ultimo; le frecce scorrono poi la sua cartella.
+        keys = ["multi_a", "multi_b", "multi_c"]
+        start = open_case("tre documenti in un solo evento: si vede l'ultimo", keys, expect="multi_c")
         if start is not None:
-            text = log_since(log, start)
-            delivered = all(f"open file: {SYSROOT}".encode() in text and NFC(os.path.basename(files[k][0])).encode() in NFC(text.decode(errors="replace")).encode() for k in ("multi_a", "multi_b", "multi_c"))
-            record("tre documenti in un solo evento: tutti consegnati a Zuer", delivered)
+            text = NFC(log_since(log, start).decode(errors="replace"))
+            delivered = all(f"open file: {SYSROOT}{NFC(files[k][0])}" in text for k in keys)
+            record("tre documenti in un solo evento: tutti consegnati a Zuer, in ordine", delivered and
+                   text.index(NFC(files["multi_a"][0])) < text.index(NFC(files["multi_b"][0])) < text.index(NFC(files["multi_c"][0])))
+            time.sleep(2)
+            dims = [(int(m[2]), int(m[3])) for m in map(TRACE.search, log_since(log, start).splitlines()) if m]
+            last = files["multi_c"][1]
+            record("tre documenti in un solo evento: nessun altro sopra l'ultimo", last in dims and all(d == last for d in dims[dims.index(last):]))
+        # Un file mancante in mezzo non ferma gli altri: si vede comunque l'ultimo.
+        # Prima un altro file, così l'ultimo dell'evento non è già quello mostrato.
+        open_case("(preparazione: un altro file)", ["ascii"], expect="ascii")
+        start = open_case("evento con un file mancante in mezzo: si vede l'ultimo", ["multi_a", "missing", "multi_c"], expect="multi_c")
+        if start is not None:
+            text = NFC(log_since(log, start).decode(errors="replace"))
+            record("evento con un file mancante in mezzo: il mancante è segnalato", f"illeggibile: {SYSROOT}{NFC(files['missing'][0])}" in text)
 
     if want("busy"):
         # Il secondo Apple Event arriva mentre il loader decodifica il PNG grande: deve
@@ -279,6 +346,10 @@ def main():
 
     kill_zuer()
     failed = [n for n, ok in results if not ok]
+    if failed:
+        keep = log + time.strftime(".fallito-%H%M%S")
+        shutil.copyfile(log, keep)
+        print(f"traccia conservata: {keep}")
     print(f"\n{len(results) - len(failed)}/{len(results)} passati" + (f"; falliti: {', '.join(failed)}" if failed else ""))
     print(f"traccia: {log}")
     return 1 if failed else 0

@@ -745,5 +745,8 @@ pub const ccc_ranges = [_]Ccc{
     .{ .first = 0x1E8D0, .last = 0x1E8D6, .class = 220 }, .{ .first = 0x1E944, .last = 0x1E949, .class = 230 }, .{ .first = 0x1E94A, .last = 0x1E94A, .class = 7 },
 };
 
+/// Caratteri ASCII che sono la NFD di un carattere non ASCII.
+pub const ascii_nfd_targets = "\x3b\x4b\x60";
+
 /// Versione Unicode dei dati.
 pub const unicode_version = "16.0.0";

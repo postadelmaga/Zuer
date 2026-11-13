@@ -66,12 +66,22 @@ manda un Apple Event (`kAEOpenDocuments`); AppKit lo passa al delegate
 questo equivale a lanciare `zuer-gui <percorso>`:
 
 - la callback gira sul thread finestra, dentro `win.run()`, a stato inizializzato;
-- il caricamento passa da `nav.postLoad`, latest-wins: con più file in un evento, o un
-  secondo evento mentre il loader decodifica, si vede l'ultimo. Il file iniziale
-  (`decodeInitial`) riceve la generazione letta prima di creare il suo thread, quindi
-  non si installa sopra un file chiesto nel frattempo;
+- il caricamento passa da `nav.postLoad`, latest-wins. Zuer mostra un documento alla
+  volta: di un evento con più file li apre tutti, in ordine, e resta sull'ultimo; le
+  frecce scorrono poi la sua cartella. Un file mancante in mezzo è segnalato e non
+  ferma gli altri. Un secondo evento mentre il loader decodifica sostituisce il primo;
+- il file iniziale (`decodeInitial`) riceve la generazione letta prima di creare il suo
+  thread, quindi non si installa sopra un file chiesto nel frattempo;
 - un file che non si può aprire mostra un messaggio al posto del contenuto
   (`nav.showMessage`), non solo una riga su stderr.
+
+**Errori e cache di prefetch.** Il contenuto che si lascia viene parcheggiato nella
+cache sotto il suo percorso (`parkOutgoingLocked`), così tornando indietro non si
+ridecodifica. Un messaggio d'errore (file non trovato, permessi, decode fallito) non
+è il contenuto del file: lo si installa con `applyMessage`, che marca
+`shared.decoded_is_message`, e non viene mai parcheggiato. Altrimenti un file creato
+o reso leggibile dopo, riaperto allo stesso percorso, mostrerebbe l'errore di prima.
+Il prefetch già scartava i decode falliti.
 
 **Accenti in un'altra forma Unicode** (`src/unicode_path.zig`). Gli URL dei file
 arrivano con gli accenti decomposti (NFD, HFS+): `NSURL fileURLWithPath:` →
@@ -84,13 +94,17 @@ nel processo che manda l'evento. Il nome originale non viaggia nell'evento.
 - **Linux:** succede anche a un file copiato da un Mac (nome decomposto) quando lo si
   apre scrivendo il nome a mano.
 
-`findEquivalent` interviene solo se il percorso ricevuto dà `FileNotFound` e contiene
-byte non ASCII. Per ogni componente che non esiste elenca la sola cartella che lo
+`findEquivalent` interviene solo se il percorso ricevuto dà `FileNotFound` e può avere
+un'altra forma. Succede quando contiene byte non ASCII, oppure `;`, `` ` `` o `K`: sono
+la NFD di U+037E, U+1FEF e U+212A, e da macOS o Darling quei nomi arrivano in ASCII
+(`ascii_nfd_targets`, generato). Per ogni componente che non esiste elenca la sola cartella che lo
 contiene, senza ricorsione, e prende la voce con la stessa NFD:
 
 - se le voci equivalenti sono più d'una (su Linux possono coesistere) dà
   `AmbiguousName` e non ne sceglie nessuna;
-- il nome usato è quello del disco, quindi lo sono anche l'etichetta e le frecce.
+- il nome usato è quello del disco, quindi lo sono anche l'etichetta e le frecce;
+- il confronto è solo canonico. Maiuscole e minuscole contano: su Windows un nome
+  che differisce sia per forma Unicode sia per maiuscole non si ritrova.
 
 Lo usano `openFromSystem` e l'argomento da riga di comando (`nav.resolveInitialFile`).
 La NFD è completa (Unicode 16, Hangul compreso) e le tabelle sono generate da
@@ -103,8 +117,10 @@ per nome.
 
 Prova d'integrazione sotto Darling: `scripts/darling-open-check.py <Zuer.app>`.
 Copre ASCII, NFC e NFD, cold launch e istanza aperta, cartella accentata, giapponese e
-coreano, file inesistente, nomi ambigui, più documenti, secondo evento a loader
-occupato.
+coreano, punto interrogativo greco, file inesistente, nomi ambigui, più documenti
+(anche con un file mancante in mezzo), secondo evento a loader occupato, errore in
+cache poi file creato (ASCII e Unicode). Uccide per PID solo i processi del bundle di
+prova.
 
 ## Miniature dell'esploratore
 

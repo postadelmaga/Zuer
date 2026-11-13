@@ -68,6 +68,10 @@ pub const GuiAppState = struct {
 
         // Variabili Zicro/Loader
         decoded: decoder_mod.Decoded = .{ .text = "" },
+        /// `decoded` è un messaggio (file non trovato, illeggibile, decode fallito) al
+        /// posto del contenuto del file: non va parcheggiato nella cache di prefetch,
+        /// dove riaprendo lo stesso percorso prevarrebbe sul file ormai disponibile.
+        decoded_is_message: bool = false,
         // Pin del decode per il raster fuori-lock (vedi rasterizeText in gui.zig):
         // il render worker pinna `decoded` e rilascia il lock per layout/raster;
         // `applyDecoded`, se swappa nel frattempo, NON libera il vecchio valore ma

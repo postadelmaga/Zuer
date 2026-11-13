@@ -34,6 +34,11 @@ for cp in range(MAX_CP + 1):
     offsets.append(len(values))
     max_len = max(max_len, len(d))
 
+# Caratteri ASCII che sono la NFD di un carattere non ASCII (U+037E → ";", U+1FEF → "`",
+# U+212A → "K"): un nome tutto ASCII che li contiene può avere un equivalente non ASCII.
+ascii_targets = sorted({unicodedata.normalize("NFD", chr(k)) for k in keys if all(ord(c) < 0x80 for c in unicodedata.normalize("NFD", chr(k)))})
+assert all(len(t) == 1 for t in ascii_targets)
+
 ranges = []  # (primo, ultimo, classe)
 for cp in range(MAX_CP + 1):
     if is_surrogate(cp):
@@ -71,4 +76,6 @@ print(emit("decomp_values", "u21", [f"0x{v:X}" for v in values]))
 print("\n/// Classi di combinazione diverse da zero: intervalli `[primo, ultimo]` crescenti.")
 print("pub const Ccc = struct { first: u21, last: u21, class: u8 };")
 print(emit("ccc_ranges", "Ccc", [f".{{ .first = 0x{a:X}, .last = 0x{b:X}, .class = {c} }}" for a, b, c in ranges], 3))
+zig_str = "".join("\\x%02x" % ord(t) for t in ascii_targets)
+print(f"\n/// Caratteri ASCII che sono la NFD di un carattere non ASCII.\npub const ascii_nfd_targets = \"{zig_str}\";")
 print(f"\n/// Versione Unicode dei dati.\npub const unicode_version = \"{unicodedata.unidata_version}\";")

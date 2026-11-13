@@ -155,6 +155,13 @@ pub fn enqueueLoad(state: *GuiAppState, new_path: []const u8) void {
     state.nav.cond.signal(state.io);
 }
 
+/// Installa `msg` (allocato con `gpa`, ne prende possesso) come messaggio d'errore
+/// al posto del contenuto di `path`: si vede come testo ma non entra mai nella
+/// cache di prefetch (vedi `parkOutgoingLocked`).
+fn applyMessage(state: *GuiAppState, msg: []const u8, path: []const u8, gen: ?u32) !void {
+    return applyDecoded(state, .{ .text = msg }, .{ .message = true }, path, gen);
+}
+
 /// Un messaggio al posto del contenuto (un file chiesto dal sistema che non si può
 /// aprire): supera ogni caricamento in corso, come una navigazione più recente. Sul
 /// thread finestra, come `postLoad`.
@@ -171,7 +178,7 @@ pub fn showMessage(state: *GuiAppState, path: []const u8, msg: []const u8) void 
     state.shared.mutex.lockUncancelable(state.io);
     state.current_file_index = null;
     state.shared.mutex.unlock(state.io);
-    applyDecoded(state, .{ .text = text }, .{}, path, gen) catch return;
+    applyMessage(state, text, path, gen) catch return;
     resizeToContent(state);
 }
 
@@ -182,7 +189,7 @@ fn showApplyFailure(state: *GuiAppState, err: anyerror, path: []const u8, gen: ?
     if (err != error.RendererInit) return;
     const why = if (state.renderer_error) |e| @errorName(e) else "sconosciuto";
     const msg = std.fmt.allocPrint(state.gpa, "Modello 3D non visualizzabile: renderer GPU (Vulkan) non disponibile.\nMotivo: {s}", .{why}) catch return;
-    applyDecoded(state, .{ .text = msg }, .{}, path, gen) catch {};
+    applyMessage(state, msg, path, gen) catch {};
 }
 
 /// True se una navigazione più recente è arrivata dopo che il worker ha preso
@@ -243,6 +250,8 @@ pub const Prepared = struct {
     rgba: ?[]align(4) u8 = null,
     video: ?PreparedVideo = null,
     midi: ?*midi_player.MidiPlayer = null,
+    /// Il contenuto è un messaggio d'errore, non il file (vedi `applyMessage`).
+    message: bool = false,
 
     pub fn deinit(self: *Prepared, state: *GuiAppState) void {
         if (self.stage) |*s| s.buffer.deinit(state.gpa);
@@ -501,6 +510,7 @@ pub fn applyDecoded(state: *GuiAppState, new_decoded: decoder_mod.Decoded, pre_i
 
     // 3. Aggiorna decoded
     state.shared.decoded = new_decoded;
+    state.shared.decoded_is_message = pre.message;
 
     // 4. Aggiorna percorso file corrente
     state.gpa.free(state.shared.current_file_path);
@@ -955,6 +965,9 @@ pub fn navigate(state: *GuiAppState, direction: i2) void {
 fn parkOutgoingLocked(state: *GuiAppState, new_path: []const u8) bool {
     const old_path = state.shared.current_file_path;
     if (old_path.len == 0 or std.mem.eql(u8, old_path, new_path)) return false;
+    // Un errore non è il contenuto del file: in cache sopravviverebbe al file creato
+    // o reso leggibile dopo, e riaprendolo si rivedrebbe l'errore.
+    if (state.shared.decoded_is_message) return false;
     const d = &state.shared.decoded;
     switch (d.*) {
         .image, .text, .markdown, .csv, .workbook => {},
@@ -1180,7 +1193,7 @@ pub fn decodeInitial(state: *GuiAppState, path: []const u8, gen: u32) void {
         std.debug.print("[gui] caricamento fallito: {s}: {s}\n", .{ path, d.err });
         const msg: []const u8 = std.fmt.allocPrint(state.gpa, "Errore nel caricamento del file:\n{s}", .{d.err}) catch "";
         d.deinit(state.gpa);
-        applyDecoded(state, .{ .text = msg }, .{}, path, gen) catch {};
+        applyMessage(state, msg, path, gen) catch {};
         return;
     }
     // Staging GPU, RGBA, player A/V e MIDI preparati QUI, fuori lock.
@@ -1264,7 +1277,7 @@ pub fn loadWorker(state: *GuiAppState) void {
             std.debug.print("[gui] caricamento fallito: {s}: {s}\n", .{ path, d.err });
             const msg: []const u8 = std.fmt.allocPrint(gpa, "Errore nel caricamento del file:\n{s}", .{d.err}) catch "";
             d.deinit(gpa);
-            applyDecoded(state, .{ .text = msg }, .{}, path, gen) catch {};
+            applyMessage(state, msg, path, gen) catch {};
         } else {
             // Staging GPU, RGBA, player A/V e MIDI preparati fuori lock (era
             // tutto dentro `applyDecoded`, con spinner e input congelati).

@@ -11,8 +11,8 @@
 //!   incollato in forma composta.
 //!
 //! `findEquivalent` ritrova il percorso che esiste davvero: solo DOPO che quello ricevuto
-//! non è stato trovato, solo per i componenti che non esistono e contengono byte non
-//! ASCII, elencando la sola cartella che li contiene (nessuna ricerca ricorsiva). Il
+//! non è stato trovato, solo per i componenti che non esistono e possono avere
+//! un'altra forma (byte non ASCII, o ";" "`" "K", vedi `mayHaveOtherForm`), elencando la sola cartella che li contiene (nessuna ricerca ricorsiva). Il
 //! nome scelto è quello di una voce della cartella canonicamente equivalente (stessa
 //! NFD); se le voci equivalenti sono più d'una non se ne sceglie nessuna.
 
@@ -104,6 +104,16 @@ fn isAscii(s: []const u8) bool {
     return true;
 }
 
+/// Vero se `s` può avere una forma equivalente con byte diversi: contiene byte non
+/// ASCII, oppure un carattere ASCII che è la NFD di uno non ASCII (";" di U+037E,
+/// "`" di U+1FEF, "K" di U+212A: da macOS o Darling quei nomi arrivano in ASCII).
+fn mayHaveOtherForm(s: []const u8) bool {
+    for (s) |b| {
+        if (b >= 0x80 or std.mem.indexOfScalar(u8, data.ascii_nfd_targets, b) != null) return true;
+    }
+    return false;
+}
+
 /// Vero se `a` e `b` sono lo stesso testo Unicode, anche con byte diversi (stessa NFD).
 /// Byte non UTF-8 validi: uguali solo se identici.
 pub fn canonicallyEqual(a: []const u8, b: []const u8) bool {
@@ -134,8 +144,8 @@ pub const FindError = error{
 /// qualche nome ha gli accenti in un'altra forma Unicode. Da chiamare SOLO dopo che
 /// l'accesso a `path` ha dato FileNotFound. Allocato con `gpa`.
 pub fn findEquivalent(io: std.Io, gpa: std.mem.Allocator, path: []const u8) FindError![]u8 {
-    // Un percorso tutto ASCII ha una sola forma: non c'è altro da cercare.
-    if (isAscii(path)) return error.FileNotFound;
+    // Un percorso tutto ASCII senza ";", "`", "K" ha una sola forma: niente da cercare.
+    if (!mayHaveOtherForm(path)) return error.FileNotFound;
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
@@ -157,7 +167,7 @@ pub fn findEquivalent(io: std.Io, gpa: std.mem.Allocator, path: []const u8) Find
 
         if (dir.statFile(io, comp.name, .{})) |_| {} else |err| switch (err) {
             error.FileNotFound => {
-                if (isAscii(comp.name)) return error.FileNotFound;
+                if (!mayHaveOtherForm(comp.name)) return error.FileNotFound;
                 chosen_owned = try equivalentEntry(io, gpa, dir, comp.name);
                 chosen = chosen_owned.?;
             },
@@ -323,6 +333,18 @@ test "findEquivalent: inesistente, ASCII, nome davvero diverso, ambiguo" {
     const got_k = try findEquivalent(io, gpa, kelvin);
     defer gpa.free(got_k);
     try std.testing.expectEqualStrings("K.txt", std.fs.path.basename(got_k));
+
+    // E al contrario: sul disco il carattere non ASCII, chiesto nella sua NFD ASCII
+    // (come lo manda macOS/Darling per U+037E, il punto interrogativo greco).
+    try tmp.dir.writeFile(io, .{ .sub_path = "perch\xcd\xbe.txt", .data = "q" }); // U+037E
+    const greek = try std.fs.path.join(gpa, &.{ base, "perch;.txt" });
+    defer gpa.free(greek);
+    const got_q = try findEquivalent(io, gpa, greek);
+    defer gpa.free(got_q);
+    try std.testing.expectEqualStrings("perch\xcd\xbe.txt", std.fs.path.basename(got_q));
+    // Un nome ASCII senza quei caratteri non ha altre forme: nessuna ricerca.
+    try std.testing.expect(!mayHaveOtherForm("manca.png"));
+    try std.testing.expect(mayHaveOtherForm("Kelvin.png"));
 
     // Un componente intermedio che non è una cartella.
     const through = try std.fs.path.join(gpa, &.{ base, "citt\xc3\xa0.png", "dentro " ++ nfd_e });
