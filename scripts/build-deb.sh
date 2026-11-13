@@ -30,6 +30,7 @@ ARCH="$(dpkg --print-architecture)"
 # 0.1.0-rc1 → 0.1.0~rc1: per dpkg la prerelease viene prima della versione finale.
 DEBVER="${VERSION//-/\~}"
 
+mkdir -p zig-out
 WORK="$(mktemp -d "${TMPDIR:-zig-out}/zuer-deb.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 PREFIX="$WORK/build"
