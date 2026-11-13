@@ -1458,7 +1458,10 @@ pub fn main(init: std.process.Init) !void {
         yt_search.openById(&gui_state, vid);
         gui_state.shared.mutex.unlock(io);
     } else if (gui_state.shared.loading) {
-        decode_thread = try std.Thread.spawn(.{}, nav.decodeInitial, .{ &gui_state, file_path });
+        gui_state.nav.mutex.lockUncancelable(io);
+        const gen = gui_state.nav.gen;
+        gui_state.nav.mutex.unlock(io);
+        decode_thread = try std.Thread.spawn(.{}, nav.decodeInitial, .{ &gui_state, file_path, gen });
     }
     defer if (decode_thread) |t| t.join();
 

@@ -57,6 +57,55 @@ worker mentre arriva un task, timeout di inattività contemporaneo a un submit, 
 satura con più produttori, crescita e ritiro del pool. Quelli sulle corse corrette
 sono stati verificati reintroducendo il bug: falliscono.
 
+## File aperti dal sistema (Finder, `open -a`)
+
+Su macOS un file aperto dal Finder non arriva in argv. macOS lancia l'app e le
+manda un Apple Event (`kAEOpenDocuments`); AppKit lo passa al delegate
+`application:openURLs:` di Zicro (`window_cocoa.zig`), che chiama `on_open_file` con
+`[url path]`. In Zuer (`gui.openFileFromSystem` → `file_explorer.openFromSystem`)
+questo equivale a lanciare `zuer-gui <percorso>`:
+
+- la callback gira sul thread finestra, dentro `win.run()`, a stato inizializzato;
+- il caricamento passa da `nav.postLoad`, latest-wins: con più file in un evento, o un
+  secondo evento mentre il loader decodifica, si vede l'ultimo. Il file iniziale
+  (`decodeInitial`) riceve la generazione letta prima di creare il suo thread, quindi
+  non si installa sopra un file chiesto nel frattempo;
+- un file che non si può aprire mostra un messaggio al posto del contenuto
+  (`nav.showMessage`), non solo una riga su stderr.
+
+**Accenti in un'altra forma Unicode** (`src/unicode_path.zig`). Gli URL dei file
+arrivano con gli accenti decomposti (NFD, HFS+): `NSURL fileURLWithPath:` →
+`CFURLCreateWithFileSystemPath` → `CFStringGetFileSystemRepresentation` decompone già
+nel processo che manda l'evento. Il nome originale non viaggia nell'evento.
+
+- **macOS:** APFS e HFS+ aprono il file in entrambe le forme, quindi non serve altro.
+- **Darling:** fa lo stesso su un filesystem Linux, che confronta i byte: `città.png`
+  salvato composto arriva come `citta` + U+0300 e non esiste.
+- **Linux:** succede anche a un file copiato da un Mac (nome decomposto) quando lo si
+  apre scrivendo il nome a mano.
+
+`findEquivalent` interviene solo se il percorso ricevuto dà `FileNotFound` e contiene
+byte non ASCII. Per ogni componente che non esiste elenca la sola cartella che lo
+contiene, senza ricorsione, e prende la voce con la stessa NFD:
+
+- se le voci equivalenti sono più d'una (su Linux possono coesistere) dà
+  `AmbiguousName` e non ne sceglie nessuna;
+- il nome usato è quello del disco, quindi lo sono anche l'etichetta e le frecce.
+
+Lo usano `openFromSystem` e l'argomento da riga di comando (`nav.resolveInitialFile`).
+La NFD è completa (Unicode 16, Hangul compreso) e le tabelle sono generate da
+`scripts/gen-unicode-nfd.py`. Su tutti i codepoint e su 50.000 stringhe casuali con
+più segni combinanti coincide con `unicodedata` di Python.
+
+Costo: nessuno se il file esiste. Nel caso di ripiego, circa 7 ms per una cartella di
+10.000 voci, di cui circa 4,5 ms per la sola lettura della cartella e circa 250 ns
+per nome.
+
+Prova d'integrazione sotto Darling: `scripts/darling-open-check.py <Zuer.app>`.
+Copre ASCII, NFC e NFD, cold launch e istanza aperta, cartella accentata, giapponese e
+coreano, file inesistente, nomi ambigui, più documenti, secondo evento a loader
+occupato.
+
 ## Miniature dell'esploratore
 
 La pipeline sta in `src/thumbs.zig` (senza dipendenze dalla GUI: la usa anche il

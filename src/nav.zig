@@ -20,6 +20,7 @@ const yt_search = @import("yt_search.zig");
 const layout = @import("layout.zig");
 const gui_state_mod = @import("gui_state.zig");
 const vtcache = @import("vtcache.zig");
+const unicode_path = @import("unicode_path.zig");
 const GuiAppState = gui_state_mod.GuiAppState;
 const Prefetched = gui_state_mod.Prefetched;
 const resetScroll = gui_state_mod.resetScroll;
@@ -152,6 +153,26 @@ pub fn enqueueLoad(state: *GuiAppState, new_path: []const u8) void {
     state.shared.file_changed = true;
     state.shared.mutex.unlock(state.io);
     state.nav.cond.signal(state.io);
+}
+
+/// Un messaggio al posto del contenuto (un file chiesto dal sistema che non si può
+/// aprire): supera ogni caricamento in corso, come una navigazione più recente. Sul
+/// thread finestra, come `postLoad`.
+pub fn showMessage(state: *GuiAppState, path: []const u8, msg: []const u8) void {
+    const text = state.gpa.dupe(u8, msg) catch return;
+    state.nav.mutex.lockUncancelable(state.io);
+    if (state.nav.req) |old| state.gpa.free(old);
+    state.nav.req = null;
+    state.nav.gen +%= 1;
+    const gen = state.nav.gen;
+    state.nav.mutex.unlock(state.io);
+    // La lista delle frecce è ancora quella della cartella di prima: unita al percorso
+    // del messaggio aprirebbe un file con lo stesso nome ma nell'altra cartella.
+    state.shared.mutex.lockUncancelable(state.io);
+    state.current_file_index = null;
+    state.shared.mutex.unlock(state.io);
+    applyDecoded(state, .{ .text = text }, .{}, path, gen) catch return;
+    resizeToContent(state);
 }
 
 /// Un modello 3D senza renderer GPU (loader/driver Vulkan assenti, device perso
@@ -1072,7 +1093,22 @@ pub fn resizeToContent(state: *GuiAppState) void {
 /// zuer su una cartella si apre una preview navigabile con le frecce (initFileList
 /// popola la lista con gli altri file). Se `arg` è già un file, lo duplica. Il
 /// chiamante possiede e libera la stringa restituita.
-pub fn resolveInitialFile(io: std.Io, gpa: std.mem.Allocator, arg: []const u8) !?[]u8 {
+pub fn resolveInitialFile(io: std.Io, gpa: std.mem.Allocator, arg_in: []const u8) !?[]u8 {
+    // Non trovato: forse ha gli accenti in un'altra forma Unicode di come è sul disco
+    // (vedi unicode_path.zig). Un percorso che esiste non passa di qui.
+    var found: ?[]u8 = null;
+    defer if (found) |f| gpa.free(f);
+    if (std.Io.Dir.cwd().statFile(io, arg_in, .{})) |_| {} else |e| if (e == error.FileNotFound) {
+        found = unicode_path.findEquivalent(io, gpa, arg_in) catch |fe| switch (fe) {
+            error.AmbiguousName => blk: {
+                std.debug.print("'{s}': più file con questo nome, con gli accenti in forme Unicode diverse\n", .{arg_in});
+                break :blk null;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
+    }
+    const arg = found orelse arg_in;
     // openDir riesce solo sulle cartelle; su un file dà errore → è già un file.
     var dir = std.Io.Dir.cwd().openDir(io, arg, .{ .iterate = true }) catch
         return try gpa.dupe(u8, arg);
@@ -1104,7 +1140,11 @@ pub fn resolveInitialFile(io: std.Io, gpa: std.mem.Allocator, arg: []const u8) !
 /// Decodifica il file iniziale su un thread di background e lo installa nello
 /// stato quando è pronto (azzerando lo spinner via `applyDecoded`). Sugli errori
 /// mostra il messaggio come testo nella finestra invece di terminare il processo.
-pub fn decodeInitial(state: *GuiAppState, path: []const u8) void {
+///
+/// `gen` è la generazione letta da chi crea il thread, PRIMA di crearlo: letta qui,
+/// un file chiesto nel frattempo (Apple Event dal Finder, una freccia) avrebbe la
+/// stessa generazione e il file iniziale potrebbe installarsi sopra di esso.
+pub fn decodeInitial(state: *GuiAppState, path: []const u8, gen: u32) void {
     scheduler.setThreadPriority(.interactive);
     // Decode interattivo fuori dal pool: le miniature riducono il parallelismo.
     scheduler.beginForeground();
@@ -1112,9 +1152,6 @@ pub fn decodeInitial(state: *GuiAppState, path: []const u8) void {
     // Latest-wins anche per il decode iniziale (come `loadWorker`): appena la
     // fase coarse spegne lo spinner l'utente può navigare, e il full del file
     // iniziale — ormai superato — non deve sovrascrivere quello navigato.
-    state.nav.mutex.lockUncancelable(state.io);
-    const gen = state.nav.gen;
-    state.nav.mutex.unlock(state.io);
 
     // Fase 1 (progressiva): se la cache texture coarse è calda (riapertura), una
     // resa a bassa risoluzione quasi istantanea; poi la fase 2 raffina a pieno.

@@ -19,6 +19,7 @@ const yt_search = @import("yt_search.zig");
 const card_grid = @import("card_grid.zig");
 const gui_state_mod = @import("gui_state.zig");
 const vtcache = @import("vtcache.zig");
+const unicode_path = @import("unicode_path.zig");
 const GuiAppState = gui_state_mod.GuiAppState;
 const zrame = @import("zrame");
 const zicro = @import("zicro");
@@ -335,11 +336,33 @@ pub fn openFromSystem(state: *GuiAppState, path: []const u8) void {
         state.shared.file_changed = true;
     }
     state.shared.mutex.unlock(state.io);
-    const st = std.Io.Dir.cwd().statFile(state.io, path, .{}) catch |e| {
-        std.debug.print("[gui] file dal sistema illeggibile: {s} ({s})\n", .{ path, @errorName(e) });
+    const io = state.io;
+    var found: ?[]u8 = null;
+    defer if (found) |f| state.gpa.free(f);
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch |e| retry: {
+        // Non trovato: forse ha gli accenti in un'altra forma Unicode di com'è sul
+        // disco. Da macOS (e da Darling) arrivano sempre decomposti; su un filesystem
+        // che confronta i byte serve il nome com'è salvato (vedi unicode_path.zig).
+        var why: anyerror = e;
+        if (e == error.FileNotFound) {
+            if (unicode_path.findEquivalent(io, state.gpa, path)) |f| {
+                found = f;
+                std.debug.print("[gui] file dal sistema ritrovato in un'altra forma Unicode: {s}\n", .{f});
+                if (std.Io.Dir.cwd().statFile(io, f, .{})) |s| break :retry s else |e2| why = e2;
+            } else |fe| why = fe;
+        }
+        std.debug.print("[gui] file dal sistema illeggibile: {s} ({s})\n", .{ path, @errorName(why) });
+        var buf: [std.fs.max_path_bytes + 160]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "{s}:\n{s}", .{ switch (why) {
+            error.FileNotFound => "File non trovato",
+            error.AmbiguousName => "Più file con questo nome, con gli accenti in forme Unicode diverse: non ne scelgo uno",
+            else => "File non leggibile",
+        }, path }) catch "File non trovato";
+        nav.showMessage(state, path, msg);
         return;
     };
-    if (st.kind == .directory) previewFolder(state, path) else openFile(state, path);
+    const real = found orelse path;
+    if (st.kind == .directory) previewFolder(state, real) else openFile(state, real);
 }
 
 /// Anteprima di una CARTELLA (click destro): apre il suo primo file e aggancia
