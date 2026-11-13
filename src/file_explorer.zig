@@ -187,8 +187,11 @@ fn enterDir(state: *GuiAppState, dir_path: []const u8) bool {
         var it = dir.iterate();
         while (it.next(state.io) catch null) |entry| {
             if (entry.name.len == 0 or entry.name[0] == '.') continue; // nascosti
-            const is_dir = entry.kind == .directory;
-            if (!is_dir and entry.kind != .file) continue;
+            // I link valgono per ciò a cui puntano (stat solo per loro, non per
+            // le voci normali: vedi sotto).
+            const kind = nav.entryKind(state.io, dir, entry);
+            const is_dir = kind == .directory;
+            if (!is_dir and kind != .file) continue;
             if (list.items.len >= max_entries) {
                 truncated = true;
                 break;
@@ -274,7 +277,7 @@ fn setFileListForDir(state: *GuiAppState, dir_path: []const u8, cur_name: []cons
         defer dir.close(state.io);
         var it = dir.iterate();
         while (it.next(state.io) catch null) |entry| {
-            if (entry.kind == .file and entry.name.len > 0 and entry.name[0] != '.') {
+            if (entry.name.len > 0 and entry.name[0] != '.' and nav.entryKind(state.io, dir, entry) == .file) {
                 const name = state.gpa.dupe(u8, entry.name) catch break;
                 names.append(state.gpa, name) catch {
                     state.gpa.free(name);

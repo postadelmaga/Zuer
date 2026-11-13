@@ -322,6 +322,35 @@ fn listHwDevices(out: *[max_hw_devices][max_hw_device_path]u8) u8 {
 
 const OpenedHw = struct { codec_ctx: [*c]c.AVCodecContext, hw_device_ctx: [*c]c.AVBufferRef };
 
+/// macOS: VideoToolbox decodifica davvero `codec_id` in hardware? Lo chiede a
+/// `VTIsHardwareDecodeSupported` (macOS 10.13+) PRIMA di creare il device: provarlo e
+/// basta non è sicuro ovunque. Un VideoToolbox che non decodifica (lo stub di Darling)
+/// fa riuscire `VTDecompressionSessionCreate` senza dare una sessione, e la chiusura
+/// del contesto in libavcodec manda poi in crash il processo. Codec senza un tipo
+/// CoreMedia noto qui: vale la risposta per H.264, cioè "questo sistema ha un decoder
+/// VideoToolbox". Funzione assente (sistema vecchio): si prova come prima.
+fn videoToolboxDecodes(codec_id: c.enum_AVCodecID) bool {
+    if (comptime builtin.os.tag != .macos) return true;
+    const handle = std.c.dlopen("/System/Library/Frameworks/VideoToolbox.framework/VideoToolbox", .{ .NOW = true }) orelse return true;
+    const sym = std.c.dlsym(handle, "VTIsHardwareDecodeSupported") orelse return true;
+    const isSupported: *const fn (u32) callconv(.c) u8 = @ptrCast(@alignCast(sym));
+    const fourcc = struct {
+        fn f(comptime s: *const [4]u8) u32 {
+            return std.mem.readInt(u32, s, .big);
+        }
+    }.f;
+    const codec_type: u32 = switch (codec_id) {
+        c.AV_CODEC_ID_HEVC => fourcc("hvc1"),
+        c.AV_CODEC_ID_VP9 => fourcc("vp09"),
+        c.AV_CODEC_ID_AV1 => fourcc("av01"),
+        c.AV_CODEC_ID_MPEG2VIDEO => fourcc("mp2v"),
+        c.AV_CODEC_ID_MPEG4 => fourcc("mp4v"),
+        c.AV_CODEC_ID_PRORES => fourcc("apcn"),
+        else => fourcc("avc1"),
+    };
+    return isSupported(codec_type) != 0;
+}
+
 /// Tenta di aprire `codec` in hardware sul device VAAPI `device_path`
 /// (`null` = device di default del sistema). Verifica che il decoder supporti
 /// il metodo hw_device_ctx e che `avcodec_open2` riesca; NON garantisce che il
@@ -685,6 +714,8 @@ pub const Player = struct {
                         break;
                     }
                 }
+            } else if (!videoToolboxDecodes(codec.*.id)) {
+                // macOS senza decoder hardware per questo codec: software puro.
             } else if (probeHwDevice(codec, stream, null, fmt_ctx, stream_idx, packet, frame)) |opened| {
                 // Nessun render node enumerabile (non-Linux, o sistema senza DRM):
                 // prova comunque il device di default del sistema.

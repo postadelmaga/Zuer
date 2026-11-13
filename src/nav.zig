@@ -881,7 +881,7 @@ pub fn initFileList(state: *GuiAppState) !void {
     while (try iterator.next(state.io)) |entry| {
         // Stesso filtro di `resolveInitialFile`: salta i file nascosti, così
         // le frecce non navigano su dotfile che l'apertura iniziale salta.
-        if (entry.kind == .file and entry.name.len > 0 and entry.name[0] != '.') {
+        if (entry.name.len > 0 and entry.name[0] != '.' and entryKind(state.io, dir, entry) == .file) {
             try state.file_list.append(state.gpa, try state.gpa.dupe(u8, entry.name));
         }
     }
@@ -897,6 +897,7 @@ pub fn initFileList(state: *GuiAppState) !void {
 }
 
 pub const indexOfFile = @import("dir_match.zig").indexOfFile;
+pub const entryKind = @import("dir_match.zig").entryKind;
 
 pub fn navigate(state: *GuiAppState, direction: i2) void {
     // Direttiva UX: mentre un modello sta caricando (spinner, non ancora
@@ -1134,7 +1135,7 @@ pub fn resolveInitialFile(io: std.Io, gpa: std.mem.Allocator, arg_in: []const u8
     }
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
-        if (entry.kind == .file and entry.name.len > 0 and entry.name[0] != '.')
+        if (entry.name.len > 0 and entry.name[0] != '.' and entryKind(io, dir, entry) == .file)
             try names.append(gpa, try gpa.dupe(u8, entry.name));
     }
     if (names.items.len == 0) return null; // cartella senza file visibili

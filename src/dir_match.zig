@@ -22,6 +22,44 @@ pub fn indexOfFile(io: std.Io, dir_path: []const u8, names: []const []const u8, 
     return null;
 }
 
+/// Tipo di una voce di cartella seguendo i link: un symlink vale per ciò a cui punta
+/// (macOS: /tmp, /var; Darling: ~/Downloads verso la home Linux; Linux: cartelle
+/// collegate in home), una voce di tipo sconosciuto (DT_UNKNOWN, alcuni filesystem)
+/// per ciò che è. Un link rotto è `.unknown`. Lo stat si fa solo per quelle voci.
+pub fn entryKind(io: std.Io, dir: std.Io.Dir, entry: std.Io.Dir.Entry) std.Io.File.Kind {
+    return switch (entry.kind) {
+        .sym_link, .unknown => (dir.statFile(io, entry.name, .{}) catch return .unknown).kind,
+        else => entry.kind,
+    };
+}
+
+test "entryKind: i link valgono per ciò a cui puntano" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "vera");
+    try tmp.dir.writeFile(io, .{ .sub_path = "file.txt", .data = "x" });
+    try tmp.dir.symLink(io, "vera", "link-cartella", .{ .is_directory = true });
+    try tmp.dir.symLink(io, "file.txt", "link-file", .{});
+    try tmp.dir.symLink(io, "manca", "link-rotto", .{});
+
+    var seen: usize = 0;
+    var dir = try tmp.dir.openDir(io, ".", .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |e| {
+        const want: std.Io.File.Kind = if (std.mem.eql(u8, e.name, "link-cartella") or std.mem.eql(u8, e.name, "vera"))
+            .directory
+        else if (std.mem.eql(u8, e.name, "link-rotto"))
+            .unknown
+        else
+            .file;
+        try std.testing.expectEqual(want, entryKind(io, dir, e));
+        seen += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 5), seen);
+}
+
 test "indexOfFile: per nome, poi per inode (stesso file, byte diversi)" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
