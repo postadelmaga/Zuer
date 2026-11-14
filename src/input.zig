@@ -31,13 +31,7 @@ const KEY_LEFT: u32 = 105;
 const KEY_RIGHT: u32 = 106;
 const KEY_PGUP: u32 = 104;
 const KEY_PGDOWN: u32 = 109;
-const KEY_MINUS: u32 = 12;
-const KEY_EQUAL: u32 = 13;
 const KEY_1: u32 = 2;
-const KEY_2: u32 = 3;
-const KEY_3: u32 = 4;
-const KEY_4: u32 = 5;
-const KEY_5: u32 = 6;
 const KEY_C: u32 = 46;
 const KEY_V: u32 = 47;
 const KEY_F: u32 = 33;
@@ -50,10 +44,14 @@ const KEY_Y: u32 = 21;
 const KEY_BACKSPACE: u32 = 14;
 const KEY_A: u32 = 30;
 const KEY_O: u32 = 24;
-const KEY_D: u32 = 32;
 const KEY_R: u32 = 19;
 const KEY_N: u32 = 49;
 const KEY_H: u32 = 35;
+const KEY_I: u32 = 23;
+const KEY_W: u32 = 17;
+const KEY_HOME: u32 = 102;
+const KEY_END: u32 = 107;
+const KEY_F1: u32 = 59;
 
 // Stato per il rilevamento del doppio-click sinistro (solo thread finestra).
 var last_click_ms: i64 = -1000;
@@ -350,7 +348,9 @@ fn scrollTo(app_state: *GuiAppState, y: f32) void {
     app_state.shared.file_changed = true;
 }
 
-fn changePdfPage(app_state: *GuiAppState, direction: i32) void {
+const PageMove = enum { prev, next, first, last };
+
+fn changePdfPage(app_state: *GuiAppState, move: PageMove) void {
     app_state.shared.mutex.lockUncancelable(app_state.io);
     const path = app_state.gpa.dupe(u8, app_state.shared.current_file_path) catch {
         app_state.shared.mutex.unlock(app_state.io);
@@ -378,19 +378,15 @@ fn changePdfPage(app_state: *GuiAppState, direction: i32) void {
         current_page = std.fmt.parseInt(usize, page_str, 10) catch 1;
     }
 
-    var new_page = current_page;
-    if (direction > 0) {
-        // total_pages == 0 → nessuna paginazione nota: niente navigazione in
-        // avanti (mai un fallback tipo 99999, che porterebbe su pagine
-        // inesistenti con conseguenti errori di decode).
-        if (total_pages > 0 and current_page < total_pages) {
-            new_page += 1;
-        }
-    } else {
-        if (current_page > 1) {
-            new_page -= 1;
-        }
-    }
+    // total_pages == 0 → nessuna paginazione nota: niente navigazione in avanti
+    // (mai un fallback tipo 99999, che porterebbe su pagine inesistenti con
+    // conseguenti errori di decode).
+    const new_page: usize = switch (move) {
+        .next => if (total_pages > 0 and current_page < total_pages) current_page + 1 else current_page,
+        .prev => if (current_page > 1) current_page - 1 else current_page,
+        .first => 1,
+        .last => if (total_pages > 0) total_pages else current_page,
+    };
 
     if (new_page == current_page) return;
 
@@ -545,7 +541,6 @@ fn handleYtKey(app_state: *GuiAppState, key: u32) bool {
 /// Callback `on_text` di zrame (traduzione xkbcommon layout-correct, additiva a
 /// `on_key`): digitazione nel campo query dell'overlay YouTube.
 pub fn textCallback(win: *zrame.Window, bytes: [4]u8, len: u8, user: ?*anyopaque) void {
-    _ = win;
     const app_state: *GuiAppState = @ptrCast(@alignCast(user orelse return));
     if (len == 0 or len > 4) return;
     app_state.shared.mutex.lockUncancelable(app_state.io);
@@ -555,7 +550,16 @@ pub fn textCallback(win: *zrame.Window, bytes: [4]u8, len: u8, user: ?*anyopaque
         yt.swallow_text = false;
         return;
     }
-    if (!yt.active or app_state.ctrl_down) return;
+    if (!yt.active) {
+        // Niente campo di testo aperto: un simbolo può essere una scorciatoia.
+        if (len == 1 and !app_state.shared.fx.active) {
+            app_state.shared.mutex.unlock(app_state.io);
+            defer app_state.shared.mutex.lockUncancelable(app_state.io);
+            handleSymbol(app_state, win, bytes[0]);
+        }
+        return;
+    }
+    if (app_state.ctrl_down) return;
     // Inserimento (con eventuale rimpiazzo della selezione Ctrl+A); invalida i
     // risultati mostrati, che non corrispondono più alla query.
     yt_search.insertText(app_state, bytes[0..len]);
@@ -577,187 +581,233 @@ pub fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) 
         app_state.shared.yt.bs_held = false;
         app_state.shared.mutex.unlock(app_state.io);
     }
-    // Guida dei tasti: visibile finché `h` è premuto. Il rilascio si prende
-    // sempre, anche se nel frattempo si è aperto un overlay.
-    // La chiusura la fa il render worker dopo un breve margine (`help_release_s`):
-    // una nuova pressione nel frattempo la annulla.
-    if (key == KEY_H and !pressed) {
-        app_state.shared.mutex.lockUncancelable(app_state.io);
-        if (app_state.shared.help and app_state.shared.help_release_s < 0) app_state.shared.help_release_s = 0;
-        app_state.shared.mutex.unlock(app_state.io);
+    if (!pressed) return;
+    const ctrl = app_state.ctrl_down;
+    const shift = app_state.shift_down;
+
+    // Overlay ricerca YouTube: ha priorità su tutto (col pannello aperto la
+    // tastiera è sua; da chiuso `y` lo apre).
+    if (handleYtKey(app_state, key)) return;
+    // Esploratore file: da chiuso `e` lo apre, da aperto la tastiera è sua
+    // (Esc/e chiudono, frecce/Invio navigano, Backspace sale di cartella).
+    if (file_explorer.handleKey(app_state, key)) return;
+
+    // Popup: `h`/F1 la guida, `i` le informazioni sul file (uno alla volta; il
+    // `?` arriva da `textCallback`, che conosce il layout). Esc chiude quello aperto.
+    if (!ctrl and (key == KEY_H or key == KEY_F1 or key == KEY_I)) {
+        togglePopup(app_state, if (key == KEY_I) .info else .help);
         return;
     }
-    if (pressed) {
-        // Overlay ricerca YouTube: ha priorità su tutto (col pannello aperto la
-        // tastiera è sua; da chiuso `y` lo apre).
-        if (handleYtKey(app_state, key)) return;
-        // Esploratore file: da chiuso `e` lo apre, da aperto la tastiera è sua
-        // (Esc/e chiudono, frecce/Invio navigano, Backspace sale di cartella).
-        if (file_explorer.handleKey(app_state, key)) return;
-        if (key == KEY_H and !app_state.ctrl_down) {
-            app_state.shared.mutex.lockUncancelable(app_state.io);
-            app_state.shared.help_release_s = -1;
-            // Le ripetizioni del tasto tenuto giù non ricompongono nulla.
-            if (!app_state.shared.help) {
-                app_state.shared.help = true;
-                app_state.shared.file_changed = true;
-            }
-            app_state.shared.mutex.unlock(app_state.io);
-            return;
-        }
-        // Snapshot sotto lock: `current_file_path` è liberato/riassegnato e i
-        // flag di tipo (is_text/is_mesh) riscritti da `applyDecoded` (thread
-        // loader) sotto `mutex` — mai leggerli a nudo.
-        app_state.shared.mutex.lockUncancelable(app_state.io);
-        app_state.shared.ui_idle_s = 0; // ogni tasto rivela l'etichetta nome file
-        const is_text = app_state.shared.is_text;
-        const is_mesh = app_state.shared.is_mesh;
-        const is_pdf = isPdfPath(app_state.shared.current_file_path);
-        app_state.shared.mutex.unlock(app_state.io);
-        // Video: Spazio = play/pausa, ←/→ = seek ∓5 s (stile YouTube). ESC/F
-        // cadono al comportamento comune (chiudi / fullscreen).
-        if (app_state.video.isActive()) {
-            const vid = &app_state.video;
-            if (key == KEY_SPACE) {
+    if (key == KEY_ESC and closePopup(app_state)) return;
+
+    // Chiusura: Esc (dopo popup, schermo intero e archivi), Q, Ctrl+Q, Ctrl+W
+    // (Cmd su macOS, come ogni app).
+    if (key == KEY_Q or (ctrl and key == KEY_W)) {
+        win.close();
+        return;
+    }
+
+    // Snapshot sotto lock: `current_file_path` è liberato/riassegnato e i
+    // flag di tipo (is_text/is_mesh) riscritti da `applyDecoded` (thread
+    // loader) sotto `mutex` — mai leggerli a nudo.
+    app_state.shared.mutex.lockUncancelable(app_state.io);
+    app_state.shared.ui_idle_s = 0; // ogni tasto rivela l'etichetta nome file
+    const is_text = app_state.shared.is_text;
+    const is_mesh = app_state.shared.is_mesh;
+    const is_pdf = isPdfPath(app_state.shared.current_file_path);
+    app_state.shared.mutex.unlock(app_state.io);
+
+    // Video e audio: Spazio = play/pausa, ←/→ = ∓5 s (Maiusc: ∓30 s), Home =
+    // dall'inizio. Il resto cade sui tasti comuni (frecce su/giù, Esc, F…).
+    if (app_state.video.isActive() and !ctrl) {
+        const vid = &app_state.video;
+        switch (key) {
+            KEY_SPACE => {
                 app_state.shared.mutex.lockUncancelable(app_state.io);
                 vid.playing = !vid.playing;
                 vid.idle_s = 0;
                 app_state.shared.mutex.unlock(app_state.io);
                 return;
-            } else if (key == KEY_RIGHT or key == KEY_LEFT) {
+            },
+            KEY_RIGHT, KEY_LEFT, KEY_HOME => {
                 app_state.shared.mutex.lockUncancelable(app_state.io);
-                var t = vid.pos_s + (if (key == KEY_RIGHT) @as(f64, 5) else -5);
+                const step: f64 = if (shift) 30 else 5;
+                var t: f64 = if (key == KEY_HOME) 0 else vid.pos_s + (if (key == KEY_RIGHT) step else -step);
                 if (t < 0) t = 0;
                 if (vid.dur_s > 0 and t > vid.dur_s - 0.1) t = vid.dur_s - 0.1;
                 vid.seek_to = t;
                 vid.idle_s = 0;
                 app_state.shared.mutex.unlock(app_state.io);
                 return;
-            } else if (key == KEY_V) {
-                // Toggle video ↔ solo audio (oscilloscopio): l'audio non si ferma.
+            },
+            KEY_END => return,
+            // Video ↔ solo audio (oscilloscopio): l'audio non si ferma.
+            KEY_V => {
                 nav.toggleVideoTrack(app_state);
                 return;
-            } else if (key == KEY_C and !app_state.ctrl_down) {
-                // Sottotitoli YouTube (stile player web): toggle; al primo uso
-                // li scarica yt-dlp su un thread. No-op sui video non-YouTube.
+            },
+            // YouTube: sottotitoli (al primo uso li scarica yt-dlp su un thread),
+            // prossimo della coda "guarda dopo", pagina nel browser.
+            KEY_C, KEY_N, KEY_O => {
                 app_state.shared.mutex.lockUncancelable(app_state.io);
-                yt_search.toggleSubs(app_state);
-                app_state.shared.mutex.unlock(app_state.io);
-                return;
-            } else if (key == KEY_N and !app_state.ctrl_down) {
-                // Prossimo video della coda "guarda dopo".
-                app_state.shared.mutex.lockUncancelable(app_state.io);
-                yt_search.playNext(app_state);
-                app_state.shared.mutex.unlock(app_state.io);
-                return;
-            } else if (key == KEY_O and !app_state.ctrl_down) {
-                // Apri nel browser la pagina YouTube del video in riproduzione.
-                app_state.shared.mutex.lockUncancelable(app_state.io);
-                yt_search.openPageLocked(app_state);
-                app_state.shared.mutex.unlock(app_state.io);
-                return;
-            }
-        }
-        // MIDI: Spazio = play/pausa; a fine brano (il synth si auto-pausa col
-        // clock fermo sulla durata) Spazio riparte da capo. Il puntatore
-        // `midi` è protetto dal mutex (applyDecoded può fermarlo dai worker);
-        // le operazioni sul player sono atomics interne.
-        if (key == KEY_SPACE) {
-            app_state.shared.mutex.lockUncancelable(app_state.io);
-            if (app_state.midi) |mp| {
-                const dur = mp.durationSeconds();
-                if (!mp.isPlaying() and dur > 0 and mp.clockSeconds() >= dur - 0.05) {
-                    mp.seek(0);
-                    mp.setPlaying(true);
-                } else {
-                    mp.setPlaying(!mp.isPlaying());
+                switch (key) {
+                    KEY_C => yt_search.toggleSubs(app_state),
+                    KEY_N => yt_search.playNext(app_state),
+                    else => yt_search.openPageLocked(app_state),
                 }
                 app_state.shared.mutex.unlock(app_state.io);
                 return;
-            }
-            app_state.shared.mutex.unlock(app_state.io);
-        }
-        // Scorciatoie col Ctrl per documenti di testo (Ctrl+A = seleziona tutto, Ctrl+C = copia, Ctrl+D = deseleziona).
-        if (is_text and app_state.ctrl_down) {
-            if (key == KEY_A) {
-                app_state.shared.mutex.lockUncancelable(app_state.io);
-                const nrows: i32 = @intCast(app_state.shared.text_lines.items.len);
-                if (nrows > 0) {
-                    const last_line = app_state.shared.text_lines.items[@intCast(nrows - 1)];
-                    const last_col: i32 = @intCast(compose.cpLen(last_line));
-                    app_state.shared.sel_a = .{ 0, 0 };
-                    app_state.shared.sel_b = .{ nrows - 1, last_col };
-                    app_state.shared.sel_active = true;
-                    app_state.shared.file_changed = true;
-                }
-                app_state.shared.mutex.unlock(app_state.io);
-                return;
-            } else if (key == KEY_C) {
-                app_state.shared.mutex.lockUncancelable(app_state.io);
-                const sel = buildSelectedText(app_state, app_state.gpa);
-                app_state.shared.mutex.unlock(app_state.io);
-                if (sel) |txt| {
-                    clipboard.copy(txt);
-                    app_state.gpa.free(txt);
-                }
-                return;
-            } else if (key == KEY_D) {
-                app_state.shared.mutex.lockUncancelable(app_state.io);
-                app_state.shared.sel_active = false;
-                app_state.shared.sel_selecting = false;
-                app_state.shared.file_changed = true;
-                app_state.shared.mutex.unlock(app_state.io);
-                return;
-            }
-        }
-        // Navigazione archivio: nel listato ↑/↓ spostano la riga e Invio apre la
-        // voce; dentro una voce Esc torna al listato. Ha priorità sul resto (il
-        // ramo is_text sotto scorrerebbe la tabella invece di selezionare).
-        if (handleArchiveKey(app_state, win, key)) return;
-        if (key == KEY_ESC or key == KEY_Q) {
-            win.close();
-        } else if (key == KEY_0) {
-            // Reset vista: torna al fit (1:1 sullo schermo) e ricentra.
-            resetView(app_state);
-        } else if (key == KEY_DOWN or key == KEY_UP) {
-            // ↑/↓ cambiano SEMPRE file, per ogni tipo di contenuto (anche
-            // testo, PDF e video): un solo gesto per scorrere la cartella.
-            nav.navigate(app_state, if (key == KEY_DOWN) 1 else -1);
-        } else if (is_text and (key == KEY_PGUP or key == KEY_PGDOWN)) {
-            // Nel testo lo scorrimento resta su PagSu/PagGiù (e rotellina).
-            scrollText(app_state, if (key == KEY_PGDOWN) scroll_step * 10 else -scroll_step * 10);
-        } else if (is_pdf and (key == KEY_LEFT or key == KEY_RIGHT or key == KEY_PGUP or key == KEY_PGDOWN)) {
-            // PDF: ←/→ sfogliano le pagine (come il seek nei video).
-            const dir: i32 = if (key == KEY_RIGHT or key == KEY_PGDOWN) 1 else -1;
-            changePdfPage(app_state, dir);
-        } else if (key == KEY_RIGHT or key == KEY_LEFT) {
-            // Dove ←/→ non hanno un uso proprio (immagini, mesh, testo)
-            // continuano a cambiare file.
-            nav.navigate(app_state, if (key == KEY_RIGHT) 1 else -1);
-        } else if (key == KEY_EQUAL) {
-            const cpx = win.contentPx();
-            applyZoomAt(app_state, 1.1, @as(f32, @floatFromInt(cpx.w)) / 2.0, @as(f32, @floatFromInt(cpx.h)) / 2.0, cpx.w, cpx.h);
-        } else if (key == KEY_MINUS) {
-            const cpx = win.contentPx();
-            applyZoomAt(app_state, 1.0 / 1.1, @as(f32, @floatFromInt(cpx.w)) / 2.0, @as(f32, @floatFromInt(cpx.h)) / 2.0, cpx.w, cpx.h);
-        } else if (key == KEY_R and !app_state.ctrl_down) {
-            rotateView(app_state, !app_state.shift_down);
-        } else if (key == KEY_F or key == KEY_F11) {
-            win.toggleFullscreen();
-        } else if (key == KEY_V and is_mesh) {
-            toggleVoxel(app_state);
-        } else if (key == KEY_1) {
-            win.setStyle(minimalFrame(zrame.Style.fluent())) catch {};
-        } else if (key == KEY_2) {
-            win.setStyle(minimalFrame(zrame.Style.macos())) catch {};
-        } else if (key == KEY_3) {
-            win.setStyle(minimalFrame(zrame.Style.aurora())) catch {};
-        } else if (key == KEY_4) {
-            win.setStyle(minimalFrame(zrame.Style.material())) catch {};
-        } else if (key == KEY_5) {
-            win.setStyle(minimalFrame(zrame.Style.psy())) catch {};
+            },
+            else => {},
         }
     }
+    // MIDI: Spazio = play/pausa; a fine brano (il synth si auto-pausa col
+    // clock fermo sulla durata) Spazio riparte da capo. Il puntatore
+    // `midi` è protetto dal mutex (applyDecoded può fermarlo dai worker);
+    // le operazioni sul player sono atomics interne.
+    if (key == KEY_SPACE) {
+        app_state.shared.mutex.lockUncancelable(app_state.io);
+        if (app_state.midi) |mp| {
+            const dur = mp.durationSeconds();
+            if (!mp.isPlaying() and dur > 0 and mp.clockSeconds() >= dur - 0.05) {
+                mp.seek(0);
+                mp.setPlaying(true);
+            } else {
+                mp.setPlaying(!mp.isPlaying());
+            }
+            app_state.shared.mutex.unlock(app_state.io);
+            return;
+        }
+        app_state.shared.mutex.unlock(app_state.io);
+    }
+    // Ctrl+A seleziona tutto il testo; Ctrl+C copia la selezione (o tutto il
+    // testo), e fuori dai testi il percorso del file.
+    if (ctrl and key == KEY_A and is_text) {
+        app_state.shared.mutex.lockUncancelable(app_state.io);
+        const nrows: i32 = @intCast(app_state.shared.text_lines.items.len);
+        if (nrows > 0) {
+            const last_line = app_state.shared.text_lines.items[@intCast(nrows - 1)];
+            const last_col: i32 = @intCast(compose.cpLen(last_line));
+            app_state.shared.sel_a = .{ 0, 0 };
+            app_state.shared.sel_b = .{ nrows - 1, last_col };
+            app_state.shared.sel_active = true;
+            app_state.shared.file_changed = true;
+        }
+        app_state.shared.mutex.unlock(app_state.io);
+        return;
+    }
+    if (ctrl and key == KEY_C) {
+        app_state.shared.mutex.lockUncancelable(app_state.io);
+        const txt = if (is_text and app_state.shared.text_lines.items.len > 0)
+            buildSelectedText(app_state, app_state.gpa)
+        else
+            app_state.gpa.dupe(u8, stripFragment(app_state.shared.current_file_path)) catch null;
+        app_state.shared.mutex.unlock(app_state.io);
+        if (txt) |t| {
+            clipboard.copy(t);
+            app_state.gpa.free(t);
+        }
+        return;
+    }
+    if (ctrl) return; // le altre combinazioni col Ctrl non sono scorciatoie
+    // Navigazione archivio: nel listato ↑/↓ spostano la riga e Invio apre la
+    // voce; dentro una voce Esc torna al listato. Ha priorità sul resto (il
+    // ramo is_text sotto scorrerebbe la tabella invece di selezionare).
+    if (handleArchiveKey(app_state, win, key)) return;
+    switch (key) {
+        // Esc: prima esce dallo schermo intero, poi chiude.
+        KEY_ESC => if (win.fullscreen) win.toggleFullscreen() else win.close(),
+        KEY_F, KEY_F11 => win.toggleFullscreen(),
+        // ↑/↓ cambiano SEMPRE file, per ogni tipo di contenuto (anche testo, PDF
+        // e video): un solo gesto per scorrere la cartella.
+        KEY_DOWN, KEY_UP => nav.navigate(app_state, if (key == KEY_DOWN) 1 else -1),
+        KEY_LEFT, KEY_RIGHT => {
+            // PDF: ←/→ sfogliano le pagine (come il seek nei video); altrove
+            // (immagini, mesh, testo) cambiano file.
+            if (is_pdf) {
+                changePdfPage(app_state, if (key == KEY_RIGHT) .next else .prev);
+            } else {
+                nav.navigate(app_state, if (key == KEY_RIGHT) 1 else -1);
+            }
+        },
+        KEY_PGUP, KEY_PGDOWN => {
+            if (is_pdf) {
+                changePdfPage(app_state, if (key == KEY_PGDOWN) .next else .prev);
+            } else if (is_text) {
+                scrollText(app_state, if (key == KEY_PGDOWN) scroll_step * 10 else -scroll_step * 10);
+            }
+        },
+        // Home/Fine: inizio/fine del documento (testo, PDF), altrove primo/ultimo
+        // file della cartella.
+        KEY_HOME, KEY_END => {
+            const last = key == KEY_END;
+            if (is_pdf) {
+                changePdfPage(app_state, if (last) .last else .first);
+            } else if (is_text) {
+                scrollTo(app_state, if (last) std.math.floatMax(f32) else 0);
+            } else {
+                nav.navigateEdge(app_state, last);
+            }
+        },
+        // Con Maiusc lo 0 è un `=` (tastiera italiana): lo zoom lo fa `handleSymbol`.
+        KEY_0 => if (!shift) resetView(app_state),
+        // 1: pixel reali (1:1) ↔ adattata, come il doppio click.
+        KEY_1 => if (!shift and !is_text and !is_mesh) {
+            const cpx = win.contentPx();
+            toggleFitActual(app_state, @as(f32, @floatFromInt(cpx.w)) / 2.0, @as(f32, @floatFromInt(cpx.h)) / 2.0, cpx.w, cpx.h);
+        },
+        KEY_R => rotateView(app_state, !shift),
+        KEY_V => if (is_mesh) toggleVoxel(app_state),
+        else => {},
+    }
+}
+
+/// Le scorciatoie fatte di un simbolo (`+`, `-`, `?`) arrivano col carattere che il
+/// layout produce, non con la posizione del tasto: sulla tastiera italiana il `+`
+/// e il `-` non stanno dove li mette quella americana. Thread finestra.
+fn handleSymbol(app_state: *GuiAppState, win: *zrame.Window, ch: u8) void {
+    switch (ch) {
+        '+', '=', '-' => {
+            const cpx = win.contentPx();
+            const f: f32 = if (ch == '-') 1.0 / 1.1 else 1.1;
+            applyZoomAt(app_state, f, @as(f32, @floatFromInt(cpx.w)) / 2.0, @as(f32, @floatFromInt(cpx.h)) / 2.0, cpx.w, cpx.h);
+        },
+        '?' => togglePopup(app_state, .help),
+        else => {},
+    }
+}
+
+const Popup = enum { help, info };
+
+/// Apre il popup chiesto (chiudendo l'altro) o lo chiude se è già aperto.
+fn togglePopup(app_state: *GuiAppState, which: Popup) void {
+    app_state.shared.mutex.lockUncancelable(app_state.io);
+    defer app_state.shared.mutex.unlock(app_state.io);
+    const sh = &app_state.shared;
+    const was = if (which == .help) sh.help else sh.info;
+    sh.help = which == .help and !was;
+    sh.info = which == .info and !was;
+    // Forza la ricostruzione della scheda: il file può essere cambiato su disco.
+    if (sh.info) sh.info_card.seq = 0;
+    sh.file_changed = true;
+}
+
+/// Chiude il popup aperto; false se non ce n'era uno.
+fn closePopup(app_state: *GuiAppState) bool {
+    app_state.shared.mutex.lockUncancelable(app_state.io);
+    defer app_state.shared.mutex.unlock(app_state.io);
+    const sh = &app_state.shared;
+    if (!sh.help and !sh.info) return false;
+    sh.help = false;
+    sh.info = false;
+    sh.file_changed = true;
+    return true;
+}
+
+fn stripFragment(path: []const u8) []const u8 {
+    // Il frammento `#…` dei PDF è la pagina; dentro un archivio è la voce, e lì il
+    // percorso utile resta quello dell'archivio.
+    return if (std.mem.indexOfScalar(u8, path, '#')) |h| path[0..h] else path;
 }
 
 /// La rotella (`.scroll` di `on_mouse`): `value` in unità d'asse Wayland, positivo =

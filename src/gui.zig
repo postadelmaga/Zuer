@@ -35,7 +35,9 @@ const input = @import("input.zig");
 // Ricerca YouTube (overlay tasto `y`): stato in Shared, ricerca/streaming yt-dlp.
 const yt_search = @import("yt_search.zig");
 const help_popup = @import("help_popup.zig");
+const info_popup = @import("info_popup.zig");
 const file_explorer = @import("file_explorer.zig");
+const unicode_path = @import("unicode_path.zig");
 const crash_log = @import("crash_log.zig");
 const crash_report = @import("crash_report.zig");
 const build_options = @import("build_options");
@@ -363,10 +365,15 @@ fn drawFilenameLabel(buf: []u8, W: u32, H: u32, raster: *glyph.Raster, name: []c
     }
 }
 
-/// Margine fra il rilascio di `h` e la chiusura della guida (vedi `help_release_s`):
-/// più lungo del passo fra rilascio e ripressione di un autorepeat a coppie, abbastanza
-/// corto da non far sembrare la guida in ritardo.
-const help_release_grace_s: f32 = 0.15;
+/// Popup sopra ogni altro overlay: guida dei tasti o scheda informazioni (uno solo
+/// alla volta). Con `shared.mutex` acquisito.
+fn drawPopups(state: *GuiAppState, buf: []u8, W: u32, H: u32, raster: *glyph.Raster) void {
+    if (state.shared.help) {
+        help_popup.draw(buf, W, H, raster);
+    } else if (state.shared.info) {
+        info_popup.draw(buf, W, H, raster, &state.shared.info_card);
+    }
+}
 
 fn renderWorker(
     win: *zrame.Window,
@@ -467,16 +474,10 @@ fn renderWorker(
 
         state.shared.mutex.lockUncancelable(state.io);
 
-        // Guida dei tasti: chiusa solo se `h` resta su per `help_release_grace_s`.
-        if (state.shared.help_release_s >= 0) {
-            state.shared.help_release_s += frame_dt;
-            if (!state.shared.help) {
-                state.shared.help_release_s = -1;
-            } else if (state.shared.help_release_s >= help_release_grace_s) {
-                state.shared.help = false;
-                state.shared.help_release_s = -1;
-                state.shared.file_changed = true;
-            }
+        // Scheda informazioni aperta: segue il contenuto (navigazione, pagina PDF).
+        if (state.shared.info and state.shared.info_card.seq != state.shared.load_seq) {
+            info_popup.build(state);
+            state.shared.file_changed = true;
         }
 
         // Autorepeat Backspace dell'overlay (vale per ogni ramo: testo, video…).
@@ -614,7 +615,7 @@ fn renderWorker(
             // ricomponeva l'intera finestra trasparente (~30% di un core a controlli
             // visibili, misurato).
             const only_tick = ovl_tick and !(new_frame or size_ch or ctrl_ch or vs.scrubbing or yt_ch or yt_anim or label_ch or gpu_ch);
-            const band_only = only_tick and !yt_active and !state.shared.yt.subs_on and !state.shared.fx.active and !state.shared.help;
+            const band_only = only_tick and !yt_active and !state.shared.yt.subs_on and !state.shared.fx.active and !state.shared.help and !state.shared.info;
             var pres_dirty: ?zrame.Rect = null;
             if (do_present) last_label_alpha = label_alpha;
             var pres_w: u32 = 0;
@@ -666,9 +667,7 @@ fn renderWorker(
                     if (name_raster) |*r| yt_search.drawOverlay(composited_rgba.*, fr.w, fr.h, state, r, @as(f32, @floatFromInt(spin_frame)) / 60.0);
                     spin_frame +%= 1;
                 }
-                if (state.shared.help) {
-                    if (name_raster) |*r| help_popup.draw(composited_rgba.*, fr.w, fr.h, r);
-                }
+                if (name_raster) |*r| drawPopups(state, composited_rgba.*, fr.w, fr.h, r);
                 vid_pw = cur_w;
                 vid_ph = cur_h;
                 vid_prev_ctrl = vs.controls;
@@ -930,9 +929,7 @@ fn renderWorker(
                     if (name_raster) |*r| yt_search.drawOverlay(composited_rgba.*, cur_w, cur_h, state, r, @as(f32, @floatFromInt(spin_frame)) / 60.0);
                     spin_frame +%= 1;
                 }
-                if (state.shared.help) {
-                    if (name_raster) |*r| help_popup.draw(composited_rgba.*, cur_w, cur_h, r);
-                }
+                if (name_raster) |*r| drawPopups(state, composited_rgba.*, cur_w, cur_h, r);
                 did_compose = true;
             }
         }
@@ -1024,9 +1021,7 @@ fn renderWorker(
                     if (name_raster) |*r| yt_search.drawOverlay(composited_rgba.*, cur_w, cur_h, state, r, @as(f32, @floatFromInt(spin_frame)) / 60.0);
                     spin_frame +%= 1;
                 }
-                if (state.shared.help) {
-                    if (name_raster) |*r| help_popup.draw(composited_rgba.*, cur_w, cur_h, r);
-                }
+                if (name_raster) |*r| drawPopups(state, composited_rgba.*, cur_w, cur_h, r);
                 state.shared.mutex.unlock(state.io);
                 did_compose = true;
             } else {
@@ -1073,6 +1068,22 @@ fn renderWorker(
 }
 
 /// `on_open_file` di zrame (macOS: Finder/Dock, vedi `file_explorer.openFromSystem`).
+/// Un percorso consegnato dal Finder all'avvio si può aprire come l'argomento della
+/// riga di comando: un file che esiste (anche con gli accenti in un'altra forma
+/// Unicode, se il corrispondente è uno solo) o una cartella con qualcosa da mostrare.
+fn launchArgUsable(io: std.Io, gpa: std.mem.Allocator, path: []const u8) bool {
+    if (std.Io.Dir.cwd().statFile(io, path, .{})) |st| {
+        if (st.kind == .file) return true;
+        if (st.kind != .directory) return false;
+        const first = nav.resolveInitialFile(io, gpa, path) catch return false;
+        defer if (first) |f| gpa.free(f);
+        return first != null;
+    } else |_| {}
+    const eq = unicode_path.findEquivalent(io, gpa, path) catch return false;
+    gpa.free(eq);
+    return true;
+}
+
 fn openFileFromSystem(_: *zrame.Window, path: []const u8, user: ?*anyopaque) void {
     const state: *GuiAppState = @ptrCast(@alignCast(user orelse return));
     file_explorer.openFromSystem(state, path);
@@ -1216,6 +1227,29 @@ pub fn main(init: std.process.Init) !void {
             _ = args.next();
         } else if (arg_path_opt == null) {
             arg_path_opt = a;
+        }
+    }
+    // macOS, lancio dal Finder (doppio clic, "Apri con", trascinamento sull'icona):
+    // il file non è in argv, arriva come Apple Event a lancio finito. Lo si chiede a
+    // Zicro PRIMA di creare la finestra, così l'avvio è uguale a quello con un
+    // argomento: finestra già della forma del file, niente ricerca YouTube aperta e
+    // poi sostituita. Gli altri file (più di uno, o arrivati dopo) li apre
+    // `on_open_file` come prima.
+    var launch_files: [][]u8 = &.{};
+    defer {
+        for (launch_files) |f| gpa.free(f);
+        gpa.free(launch_files);
+    }
+    // Un file che non si apre come un argomento (inesistente, nome ambiguo, cartella
+    // vuota, il bundle .app che Darling consegna se si lancia l'app senza file) passa
+    // invece, a finestra creata, da `on_open_file`: lì il caso ha il suo messaggio.
+    var launch_deferred: ?[]const u8 = null;
+    if (comptime builtin.os.tag == .macos) {
+        if (arg_path_opt == null) {
+            launch_files = zicro.window.Window.launchFiles(gpa, 1500);
+            if (launch_files.len > 0) {
+                if (launchArgUsable(io, gpa, launch_files[0])) arg_path_opt = launch_files[0] else launch_deferred = launch_files[0];
+            }
         }
     }
     // Senza argomenti (scorciatoia di sistema, lancio dal menu: KDE non espande
@@ -1363,6 +1397,28 @@ pub fn main(init: std.process.Init) !void {
     var composited_rgba: []align(4) u8 = &.{};
     defer gpa.free(composited_rgba);
 
+    // File iniziale pesante (immagini, video, PDF, file grandi): la decodifica parte
+    // SUBITO su un thread, prima della finestra, e main aspetta un attimo che ne
+    // esca la forma (`nav.awaitWindow`). Se arriva in tempo la finestra nasce già
+    // della taglia giusta e col contenuto pronto, senza spinner né ridimensionamento
+    // visibile; altrimenti nasce sulla stima e si adatta dopo, come prima.
+    // Il thread installa il contenuto solo a finestra creata (`nav.windowReady`).
+    // Va gioinato prima dei defer che liberano lo stato.
+    var decode_thread: ?std.Thread = null;
+    defer if (decode_thread) |t| t.join();
+    var early_size: u64 = 0;
+    if (yt_id == null and !yt_start and gui_state.shared.loading) {
+        decode_thread = try std.Thread.spawn(.{}, nav.decodeInitial, .{ &gui_state, file_path, gui_state.nav.gen });
+        var wait_ms: u32 = 600;
+        if (getenv("ZUER_SHOW_WAIT_MS")) |v| wait_ms = std.fmt.parseInt(u32, std.mem.span(v), 10) catch wait_ms;
+        var waited: u32 = 0;
+        while (waited < wait_ms) : (waited += 4) {
+            early_size = gui_state.startup.size.load(.acquire);
+            if (early_size != 0) break;
+            io.sleep(.fromMilliseconds(4), .awake) catch {};
+        }
+    }
+
     // Proporzioni intelligenti per tipo di contenuto: nel percorso sincrono il
     // tipo è già noto dal decoded; in quello async (spinner) si stima
     // dall'estensione, così la finestra nasce già con la forma giusta.
@@ -1415,7 +1471,18 @@ pub fn main(init: std.process.Init) !void {
     // raddoppierebbe l'ingrandimento (≈ az², immagine croppata all'apertura).
     // Il fit sulla finestra ingrandita realizza da solo l'auto-zoom.
     gui_state.shared.zoom = if (win_kind == .image) 1.0 else az0;
-    const win_size = layout.initialWindowSize(win_kind, layout.scaleDim(size_w, az0), layout.scaleDim(size_h, az0));
+    var win_size = layout.initialWindowSize(win_kind, layout.scaleDim(size_w, az0), layout.scaleDim(size_h, az0));
+    // Forma reale già pubblicata dal decode iniziale: vince sulla stima.
+    if (early_size != 0) {
+        win_size = .{ .w = @intCast(early_size >> 32), .h = @truncate(early_size) };
+        gui_state.shared.zoom = @bitCast(gui_state.startup.zoom_bits.load(.acquire));
+        gui_state.initial_size_known = true;
+    }
+    if (getenv("ZUER_TRACE") != null)
+        std.debug.print("[trace] finestra {d}x{d} ({s})\n", .{ win_size.w, win_size.h, if (early_size != 0) "forma del contenuto" else if (gui_state.initial_size_known) "dimensioni note" else "stima" });
+    // Anche se la finestra non si crea, il thread di decode non deve restare
+    // fermo ad aspettarla (il join qui sopra non tornerebbe più).
+    errdefer nav.windowReady(&gui_state);
     const win = try zrame.Window.init(gpa, .{
         .title = "zuer-gui",
         .app_id = "it.zuer.gui",
@@ -1427,6 +1494,9 @@ pub fn main(init: std.process.Init) !void {
         .on_open_file = openFileFromSystem,
         .user = &gui_state,
         .style = gui_state_mod.minimalFrame(zrame.Style.fluent()),
+        // Esc lo gestisce Zuer (`input.keyCallback`): chiude prima popup, overlay,
+        // schermo intero e voce d'archivio, e solo alla fine la finestra.
+        .close_on_esc = false,
         // Il piano video (dmabuf) è scalato dal compositor al fit-rect, centrato:
         // coincide col frame che la GUI compone sopra (controlli, overlay) anche
         // quando la sua taglia di render è minore (sorgente piccola a schermo intero).
@@ -1442,14 +1512,13 @@ pub fn main(init: std.process.Init) !void {
     // La navigazione con le frecce usa la finestra per animare il resize sul
     // contenuto. Impostata prima di `win.run()` (dove partono le callback).
     gui_state.win = win;
+    nav.windowReady(&gui_state);
+    if (launch_deferred) |p| file_explorer.openFromSystem(&gui_state, p);
 
     // Spawna il thread lavoratore per il rendering offscreen e compositing
     const thread = try std.Thread.spawn(.{}, renderWorker, .{ win, &gui_state, &composited_rgba });
     defer thread.join();
 
-    // File grande/PDF iniziale: decodifica su un thread di background mentre il
-    // worker mostra lo spinner. Va gioinato prima dei defer che liberano lo stato.
-    var decode_thread: ?std.Thread = null;
     if (yt_id) |vid| {
         // Link YouTube: risoluzione yt-dlp + apertura container su un thread
         // detached (stesso percorso di Invio nell'overlay di ricerca); un
@@ -1457,13 +1526,7 @@ pub fn main(init: std.process.Init) !void {
         gui_state.shared.mutex.lockUncancelable(io);
         yt_search.openById(&gui_state, vid);
         gui_state.shared.mutex.unlock(io);
-    } else if (gui_state.shared.loading) {
-        gui_state.nav.mutex.lockUncancelable(io);
-        const gen = gui_state.nav.gen;
-        gui_state.nav.mutex.unlock(io);
-        decode_thread = try std.Thread.spawn(.{}, nav.decodeInitial, .{ &gui_state, file_path, gen });
     }
-    defer if (decode_thread) |t| t.join();
 
     // Thread di prefetch dei file adiacenti (navigazione istantanea). Il suo
     // defer è registrato DOPO quello che libera la cache → viene eseguito PRIMA:

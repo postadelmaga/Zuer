@@ -205,6 +205,10 @@ pub const VideoDecoder = struct {
     shown_gen: std.atomic.Value(u32) = .init(0),
     gpu_stats: GpuStats = .{},
     start_s: f64 = 0,
+    /// Risoluzione della sorgente (aspetto applicato), non quella ridotta dei frame
+    /// resi: per la scheda informazioni. Scritta prima che `start` ritorni, poi fissa.
+    src_w: u32 = 0,
+    src_h: u32 = 0,
 
     /// Poster (primo frame) + decoder avviato. Il chiamante prende possesso di
     /// `.rgba` (→ `static_rgba`) e del decoder (chiuso da `stopAndDestroy`).
@@ -266,6 +270,8 @@ pub const VideoDecoder = struct {
             .max_dim = max_dim,
             .duration_s = p.duration_s,
             .frame_rate = p.frame_rate,
+            .src_w = @intCast(@max(p.codec_ctx.*.width, 0)),
+            .src_h = @intCast(@max(p.codec_ctx.*.height, 0)),
         };
         self.cmd_wake = &self.wake;
         // Semina il primo frame come slot 0 (gen 0, pubblicato con tail = 1).
@@ -579,6 +585,8 @@ pub const VideoDecoder = struct {
                             const fps = m.frameRate();
                             self.frame_rate = if (fps > 0) fps else 30.0;
                             self.duration_s = self.durationSeconds();
+                            self.src_w = disp[0];
+                            self.src_h = disp[1];
                             const hw = m.hwdec();
                             logSession(self, "mpv", if (hw.len == 0) "no" else hw);
                             self.finishStart(.ok);

@@ -20,6 +20,7 @@ const midi_player = @import("midi_player.zig");
 const yt_search = @import("yt_search.zig");
 // Esploratore file (overlay tasto `f`): stesso schema dell'overlay YouTube.
 const file_explorer = @import("file_explorer.zig");
+const info_popup = @import("info_popup.zig");
 const compose = @import("compose.zig");
 const TabBarState = compose.TabBarState;
 const zrame = @import("zrame");
@@ -47,6 +48,18 @@ pub const Prefetched = struct {
         if (self.rgba) |r| gpa.free(r);
         self.rgba = null;
     }
+};
+
+/// Il decode iniziale gira mentre main aspetta di creare la finestra: pubblica
+/// la forma del contenuto (così la finestra nasce già della taglia giusta) e poi
+/// aspetta la finestra prima di installare (player video e presenter la usano).
+pub const Startup = struct {
+    /// Taglia della finestra per il contenuto, `(w << 32) | h`; 0 = non ancora nota.
+    size: std.atomic.Value(u64) = .init(0),
+    /// Zoom iniziale del contenuto (bit di un f32), scritto prima di `size`.
+    zoom_bits: std.atomic.Value(u32) = .init(@bitCast(@as(f32, 1.0))),
+    /// 1 = la finestra esiste e `win` è impostato: il decode può installare.
+    win_ready: std.atomic.Value(u32) = .init(0),
 };
 
 pub const GuiAppState = struct {
@@ -90,13 +103,13 @@ pub const GuiAppState = struct {
         // Barra delle linguette dei fogli (solo workbook multi-foglio).
         tab_bar: TabBarState = .{},
         file_changed: bool = false,
-        /// Guida dei tasti visibile (tasto `h` tenuto premuto).
+        /// Guida dei tasti visibile (`h` la apre e la chiude, Esc la chiude).
         help: bool = false,
-        /// Secondi dal rilascio di `h` mentre la guida è visibile (< 0: nessun rilascio
-        /// in sospeso). Il render worker la chiude dopo `help_release_grace_s` senza una
-        /// nuova pressione: un autorepeat che arriva come coppie rilascio/pressione
-        /// (segnalato su macOS) la faceva aprire e chiudere a intermittenza.
-        help_release_s: f32 = -1,
+        /// Scheda informazioni sul file visibile (`i`, Esc la chiude).
+        info: bool = false,
+        /// Contenuto della scheda: il render worker la ricostruisce quando cambia
+        /// il contenuto (`info_card.seq != load_seq`).
+        info_card: info_popup.Card = .{},
         // Vero mentre il decoder del file iniziale gira su un thread di background:
         // il worker mostra lo spinner di caricamento invece del contenuto.
         loading: bool = false,
@@ -292,6 +305,9 @@ pub const GuiAppState = struct {
     /// reali del contenuto (header immagine letto in main, tabella sincrona):
     /// `decodeInitial` allora NON richiede un resize dopo l'apply.
     initial_size_known: bool = false,
+    /// Avvio senza salti: il decode iniziale parte PRIMA della finestra (vedi
+    /// `nav.awaitWindow` e `main` in gui.zig).
+    startup: Startup = .{},
 
     // Stato di trascinamento e ultima posizione nota del puntatore: toccati
     // SOLO dal thread finestra (callback input). -1 = puntatore ancora fuori:

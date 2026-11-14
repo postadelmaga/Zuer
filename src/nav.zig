@@ -919,7 +919,22 @@ pub fn navigate(state: *GuiAppState, direction: i2) void {
             next_idx = current_idx - 1;
         }
     }
+    navigateTo(state, next_idx);
+}
 
+/// Home/Fine: primo o ultimo file della cartella.
+pub fn navigateEdge(state: *GuiAppState, last: bool) void {
+    if (state.shared.loading) return;
+    const n = state.file_list.items.len;
+    if (n <= 1) return;
+    const target: usize = if (last) n - 1 else 0;
+    if (state.current_file_index == target) return;
+    navigateTo(state, target);
+}
+
+/// Apre il file `next_idx` della lista della cartella (dalla cache dei vicini se
+/// c'è, altrimenti in asincrono sul loader). Thread finestra.
+fn navigateTo(state: *GuiAppState, next_idx: usize) void {
     // `current_file_path` è liberato/riassegnato da `applyDecoded` (anche sui
     // thread loader) sotto `mutex`: leggilo — e usa la slice di dirname —
     // solo sotto lock, costruendo qui il nuovo percorso.
@@ -1056,21 +1071,37 @@ fn installFromCache(state: *GuiAppState, pf: Prefetched, path: []const u8) void 
 /// proporzioni fisse sensate. No-op finché la finestra non esiste.
 pub fn resizeToContent(state: *GuiAppState) void {
     const win = state.win orelse return;
-    // Snapshot delle dimensioni naturali sotto lock (il render worker legge
-    // `decoded`/`static_*` concorrentemente): le immagini hanno static_w/h
-    // note, le tabelle richiedono la misura naturale della griglia.
+    // Snapshot sotto lock (il render worker legge `decoded`/`static_*`
+    // concorrentemente). Lo zoom pilota il worker, che lo legge sotto lock: va
+    // scritto PRIMA di rilasciare il mutex.
     state.shared.mutex.lockUncancelable(state.io);
-    const kind = layout.winKindFromDecoded(&state.shared.decoded);
+    const fit = fitFor(state, &state.shared.decoded, state.shared.static_w, state.shared.static_h);
+    state.shared.zoom = fit.zoom;
+    state.shared.mutex.unlock(state.io);
+    // `resizeToContent` gira anche sul loadWorker (navigazione a cache-miss):
+    // il resize va differito al thread finestra, le surface Wayland non sono
+    // thread-safe (altrimenti `xdg_surface: attached a buffer before configure`).
+    win.requestResize(fit.w, fit.h);
+}
+
+const Fit = struct { w: u32, h: u32, zoom: f32 };
+
+/// Taglia della finestra e zoom iniziale per un contenuto decodificato, con
+/// l'euristica di `initialWindowSize`: immagini sull'aspetto reale con tetto,
+/// tabelle sulla larghezza naturale delle colonne, documenti/mesh con
+/// proporzioni fisse. `img_w`×`img_h`: l'immagine mostrata (per le immagini).
+fn fitFor(state: *GuiAppState, d: *const decoder_mod.Decoded, img_w: u32, img_h: u32) Fit {
+    const kind = layout.winKindFromDecoded(d);
     var nat_w: u32 = 0;
     var nat_h: u32 = 0;
     switch (kind) {
         .image => {
-            nat_w = state.shared.static_w;
-            nat_h = state.shared.static_h;
+            nat_w = img_w;
+            nat_h = img_h;
         },
         .table => {
             const opts0 = text_render.RenderOpts{ .width = 1280, .pointsize = 15 };
-            const csv0: ?decoder_mod.CsvData = switch (state.shared.decoded) {
+            const csv0: ?decoder_mod.CsvData = switch (d.*) {
                 .csv => |c| c,
                 .workbook => |w| w.activeCsv(),
                 else => null,
@@ -1086,20 +1117,37 @@ pub fn resizeToContent(state: *GuiAppState) void {
         else => {},
     }
     // Contenuto piccolo → ingrandiscilo un po' e dimensiona la finestra sul
-    // contenuto già zoomato (aderente, niente vuoto). Lo zoom pilota il worker,
-    // che lo legge sotto lock: va scritto PRIMA di rilasciare il mutex.
-    // Immagini: la finestra viene dimensionata sul contenuto già ingrandito e
-    // il compose scala rispetto al FIT della finestra → `zoom = az` qui
-    // raddoppierebbe l'ingrandimento (≈ az², immagine croppata). Il fit sulla
-    // finestra ingrandita realizza da solo l'auto-zoom: zoom resta 1.
+    // contenuto già zoomato (aderente, niente vuoto). Immagini: il compose scala
+    // rispetto al FIT della finestra, che è già sul contenuto ingrandito →
+    // `zoom = az` raddoppierebbe l'ingrandimento (≈ az², immagine croppata).
     const az = layout.autoZoomForContent(kind, nat_w, nat_h);
-    state.shared.zoom = if (kind == .image) 1.0 else az;
-    state.shared.mutex.unlock(state.io);
     const size = layout.initialWindowSize(kind, layout.scaleDim(nat_w, az), layout.scaleDim(nat_h, az));
-    // `resizeToContent` gira anche sul loadWorker (navigazione a cache-miss):
-    // il resize va differito al thread finestra, le surface Wayland non sono
-    // thread-safe (altrimenti `xdg_surface: attached a buffer before configure`).
-    win.requestResize(size.w, size.h);
+    return .{ .w = size.w, .h = size.h, .zoom = if (kind == .image) 1.0 else az };
+}
+
+/// Avvio: il decode iniziale parte prima che la finestra esista. Al primo
+/// contenuto pronto ne pubblica la forma (main crea la finestra già della taglia
+/// giusta, niente salto) e poi aspetta la finestra prima di installare: il player
+/// video, il presenter e i resize hanno bisogno di lei. No-op dopo l'avvio.
+fn awaitWindow(state: *GuiAppState, d: *const decoder_mod.Decoded) void {
+    const st = &state.startup;
+    if (st.win_ready.load(.acquire) != 0) return;
+    if (st.size.load(.acquire) == 0) {
+        const img: [2]u32 = switch (d.*) {
+            .image => |im| .{ @intCast(im.width), @intCast(im.height) },
+            else => .{ 0, 0 },
+        };
+        const fit = fitFor(state, d, img[0], img[1]);
+        st.zoom_bits.store(@bitCast(fit.zoom), .release);
+        st.size.store((@as(u64, fit.w) << 32) | fit.h, .release);
+    }
+    while (st.win_ready.load(.acquire) == 0) state.io.futexWait(u32, &st.win_ready.raw, 0) catch {};
+}
+
+/// Main, appena creata la finestra: sblocca `awaitWindow`.
+pub fn windowReady(state: *GuiAppState) void {
+    state.startup.win_ready.store(1, .release);
+    state.io.futexWake(u32, &state.startup.win_ready.raw, std.math.maxInt(u32));
 }
 
 /// Risolve l'argomento iniziale in un percorso di file. Se `arg` è una CARTELLA,
@@ -1175,6 +1223,7 @@ pub fn decodeInitial(state: *GuiAppState, path: []const u8, gen: u32) void {
         if (decoder_mod.decodeCoarse(path, state.io, state.gpa)) |coarse| {
             var c = coarse;
             if (!navSuperseded(state, gen) and coarseAcceptable(&c, path)) {
+                awaitWindow(state, &c);
                 const pre = prepareFor(state, &c, path, false);
                 applyDecoded(state, c, pre, path, gen) catch |e|
                     std.debug.print("apply coarse: {s}\n", .{@errorName(e)});
@@ -1194,9 +1243,11 @@ pub fn decodeInitial(state: *GuiAppState, path: []const u8, gen: u32) void {
         std.debug.print("[gui] caricamento fallito: {s}: {s}\n", .{ path, d.err });
         const msg: []const u8 = std.fmt.allocPrint(state.gpa, "Errore nel caricamento del file:\n{s}", .{d.err}) catch "";
         d.deinit(state.gpa);
+        awaitWindow(state, &.{ .text = "" }); // il messaggio è un documento di testo
         applyMessage(state, msg, path, gen) catch {};
         return;
     }
+    awaitWindow(state, &d);
     // Staging GPU, RGBA, player A/V e MIDI preparati QUI, fuori lock.
     const pre = prepareFor(state, &d, path, true);
     applyDecoded(state, d, pre, path, gen) catch |e| {
@@ -1204,9 +1255,9 @@ pub fn decodeInitial(state: *GuiAppState, path: []const u8, gen: u32) void {
         showApplyFailure(state, e, path, gen);
     };
     if (navSuperseded(state, gen)) return;
-    // La finestra è nata sulla forma stimata (estensione): adattala al contenuto
-    // reale, a meno che main l'abbia già dimensionata su dimensioni certe
-    // (header immagine, tabella sincrona).
+    // La finestra è nata sulla forma stimata (estensione, il decode non è finito in
+    // tempo): adattala al contenuto reale. Se main l'ha creata sulla forma
+    // pubblicata da `awaitWindow`, è già giusta.
     if (!state.initial_size_known) resizeToContent(state);
     // Contenuto iniziale pronto: precarica i vicini per una navigazione fluida.
     schedulePrefetchAround(state);

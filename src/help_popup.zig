@@ -1,8 +1,9 @@
-//! Guida dei tasti: popup visibile finché si tiene premuto `h` (`Shared.help`).
-//! L'elenco è scritto a mano: va aggiornato insieme a `input.zig`,
+//! Guida dei tasti: popup aperto e chiuso da `h` (o F1, `?`), chiuso anche da Esc
+//! (`Shared.help`). L'elenco è scritto a mano: va aggiornato insieme a `input.zig`,
 //! `yt_search.zig` e `file_explorer.zig` quando cambia un tasto.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const zicro = @import("zicro");
 const paint = zicro.paint;
 const glyph = @import("glyph.zig");
@@ -11,40 +12,46 @@ const yt_search = @import("yt_search.zig");
 const Entry = struct { k: []const u8, d: []const u8 };
 const Section = struct { title: []const u8, entries: []const Entry };
 
+/// Il modificatore delle scorciatoie come lo chiama il sistema: Cmd su macOS.
+const mod = if (builtin.os.tag == .macos) "⌘" else "Ctrl+";
+
 pub const sections = [_]Section{
     .{ .title = "Generale", .entries = &.{
-        .{ .k = "h (tieni premuto)", .d = "questa guida" },
-        .{ .k = "↑ ↓  ← →", .d = "file precedente / successivo" },
-        .{ .k = "F  F11", .d = "schermo intero" },
-        .{ .k = "= -  rotella", .d = "zoom" },
-        .{ .k = "0", .d = "vista adattata" },
+        .{ .k = "↑ ↓", .d = "file precedente / successivo" },
+        .{ .k = "Home  Fine", .d = "primo / ultimo file" },
+        .{ .k = "+ -  rotella", .d = "zoom" },
+        .{ .k = "0   1", .d = "adatta / pixel reali" },
         .{ .k = "R  Maiusc+R", .d = "ruota" },
-        .{ .k = "1 … 5", .d = "stile della finestra" },
+        .{ .k = "F", .d = "schermo intero" },
+        .{ .k = "i", .d = "informazioni sul file" },
+        .{ .k = mod ++ "C", .d = "copia il percorso" },
         .{ .k = "e", .d = "esplora file" },
         .{ .k = "y", .d = "cerca su YouTube" },
-        .{ .k = "Esc  Q", .d = "chiudi" },
+        .{ .k = "h  ?", .d = "questa guida" },
+        .{ .k = "Esc", .d = "chiudi" },
     } },
     .{ .title = "Video e audio", .entries = &.{
         .{ .k = "Spazio", .d = "play / pausa" },
         .{ .k = "← →", .d = "indietro / avanti 5 s" },
-        .{ .k = "v", .d = "video / solo audio" },
-        .{ .k = "c", .d = "sottotitoli (YouTube)" },
-        .{ .k = "o", .d = "apri su YouTube" },
-        .{ .k = "n", .d = "prossimo in coda" },
+        .{ .k = "Maiusc+← →", .d = "indietro / avanti 30 s" },
+        .{ .k = "Home", .d = "dall'inizio" },
+        .{ .k = "v", .d = "solo audio / video" },
+        .{ .k = "c  n  o", .d = "YouTube: sottotitoli, coda, web" },
     } },
     .{ .title = "Testo, PDF, 3D", .entries = &.{
-        .{ .k = "PagSu PagGiù", .d = "scorri / pagina (PDF)" },
+        .{ .k = "PagSu PagGiù", .d = "scorri / pagina" },
         .{ .k = "← →", .d = "pagina (PDF)" },
-        .{ .k = "Ctrl+A C D", .d = "seleziona / copia / deseleziona" },
+        .{ .k = "Home  Fine", .d = "inizio / fine" },
+        .{ .k = mod ++ "A  " ++ mod ++ "C", .d = "seleziona tutto / copia" },
         .{ .k = "v", .d = "voxel (modelli 3D)" },
-        .{ .k = "Esc", .d = "dall'archivio torna all'elenco" },
+        .{ .k = "Invio  Esc", .d = "archivi: apri voce / elenco" },
     } },
     .{ .title = "Ricerca YouTube", .entries = &.{
         .{ .k = "frecce  PagSu PagGiù", .d = "scegli il video" },
         .{ .k = "Invio", .d = "cerca / apri" },
-        .{ .k = "Ctrl+Invio  destro", .d = "aggiungi / togli dalla coda" },
-        .{ .k = "Ctrl+A C V", .d = "seleziona / copia / incolla" },
-        .{ .k = "Ctrl+O", .d = "apri nel browser" },
+        .{ .k = mod ++ "Invio  destro", .d = "aggiungi / togli dalla coda" },
+        .{ .k = mod ++ "A C V", .d = "seleziona / copia / incolla" },
+        .{ .k = mod ++ "O", .d = "apri nel browser" },
         .{ .k = "Esc", .d = "chiudi" },
     } },
     .{ .title = "Esplora file", .entries = &.{
@@ -54,7 +61,7 @@ pub const sections = [_]Section{
     } },
 };
 
-const panel_bg = paint.Color.rgba(13, 15, 22, 0.94);
+const panel_bg = paint.Color.rgba(13, 15, 22, 0.97);
 const title_fg = [3]u8{ 120, 160, 255 };
 const key_fg = [3]u8{ 235, 238, 245 };
 const desc_fg = [3]u8{ 150, 158, 175 };

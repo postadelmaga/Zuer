@@ -46,6 +46,11 @@ zuer tabella.csv         # nel terminale (solo Linux)
 |---|---|
 | `↑` `↓` | file precedente o successivo della cartella |
 | `←` `→` | pagina nei PDF, ±5 secondi nei video, altrove cambia file |
+| `Home` `Fine` | inizio e fine del documento, altrove primo e ultimo file |
+| `+` `-` `0` `1` | zoom, vista adattata, pixel reali |
+| `i` | informazioni sul file |
+| `h` | tutti i tasti |
+| `Esc` | chiude il popup aperto, esce dallo schermo intero, poi chiude |
 | rotellina, PagSu/PagGiù | scorre il testo |
 | tasto destro tenuto premuto | sposta la finestra |
 
