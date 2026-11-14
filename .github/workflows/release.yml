@@ -452,6 +452,12 @@ jobs:
           open -n -a "$APP" --env ZUER_NO_CRASH_REPORT=1 --env ZUER_TRACE=1 --env ZICRO_COCOA_TRACE=1 \
             --stdout "$OLOG" --stderr "$OLOG" "$D/prova.pdf"
           wait_for 'file=prova.pdf' || OK=0
+          # Apertura pulita: il file del Finder arriva PRIMA della finestra (Zicro
+          # `launchFiles`), che nasce sul file e non come la finestra generica della
+          # ricerca YouTube ("dimensioni note"), poi ridimensionata.
+          grep -E 'launch file:|launchFiles:|\[trace\] finestra' "$OLOG" || true
+          if ! grep -q 'launch file:.*prova.pdf' "$OLOG"; then echo "::error::il file del Finder non è arrivato prima della finestra"; OK=0; fi
+          if ! grep -E '\[trace\] finestra' "$OLOG" | head -1 | grep -qE '\((forma del contenuto|stima)\)'; then echo "::error::la prima finestra non nasce sul file"; OK=0; fi
           # Il secondo con accenti e spazi: arriva dal Finder magari in forma Unicode
           # decomposta, ma Zuer deve mostrarlo col nome com'è sul disco.
           if [[ $OK == 1 ]]; then
