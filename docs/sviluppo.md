@@ -12,7 +12,7 @@ Requisiti, build per ogni sistema, installer, variabili d'ambiente e strumenti d
   a runtime, facoltativi: **libmpv** (`libmpv.so.2`: senza, il video ripiega su
   libav, senza piano dmabuf), `libva` (sonda hwdec), `poppler` (`pdftoppm`) e
   LibreOffice (`soffice`) per pdf/office, ImageMagick per i formati immagine rari,
-  `yt-dlp` per i link YouTube
+  `yt-dlp` per i link YouTube, `lp` (CUPS) per la stampa
 
 ## Build & installazione (Linux)
 
@@ -127,6 +127,7 @@ cross-process del protocollo kitty) e i decoder **pdf/office** (tool esterni).
 zig build gpu-selftest    # render headless di un cubo per validare la pipeline mesh
 zig build raster-debug -- file      # rasterizza un file su PPM (stdout)
 zig build decode-test -- file       # decodifica un file e stampa il risultato
+zig build print-debug -- file out.pdf    # il PDF che Ctrl+P manderebbe in stampa (immagini: zig-out/bin/print-debug)
 zig build bench-decode -- fg bg...  # latenza di un decode con altri decode in sfondo
 zig build test                      # test unitari (detector, scheduler, miniature)
 zig build player-test -- video      # itera i frame video col motore libav

@@ -36,6 +36,7 @@ const input = @import("input.zig");
 const yt_search = @import("yt_search.zig");
 const help_popup = @import("help_popup.zig");
 const info_popup = @import("info_popup.zig");
+const print_mod = @import("print.zig");
 const file_explorer = @import("file_explorer.zig");
 const unicode_path = @import("unicode_path.zig");
 const crash_log = @import("crash_log.zig");
@@ -77,7 +78,8 @@ fn rasterizeText(state: *GuiAppState, width: u32, text_zoom: f32) void {
     const opts = text_render.RenderOpts{ .width = @max(width, 64), .pointsize = @max(pointsize, 6) };
 
     // GPU solo se riesce: renderer assente, fallito o perso → percorso CPU qui sotto.
-    if (native and state.text_gpu) {
+    // Il markdown ha solo il percorso CPU (impaginazione proporzionale).
+    if (native and state.text_gpu and state.shared.decoded != .markdown) {
         if (rasterizeTextGpu(state, std.fs.path.basename(state.shared.current_file_path), opts)) return;
     }
 
@@ -304,7 +306,10 @@ fn labelAlpha(idle_s: f32) f32 {
     return std.math.clamp(1.0 - (idle_s - 2.5) / 0.3, 0.0, 1.0);
 }
 
-fn drawFilenameLabel(buf: []u8, W: u32, H: u32, raster: *glyph.Raster, name: []const u8, alpha: f32) void {
+/// `print_btn`: il contenuto si può stampare; il pulsante della stampa sta
+/// all'estrema destra e l'etichetta gli si affianca a sinistra.
+fn drawFilenameLabel(buf: []u8, W: u32, H: u32, raster: *glyph.Raster, name: []const u8, alpha: f32, print_btn: ?bool) void {
+    print_mod.button.store(0, .monotonic);
     if (name.len == 0 or W == 0 or H == 0 or alpha <= 0.01) return;
     var view = std.unicode.Utf8View.init(name) catch return;
 
@@ -324,13 +329,22 @@ fn drawFilenameLabel(buf: []u8, W: u32, H: u32, raster: *glyph.Raster, name: []c
     const box_w = n * cell + pad_x * 2;
     const box_h = line_h + pad_y * 2;
     const wi: i32 = @intCast(W);
-    var box_x = wi - margin - box_w;
-    if (box_x < margin) box_x = margin;
     const box_y: i32 = margin;
+    // Pulsante della stampa: un cerchio poco più alto dell'etichetta, centrato
+    // sulla sua riga.
+    const btn_s: i32 = box_h + 8;
+    const right = if (print_btn != null) wi - margin - btn_s - 6 else wi - margin;
+    var box_x = right - box_w;
+    if (box_x < margin) box_x = margin;
 
     // Sfondo pill scuro via il Canvas straight di zicro (buffer 4-allineato).
     const u32px: [*]u32 = @ptrCast(@alignCast(buf.ptr));
     var canvas = paint.Canvas.initRgba8(u32px[0 .. @as(usize, W) * H], W, H);
+    if (print_btn) |hover| {
+        const bx = wi - margin - btn_s;
+        const by = box_y + @divTrunc(box_h - btn_s, 2);
+        if (bx > box_x + box_w) print_mod.drawButton(&canvas, @floatFromInt(bx), @floatFromInt(by), @floatFromInt(btn_s), alpha, hover);
+    }
     canvas.fillRoundedRect(@floatFromInt(box_x), @floatFromInt(box_y), @floatFromInt(box_w), @floatFromInt(box_h), 6.0, paint.Color.rgba(16, 18, 26, 0.62 * alpha));
 
     // Testo monospazio bianco.
@@ -373,6 +387,7 @@ fn drawPopups(state: *GuiAppState, buf: []u8, W: u32, H: u32, raster: *glyph.Ras
     } else if (state.shared.info) {
         info_popup.draw(buf, W, H, raster, &state.shared.info_card);
     }
+    print_mod.draw(buf, W, H, raster, &state.shared.print);
 }
 
 fn renderWorker(
@@ -499,6 +514,7 @@ fn renderWorker(
         was_loading = now_loading;
         // Inattività per l'auto-hide dell'etichetta nome file (reset da input/nav).
         state.shared.ui_idle_s += frame_dt;
+        print_mod.tick(&state.shared, frame_dt);
         const label_alpha = labelAlpha(state.shared.ui_idle_s);
         const label_ch = @abs(label_alpha - last_label_alpha) > 0.002;
 
@@ -656,7 +672,7 @@ fn renderWorker(
                 videomod.drawVideoControls(composited_rgba.*, fr.w, fr.h, vs, raster, gpu_video and !state.shared.yt.subs_on);
                 // Fuori dalla fascia dei controlli il buffer è già quello buono.
                 if (pres_dirty == null) {
-                    if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, fr.w, fr.h, r, std.fs.path.basename(state.shared.current_file_path), label_alpha);
+                    if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, fr.w, fr.h, r, std.fs.path.basename(state.shared.current_file_path), label_alpha, null);
                     vid_full_w = fr.w;
                     vid_full_h = fr.h;
                 }
@@ -865,6 +881,10 @@ fn renderWorker(
                         text_render.paintTableViewport(doc, composited_rgba.*, cur_w, cur_h, geom.off_y, geom.x_src, geom.x_dst, header_band) catch |e| {
                             std.debug.print("[gui] paintTableViewport fallito: {s}\n", .{@errorName(e)});
                         };
+                    } else if (doc.md != null) {
+                        text_render.paintMdViewport(doc, composited_rgba.*, cur_w, cur_h, geom.off_y, geom.x_src, geom.x_dst) catch |e| {
+                            std.debug.print("[gui] paintMdViewport fallito: {s}\n", .{@errorName(e)});
+                        };
                     } else {
                         text_render.paintDocViewport(doc, composited_rgba.*, cur_w, cur_h, geom.off_y, geom.x_src, geom.x_dst) catch |e| {
                             std.debug.print("[gui] paintDocViewport fallito: {s}\n", .{@errorName(e)});
@@ -883,7 +903,11 @@ fn renderWorker(
                 if (state.shared.is_table and state.shared.table_sel_row >= 0) {
                     compose.drawTableRowHighlight(composited_rgba.*, cur_w, cur_h, state.shared.static_w, state.shared.static_h, state.shared.scroll_y, state.shared.scroll_x, state.shared.text_metrics, state.shared.table_sel_row, header_band);
                 }
-                if (state.shared.sel_active) {
+                const md_doc: ?*text_render.DocLayout = if (state.shared.text_doc) |*d| (if (d.md != null) d else null) else null;
+                if (state.shared.sel_active and md_doc != null) {
+                    const geom = compose.textBlitGeom(cur_w, cur_h, state.shared.static_w, state.shared.static_h, state.shared.scroll_y, state.shared.scroll_x);
+                    text_render.drawMdSelection(md_doc.?, composited_rgba.*, cur_w, cur_h, geom.off_y, geom.x_src, geom.x_dst, state.shared.sel_a, state.shared.sel_b);
+                } else if (state.shared.sel_active) {
                     compose.drawTextSelection(composited_rgba.*, cur_w, cur_h, state.shared.static_w, state.shared.static_h, state.shared.scroll_y, state.shared.scroll_x, state.shared.text_metrics, state.shared.text_lines.items, state.shared.sel_a, state.shared.sel_b);
                 }
                 // Scrollbar flottanti egui, disegnate dal Canvas straight di zicro
@@ -919,7 +943,7 @@ fn renderWorker(
             // Nome file in alto a destra (monospazio), sopra ogni contenuto. Nel
             // ramo mesh il frame viene composto DOPO l'unlock: label e flag lì.
             if (mesh_push == null and mesh_voxel_push == null) {
-                if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, cur_w, cur_h, r, std.fs.path.basename(state.shared.current_file_path), label_alpha);
+                if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, cur_w, cur_h, r, std.fs.path.basename(state.shared.current_file_path), label_alpha, if (print_mod.printable(state)) state.shared.print.hover else null);
                 // Esploratore file sotto l'eventuale overlay YouTube (siamo sotto lock).
                 if (state.shared.fx.active) {
                     if (name_raster) |*r| file_explorer.drawOverlay(composited_rgba.*, cur_w, cur_h, state, r);
@@ -1010,7 +1034,7 @@ fn renderWorker(
                     // fino al prossimo render, quindi comporre fuori dal lock è sicuro.
                     compose.composeFrame(composited_rgba.*, cur_w, cur_h, mr, cur_w, cur_h, 1.0, 0.0, 0.0, null);
                 }
-                if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, cur_w, cur_h, r, mesh_name_buf[0..mesh_name_len], label_alpha);
+                if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, cur_w, cur_h, r, mesh_name_buf[0..mesh_name_len], label_alpha, null);
                 // Overlay (esploratore file + YouTube) anche sulle mesh: qui il frame
                 // è composto fuori dal lock, quindi lo stato va riletto sotto mutex.
                 state.shared.mutex.lockUncancelable(state.io);

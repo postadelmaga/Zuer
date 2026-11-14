@@ -12,6 +12,7 @@ const gpu = @import("gpu_renderer.zig");
 const voxel = @import("voxel.zig");
 const decoder_mod = @import("decoder.zig");
 const loader_mod = @import("loader.zig");
+const print_mod = @import("print.zig");
 const text_render = @import("text_render.zig");
 // Player video nativo (libav): puntato da `GuiAppState.video`.
 const videomod = @import("video.zig");
@@ -110,6 +111,8 @@ pub const GuiAppState = struct {
         /// Contenuto della scheda: il render worker la ricostruisce quando cambia
         /// il contenuto (`info_card.seq != load_seq`).
         info_card: info_popup.Card = .{},
+        /// Pannello della stampa (Ctrl+P): conferma, avanzamento, esito.
+        print: print_mod.Ui = .{},
         // Vero mentre il decoder del file iniziale gira su un thread di background:
         // il worker mostra lo spinner di caricamento invece del contenuto.
         loading: bool = false,

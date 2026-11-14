@@ -363,6 +363,28 @@ pub fn build(b: *std.Build) void {
     raster_dbg_run.addPassthruArgs();
     b.step("raster-debug", "Rasterizza un file su PPM (stdout)").dependOn(&raster_dbg_run.step);
 
+    // Tool di sviluppo: il PDF che la stampa (Ctrl+P) genererebbe per un file,
+    // scritto su disco invece che mandato alla stampante (zig build print-debug).
+    const print_dbg = b.addExecutable(.{
+        .name = "print-debug",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/print_debug.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    print_dbg.root_module.addImport("zicro", dep_zicro.module("zicro"));
+    addStbTruetypeHeaders(b, print_dbg.root_module);
+    // Lo step lo installa anche in zig-out/bin (fuori dall'install normale, non
+    // finisce nei pacchetti): lanciato da lì trova i plugin e apre anche le
+    // immagini; dalla cache legge solo testo e markdown.
+    const print_dbg_run = b.addRunArtifact(print_dbg);
+    print_dbg_run.step.dependOn(&b.addInstallArtifact(print_dbg, .{}).step);
+    print_dbg_run.setEnvironmentVariable("ZUER_GUI", "1");
+    print_dbg_run.addPassthruArgs();
+    b.step("print-debug", "Scrive il PDF di stampa di un file").dependOn(&print_dbg_run.step);
+
     // Self-test headless del percorso GPU mesh (normali + shading PBR-ish):
     // renderizza un cubo offscreen e verifica copertura/variazione di luce.
     const gpu_selftest = b.addExecutable(.{
@@ -559,6 +581,36 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }) });
         t.root_module.addImport("zicro", dep_zicro.module("zicro"));
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
+    {
+        // Parser markdown (blocchi, enfasi, liste, tabelle, HTML).
+        const t = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("src/md_parse.zig"),
+            .target = target,
+            .optimize = optimize,
+        }) });
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
+    {
+        // PDF della stampa: struttura, xref e stream decomprimibili.
+        const t = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("src/pdf_writer.zig"),
+            .target = target,
+            .optimize = optimize,
+        }) });
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
+    {
+        // Il PDF di stampa di testi, markdown e immagini (text_render + glyph).
+        const t = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("src/print_pdf.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }) });
+        t.root_module.addImport("zicro", dep_zicro.module("zicro"));
+        addStbTruetypeHeaders(b, t.root_module);
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
     {

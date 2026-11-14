@@ -25,6 +25,7 @@ pub const sections = [_]Section{
         .{ .k = "F", .d = "schermo intero" },
         .{ .k = "i", .d = "informazioni sul file" },
         .{ .k = mod ++ "C", .d = "copia il percorso" },
+        .{ .k = mod ++ "P", .d = "stampa (o l'icona in alto)" },
         .{ .k = "e", .d = "esplora file" },
         .{ .k = "y", .d = "cerca su YouTube" },
         .{ .k = "h  ?", .d = "questa guida" },

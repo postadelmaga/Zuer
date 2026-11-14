@@ -19,6 +19,12 @@ const font_bold = @embedFile("assets/Hack-Bold.ttf");
 const font_italic = @embedFile("assets/Hack-Italic.ttf");
 const font_bold_italic = @embedFile("assets/Hack-BoldItalic.ttf");
 
+/// I file TrueType della famiglia `mono`, per `Style`: la stampa li incorpora
+/// nel PDF così la carta usa gli stessi glifi dello schermo.
+pub const mono_fonts = [4][]const u8{ font_regular, font_bold, font_italic, font_bold_italic };
+/// stb_truetype, per chi deve leggere le metriche delle facce (la stampa).
+pub const stb = c;
+
 // Famiglia proporzionale per il rendering "foglio di calcolo" delle tabelle:
 // Ubuntu-Light, lo stesso font di default di egui usato da ../viewer, così csv/xlsx
 // hanno resa identica. Ubuntu-Light non ha una faccia bold: header e corsivi
@@ -26,9 +32,20 @@ const font_bold_italic = @embedFile("assets/Hack-BoldItalic.ttf");
 const font_sans_regular = @embedFile("assets/Ubuntu-Light.ttf");
 const font_sans_bold = @embedFile("assets/Ubuntu-Light.ttf");
 
-/// Famiglia tipografica: `mono` (Hack, per codice/testo, resa a griglia) oppure
-/// `sans` (Ubuntu-Light, proporzionale, per le tabelle — parità con ../viewer).
-pub const Family = enum { mono, sans };
+// Famiglia proporzionale del markdown (testo corrente, titoli, celle): Liberation
+// Sans nelle quattro facce, metricamente compatibile con Arial.
+const font_prose_regular = @embedFile("assets/LiberationSans-Regular.ttf");
+const font_prose_bold = @embedFile("assets/LiberationSans-Bold.ttf");
+const font_prose_italic = @embedFile("assets/LiberationSans-Italic.ttf");
+const font_prose_bold_italic = @embedFile("assets/LiberationSans-BoldItalic.ttf");
+
+/// I file TrueType della famiglia `prose`, per `Style` (vedi `mono_fonts`).
+pub const prose_fonts = [4][]const u8{ font_prose_regular, font_prose_bold, font_prose_italic, font_prose_bold_italic };
+
+/// Famiglia tipografica: `mono` (Hack, per codice/testo, resa a griglia),
+/// `sans` (Ubuntu-Light, proporzionale, per le tabelle — parità con ../viewer)
+/// oppure `prose` (Liberation Sans, il testo del markdown; corpo per em).
+pub const Family = enum { mono, sans, prose };
 
 pub const Rgb = struct {
     r: u8,
@@ -92,6 +109,7 @@ pub const Raster = struct {
             .mono => .{ font_regular, font_bold, font_italic, font_bold_italic },
             // Sans: corsivi ripiegano su regular/bold (le tabelle non li usano).
             .sans => .{ font_sans_regular, font_sans_bold, font_sans_regular, font_sans_bold },
+            .prose => prose_fonts,
         };
         var infos: [4]c.stbtt_fontinfo = undefined;
         var scale: [4]f32 = undefined;
@@ -103,7 +121,7 @@ pub const Raster = struct {
             // corpo di 13.5 rende identico a egui. Mono (codice/testo, resa a griglia):
             // scala per altezza-pixel (ascent−descent), storicamente usata dal layout.
             scale[i] = switch (family) {
-                .sans => c.stbtt_ScaleForMappingEmToPixels(&infos[i], px_height),
+                .sans, .prose => c.stbtt_ScaleForMappingEmToPixels(&infos[i], px_height),
                 .mono => c.stbtt_ScaleForPixelHeight(&infos[i], px_height),
             };
         }

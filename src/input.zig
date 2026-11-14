@@ -7,12 +7,14 @@ const std = @import("std");
 const builtin = @import("builtin");
 // CPU frame compositor: qui servono la geometria del blit testo (hit-test) e cpLen.
 const compose = @import("compose.zig");
+const text_render = @import("text_render.zig");
 const clipboard = @import("clipboard.zig");
 // Player video nativo: hit-test dei controlli overlay e seek da tastiera/mouse.
 const videomod = @import("video.zig");
 const nav = @import("nav.zig");
 const yt_search = @import("yt_search.zig");
 const file_explorer = @import("file_explorer.zig");
+const print_mod = @import("print.zig");
 const gui_state_mod = @import("gui_state.zig");
 const GuiAppState = gui_state_mod.GuiAppState;
 const resetScroll = gui_state_mod.resetScroll;
@@ -52,6 +54,7 @@ const KEY_W: u32 = 17;
 const KEY_HOME: u32 = 102;
 const KEY_END: u32 = 107;
 const KEY_F1: u32 = 59;
+const KEY_P: u32 = 25;
 
 // Stato per il rilevamento del doppio-click sinistro (solo thread finestra).
 var last_click_ms: i64 = -1000;
@@ -85,6 +88,8 @@ fn textHit(state: *GuiAppState, W: u32, H: u32, mx: f32, my: f32) [2]i32 {
     const geom = compose.textBlitGeom(W, H, state.shared.static_w, state.shared.static_h, state.shared.scroll_y, state.shared.scroll_x);
     const sx = @as(i32, @intFromFloat(mx)) - @as(i32, @intCast(geom.x_dst)) + @as(i32, @intCast(geom.x_src));
     const sy = @as(i32, @intFromFloat(my)) + @as(i32, @intCast(geom.off_y));
+    // Markdown: righe e caratteri a posizioni proporzionali.
+    if (state.shared.text_doc) |*doc| if (doc.md != null) return text_render.mdHit(doc, @floatFromInt(sx), @floatFromInt(sy));
     const nrows: i32 = @intCast(state.shared.text_lines.items.len);
     var row: i32 = if (m.line_h > 0) @divFloor(sy - m.pad_y, m.line_h) else 0;
     row = std.math.clamp(row, 0, @max(nrows - 1, 0));
@@ -591,6 +596,12 @@ pub fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) 
     // Esploratore file: da chiuso `e` lo apre, da aperto la tastiera è sua
     // (Esc/e chiudono, frecce/Invio navigano, Backspace sale di cartella).
     if (file_explorer.handleKey(app_state, key)) return;
+    // Stampa: Ctrl+P (⌘P) apre la conferma; col pannello aperto Invio/Esc sono suoi.
+    if (print_mod.handleKey(app_state, key)) return;
+    if (ctrl and key == KEY_P) {
+        print_mod.request(app_state);
+        return;
+    }
 
     // Popup: `h`/F1 la guida, `i` le informazioni sul file (uno alla volta; il
     // `?` arriva da `textCallback`, che conosce il layout). Esc chiude quello aperto.
@@ -889,6 +900,12 @@ pub fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopa
                 if (down) win.beginMove();
                 return true;
             }
+            // Pulsante della stampa (in alto a destra): il click apre la conferma,
+            // come Ctrl+P; anche il rilascio è suo (niente selezione o pan).
+            if (event.button == 0x110 and print_mod.buttonHit(app_state.last_x, app_state.last_y)) {
+                if (down) print_mod.request(app_state);
+                return true;
+            }
             // Snapshot dei flag di tipo sotto lock (pattern `is_pdf` del key
             // handler): sono riscritti da `applyDecoded` sui thread loader.
             app_state.shared.mutex.lockUncancelable(app_state.io);
@@ -1098,6 +1115,7 @@ pub fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopa
             // in drag), non facciamo selezione/pan.
             app_state.shared.mutex.lockUncancelable(app_state.io);
             app_state.shared.ui_idle_s = 0; // mostra l'etichetta nome file
+            print_mod.onMotion(&app_state.shared, event.x, event.y);
             const sc_consumed = app_state.shared.sc.onMotion(event.x, event.y);
             if (sc_consumed) app_state.shared.file_changed = true;
             app_state.shared.mutex.unlock(app_state.io);
