@@ -1,44 +1,49 @@
-# Zuer 0.1.2 — note di rilascio
+# Zuer 0.3.0 — note di rilascio
 
-Tag `v0.1.2`, dopo la 0.1.2 ([RELEASE-0.1.2.md](RELEASE-0.1.2.md)). Zicro al commit di
+Tag `v0.3.0`, dopo la 0.1.2 ([RELEASE-0.1.2.md](RELEASE-0.1.2.md)). Zicro al commit di
 `.github/zicro.ref`. Stesse parole per come è stato verificato: **verificato** (questa
-macchina Linux), **CI** (runner GitHub: per macOS sono Mac veri), **non verificato**, e
-**sotto Darling** (la build macOS x86_64 eseguita su Linux da Darling).
+macchina Linux), **CI** (runner GitHub: per macOS sono Mac veri), **non verificato**,
+**sotto Darling** (la build macOS x86_64 eseguita su Linux da Darling) e **sotto Wine**
+(la build Windows eseguita su Linux da Wine).
 
 ## Cosa cambia rispetto a 0.1.2
 
-### Apertura senza salti
+### Stampa: `Ctrl+P` (`⌘P` su macOS) o l'icona in alto a destra
 
-Zuer apriva prima una finestra grande e poi la adattava al file. Ora prepara il file
-prima di creare la finestra, che compare già della forma giusta e col contenuto pronto.
-Se un file richiede più di 0,6 s, la finestra parte su una stima e si adatta dopo,
-come prima. Su macOS, aprendo dal Finder, Zuer non mostra più la finestra della
-ricerca YouTube che poi diventava quella del file. (verificato su Linux con immagini,
-video e PDF; sotto Darling: 21 casi di apertura dal Finder; CI: `open -a` su macOS
-arm64 e Intel, finestra nata sul file)
+Accanto al nome del file c'è un'icona a forma di stampante: un clic, o `Ctrl+P`, apre un
+pannello di conferma; Invio stampa sulla stampante predefinita, Esc annulla.
 
-### Informazioni sul file: `i`
+- **PDF**: si stampa il file originale.
+- **Immagini**: su un foglio A4 orientato come l'immagine, centrata e adattata ai margini.
+- **Testi e codice**: testo vero (nitido e selezionabile nel PDF), monospazio con i
+  colori della sintassi, numero di pagina in fondo.
+- **Markdown**: impaginato come lo si vede a schermo, con colori adatti alla carta; le
+  pagine non spezzano una tabella o un blocco di codice e non lasciano un titolo da solo
+  in fondo.
 
-Un popup con nome, tipo, risoluzione (dei video quella vera), pagina, durata, righe e
-colonne o vertici a seconda del file, peso, data di modifica, cartella e posizione nella
-cartella. Si aggiorna mentre si naviga con le frecce; `i` o Esc lo chiudono.
-(verificato su immagini, video, PDF e testo)
+Linux e macOS stampano con `lp` (CUPS); su Windows il PDF va all'applicazione
+predefinita per i PDF (verbo "stampa" della shell) e, se non lo sa stampare, viene
+aperto lì. Se qualcosa manca (CUPS, una stampante predefinita, un lettore PDF) il pannello
+lo dice. Nei video, nei modelli 3D e negli archivi l'icona non compare.
+(verificato su Linux con un `lp` di prova; sotto Darling: il `lp` di macOS chiamato
+davvero, che risponde "nessuna stampante predefinita"; sotto Wine: PDF prodotto e
+messaggio "nessuna applicazione sa stampare i PDF"; **non verificato su una stampante
+reale**)
 
-### Tasti rivisti
+### Markdown impaginato davvero
 
-- Tolti: `1`…`5` (stile della finestra) e `Ctrl+D`. `h` ora apre e chiude la guida
-  (prima andava tenuto premuto).
-- Nuovi: `Home`/`Fine` (primo e ultimo file; inizio e fine nei testi; prima e ultima
-  pagina nei PDF; nei video `Home` riparte dall'inizio), `Maiusc+←/→` (±30 secondi),
-  `1` (pixel reali), `Ctrl+C` fuori dai testi (copia il percorso), `Ctrl+W`/`Ctrl+Q`
-  per chiudere (Cmd su macOS).
-- `+`, `-` e `?` seguono la tastiera in uso: sulla tastiera italiana lo zoom ora
-  funziona.
-- Esc chiude prima il popup aperto, poi esce dallo schermo intero, poi chiude Zuer.
-  Prima su Linux e Windows ogni Esc chiudeva Zuer, anche dalla ricerca YouTube o
-  dentro un archivio.
+Il markdown prima si vedeva come testo semplice. Ora è impaginato: carattere
+proporzionale (Liberation Sans), titoli più grandi per livello, grassetto, corsivo,
+barrato, codice in linea su fondo, link colorati, elenchi puntati, annidati, numerati e
+di attività, citazioni, blocchi di codice con i colori della sintassi, righe orizzontali
+e tabelle con allineamento e celle che vanno a capo. Selezione e copia seguono la nuova
+impaginazione: il testo copiato resta pulito (elenchi coi loro segni, celle separate da
+tabulazioni). (verificato su Linux; sotto Darling e sotto Wine)
 
-(verificato su Linux con una tastiera virtuale; non verificato a mano su Windows e macOS)
+Limiti: i link `[testo][rif]` restano testo, le immagini mostrano il loro testo
+alternativo, i caratteri assenti dai due font (come `⌘`) compaiono come un riquadro.
+File costruiti apposta (migliaia di livelli annidati, migliaia di `*` o `[` aperti) non
+bloccano né fanno cadere Zuer: oltre una certa profondità il resto diventa testo.
 
 ## Distribuzione
 
@@ -48,10 +53,10 @@ Zuer e Zicro, architettura, sha256).
 
 | Sistema | Architettura | Artefatto |
 |---|---|---|
-| macOS 13 o successivo | Apple Silicon (arm64) | `zuer-0.1.2-macos-arm64.tar.gz` (`Zuer.app`, con FFmpeg e MoltenVK in `Contents/Frameworks`) |
-| macOS 13 o successivo | Intel (x86_64) | `zuer-0.1.2-macos-x86_64.tar.gz` (stesso contenuto, compilato e provato su un Mac Intel) |
-| Windows 10/11 | x64 | `zuer-0.1.2-windows-x64-setup.exe` |
-| Ubuntu 26.04 LTS | x64 | `zuer-0.1.2-ubuntu26.04-amd64.deb` |
+| macOS 13 o successivo | Apple Silicon (arm64) | `zuer-0.3.0-macos-arm64.tar.gz` (`Zuer.app`, con FFmpeg e MoltenVK in `Contents/Frameworks`) |
+| macOS 13 o successivo | Intel (x86_64) | `zuer-0.3.0-macos-x86_64.tar.gz` (stesso contenuto, compilato e provato su un Mac Intel) |
+| Windows 10/11 | x64 | `zuer-0.3.0-windows-x64-setup.exe` |
+| Ubuntu 26.04 LTS | x64 | `zuer-0.3.0-ubuntu26.04-amd64.deb` |
 | Altre distribuzioni Linux | x64 | dai sorgenti: `zig build` + `install.sh` |
 
 Quale pacchetto macOS: menu Apple → Informazioni su questo Mac. "Chip Apple M…" →
@@ -62,7 +67,7 @@ sono pacchetti universali né Windows ARM.
 **Verifica del download**: nella cartella dei file scaricati,
 `sha256sum -c SHA256SUMS --ignore-missing` (Linux/Git Bash) oppure
 `shasum -a 256 -c SHA256SUMS` (macOS); su Windows
-`Get-FileHash .\zuer-0.1.2-windows-x64-setup.exe -Algorithm SHA256` e confronto a mano.
+`Get-FileHash .\zuer-0.3.0-windows-x64-setup.exe -Algorithm SHA256` e confronto a mano.
 
 **macOS**: estrarre l'archivio e trascinare `Zuer.app` in Applicazioni. Il pacchetto
 **non è firmato con un Developer ID né notarizzato** (la firma è solo ad-hoc): al primo
@@ -82,7 +87,7 @@ con il `tar` di sistema; `.doc` e `.rtf` con `textutil`; video con FFmpeg LGPL c
 dal sorgente (VideoToolbox, AV1 software con dav1d); 3D con MoltenVK. Disinstallazione:
 cancellare `Zuer.app` (cache in `~/.cache/zuer`).
 
-**Ubuntu**: `sudo apt install ./zuer-0.1.2-ubuntu26.04-amd64.deb` (con `./`: apt
+**Ubuntu**: `sudo apt install ./zuer-0.3.0-ubuntu26.04-amd64.deb` (con `./`: apt
 installa anche le dipendenze). Il pacchetto non è firmato né in un repository: gli
 aggiornamenti si installano allo stesso modo. Disinstallazione: `sudo apt remove zuer`
 (cache in `~/.cache/zuer`). Solo Ubuntu 26.04: sulle versioni precedenti le librerie
@@ -101,9 +106,9 @@ i modelli 3D non si vedono, con il motivo a schermo.
 **Licenze nei pacchetti**: `LICENSE` (AGPL-3.0-or-later); FFmpeg (LGPL) con
 `FFmpeg-LICENSE.txt` (comprende dav1d, BSD-2-Clause) e `FFmpeg-SOURCE.txt`
 (commit e opzioni di configure: la build si ripete con `scripts/build-ffmpeg.sh`);
-`THIRD-PARTY-NOTICES.txt` (libwebp, nanosvg, TinySoundFont, stb);
+`THIRD-PARTY-NOTICES.txt` (libwebp, nanosvg, TinySoundFont, stb, i font Hack e Liberation Sans);
 su Windows PDFium con `PDFium-LICENSE.txt`; su macOS MoltenVK (Apache-2.0) con
-`MoltenVK-LICENSE.txt`. Il sorgente di Zuer è il tag `v0.1.2`, quello di Zicro il commit
+`MoltenVK-LICENSE.txt`. Il sorgente di Zuer è il tag `v0.3.0`, quello di Zicro il commit
 in `.github/zicro.ref`. La procedura per una nuova versione è in RELEASE-1.0.0.md,
 "Fare una nuova versione".
 
@@ -115,7 +120,7 @@ Zuer — componenti di terze parti compilati nei binari
 
 Zuer è distribuito sotto AGPL-3.0-or-later (file LICENSE). I binari contengono anche
 il codice seguente, con le sue licenze. Le librerie distribuite come file separati
-hanno la loro licenza accanto: FFmpeg (FFmpeg-LICENSE.txt, comprende dav1d su macOS),
+hanno la loro licenza accanto: FFmpeg (FFmpeg-LICENSE.txt, comprende dav1d),
 PDFium su Windows (PDFium-LICENSE.txt), MoltenVK su macOS (MoltenVK-LICENSE.txt).
 
 -------------------------------------------------------------------------------
@@ -203,4 +208,161 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 stb_image, stb_truetype — https://github.com/nothings/stb
 -------------------------------------------------------------------------------
 Usati sotto l'alternativa B della loro doppia licenza (pubblico dominio, Unlicense).
+
+-------------------------------------------------------------------------------
+Liberation Sans 2.1.5 — https://github.com/liberationfonts/liberation-fonts (testo del markdown,
+incorporato anche nei PDF di stampa)
+-------------------------------------------------------------------------------
+Digitized data copyright (c) 2010 Google Corporation
+	with Reserved Font Arimo, Tinos and Cousine.
+Copyright (c) 2012 Red Hat, Inc.
+	with Reserved Font Name Liberation.
+
+This Font Software is licensed under the SIL Open Font License,
+Version 1.1.
+
+This license is copied below, and is also available with a FAQ at:
+http://scripts.sil.org/OFL
+
+SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007
+
+PREAMBLE The goals of the Open Font License (OFL) are to stimulate
+worldwide development of collaborative font projects, to support the font
+creation efforts of academic and linguistic communities, and to provide
+a free and open framework in which fonts may be shared and improved in
+partnership with others.
+
+The OFL allows the licensed fonts to be used, studied, modified and
+redistributed freely as long as they are not sold by themselves.
+The fonts, including any derivative works, can be bundled, embedded,
+redistributed and/or sold with any software provided that any reserved
+names are not used by derivative works.  The fonts and derivatives,
+however, cannot be released under any other type of license.  The
+requirement for fonts to remain under this license does not apply to
+any document created using the fonts or their derivatives.
+
+ 
+
+DEFINITIONS
+"Font Software" refers to the set of files released by the Copyright
+Holder(s) under this license and clearly marked as such.
+This may include source files, build scripts and documentation.
+
+"Reserved Font Name" refers to any names specified as such after the
+copyright statement(s).
+
+"Original Version" refers to the collection of Font Software components
+as distributed by the Copyright Holder(s).
+
+"Modified Version" refers to any derivative made by adding to, deleting,
+or substituting ? in part or in whole ?
+any of the components of the Original Version, by changing formats or
+by porting the Font Software to a new environment.
+
+"Author" refers to any designer, engineer, programmer, technical writer
+or other person who contributed to the Font Software.
+
+
+PERMISSION & CONDITIONS
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of the Font Software, to use, study, copy, merge, embed, modify,
+redistribute, and sell modified and unmodified copies of the Font
+Software, subject to the following conditions:
+
+1) Neither the Font Software nor any of its individual components,in
+   Original or Modified Versions, may be sold by itself.
+
+2) Original or Modified Versions of the Font Software may be bundled,
+   redistributed and/or sold with any software, provided that each copy
+   contains the above copyright notice and this license. These can be
+   included either as stand-alone text files, human-readable headers or
+   in the appropriate machine-readable metadata fields within text or
+   binary files as long as those fields can be easily viewed by the user.
+
+3) No Modified Version of the Font Software may use the Reserved Font
+   Name(s) unless explicit written permission is granted by the
+   corresponding Copyright Holder. This restriction only applies to the
+   primary font name as presented to the users.
+
+4) The name(s) of the Copyright Holder(s) or the Author(s) of the Font
+   Software shall not be used to promote, endorse or advertise any
+   Modified Version, except to acknowledge the contribution(s) of the
+   Copyright Holder(s) and the Author(s) or with their explicit written
+   permission.
+
+5) The Font Software, modified or unmodified, in part or in whole, must
+   be distributed entirely under this license, and must not be distributed
+   under any other license. The requirement for fonts to remain under
+   this license does not apply to any document created using the Font
+   Software.
+
+
+ 
+TERMINATION
+This license becomes null and void if any of the above conditions are not met.
+
+ 
+
+DISCLAIMER
+THE FONT SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT
+OF COPYRIGHT, PATENT, TRADEMARK, OR OTHER RIGHT.  IN NO EVENT SHALL THE
+COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+INCLUDING ANY GENERAL, SPECIAL, INDIRECT, INCIDENTAL, OR CONSEQUENTIAL
+DAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM OTHER
+DEALINGS IN THE FONT SOFTWARE.
+
+
+-------------------------------------------------------------------------------
+Hack — https://github.com/source-foundry/Hack (testo monospazio, incorporato anche
+nei PDF di stampa)
+-------------------------------------------------------------------------------
+The work in the Hack project is Copyright 2018 Source Foundry Authors and licensed under the MIT License
+
+The work in the DejaVu project was committed to the public domain.
+
+Bitstream Vera Sans Mono Copyright 2003 Bitstream Inc. and licensed under the Bitstream Vera License with Reserved Font Names "Bitstream" and "Vera"
+
+MIT License
+
+Copyright (c) 2018 Source Foundry Authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+BITSTREAM VERA LICENSE
+
+Copyright (c) 2003 by Bitstream, Inc. All Rights Reserved. Bitstream Vera is a trademark of Bitstream, Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of the fonts accompanying this license ("Fonts") and associated documentation files (the "Font Software"), to reproduce and distribute the Font Software, including without limitation the rights to use, copy, merge, publish, distribute, and/or sell copies of the Font Software, and to permit persons to whom the Font Software is furnished to do so, subject to the following conditions:
+
+The above copyright and trademark notices and this permission notice shall be included in all copies of one or more of the Font Software typefaces.
+
+The Font Software may be modified, altered, or added to, and in particular the designs of glyphs or characters in the Fonts may be modified and additional glyphs or characters may be added to the Fonts, only if the fonts are renamed to names not containing either the words "Bitstream" or the word "Vera".
+
+This License becomes null and void to the extent applicable to Fonts or Font Software that has been modified and is distributed under the "Bitstream Vera" names.
+
+The Font Software may be sold as part of a larger software package but no copy of one or more of the Font Software typefaces may be sold by itself.
+
+THE FONT SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF COPYRIGHT, PATENT, TRADEMARK, OR OTHER RIGHT. IN NO EVENT SHALL BITSTREAM OR THE GNOME FOUNDATION BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, INCLUDING ANY GENERAL, SPECIAL, INDIRECT, INCIDENTAL, OR CONSEQUENTIAL DAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM OTHER DEALINGS IN THE FONT SOFTWARE.
+
+Except as contained in this notice, the names of Gnome, the Gnome Foundation, and Bitstream Inc., shall not be used in advertising or otherwise to promote the sale, use or other dealings in this Font Software without prior written authorization from the Gnome Foundation or Bitstream Inc., respectively. For further information, contact: fonts at gnome dot org.
 ```

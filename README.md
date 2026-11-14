@@ -3,7 +3,7 @@
 Un visualizzatore di file veloce, scritto in Zig. Apri un file, o una cartella, e lo vedi
 subito: documenti, tabelle, immagini, video, audio, modelli 3D e archivi.
 
-Funziona su **Linux**, **Windows** e **macOS** (Apple Silicon e Intel). Versione **0.1.2**:
+Funziona su **Linux**, **Windows** e **macOS** (Apple Silicon e Intel). Versione **0.3.0**:
 le novità sono in [RELEASE.md](RELEASE.md).
 
 ## Cosa apre
@@ -49,6 +49,7 @@ zuer tabella.csv         # nel terminale (solo Linux)
 | `Home` `Fine` | inizio e fine del documento, altrove primo e ultimo file |
 | `+` `-` `0` `1` | zoom, vista adattata, pixel reali |
 | `i` | informazioni sul file |
+| `Ctrl+P` (`⌘P` su macOS) o l'icona in alto | stampa PDF, immagini, testi e markdown (come li mostra) |
 | `h` | tutti i tasti |
 | `Esc` | chiude il popup aperto, esce dallo schermo intero, poi chiude |
 | rotellina, PagSu/PagGiù | scorre il testo |
