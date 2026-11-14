@@ -1,51 +1,44 @@
-# Zuer 0.1.1 — note di rilascio
+# Zuer 0.1.2 — note di rilascio
 
-Tag `v0.1.1`, dopo la 0.1.0 ([RELEASE-0.1.0.md](RELEASE-0.1.0.md)). Zicro al commit di
+Tag `v0.1.2`, dopo la 0.1.2 ([RELEASE-0.1.2.md](RELEASE-0.1.2.md)). Zicro al commit di
 `.github/zicro.ref`. Stesse parole per come è stato verificato: **verificato** (questa
-macchina Linux), **CI** (runner GitHub virtuale), **non verificato**, e **sotto Darling**
-(la build macOS x86_64 eseguita su Linux da Darling).
+macchina Linux), **CI** (runner GitHub: per macOS sono Mac veri), **non verificato**, e
+**sotto Darling** (la build macOS x86_64 eseguita su Linux da Darling).
 
-## Cosa cambia rispetto a 0.1.0
+## Cosa cambia rispetto a 0.1.2
 
-### Linux: pacchetto .deb per Ubuntu 26.04 LTS
+### Apertura senza salti
 
-`zuer-0.1.1-ubuntu26.04-amd64.deb`, costruito su Ubuntu 26.04: le dipendenze sono
-quelle della distribuzione (FFmpeg, PipeWire, Vulkan, Wayland…) e `apt` le installa da
-sé. Binari e plugin in `/usr/lib/zuer`, `zuer` e `zuer-gui` in `/usr/bin`, Zuer nel
-menu delle applicazioni. Non cambia le app predefinite. Senza il decoder VP9 su GPU
-(compute_vp9 non è nei repository di Ubuntu): il VP9 passa da FFmpeg, come su macOS e
-Windows. Serve una sessione Wayland (quella predefinita di Ubuntu). (CI: costruito,
-installato con `apt`, `--version` di entrambi i programmi, nessuna libreria mancante,
-rimosso; verificato: costruito e installato in un container Ubuntu 26.04)
+Zuer apriva prima una finestra grande e poi la adattava al file. Ora prepara il file
+prima di creare la finestra, che compare già della forma giusta e col contenuto pronto.
+Se un file richiede più di 0,6 s, la finestra parte su una stima e si adatta dopo,
+come prima. Su macOS, aprendo dal Finder, Zuer non mostra più la finestra della
+ricerca YouTube che poi diventava quella del file. (verificato su Linux con immagini,
+video e PDF; sotto Darling: 21 casi di apertura dal Finder; CI: `open -a` su macOS
+arm64 e Intel, finestra nata sul file)
 
-### macOS: file con gli accenti aperti dal Finder
+### Informazioni sul file: `i`
 
-Un file con lettere accentate aperto dal Finder ("Apri con", doppio clic, `open -a`)
-arrivava con il nome in un'altra forma Unicode (decomposta, `è` = `e` + accento) e
-Zuer rispondeva che il file non esisteva. Ora lo ritrova confrontando i nomi della
-cartella in forma canonica; se due file diversi sono equivalenti non sceglie e lo dice.
-Vale anche per cartelle con accenti, giapponese e coreano. (sotto Darling: 21 casi,
-apertura a freddo e con Zuer già aperto)
+Un popup con nome, tipo, risoluzione (dei video quella vera), pagina, durata, righe e
+colonne o vertici a seconda del file, peso, data di modifica, cartella e posizione nella
+cartella. Si aggiorna mentre si naviga con le frecce; `i` o Esc lo chiudono.
+(verificato su immagini, video, PDF e testo)
 
-### Un errore non resta in memoria al posto del file
+### Tasti rivisti
 
-Se un file non si apriva (per esempio perché non c'era ancora), il messaggio d'errore
-restava nella cache delle anteprime e tornava anche dopo, a file presente. Ora gli
-errori non entrano mai nella cache. (verificato, sotto Darling)
+- Tolti: `1`…`5` (stile della finestra) e `Ctrl+D`. `h` ora apre e chiude la guida
+  (prima andava tenuto premuto).
+- Nuovi: `Home`/`Fine` (primo e ultimo file; inizio e fine nei testi; prima e ultima
+  pagina nei PDF; nei video `Home` riparte dall'inizio), `Maiusc+←/→` (±30 secondi),
+  `1` (pixel reali), `Ctrl+C` fuori dai testi (copia il percorso), `Ctrl+W`/`Ctrl+Q`
+  per chiudere (Cmd su macOS).
+- `+`, `-` e `?` seguono la tastiera in uso: sulla tastiera italiana lo zoom ora
+  funziona.
+- Esc chiude prima il popup aperto, poi esce dallo schermo intero, poi chiude Zuer.
+  Prima su Linux e Windows ogni Esc chiudeva Zuer, anche dalla ricerca YouTube o
+  dentro un archivio.
 
-### Esploratore: i collegamenti si vedono
-
-Nell'esploratore (`e`) e nella navigazione con le frecce i collegamenti simbolici
-sparivano. Ora valgono per ciò a cui puntano: una cartella collegata si apre come una
-cartella. Un collegamento rotto resta escluso. (verificato; sotto Darling la home di
-macOS mostra Download, Desktop e Documenti)
-
-### macOS: video senza decodifica hardware
-
-Su un sistema dove VideoToolbox non decodifica il codec, Zuer passa subito alla
-decodifica software invece di provarci. Prima, sotto Darling, aprire un mp4 chiudeva
-Zuer. (sotto Darling: un mp4 H.264 si riproduce; non verificato su un Mac, dove H.264 e
-HEVC restano in hardware)
+(verificato su Linux con una tastiera virtuale; non verificato a mano su Windows e macOS)
 
 ## Distribuzione
 
@@ -55,10 +48,10 @@ Zuer e Zicro, architettura, sha256).
 
 | Sistema | Architettura | Artefatto |
 |---|---|---|
-| macOS 13 o successivo | Apple Silicon (arm64) | `zuer-0.1.1-macos-arm64.tar.gz` (`Zuer.app`, con FFmpeg e MoltenVK in `Contents/Frameworks`) |
-| macOS 13 o successivo | Intel (x86_64) | `zuer-0.1.1-macos-x86_64.tar.gz` (stesso contenuto, compilato e provato su un Mac Intel) |
-| Windows 10/11 | x64 | `zuer-0.1.1-windows-x64-setup.exe` |
-| Ubuntu 26.04 LTS | x64 | `zuer-0.1.1-ubuntu26.04-amd64.deb` |
+| macOS 13 o successivo | Apple Silicon (arm64) | `zuer-0.1.2-macos-arm64.tar.gz` (`Zuer.app`, con FFmpeg e MoltenVK in `Contents/Frameworks`) |
+| macOS 13 o successivo | Intel (x86_64) | `zuer-0.1.2-macos-x86_64.tar.gz` (stesso contenuto, compilato e provato su un Mac Intel) |
+| Windows 10/11 | x64 | `zuer-0.1.2-windows-x64-setup.exe` |
+| Ubuntu 26.04 LTS | x64 | `zuer-0.1.2-ubuntu26.04-amd64.deb` |
 | Altre distribuzioni Linux | x64 | dai sorgenti: `zig build` + `install.sh` |
 
 Quale pacchetto macOS: menu Apple → Informazioni su questo Mac. "Chip Apple M…" →
@@ -69,7 +62,7 @@ sono pacchetti universali né Windows ARM.
 **Verifica del download**: nella cartella dei file scaricati,
 `sha256sum -c SHA256SUMS --ignore-missing` (Linux/Git Bash) oppure
 `shasum -a 256 -c SHA256SUMS` (macOS); su Windows
-`Get-FileHash .\zuer-0.1.1-windows-x64-setup.exe -Algorithm SHA256` e confronto a mano.
+`Get-FileHash .\zuer-0.1.2-windows-x64-setup.exe -Algorithm SHA256` e confronto a mano.
 
 **macOS**: estrarre l'archivio e trascinare `Zuer.app` in Applicazioni. Il pacchetto
 **non è firmato con un Developer ID né notarizzato** (la firma è solo ad-hoc): al primo
@@ -89,7 +82,7 @@ con il `tar` di sistema; `.doc` e `.rtf` con `textutil`; video con FFmpeg LGPL c
 dal sorgente (VideoToolbox, AV1 software con dav1d); 3D con MoltenVK. Disinstallazione:
 cancellare `Zuer.app` (cache in `~/.cache/zuer`).
 
-**Ubuntu**: `sudo apt install ./zuer-0.1.1-ubuntu26.04-amd64.deb` (con `./`: apt
+**Ubuntu**: `sudo apt install ./zuer-0.1.2-ubuntu26.04-amd64.deb` (con `./`: apt
 installa anche le dipendenze). Il pacchetto non è firmato né in un repository: gli
 aggiornamenti si installano allo stesso modo. Disinstallazione: `sudo apt remove zuer`
 (cache in `~/.cache/zuer`). Solo Ubuntu 26.04: sulle versioni precedenti le librerie
@@ -110,7 +103,7 @@ i modelli 3D non si vedono, con il motivo a schermo.
 (commit e opzioni di configure: la build si ripete con `scripts/build-ffmpeg.sh`);
 `THIRD-PARTY-NOTICES.txt` (libwebp, nanosvg, TinySoundFont, stb);
 su Windows PDFium con `PDFium-LICENSE.txt`; su macOS MoltenVK (Apache-2.0) con
-`MoltenVK-LICENSE.txt`. Il sorgente di Zuer è il tag `v0.1.1`, quello di Zicro il commit
+`MoltenVK-LICENSE.txt`. Il sorgente di Zuer è il tag `v0.1.2`, quello di Zicro il commit
 in `.github/zicro.ref`. La procedura per una nuova versione è in RELEASE-1.0.0.md,
 "Fare una nuova versione".
 

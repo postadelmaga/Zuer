@@ -3,7 +3,7 @@
 Un visualizzatore di file veloce, scritto in Zig. Apri un file, o una cartella, e lo vedi
 subito: documenti, tabelle, immagini, video, audio, modelli 3D e archivi.
 
-Funziona su **Linux**, **Windows** e **macOS** (Apple Silicon e Intel). Versione **0.1.1**:
+Funziona su **Linux**, **Windows** e **macOS** (Apple Silicon e Intel). Versione **0.1.2**:
 le novità sono in [RELEASE.md](RELEASE.md).
 
 ## Cosa apre
