@@ -54,8 +54,8 @@ pub const SubCue = struct { start: f64, end: f64, text: []u8 };
 /// Stato dell'overlay, dentro `Shared` (ogni accesso sotto `shared.mutex`).
 pub const YtState = struct {
     active: bool = false,
-    /// Query corrente (byte UTF-8 così come digitati).
-    query: std.ArrayList(u8) = .empty,
+    /// Campo query: testo UTF-8 + caret + selezione (zicro.line_edit).
+    query: QueryEdit = .{},
     results: []Result = &.{},
     /// Card selezionata nella griglia (-1 = nessuna).
     sel: i32 = -1,
@@ -73,11 +73,6 @@ pub const YtState = struct {
     /// Il tasto `y` che ha aperto l'overlay produce anche un evento testo
     /// (`on_text` è additivo a `on_key`): va inghiottito una volta.
     swallow_text: bool = false,
-    /// Ctrl+A: query tutta selezionata (il prossimo input la rimpiazza).
-    sel_all: bool = false,
-    /// Backspace fisicamente premuto: il render worker genera l'autorepeat
-    /// (zrame non sintetizza il key-repeat di Wayland).
-    bs_held: bool = false,
     /// La selezione è appena cambiata da tastiera: al prossimo draw lo scroll
     /// la insegue (l'hover del mouse e la rotella NON la inseguono).
     follow_sel: bool = false,
@@ -128,7 +123,6 @@ pub fn freeResults(gpa: std.mem.Allocator, results: []Result) void {
 /// Libera tutto lo stato posseduto (a fine processo).
 pub fn deinit(state: *GuiAppState) void {
     const yt = &state.shared.yt;
-    yt.query.deinit(state.gpa);
     freeResults(state.gpa, yt.results);
     yt.results = &.{};
     if (yt.err) |e| state.gpa.free(e);
@@ -191,75 +185,81 @@ fn setErr(state: *GuiAppState, msg: []const u8) void {
 
 // ── Editing della textbox ────────────────────────────────────────────────────
 
-/// Inserisce testo nella query (digitazione o incolla). Con Ctrl+A attivo il
-/// nuovo testo RIMPIAZZA la selezione. Con `shared.mutex` acquisito.
-pub fn insertText(state: *GuiAppState, bytes: []const u8) void {
+/// Il campo query: una riga, al massimo 256 byte (oltre ogni ragionevolezza).
+pub const QueryEdit = zicro.line_edit.LineEdit(256);
+
+pub const Move = struct { word: bool, extend: bool };
+
+/// Un'operazione sul campo query (tasti di editing, digitazione, incolla).
+pub const QueryOp = union(enum) {
+    insert: []const u8,
+    backspace: bool, // true = per parola (Ctrl)
+    delete: bool,
+    left: Move,
+    right: Move,
+    home: bool, // true = estende la selezione (Shift)
+    end: bool,
+    select_all,
+    cut,
+};
+
+/// Applica `op` al campo query. Se il TESTO cambia i risultati mostrati non
+/// corrispondono più: vengono invalidati e si torna alla vista ricerca; i soli
+/// movimenti del caret non toccano nulla. Con `shared.mutex` acquisito.
+pub fn editQuery(state: *GuiAppState, op: QueryOp) void {
     const yt = &state.shared.yt;
-    if (yt.sel_all) {
-        yt.query.clearRetainingCapacity();
-        yt.sel_all = false;
+    const q = &yt.query;
+    var before: [256]u8 = undefined;
+    const before_len = q.len;
+    @memcpy(before[0..before_len], q.text());
+    switch (op) {
+        .insert => |t| q.insert(t),
+        .backspace => |w| q.backspace(w),
+        .delete => |w| q.delete(w),
+        .left => |m| q.left(m.word, m.extend),
+        .right => |m| q.right(m.word, m.extend),
+        .home => |e| q.home(e),
+        .end => |e| q.end(e),
+        .select_all => q.selectAll(),
+        .cut => {
+            const sel = q.selectedText();
+            if (sel.len == 0) return;
+            copyText(state, sel);
+            _ = q.deleteSelection();
+        },
     }
-    if (yt.query.items.len + bytes.len > 256) return; // query oltre ogni ragionevolezza
-    yt.query.appendSlice(state.gpa, bytes) catch return;
-    yt.show_queue = false;
-    invalidateResults(state);
+    if (!std.mem.eql(u8, before[0..before_len], q.text())) {
+        yt.show_queue = false;
+        invalidateResults(state);
+    }
     state.shared.file_changed = true;
 }
 
-/// Una cancellazione di Backspace: con Ctrl+A attivo svuota la query, altrimenti
-/// rimuove l'ultimo codepoint UTF-8. Usata dal key handler (pressione) e dal
-/// render worker (autorepeat). Con `shared.mutex` acquisito.
-pub fn backspaceOnce(state: *GuiAppState) void {
-    const yt = &state.shared.yt;
-    if (yt.sel_all) {
-        if (yt.query.items.len == 0) {
-            yt.sel_all = false;
-            return;
-        }
-        yt.query.clearRetainingCapacity();
-        yt.sel_all = false;
-    } else {
-        const q = &yt.query;
-        if (q.items.len == 0) return;
-        // Rimuove l'ultimo codepoint UTF-8 (i byte continuazione 10xxxxxx).
-        var i = q.items.len - 1;
-        while (i > 0 and (q.items[i] & 0xC0) == 0x80) i -= 1;
-        q.shrinkRetainingCapacity(i);
-    }
-    yt.show_queue = false;
-    invalidateResults(state);
-    state.shared.file_changed = true;
-}
-
-/// Ctrl+C: copia la query negli appunti. La copia (wl-copy + waitpid) avviene su
-/// un thread così il lock non resta tenuto per un subprocess.
-pub fn copyQuery(state: *GuiAppState) void {
-    const yt = &state.shared.yt;
-    if (yt.query.items.len == 0) return;
-    const txt = state.gpa.dupe(u8, yt.query.items) catch return;
-    const t = std.Thread.spawn(.{}, copyWorker, .{ state, txt }) catch {
-        state.gpa.free(txt);
+/// Copia `txt` negli appunti. La copia (wl-copy + waitpid) avviene su un thread
+/// così il lock non resta tenuto per un subprocess.
+fn copyText(state: *GuiAppState, txt: []const u8) void {
+    const dup = state.gpa.dupe(u8, txt) catch return;
+    const t = std.Thread.spawn(.{}, copyWorker, .{ state, dup }) catch {
+        state.gpa.free(dup);
         return;
     };
     t.detach();
 }
 
-/// Ctrl+C nell'overlay: con una card selezionata copia il LINK del video
-/// (youtube.com/watch?v=…); con la query tutta selezionata (Ctrl+A) o senza
-/// risultati copia la query. Con `shared.mutex` acquisito.
+/// Ctrl+C nell'overlay: il testo selezionato nel campo, se c'è; altrimenti con
+/// una card selezionata il LINK del video (youtube.com/watch?v=…); altrimenti
+/// tutta la query. Con `shared.mutex` acquisito.
 pub fn copyQueryOrLink(state: *GuiAppState) void {
     const yt = &state.shared.yt;
-    if (!yt.sel_all and yt.sel >= 0 and yt.sel < @as(i32, @intCast(shown(yt).len))) {
+    const sel = yt.query.selectedText();
+    if (sel.len > 0) return copyText(state, sel);
+    if (yt.sel >= 0 and yt.sel < @as(i32, @intCast(shown(yt).len))) {
         const r = shown(yt)[@intCast(yt.sel)];
-        const link = std.fmt.allocPrint(state.gpa, "https://www.youtube.com/watch?v={s}", .{r.id}) catch return;
-        const t = std.Thread.spawn(.{}, copyWorker, .{ state, link }) catch {
-            state.gpa.free(link);
-            return;
-        };
-        t.detach();
-        return;
+        var link_buf: [128]u8 = undefined;
+        const link = std.fmt.bufPrint(&link_buf, "https://www.youtube.com/watch?v={s}", .{r.id}) catch return;
+        return copyText(state, link);
     }
-    copyQuery(state);
+    if (yt.query.len > 0) copyText(state, yt.query.text());
 }
 
 fn copyWorker(state: *GuiAppState, txt: []u8) void {
@@ -301,7 +301,7 @@ fn pasteWorker(state: *GuiAppState) void {
     state.shared.mutex.lockUncancelable(state.io);
     defer state.shared.mutex.unlock(state.io);
     if (!state.shared.yt.active) return;
-    insertText(state, trimmed);
+    editQuery(state, .{ .insert = trimmed });
 }
 
 // ── Ricerca ──────────────────────────────────────────────────────────────────
@@ -312,8 +312,8 @@ const search_max = 12;
 /// Da chiamare con `shared.mutex` acquisito (thread finestra, Invio).
 pub fn startSearch(state: *GuiAppState) void {
     const yt = &state.shared.yt;
-    if (yt.query.items.len == 0 or yt.searching) return;
-    const q = state.gpa.dupe(u8, yt.query.items) catch return;
+    if (yt.query.len == 0 or yt.searching) return;
+    const q = state.gpa.dupe(u8, yt.query.text()) catch return;
     invalidateResults(state);
     yt.searching = true;
     state.shared.file_changed = true;
@@ -1540,6 +1540,32 @@ const text_dim = [3]u8{ 150, 158, 175 };
 const text_err = [3]u8{ 240, 120, 110 };
 const text_link = [3]u8{ 120, 160, 255 };
 
+/// Codepoint nel testo (= colonne: i glifi dell'overlay sono a cella fissa).
+fn colCount(t: []const u8) usize {
+    var n: usize = 0;
+    for (t) |c| {
+        if (c & 0xC0 != 0x80) n += 1;
+    }
+    return n;
+}
+
+/// Offset in byte della colonna `col` (o la fine del testo).
+fn byteAtCol(t: []const u8, col: usize) usize {
+    var n: usize = 0;
+    for (t, 0..) |c, i| {
+        if (c & 0xC0 != 0x80) {
+            if (n == col) return i;
+            n += 1;
+        }
+    }
+    return t.len;
+}
+
+/// Il caret del campo query (barra verticale alta quanto il campo, meno i margini).
+fn drawCaret(canvas: *paint.Canvas, x: i32, field_y: i32, rgb: [3]u8) void {
+    canvas.fillRoundedRect(@floatFromInt(x + 1), @floatFromInt(field_y + 7), 2.0, @floatFromInt(input_h - 14), 1.0, paint.Color.rgba(rgb[0], rgb[1], rgb[2], 0.9));
+}
+
 /// Testo monospazio troncato a `max_w` px; ritorna la larghezza usata.
 /// Pubblica: riusata dall'esploratore file (stesso stile di overlay).
 pub fn drawText(buf: []u8, W: u32, H: u32, raster: *glyph.Raster, x: i32, baseline: i32, text: []const u8, rgb: [3]u8, max_w: i32) i32 {
@@ -1652,25 +1678,32 @@ pub fn drawOverlay(buf: []u8, W: u32, H: u32, state: *GuiAppState, raster: *glyp
     const in_x = lay.xp + pad + 12;
     const in_max = lay.wp - pad * 2 - 24 - input_h; // spazio a destra per lo spinner
     const in_base = lay.yp + pad + @divTrunc(input_h - line_h, 2) + raster.ascent;
-    if (yt.query.items.len == 0) {
+    if (yt.query.len == 0) {
         _ = drawText(buf, W, H, raster, in_x, in_base, "Cerca su YouTube…", text_dim, in_max);
+        if (yt.sel < 0) drawCaret(&canvas, in_x, lay.yp + pad, text_fg);
     } else {
-        // Ctrl+A: highlight di selezione dietro il testo (larghezza dei codepoint
-        // effettivamente visibili, come li disegna drawText).
-        if (yt.sel_all) {
-            var cols: i32 = 0;
-            var view = std.unicode.Utf8View.init(yt.query.items) catch null;
-            if (view) |*v| {
-                var it = v.iterator();
-                while (it.nextCodepoint()) |_| cols += 1;
+        // Glifi a cella fissa: tutto si misura in colonne (codepoint). Se il testo
+        // non entra, la vista scorre quanto basta a tenere il caret dentro.
+        const q = &yt.query;
+        const adv = raster.advance;
+        const fit: usize = if (adv > 0) @intCast(@max(1, @divTrunc(in_max, adv) - 1)) else 1;
+        const caret_col = colCount(q.text()[0..q.cursor]);
+        const first_col = caret_col -| fit;
+        const start = byteAtCol(q.text(), first_col);
+        const shown_txt = q.text()[start..];
+        if (q.selection()) |r| {
+            const c0 = colCount(q.text()[0..r.start]) -| first_col;
+            const c1 = @min(colCount(q.text()[0..r.end]) -| first_col, fit + 1);
+            if (c1 > c0) {
+                const x0 = in_x + @as(i32, @intCast(c0)) * adv;
+                canvas.fillRoundedRect(@floatFromInt(x0 - 1), @floatFromInt(lay.yp + pad + 6), @floatFromInt(@as(i32, @intCast(c1 - c0)) * adv + 2), @floatFromInt(input_h - 12), 3.0, paint.Color.rgba(70, 110, 190, 0.55));
             }
-            const sel_w = @min(cols * raster.advance, in_max);
-            canvas.fillRoundedRect(@floatFromInt(in_x - 2), @floatFromInt(lay.yp + pad + 6), @floatFromInt(sel_w + 4), @floatFromInt(input_h - 12), 3.0, paint.Color.rgba(70, 110, 190, 0.55));
         }
-        const tw = drawText(buf, W, H, raster, in_x, in_base, yt.query.items, text_fg, in_max);
-        if (!yt.sel_all) {
-            canvas.fillRoundedRect(@floatFromInt(in_x + tw + 1), @floatFromInt(lay.yp + pad + 7), 2.0, @floatFromInt(input_h - 14), 1.0, paint.Color.rgba(text_fg[0], text_fg[1], text_fg[2], 0.9));
-        }
+        _ = drawText(buf, W, H, raster, in_x, in_base, shown_txt, text_fg, in_max);
+        // Caret solo col fuoco sul campo (nessuna card selezionata: le frecce
+        // muovono lui, non la griglia).
+        if (yt.sel < 0 and q.selection() == null)
+            drawCaret(&canvas, in_x + @as(i32, @intCast(caret_col - first_col)) * adv, lay.yp + pad, text_fg);
     }
     if (yt.searching or yt.opening) {
         const scx: f32 = @floatFromInt(lay.xp + lay.wp - pad - @divTrunc(input_h, 2));

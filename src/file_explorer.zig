@@ -334,7 +334,6 @@ pub fn openFromSystem(state: *GuiAppState, path: []const u8) void {
     const yt = &state.shared.yt;
     if (yt.active) {
         yt.active = false;
-        yt.bs_held = false;
         _ = yt.scroll.onRelease();
         state.shared.file_changed = true;
     }

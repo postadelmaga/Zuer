@@ -45,6 +45,8 @@ const KEY_Q: u32 = 16;
 const KEY_ENTER: u32 = 28;
 const KEY_Y: u32 = 21;
 const KEY_BACKSPACE: u32 = 14;
+const KEY_DELETE: u32 = 111;
+const KEY_X: u32 = 45;
 const KEY_A: u32 = 30;
 const KEY_O: u32 = 24;
 const KEY_R: u32 = 19;
@@ -445,9 +447,13 @@ fn toggleVoxel(app_state: *GuiAppState) void {
 }
 
 /// Tasti dell'overlay di ricerca YouTube. Ritorna true se l'evento è consumato:
-/// col pannello aperto TUTTA la tastiera è sua (Esc chiude, ↑/↓ selezionano,
-/// Invio cerca/apre, Backspace cancella; i caratteri arrivano da `textCallback`).
-/// A pannello chiuso, `y` lo apre.
+/// col pannello aperto TUTTA la tastiera è sua; i caratteri arrivano da
+/// `textCallback`. A pannello chiuso, `y` lo apre.
+///
+/// Il fuoco è sul campo query (nessuna card selezionata, `sel < 0`) o sulla
+/// griglia: ←/→ muovono il caret o la card di conseguenza; ↓ dal campo entra
+/// nella griglia, ↑ dalla prima riga torna al campo. Shift/Ctrl+frecce, Home,
+/// End, Backspace e Canc lavorano sempre sul testo (zicro.line_edit).
 fn handleYtKey(app_state: *GuiAppState, key: u32) bool {
     app_state.shared.mutex.lockUncancelable(app_state.io);
     defer app_state.shared.mutex.unlock(app_state.io);
@@ -459,8 +465,6 @@ fn handleYtKey(app_state: *GuiAppState, key: u32) bool {
             // Il 'y' di apertura genera anche un evento testo (on_text è
             // additivo a on_key): non deve finire nella query.
             yt.swallow_text = true;
-            yt.sel_all = false;
-            yt.bs_held = false;
             _ = yt.scroll.onRelease();
             app_state.shared.file_changed = true;
             return true;
@@ -468,14 +472,17 @@ fn handleYtKey(app_state: *GuiAppState, key: u32) bool {
         return false;
     }
     // Scorciatoie col Ctrl: seleziona tutto / copia / incolla nella textbox.
+    const shift = app_state.shift_down;
     if (app_state.ctrl_down) {
         switch (key) {
-            KEY_A => {
-                if (yt.query.items.len > 0) {
-                    yt.sel_all = true;
-                    app_state.shared.file_changed = true;
-                }
-            },
+            KEY_A => yt_search.editQuery(app_state, .select_all),
+            KEY_X => yt_search.editQuery(app_state, .cut),
+            KEY_BACKSPACE => yt_search.editQuery(app_state, .{ .backspace = true }),
+            KEY_DELETE => yt_search.editQuery(app_state, .{ .delete = true }),
+            KEY_LEFT => yt_search.editQuery(app_state, .{ .left = .{ .word = true, .extend = shift } }),
+            KEY_RIGHT => yt_search.editQuery(app_state, .{ .right = .{ .word = true, .extend = shift } }),
+            KEY_HOME => yt_search.editQuery(app_state, .{ .home = shift }),
+            KEY_END => yt_search.editQuery(app_state, .{ .end = shift }),
             // Con una card selezionata copia il link del video; con Ctrl+A
             // (o senza risultati) copia la query.
             KEY_C => yt_search.copyQueryOrLink(app_state),
@@ -492,26 +499,27 @@ fn handleYtKey(app_state: *GuiAppState, key: u32) bool {
     switch (key) {
         KEY_ESC => {
             yt.active = false;
-            yt.bs_held = false;
             _ = yt.scroll.onRelease();
             app_state.shared.file_changed = true;
         },
-        KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT => {
-            // Navigazione a griglia: ←/→ di una card, ↑/↓ di una riga. Lo
-            // scroll insegue la selezione (solo per la tastiera: follow_sel).
-            const n: i32 = @intCast(yt_search.shown(yt).len);
-            if (n > 0) {
-                const step: i32 = switch (key) {
-                    KEY_LEFT => -1,
-                    KEY_RIGHT => 1,
-                    KEY_UP => -yt_search.grid_cols,
-                    else => yt_search.grid_cols,
-                };
-                yt.sel = std.math.clamp(yt.sel + step, 0, n - 1);
+        KEY_LEFT, KEY_RIGHT => if (shift or yt.sel < 0) {
+            const m: yt_search.Move = .{ .word = false, .extend = shift };
+            yt_search.editQuery(app_state, if (key == KEY_LEFT) .{ .left = m } else .{ .right = m });
+        } else gridStep(app_state, key),
+        KEY_UP => if (yt.sel >= 0 and yt.sel < yt_search.grid_cols) {
+            yt.sel = -1; // dalla prima riga si torna al campo
+            app_state.shared.file_changed = true;
+        } else if (yt.sel >= 0) gridStep(app_state, key),
+        KEY_DOWN => if (yt.sel < 0) {
+            if (yt_search.shown(yt).len > 0) {
+                yt.sel = 0;
                 yt.follow_sel = true;
                 app_state.shared.file_changed = true;
             }
-        },
+        } else gridStep(app_state, key),
+        KEY_HOME => yt_search.editQuery(app_state, .{ .home = shift }),
+        KEY_END => yt_search.editQuery(app_state, .{ .end = shift }),
+        KEY_DELETE => yt_search.editQuery(app_state, .{ .delete = false }),
         KEY_PGUP, KEY_PGDOWN => {
             const n: i32 = @intCast(yt_search.shown(yt).len);
             if (n > 0) {
@@ -524,7 +532,7 @@ fn handleYtKey(app_state: *GuiAppState, key: u32) bool {
         KEY_ENTER => {
             // Un link YouTube incollato nella query si apre direttamente,
             // senza passare dalla ricerca.
-            if (yt_search.videoIdFromUrl(yt.query.items)) |vid| {
+            if (yt_search.videoIdFromUrl(yt.query.text())) |vid| {
                 yt_search.openById(app_state, vid);
             } else if (yt_search.shown(yt).len > 0 and yt.sel >= 0) {
                 yt_search.openSelected(app_state);
@@ -532,16 +540,29 @@ fn handleYtKey(app_state: *GuiAppState, key: u32) bool {
                 yt_search.startSearch(app_state);
             }
         },
-        KEY_BACKSPACE => {
-            // Prima cancellazione subito; l'autorepeat (tasto tenuto giù) lo
-            // genera il render worker finché `bs_held` è vero (zrame non
-            // sintetizza il key-repeat di Wayland).
-            yt_search.backspaceOnce(app_state);
-            yt.bs_held = true;
-        },
+        // L'autorepeat (tasto tenuto giù) arriva dalla finestra come pressioni ripetute.
+        KEY_BACKSPACE => yt_search.editQuery(app_state, .{ .backspace = false }),
         else => {},
     }
     return true;
+}
+
+/// Un passo di navigazione nella griglia: ←/→ di una card, ↑/↓ di una riga. Lo
+/// scroll insegue la selezione (solo per la tastiera: follow_sel). Con
+/// `shared.mutex` acquisito.
+fn gridStep(app_state: *GuiAppState, key: u32) void {
+    const yt = &app_state.shared.yt;
+    const n: i32 = @intCast(yt_search.shown(yt).len);
+    if (n == 0) return;
+    const step: i32 = switch (key) {
+        KEY_LEFT => -1,
+        KEY_RIGHT => 1,
+        KEY_UP => -yt_search.grid_cols,
+        else => yt_search.grid_cols,
+    };
+    yt.sel = std.math.clamp(yt.sel + step, 0, n - 1);
+    yt.follow_sel = true;
+    app_state.shared.file_changed = true;
 }
 
 /// Callback `on_text` di zrame (traduzione xkbcommon layout-correct, additiva a
@@ -566,9 +587,9 @@ pub fn textCallback(win: *zrame.Window, bytes: [4]u8, len: u8, user: ?*anyopaque
         return;
     }
     if (app_state.ctrl_down) return;
-    // Inserimento (con eventuale rimpiazzo della selezione Ctrl+A); invalida i
-    // risultati mostrati, che non corrispondono più alla query.
-    yt_search.insertText(app_state, bytes[0..len]);
+    // Inserimento al caret (rimpiazza la selezione); invalida i risultati
+    // mostrati, che non corrispondono più alla query.
+    yt_search.editQuery(app_state, .{ .insert = bytes[0..len] });
 }
 
 pub fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) void {
@@ -580,12 +601,6 @@ pub fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) 
     if (key == KEY_LEFTCTRL or key == KEY_RIGHTCTRL) {
         app_state.ctrl_down = pressed;
         return;
-    }
-    // Rilascio del Backspace: ferma l'autorepeat dell'overlay (vedi bs_held).
-    if (!pressed and key == KEY_BACKSPACE) {
-        app_state.shared.mutex.lockUncancelable(app_state.io);
-        app_state.shared.yt.bs_held = false;
-        app_state.shared.mutex.unlock(app_state.io);
     }
     if (!pressed) return;
     const ctrl = app_state.ctrl_down;

@@ -458,12 +458,6 @@ fn renderWorker(
     var sub_raster: ?glyph.Raster = if (has_video) glyph.Raster.init(state.gpa, 17.0) catch null else null;
     defer if (sub_raster) |*r| r.deinit();
 
-    // Autorepeat del Backspace nell'overlay YouTube (zrame non sintetizza il
-    // key-repeat di Wayland): dopo il ritardo iniziale, una cancellazione ogni
-    // 50 ms finché il tasto resta giù (bs_held, azzerato al rilascio).
-    var bs_delay: f32 = 0;
-    var bs_rep: f32 = 0;
-
     // La primitiva scrollbar `state.shared.sc` è condivisa coi callback input: qui la si usa
     // solo entro il lock del mutex (già preso attorno alla sezione compose).
     // Secondi trascorsi dall'ultimo frame presentato (dal Pacer a fine loop); guida
@@ -493,18 +487,6 @@ fn renderWorker(
         if (state.shared.info and state.shared.info_card.seq != state.shared.load_seq) {
             info_popup.build(state);
             state.shared.file_changed = true;
-        }
-
-        // Autorepeat Backspace dell'overlay (vale per ogni ramo: testo, video…).
-        if (state.shared.yt.active and state.shared.yt.bs_held) {
-            bs_delay += frame_dt;
-            if (bs_delay >= 0.35) {
-                bs_rep += frame_dt;
-                while (bs_rep >= 0.05) : (bs_rep -= 0.05) yt_search.backspaceOnce(state);
-            }
-        } else {
-            bs_delay = 0;
-            bs_rep = 0;
         }
 
         // Traccia da quanto dura il caricamento per la soglia anti-flash.

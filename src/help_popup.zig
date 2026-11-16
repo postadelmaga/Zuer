@@ -48,10 +48,11 @@ pub const sections = [_]Section{
         .{ .k = "Invio  Esc", .d = "archivi: apri voce / elenco" },
     } },
     .{ .title = "Ricerca YouTube", .entries = &.{
-        .{ .k = "frecce  PagSu PagGiù", .d = "scegli il video" },
+        .{ .k = "frecce  PagSu PagGiù", .d = "scegli il video (↑: al campo)" },
+        .{ .k = "← →  Home Fine", .d = "cursore nel campo" },
         .{ .k = "Invio", .d = "cerca / apri" },
         .{ .k = mod ++ "Invio  destro", .d = "aggiungi / togli dalla coda" },
-        .{ .k = mod ++ "A C V", .d = "seleziona / copia / incolla" },
+        .{ .k = mod ++ "A C X V", .d = "seleziona/copia/taglia/incolla" },
         .{ .k = mod ++ "O", .d = "apri nel browser" },
         .{ .k = "Esc", .d = "chiudi" },
     } },
