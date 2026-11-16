@@ -709,7 +709,7 @@ pub fn drawOverlay(buf: []u8, W: u32, H: u32, state: *GuiAppState, raster: *glyp
     // la card selezionata entra intera nella banda.
     if (fx.follow_sel and fx.sel >= 0) fx.scroll.revealRow(geom(lay), @divTrunc(fx.sel, grid_cols));
     fx.follow_sel = false;
-    if (fx.scroll.tick(geom(lay), zrame.widget.nowMs())) state.shared.file_changed = true; // easing o dissolvenza in corso: un altro frame
+    if (fx.scroll.tick(geom(lay), zicro.widget.nowMs())) state.shared.file_changed = true; // easing o dissolvenza in corso: un altro frame
     fx.top_row = fx.scroll.topRow(geom(lay));
 
     const u32px: [*]u32 = @ptrCast(@alignCast(buf.ptr));

@@ -24,6 +24,7 @@ const build_options = @import("build_options");
 /// Vulkan renderer available: gates the voxel view (GPU-only feature).
 const native = build_options.gpu;
 const zrame = @import("zrame");
+const zicro = @import("zicro");
 
 // evdev key codes standard per Linux
 const KEY_ESC: u32 = 1;
@@ -824,7 +825,7 @@ fn stripFragment(path: []const u8) []const u8 {
 /// La rotella (`.scroll` di `on_mouse`): `value` in unità d'asse Wayland, positivo =
 /// scorri in giù / a destra.
 /// Pixel per unità d'asse: il passo della rotella di zicro, uguale in tutto lo stack.
-const wheel_px = zrame.scroll.wheel_gain;
+const wheel_px = zicro.scroll.wheel_gain;
 
 fn handleScroll(app_state: *GuiAppState, win: *zrame.Window, axis: u32, value: f32) void {
     // Overlay YouTube aperto: la rotella sfoglia la griglia dei risultati.

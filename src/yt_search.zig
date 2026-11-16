@@ -1420,7 +1420,7 @@ fn overlayDims(state: *GuiAppState, win: *zrame.Window) [2]u32 {
 }
 
 /// Rotella col pannello aperto: scorre la griglia col passo di zicro
-/// (`zrame.scroll.wheel_gain`), con l'easing applicato al disegno.
+/// (`zicro.scroll.wheel_gain`), con l'easing applicato al disegno.
 /// Ritorna true se l'evento è consumato (sempre, a overlay attivo).
 pub fn handleWheel(state: *GuiAppState, win: *zrame.Window, axis: u32, value: f32) bool {
     state.shared.mutex.lockUncancelable(state.io);
@@ -1642,7 +1642,7 @@ pub fn drawOverlay(buf: []u8, W: u32, H: u32, state: *GuiAppState, raster: *glyp
     // il mouse è già su una card visibile). La card selezionata entra intera.
     if (yt.follow_sel and yt.sel >= 0) yt.scroll.revealRow(geom(lay), @divTrunc(yt.sel, grid_cols));
     yt.follow_sel = false;
-    if (yt.scroll.tick(geom(lay), zrame.widget.nowMs())) state.shared.file_changed = true; // easing o dissolvenza in corso: un altro frame
+    if (yt.scroll.tick(geom(lay), zicro.widget.nowMs())) state.shared.file_changed = true; // easing o dissolvenza in corso: un altro frame
 
     const u32px: [*]u32 = @ptrCast(@alignCast(buf.ptr));
     var canvas = paint.Canvas.initRgba8(u32px[0 .. @as(usize, W) * H], W, H);
