@@ -1021,20 +1021,28 @@ pub const default_capture_capacity: usize = 1024 * 1024;
 /// complessiva di `default_run_timeout_ms`: un tool appeso non può bloccare il
 /// worker per sempre (vedi `runCaptureTimeout` per un valore esplicito).
 pub fn runCapture(allocator: std.mem.Allocator, argv: []const []const u8) !RunResult {
-    return sub.runCapture(allocator, argv, default_run_timeout_ms, default_capture_capacity);
+    return sub.runCapture(allocator, argv, default_run_timeout_ms, default_capture_capacity, null);
 }
 
 /// Come `runCapture`, con deadline complessiva esplicita: alla scadenza il
 /// processo viene terminato (SIGKILL / TerminateProcess) e ritorna `error.Timeout`.
 pub fn runCaptureTimeout(allocator: std.mem.Allocator, argv: []const []const u8, timeout_ms: u32) !RunResult {
-    return sub.runCapture(allocator, argv, timeout_ms, default_capture_capacity);
+    return sub.runCapture(allocator, argv, timeout_ms, default_capture_capacity, null);
+}
+
+/// Come `runCaptureTimeout`, interrompibile: quando `cancel` diventa vero (lo
+/// si controlla ogni ~50 ms) il processo viene terminato e ritorna
+/// `error.Canceled`. Su Unix il figlio ha un suo gruppo di processi e si
+/// termina il gruppo intero: anche i nipoti (es. deno lanciato da yt-dlp).
+pub fn runCaptureCancel(allocator: std.mem.Allocator, argv: []const []const u8, timeout_ms: u32, cancel: *const std.atomic.Value(bool)) !RunResult {
+    return sub.runCapture(allocator, argv, timeout_ms, default_capture_capacity, cancel);
 }
 
 /// Come `runCaptureTimeout`, con un hint ESPLICITO di capacità iniziale per lo
 /// stdout: chi conosce già l'ordine di grandezza dell'output (es. larghezza ×
 /// altezza × 3 di un PPM) evita del tutto le riallocazioni intermedie.
 pub fn runCaptureCapacity(allocator: std.mem.Allocator, argv: []const []const u8, timeout_ms: u32, capacity_hint: usize) !RunResult {
-    return sub.runCapture(allocator, argv, timeout_ms, capacity_hint);
+    return sub.runCapture(allocator, argv, timeout_ms, capacity_hint, null);
 }
 
 /// Legge un intero file senza `std.Io` (open/read/close libc su Unix,
@@ -1106,7 +1114,7 @@ const sub = switch (builtin.os.tag) {
         const WAIT_OBJECT_0: u32 = 0;
         const WAIT_TIMEOUT: u32 = 0x00000102;
 
-        fn runCapture(allocator: std.mem.Allocator, argv: []const []const u8, timeout_ms: u32, capacity_hint: usize) !RunResult {
+        fn runCapture(allocator: std.mem.Allocator, argv: []const []const u8, timeout_ms: u32, capacity_hint: usize, cancel: ?*const std.atomic.Value(bool)) !RunResult {
             if (argv.len == 0) return error.EmptyArgv;
             // Build a single, quoted command line (CreateProcess takes a string, not argv).
             // Quoting Win32 (regole di CommandLineToArgvW): le run di backslash che
@@ -1171,6 +1179,11 @@ const sub = switch (builtin.os.tag) {
             // scadenza il figlio viene terminato e si ritorna errore.
             const deadline: u64 = GetTickCount64() + timeout_ms;
             while (true) {
+                if (cancel) |c| if (c.load(.acquire)) {
+                    _ = TerminateProcess(pi.hProcess, 1);
+                    _ = WaitForSingleObject(pi.hProcess, 5000);
+                    return error.Canceled;
+                };
                 var avail: u32 = 0;
                 if (PeekNamedPipe(h_read, null, 0, null, &avail, null) == 0) break; // pipe chiusa → EOF
                 if (avail > 0) {
@@ -1298,6 +1311,12 @@ const sub = switch (builtin.os.tag) {
         // multi-thread (niente malloc nel figlio forkato → niente deadlock).
         extern "c" fn posix_spawnp(pid: *c_int, file: [*:0]const u8, file_actions: ?*const anyopaque, attrp: ?*const anyopaque, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) c_int;
         extern "c" fn posix_spawn_file_actions_init(fa: *anyopaque) c_int;
+        extern "c" fn posix_spawnattr_init(attr: *anyopaque) c_int;
+        extern "c" fn posix_spawnattr_destroy(attr: *anyopaque) c_int;
+        extern "c" fn posix_spawnattr_setflags(attr: *anyopaque, flags: c_short) c_int;
+        extern "c" fn posix_spawnattr_setpgroup(attr: *anyopaque, pgroup: c_int) c_int;
+        /// Uguale su glibc, musl, Bionic e Darwin.
+        const POSIX_SPAWN_SETPGROUP: c_short = 0x02;
         extern "c" fn posix_spawn_file_actions_destroy(fa: *anyopaque) c_int;
         extern "c" fn posix_spawn_file_actions_adddup2(fa: *anyopaque, fd: c_int, newfd: c_int) c_int;
         extern "c" fn posix_spawn_file_actions_addclose(fa: *anyopaque, fd: c_int) c_int;
@@ -1334,7 +1353,7 @@ const sub = switch (builtin.os.tag) {
             }
         }
 
-        fn runCapture(allocator: std.mem.Allocator, argv: []const []const u8, timeout_ms: u32, capacity_hint: usize) !RunResult {
+        fn runCapture(allocator: std.mem.Allocator, argv: []const []const u8, timeout_ms: u32, capacity_hint: usize, cancel: ?*const std.atomic.Value(bool)) !RunResult {
             if (argv.len == 0) return error.EmptyArgv;
 
             // argv null-terminato costruito PRIMA della fork: nel figlio non si può
@@ -1367,8 +1386,20 @@ const sub = switch (builtin.os.tag) {
             _ = posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", 1, 0); // O_WRONLY
             _ = posix_spawn_file_actions_addclose(&fa, read_fd);
 
+            // Interrompibile: gruppo di processi proprio (pgid = pid del figlio),
+            // così l'annullamento termina anche i processi che il figlio lancia.
+            var attr: [512]u8 align(16) = undefined;
+            const use_attr = cancel != null and posix_spawnattr_init(&attr) == 0;
+            defer if (use_attr) {
+                _ = posix_spawnattr_destroy(&attr);
+            };
+            if (use_attr) {
+                _ = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+                _ = posix_spawnattr_setpgroup(&attr, 0);
+            }
+
             var pid: c_int = 0;
-            const rc = posix_spawnp(&pid, argvZ[0].?, &fa, null, argvZ.ptr, environ);
+            const rc = posix_spawnp(&pid, argvZ[0].?, &fa, if (use_attr) @ptrCast(&attr) else null, argvZ.ptr, environ);
             _ = close(write_fd);
             if (rc != 0) return if (rc == 2) error.CommandNotFound else error.SpawnFailed; // 2 = ENOENT
 
@@ -1381,7 +1412,7 @@ const sub = switch (builtin.os.tag) {
                     _ = close(read_fd);
                     read_fd_open = false;
                 }
-                _ = kill(pid, 9); // SIGKILL
+                _ = kill(if (use_attr) -pid else pid, 9); // SIGKILL (al gruppo, se proprio)
                 _ = waitpid(pid, null, 0);
             };
 
@@ -1396,9 +1427,12 @@ const sub = switch (builtin.os.tag) {
             const deadline: i64 = nowMs() + timeout_ms;
             var pfd = [1]PollFd{.{ .fd = read_fd, .events = POLLIN, .revents = 0 }};
             while (true) {
+                if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
                 const remaining = deadline - nowMs();
                 if (remaining <= 0) return error.Timeout;
-                const pr = poll(&pfd, 1, @intCast(@min(remaining, std.math.maxInt(c_int))));
+                // Con un flag d'annullamento il poll dura al più 50 ms.
+                const slice: i64 = if (cancel != null) @min(remaining, 50) else remaining;
+                const pr = poll(&pfd, 1, @intCast(@min(slice, std.math.maxInt(c_int))));
                 if (pr == 0) continue; // scaduto il tratto: si ricontrolla la deadline
                 if (pr < 0) continue; // EINTR e simili: la deadline limita comunque il loop
                 // Con capacità libera si legge DIRETTAMENTE in coda al buffer:

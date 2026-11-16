@@ -967,6 +967,44 @@ const MpvEngine = if (mpv_enabled) struct {
         _ = &list;
     }
 
+    /// Mette nel pool un motore pronto se non ce n'è uno inattivo: chi sta per
+    /// aprire un video (es. lo stream YouTube mentre yt-dlp risolve) trova EGL,
+    /// mpv e shader già inizializzati. Non joina nulla (lo fa `acquire`): si può
+    /// chiamare da un thread che tiene altri lock. Inutilizzato, si ritira dopo
+    /// `ENGINE_IDLE_NS` come ogni motore inattivo.
+    fn prewarm(gpa: std.mem.Allocator) void {
+        if (unavailable.load(.acquire)) return;
+        lockPool();
+        const have = idle != null;
+        pool_lock.unlock();
+        if (have) return;
+        const eng = gpa.create(MpvEngine) catch return;
+        eng.* = .{ .gpa = gpa };
+        eng.thread = std.Thread.spawn(.{}, run, .{eng}) catch {
+            gpa.destroy(eng);
+            return;
+        };
+        trace("motore mpv: preavvio", .{});
+        lockPool();
+        const keep = idle == null;
+        if (keep) idle = eng;
+        pool_lock.unlock();
+        // Un altro preavvio (o un rilascio) ha riempito il posto nel frattempo.
+        if (!keep) {
+            eng.quit.store(true, .release);
+            eng.wake.notify();
+            lockPool();
+            var parked = false;
+            for (&exited) |*x| if (x.* == null) {
+                x.* = eng;
+                parked = true;
+                break;
+            };
+            pool_lock.unlock();
+            if (!parked) eng.shutdown();
+        }
+    }
+
     fn attach(eng: *MpvEngine, s: *VideoDecoder) void {
         lockPool();
         eng.attach_seq +%= 1;
@@ -1112,6 +1150,13 @@ fn trimHeap() void {
 }
 
 extern "c" fn malloc_trim(pad: usize) c_int;
+
+/// Prepara un motore mpv inattivo nel pool, se manca (vedi `MpvEngine.prewarm`).
+pub fn prewarmEngine(gpa: std.mem.Allocator) void {
+    if (comptime !mpv_enabled) return;
+    if (std.c.getenv("ZUER_NO_MPV") != null) return;
+    MpvEngine.prewarm(gpa);
+}
 
 /// Chiude il motore mpv inattivo (e quelli già ritirati), sul loro thread: per
 /// l'uscita ordinata dell'app e per i test che contano fd e thread.

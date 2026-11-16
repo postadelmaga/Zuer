@@ -184,6 +184,11 @@ pub fn setPresenter(p: ?Presenter) void {
     if (comptime @import("build_options").video) @import("video_decoder.zig").setPresenter(p);
 }
 
+/// Prepara in anticipo un motore video (mpv) per la prossima apertura.
+pub fn prewarmEngine(gpa: std.mem.Allocator) void {
+    if (comptime @import("build_options").video) @import("video_decoder.zig").prewarmEngine(gpa);
+}
+
 /// Chiude i motori video inattivi (mpv) sul loro thread: uscita ordinata e test.
 pub fn shutdownEngines() void {
     if (comptime @import("build_options").video) @import("video_decoder.zig").shutdownEngines();

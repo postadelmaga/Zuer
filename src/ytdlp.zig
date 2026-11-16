@@ -87,6 +87,50 @@ fn isExecutable(io: std.Io, path: []const u8) bool {
     return true;
 }
 
+/// Output di una risoluzione stream (vedi `yt_search.resolve`): una riga di
+/// titolo, 1-2 URL (video+audio DASH, o uno solo muxed) e una riga
+/// "subs:it=URL en=URL" (campi vuoti possibili). Slice dentro l'output.
+pub const Output = struct {
+    title: []const u8,
+    vurl: []const u8,
+    aurl: []const u8,
+    subs: []const u8 = "",
+};
+
+pub fn parseOutput(out: []const u8) error{NoUrl}!Output {
+    var lines = std.mem.tokenizeScalar(u8, out, '\n');
+    const title = std.mem.trimEnd(u8, lines.next() orelse "", "\r");
+    var subs: []const u8 = "";
+    var urls: [2][]const u8 = .{ "", "" };
+    var nurl: usize = 0;
+    while (lines.next()) |raw| {
+        const l = std.mem.trimEnd(u8, raw, "\r");
+        if (std.mem.startsWith(u8, l, "subs:")) {
+            subs = l["subs:".len..];
+        } else if (nurl < urls.len and std.mem.startsWith(u8, l, "http")) {
+            urls[nurl] = l;
+            nurl += 1;
+        }
+    }
+    if (nurl == 0) return error.NoUrl;
+    return .{ .title = title, .vurl = urls[0], .aurl = if (nurl > 1) urls[1] else urls[0], .subs = subs };
+}
+
+test "parseOutput: DASH, muxed, sottotitoli" {
+    const d = try parseOutput("Titolo\r\nhttps://v\r\nhttps://a\r\nsubs:it= en=https://s\r\n");
+    try std.testing.expectEqualStrings("Titolo", d.title);
+    try std.testing.expectEqualStrings("https://v", d.vurl);
+    try std.testing.expectEqualStrings("https://a", d.aurl);
+    try std.testing.expectEqualStrings("it= en=https://s", d.subs);
+
+    const m = try parseOutput("T\nhttps://m\nsubs:it= en=\n");
+    try std.testing.expectEqualStrings("https://m", m.vurl);
+    try std.testing.expectEqualStrings("https://m", m.aurl);
+    try std.testing.expectEqualStrings("it= en=", m.subs);
+
+    try std.testing.expectError(error.NoUrl, parseOutput("T\nsubs:\n"));
+}
+
 test "find: ZUER_YTDLP e cartelle note" {
     if (is_win) return error.SkipZigTest;
     const gpa = std.testing.allocator;

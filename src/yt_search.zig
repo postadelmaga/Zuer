@@ -105,7 +105,66 @@ pub const YtState = struct {
     subs_loading: bool = false,
     /// Cache dell'ultimo cue presentato: il lookup del frame dopo riparte da qui.
     sub_idx: usize = 0,
+    /// URL dei VTT del video corrente ("it=URL en=URL", posseduti), dalla
+    /// stessa estrazione yt-dlp dello stream: il tasto `c` li scarica con curl
+    /// senza rilanciare yt-dlp. Vuoto = sconosciuti (si ripiega su yt-dlp).
+    sub_urls: []u8 = &.{},
+    /// Prefetch: la card selezionata viene risolta in anticipo su un thread
+    /// (una alla volta); Invio la trova pronta, o aspetta quella in volo.
+    pf: ?Resolved = null,
+    pf_busy: bool = false,
+    /// Flag d'annullamento del prefetch in volo (del worker, valido finché
+    /// `pf_busy`): Invio su un ALTRO video lo alza e yt-dlp viene terminato.
+    pf_cancel: ?*std.atomic.Value(bool) = null,
+    /// Ultima (id, altezza) mandata in prefetch: non si ritenta la stessa.
+    pf_tried: IdBuf = .{},
+    pf_tried_h: u32 = 0,
 };
+
+/// Id video in un buffer fisso (gli id YouTube sono di 11 caratteri).
+pub const IdBuf = struct {
+    buf: [16]u8 = undefined,
+    len: u8 = 0,
+
+    fn get(self: *const IdBuf) []const u8 {
+        return self.buf[0..self.len];
+    }
+    fn set(self: *IdBuf, id: []const u8) bool {
+        if (id.len > self.buf.len) return false;
+        @memcpy(self.buf[0..id.len], id);
+        self.len = @intCast(id.len);
+        return true;
+    }
+    fn eql(self: *const IdBuf, id: []const u8) bool {
+        return self.len > 0 and std.mem.eql(u8, self.get(), id);
+    }
+};
+
+/// Esito di una risoluzione yt-dlp: stdout posseduto e slice al suo interno.
+pub const Resolved = struct {
+    id: IdBuf,
+    height: u32,
+    /// `zicro.widget.nowMs()` alla risoluzione (gli URL scadono dopo ore).
+    at_ms: i64,
+    out: []u8,
+    title: []const u8,
+    vurl: []const u8,
+    aurl: []const u8,
+    /// "it=URL en=URL" (campi vuoti possibili), o "".
+    subs: []const u8,
+
+    fn deinit(self: *Resolved, gpa: std.mem.Allocator) void {
+        gpa.free(self.out);
+    }
+    fn fresh(self: *const Resolved, id: []const u8, height: u32) bool {
+        return self.height == height and self.id.eql(id) and
+            zicro.widget.nowMs() - self.at_ms < prefetch_max_age_ms;
+    }
+};
+
+/// Oltre questa età un prefetch non si usa: gli URL googlevideo valgono ~6 h,
+/// ma un margine largo evita sorprese (cambio di rete/IP).
+const prefetch_max_age_ms: i64 = 20 * 60 * 1000;
 
 fn freeResult(gpa: std.mem.Allocator, r: Result) void {
     gpa.free(r.id);
@@ -130,6 +189,8 @@ pub fn deinit(state: *GuiAppState) void {
     for (yt.queue.items) |r| freeResult(state.gpa, r);
     yt.queue.deinit(state.gpa);
     clearCurrentStream(state);
+    if (yt.pf) |*p| p.deinit(state.gpa);
+    yt.pf = null;
 }
 
 /// Le card della griglia: la coda o i risultati della ricerca.
@@ -156,6 +217,8 @@ pub fn clearCurrentStream(state: *GuiAppState) void {
     yt.prev_pos = -1;
     freeSubs(state);
     yt.subs_on = false;
+    state.gpa.free(yt.sub_urls);
+    yt.sub_urls = &.{};
 }
 
 /// Svuota risultati/errore correnti (dopo una modifica alla query i vecchi
@@ -614,6 +677,10 @@ fn streamHeight(state: *GuiAppState) u32 {
 fn startOpen(state: *GuiAppState, id: []u8, title: ?[]u8, resume_s: f64, height: u32) void {
     const yt = &state.shared.yt;
     yt.opening = true;
+    cancelOtherPrefetch(yt, id, height);
+    // Il motore mpv si inizializza mentre yt-dlp risolve (apertura da link,
+    // cambio qualità: lì l'overlay non è aperto).
+    videomod.prewarmEngine(state.gpa);
     if (yt.err) |e| {
         state.gpa.free(e);
         yt.err = null;
@@ -900,30 +967,33 @@ fn finishOpenErr(state: *GuiAppState, msg: []const u8) void {
     state.shared.file_changed = true;
 }
 
-/// Thread di apertura: yt-dlp → URL video (DASH, altezza ≤ `height`) + URL
-/// audio su due righe (o una sola muxed). Con `title_opt == null` (apertura da
-/// link) anche il titolo viene chiesto a yt-dlp (`--print %(title)s`, prima
-/// riga). Con `resume_s > 0` (cambio qualità) la riproduzione riparte da lì. Il
-/// container libav viene aperto QUI, fuori dal lock (rete: secondi); solo lo
-/// swap dello stato avviene sotto `mutex`. Prende possesso di `id` e `title_opt`.
-fn openWorker(state: *GuiAppState, id: []u8, title_opt: ?[]u8, resume_s: f64, height: u32) void {
-    defer state.gpa.free(id);
-    if (comptime !has_video) {
-        if (title_opt) |t| state.gpa.free(t);
-        return;
-    }
+const ResolveError = error{ YtDlpMissing, Timeout, Canceled, NotRunnable, NotPlayable, NoUrl, OutOfMemory };
 
-    const exe = ytdlp.find(state.gpa, state.io) orelse {
-        if (title_opt) |t| state.gpa.free(t);
-        finishOpenErr(state, ytdlp.missing_msg);
-        return;
+fn resolveErrMsg(e: ResolveError) []const u8 {
+    return switch (e) {
+        error.YtDlpMissing => ytdlp.missing_msg,
+        error.Timeout => "risoluzione stream scaduta",
+        error.Canceled => "risoluzione annullata",
+        error.NotRunnable => "yt-dlp non eseguibile",
+        error.NotPlayable => "video non riproducibile (yt-dlp)",
+        error.NoUrl => "nessun URL dallo stream",
+        error.OutOfMemory => "memoria esaurita",
     };
-    defer state.gpa.free(exe);
-    const url = std.fmt.allocPrint(state.gpa, "https://www.youtube.com/watch?v={s}", .{id}) catch {
-        if (title_opt) |t| state.gpa.free(t);
-        return;
-    };
-    defer state.gpa.free(url);
+}
+
+/// Una chiamata yt-dlp → titolo, URL video (DASH, altezza ≤ `height`) + URL
+/// audio (o uno solo muxed) e URL dei sottotitoli it/en. I sottotitoli in
+/// modalità simulata non costano richieste: escono dalla stessa estrazione.
+/// Il grosso del tempo (secondi) è la JS challenge di YouTube risolta da yt-dlp
+/// con deno: per questo la card selezionata si risolve in anticipo (prefetch).
+fn resolve(gpa: std.mem.Allocator, io: std.Io, id: []const u8, height: u32, cancel: ?*const std.atomic.Value(bool)) ResolveError!Resolved {
+    var r: Resolved = .{ .id = .{}, .height = height, .at_ms = 0, .out = &.{}, .title = "", .vurl = "", .aurl = "", .subs = "" };
+    if (!r.id.set(id)) return error.NoUrl;
+
+    const exe = ytdlp.find(gpa, io) orelse return error.YtDlpMissing;
+    defer gpa.free(exe);
+    const url = try std.fmt.allocPrint(gpa, "https://www.youtube.com/watch?v={s}", .{id});
+    defer gpa.free(url);
 
     // Selettore formato dalla qualità scelta nei chip dell'overlay.
     var fmt_buf: [48]u8 = undefined;
@@ -933,17 +1003,18 @@ fn openWorker(state: *GuiAppState, id: []u8, title_opt: ?[]u8, resume_s: f64, he
     var sort_buf: [48]u8 = undefined;
     const sort: ?[]const u8 = if (hwdec_caps.get()) |caps| hwdec_caps.ytdlpSort(&sort_buf, caps, height) else null;
 
-    // `--print urls` equivale a `-g`; con titolo da scoprire lo si stampa come
-    // prima riga nella stessa estrazione (una sola chiamata yt-dlp).
-    var argv_buf: [14][]const u8 = undefined;
+    // Righe in uscita: titolo, 1-2 URL (`--print urls` = `-g`), "subs:it=… en=…".
+    // (Le chiavi col trattino, tipo en-orig, il template di yt-dlp non le legge.)
+    var argv_buf: [20][]const u8 = undefined;
     var argc: usize = 0;
-    const head = [_][]const u8{ exe, "--no-warnings", "--no-playlist" };
+    const head = [_][]const u8{
+        exe,            "--no-warnings",     "--no-playlist",
+        "--print",      "%(title).96s",      "--print",
+        "urls",         "--print",           "subs:it=%(requested_subtitles.it.url|)s en=%(requested_subtitles.en.url|)s",
+        "--write-subs", "--write-auto-subs", "--sub-langs",
+        "it,en",        "--sub-format",      "vtt",
+    };
     for (head) |a| {
-        argv_buf[argc] = a;
-        argc += 1;
-    }
-    const mid: []const []const u8 = if (title_opt == null) &.{ "--print", "%(title).96s", "--print", "urls" } else &.{"-g"};
-    for (mid) |a| {
         argv_buf[argc] = a;
         argc += 1;
     }
@@ -956,41 +1027,165 @@ fn openWorker(state: *GuiAppState, id: []u8, title_opt: ?[]u8, resume_s: f64, he
     argv_buf[argc + 1] = fmt_sel;
     argv_buf[argc + 2] = url;
     argc += 3;
-    var res = decoder_mod.runCaptureTimeout(state.gpa, argv_buf[0..argc], 30_000) catch |e| {
-        if (title_opt) |t| state.gpa.free(t);
-        finishOpenErr(state, if (e == error.Timeout) "risoluzione stream scaduta" else "yt-dlp non eseguibile");
+    const argv = argv_buf[0..argc];
+    // Sempre la variante interrompibile, anche senza annullamento: il gruppo di
+    // processi proprio fa sì che un timeout termini anche deno, non solo yt-dlp.
+    const never: std.atomic.Value(bool) = .init(false);
+    var res = decoder_mod.runCaptureCancel(gpa, argv, 60_000, cancel orelse &never) catch |e| return switch (e) {
+        error.Timeout => error.Timeout,
+        error.Canceled => error.Canceled,
+        else => error.NotRunnable,
+    };
+    errdefer res.deinit(gpa);
+    if (res.exit_code != 0) return error.NotPlayable;
+
+    const o = try ytdlp.parseOutput(res.stdout);
+    r.title = o.title;
+    r.vurl = o.vurl;
+    r.aurl = o.aurl;
+    r.subs = o.subs;
+    r.out = res.stdout;
+    r.at_ms = zicro.widget.nowMs();
+    return r;
+}
+
+/// Il prefetch di (`id`, `height`) se è pronto e fresco; se è ancora in volo lo
+/// aspetta (meglio che lanciare un secondo yt-dlp identico). null = da risolvere.
+fn takeResolved(state: *GuiAppState, id: []const u8, height: u32) ?Resolved {
+    // Il prefetch ha il suo timeout (60 s, vedi `resolve`): oltre, qualcosa non va.
+    var waited_ms: u32 = 0;
+    while (waited_ms < 65_000) : (waited_ms += 50) {
+        {
+            state.shared.mutex.lockUncancelable(state.io);
+            defer state.shared.mutex.unlock(state.io);
+            const yt = &state.shared.yt;
+            if (yt.pf) |*p| if (p.fresh(id, height)) {
+                const r = p.*;
+                yt.pf = null;
+                return r;
+            };
+            const in_flight = yt.pf_busy and yt.pf_tried.eql(id) and yt.pf_tried_h == height;
+            if (!in_flight) return null;
+        }
+        state.io.sleep(.fromMilliseconds(50), .awake) catch return null;
+    }
+    return null;
+}
+
+/// Da chiamare a ogni draw dell'overlay (con `shared.mutex`): se la card
+/// selezionata non è ancora risolta e nessun prefetch è in volo, ne avvia uno.
+/// Uno alla volta: scorrendo la griglia, alla fine del prefetch corrente si
+/// riparte dalla card selezionata in quel momento (il worker chiede un redraw).
+fn tickPrefetch(state: *GuiAppState) void {
+    if (comptime !has_video) return;
+    const yt = &state.shared.yt;
+    // Durante un'apertura il motore l'ha già preparato `startOpen`.
+    if (!yt.active or yt.opening) return;
+    // Overlay aperto = probabile apertura in arrivo: un motore mpv già pronto
+    // (il video in corso tiene occupato il suo) risparmia ~0,5 s al primo frame.
+    videomod.prewarmEngine(state.gpa);
+    if (yt.pf_busy) return;
+    const cards = shown(yt);
+    if (yt.sel < 0 or yt.sel >= @as(i32, @intCast(cards.len))) return;
+    const id = cards[@intCast(yt.sel)].id;
+    const height = streamHeight(state);
+    if (yt.pf_tried.eql(id) and yt.pf_tried_h == height) return;
+    if (yt.pf) |*p| if (p.fresh(id, height)) return;
+    var idb: IdBuf = .{};
+    if (!idb.set(id)) return;
+    const cancel = state.gpa.create(std.atomic.Value(bool)) catch return;
+    cancel.* = .init(false);
+    yt.pf_busy = true;
+    yt.pf_cancel = cancel;
+    yt.pf_tried = idb;
+    yt.pf_tried_h = height;
+    const t = std.Thread.spawn(.{}, prefetchWorker, .{ state, idb, height, cancel }) catch {
+        yt.pf_busy = false;
+        yt.pf_cancel = null;
+        state.gpa.destroy(cancel);
         return;
     };
-    defer res.deinit(state.gpa);
-    if (res.exit_code != 0) {
+    t.detach();
+}
+
+/// Interrompe il prefetch in volo se non è (`id`, `height`): chi apre un altro
+/// video non deve contendersi rete e CPU con una risoluzione ormai inutile.
+/// Con `shared.mutex` acquisito.
+fn cancelOtherPrefetch(yt: *YtState, id: []const u8, height: u32) void {
+    if (!yt.pf_busy) return;
+    if (yt.pf_tried.eql(id) and yt.pf_tried_h == height) return;
+    if (yt.pf_cancel) |c| c.store(true, .release);
+}
+
+/// Prende possesso di `cancel` (lo libera dopo averlo staccato da `YtState`).
+fn prefetchWorker(state: *GuiAppState, id: IdBuf, height: u32, cancel: *std.atomic.Value(bool)) void {
+    var r_opt: ?Resolved = resolve(state.gpa, state.io, id.get(), height, cancel) catch null;
+    state.shared.mutex.lockUncancelable(state.io);
+    defer state.shared.mutex.unlock(state.io);
+    const yt = &state.shared.yt;
+    yt.pf_busy = false;
+    yt.pf_cancel = null;
+    // Annullato: si potrà ritentare se la card torna selezionata.
+    if (cancel.load(.acquire)) yt.pf_tried = .{};
+    state.gpa.destroy(cancel);
+    if (r_opt) |*r| {
+        if (yt.pf) |*old| old.deinit(state.gpa);
+        yt.pf = r.*;
+        r_opt = null;
+    }
+    // Un redraw: se intanto la selezione è cambiata, `tickPrefetch` riparte.
+    state.shared.file_changed = true;
+}
+
+/// Thread di apertura: risolve lo stream (dal prefetch se pronto, altrimenti
+/// con yt-dlp, vedi `resolve`). Con `title_opt == null` (apertura da link) il
+/// titolo è quello di yt-dlp. Con `resume_s > 0` (cambio qualità) la
+/// riproduzione riparte da lì. Il container libav viene aperto QUI, fuori dal
+/// lock (rete: secondi); solo lo swap dello stato avviene sotto `mutex`.
+/// Prende possesso di `id` e `title_opt`.
+fn openWorker(state: *GuiAppState, id: []u8, title_opt: ?[]u8, resume_s: f64, height: u32) void {
+    defer state.gpa.free(id);
+    if (comptime !has_video) {
         if (title_opt) |t| state.gpa.free(t);
-        finishOpenErr(state, "video non riproducibile (yt-dlp)");
         return;
     }
 
-    var lines = std.mem.tokenizeScalar(u8, res.stdout, '\n');
-    const title: []u8 = title_opt orelse blk: {
-        const t = std.mem.trimEnd(u8, lines.next() orelse "", "\r");
-        break :blk state.gpa.dupe(u8, if (t.len > 0) t else "YouTube") catch {
-            finishOpenErr(state, "memoria esaurita");
+    var from_pf = true;
+    var res: Resolved = takeResolved(state, id, height) orelse blk: {
+        from_pf = false;
+        break :blk resolve(state.gpa, state.io, id, height, null) catch |e| {
+            if (title_opt) |t| state.gpa.free(t);
+            finishOpenErr(state, resolveErrMsg(e));
             return;
         };
     };
-    const vurl = std.mem.trimEnd(u8, lines.next() orelse {
-        state.gpa.free(title);
-        finishOpenErr(state, "nessun URL dallo stream");
+    defer res.deinit(state.gpa);
+
+    const title: []u8 = title_opt orelse state.gpa.dupe(u8, if (res.title.len > 0) res.title else "YouTube") catch {
+        finishOpenErr(state, "memoria esaurita");
         return;
-    }, "\r");
-    const aurl = if (lines.next()) |l| std.mem.trimEnd(u8, l, "\r") else vurl;
+    };
 
     // Apre il container in uno stato LOCALE: niente lock durante l'handshake di
     // rete. Lo swap col player corrente avviene dopo, sotto `mutex`.
     var local: videomod.VideoState = .{};
-    const first = videomod.setupStream(&local, vurl, aurl, state.gpa) catch |e| {
+    const first = videomod.setupStream(&local, res.vurl, res.aurl, state.gpa) catch |e| retry: {
+        // URL dal prefetch rifiutati (scaduti, rete cambiata): si risolve da capo.
+        if (from_pf) {
+            res.deinit(state.gpa);
+            res.out = &.{};
+            if (resolve(state.gpa, state.io, id, height, null)) |fresh_res| {
+                res = fresh_res;
+                local = .{};
+                if (videomod.setupStream(&local, res.vurl, res.aurl, state.gpa)) |f| break :retry f else |_| {}
+            } else |_| {}
+        }
         state.gpa.free(title);
         finishOpenErr(state, @errorName(e));
         return;
     };
+    const vurl = res.vurl;
+    const sub_urls: []u8 = state.gpa.dupe(u8, res.subs) catch &[_]u8{};
 
     // Il titolo diventa il "nome file" della label in alto a destra: la label usa
     // basename(), quindi eventuali '/' nel titolo vanno neutralizzati.
@@ -1039,6 +1234,8 @@ fn openWorker(state: *GuiAppState, id: []u8, title_opt: ?[]u8, resume_s: f64, he
             freeSubs(state);
             yt.subs_on = false;
         }
+        state.gpa.free(yt.sub_urls);
+        yt.sub_urls = sub_urls; // possesso trasferito
         yt.stream_h = height;
         yt.raise_s = 0;
         yt.prev_pos = -1;
@@ -1081,21 +1278,27 @@ pub fn toggleSubs(state: *GuiAppState) void {
     if (yt.subs_loading) return;
     const cid = yt.current_id orelse return; // il player corrente non è YouTube
     const id = state.gpa.dupe(u8, cid) catch return;
-    yt.subs_loading = true;
-    const t = std.Thread.spawn(.{}, subsWorker, .{ state, id }) catch {
+    const urls = state.gpa.dupe(u8, yt.sub_urls) catch {
         state.gpa.free(id);
+        return;
+    };
+    yt.subs_loading = true;
+    const t = std.Thread.spawn(.{}, subsWorker, .{ state, id, urls }) catch {
+        state.gpa.free(id);
+        state.gpa.free(urls);
         yt.subs_loading = false;
         return;
     };
     t.detach();
 }
 
-/// Thread sottotitoli: yt-dlp scarica il VTT nella cache
+/// Thread sottotitoli: il VTT finisce nella cache
 /// (`~/.cache/zuer/ytsubs/<id>.<lingua>.vtt`), lo si parsa in cue e si installa
-/// solo se il video corrente è ancora `id`. Prende possesso di `id`.
-fn subsWorker(state: *GuiAppState, id: []u8) void {
+/// solo se il video corrente è ancora `id`. Prende possesso di `id` e `urls`.
+fn subsWorker(state: *GuiAppState, id: []u8, urls: []u8) void {
     defer state.gpa.free(id);
-    const cues = fetchSubs(state, id) catch |e| {
+    defer state.gpa.free(urls);
+    const cues = fetchSubs(state, id, urls) catch |e| {
         std.debug.print("[yt] sottotitoli non disponibili: {s}\n", .{@errorName(e)});
         finishSubs(state, id, null);
         return;
@@ -1121,14 +1324,17 @@ fn finishSubs(state: *GuiAppState, id: []const u8, cues_opt: ?[]SubCue) void {
     state.shared.file_changed = true;
 }
 
-/// Scarica (o riusa dalla cache) il VTT del video e lo parsa in cue.
-fn fetchSubs(state: *GuiAppState, id: []const u8) ![]SubCue {
+/// Scarica (o riusa dalla cache) il VTT del video e lo parsa in cue. Prima gli
+/// URL già noti dall'apertura (`urls`, "it=URL en=URL": una GET con curl, meno
+/// di un secondo), poi, se mancano o falliscono, una estrazione yt-dlp intera.
+fn fetchSubs(state: *GuiAppState, id: []const u8, urls: []const u8) ![]SubCue {
     const gpa = state.gpa;
     const dir = vtcache.appCacheDir(gpa, "ytsubs") orelse return error.NoCacheDir;
     defer gpa.free(dir);
 
-    // Cache su disco: un VTT già scaricato per questo id evita yt-dlp.
+    // Cache su disco: un VTT già scaricato per questo id evita la rete.
     var vtt_path = findSubFile(gpa, state.io, dir, id);
+    if (vtt_path == null) vtt_path = curlSubs(gpa, state.io, dir, id, urls);
     if (vtt_path == null) {
         const exe = ytdlp.find(gpa, state.io) orelse return error.YtDlpMissing;
         defer gpa.free(exe);
@@ -1150,6 +1356,37 @@ fn fetchSubs(state: *GuiAppState, id: []const u8) ![]SubCue {
     const raw = try std.Io.Dir.cwd().readFileAlloc(state.io, path, gpa, .limited(8 << 20));
     defer gpa.free(raw);
     return parseVtt(gpa, raw);
+}
+
+/// Scarica il primo VTT disponibile fra gli URL "lingua=URL" (in ordine di
+/// preferenza) in `<dir>/<id>.<lingua>.vtt`. Ritorna il percorso (posseduto).
+fn curlSubs(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, id: []const u8, urls: []const u8) ?[]u8 {
+    if (!std.fs.path.isAbsolute(dir)) return null; // rename/delete *Absolute
+    var it = std.mem.tokenizeScalar(u8, urls, ' ');
+    while (it.next()) |field| {
+        const eq = std.mem.indexOfScalar(u8, field, '=') orelse continue;
+        const lang = field[0..eq];
+        const url = field[eq + 1 ..];
+        if (lang.len == 0 or !std.mem.startsWith(u8, url, "https://")) continue;
+        // Scarica su un .part e rinomina: un file troncato non entra in cache.
+        const path = std.fmt.allocPrint(gpa, "{s}/{s}.{s}.vtt", .{ dir, id, lang }) catch return null;
+        const part = std.fmt.allocPrint(gpa, "{s}.part", .{path}) catch {
+            gpa.free(path);
+            return null;
+        };
+        defer gpa.free(part);
+        const ok = blk: {
+            var dl = decoder_mod.runCaptureTimeout(gpa, &.{ "curl", "-fsSL", "-m", "15", "-o", part, url }, 20_000) catch break :blk false;
+            defer dl.deinit(gpa);
+            break :blk dl.exit_code == 0;
+        };
+        if (ok) {
+            if (std.Io.Dir.renameAbsolute(part, path, io)) |_| return path else |_| {}
+        }
+        std.Io.Dir.deleteFileAbsolute(io, part) catch {};
+        gpa.free(path);
+    }
+    return null;
 }
 
 /// Cerca nella cache un `<id>.<lingua>.vtt`, preferendo it → en → altro.
@@ -1655,6 +1892,7 @@ pub fn blitThumbClip(buf: []u8, W: u32, H: u32, dx: i32, dy: i32, dw: i32, dh: i
 pub fn drawOverlay(buf: []u8, W: u32, H: u32, state: *GuiAppState, raster: *glyph.Raster, spin_phase: f32) void {
     if (W < 160 or H < 160) return;
     const yt = &state.shared.yt;
+    tickPrefetch(state);
 
     const status = hasStatus(yt);
     const lay = layoutFor(W, H, shown(yt).len, status);
