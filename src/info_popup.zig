@@ -84,7 +84,9 @@ pub fn build(state: *GuiAppState) void {
     const vs = &state.video;
     if (comptime has_video) if (vs.isActive()) {
         const is_video = state.shared.av_has_video and !vs.audio_only;
-        if (url) {
+        if (vs.midi != null) {
+            card.add("Tipo", "Audio MIDI", .{});
+        } else if (url) {
             card.add("Tipo", "{s} in streaming", .{if (is_video) "Video" else "Audio"});
         } else {
             card.add("Tipo", "{s} {s}", .{ if (is_video) "Video" else "Audio", EXT });
@@ -96,13 +98,6 @@ pub fn build(state: *GuiAppState) void {
         addFileRows(state, card, clean, in_archive, url);
         return;
     };
-    if (state.midi) |mp| {
-        card.add("Tipo", "Audio MIDI", .{});
-        const dur = mp.durationSeconds();
-        if (dur > 0) addDuration(card, dur);
-        addFileRows(state, card, clean, in_archive, url);
-        return;
-    }
     // Al posto del contenuto c'è un messaggio d'errore (file illeggibile): niente
     // dettagli del contenuto, solo quelli del file.
     if (state.shared.decoded_is_message) {

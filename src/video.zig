@@ -35,6 +35,10 @@ const AudioPlayer = if (@import("build_options").video) @import("audio_player.zi
 // (usato solo dentro i rami `has_video`, comptime-eliminati quando il video è off).
 const VideoDecoder = if (@import("build_options").video) @import("video_decoder.zig").VideoDecoder else struct {};
 
+// Synth MIDI (TinySoundFont, vendorizzato): non dipende da libav, ma il player che
+// lo mostra (oscilloscopio + controlli) è questo, raggiunto solo con `has_video`.
+const MidiPlayer = @import("midi_player.zig").MidiPlayer;
+
 /// Frame video decodificato al massimo a questa dimensione per lato (limita memoria
 /// e tempo di rasterizzazione: i 4K si riscalano a 1920 sul lato lungo).
 const video_max_dim: usize = 1920;
@@ -70,6 +74,9 @@ pub const VideoState = struct {
     // il clock master; `audio_clk_prev` traccia il valore precedente per capire se
     // sta davvero drenando (device muto → clock fermo → NON congelare il video).
     audio: ?*AudioPlayer = null,
+    /// File MIDI: synth al posto di `audio`, stesso player solo-audio
+    /// (`audio_only`, oscilloscopio, controlli, seek).
+    midi: ?*MidiPlayer = null,
     /// Toggle 'v' da una sessione mpv: la sorgente audio (file o URL DASH) che
     /// `AudioPlayer` ha riaperto, per rimetterla nel motore quando il video torna.
     detached_audio_src: ?[:0]u8 = null,
@@ -92,6 +99,8 @@ pub const VideoState = struct {
     /// Idempotente: azzera `decoder` così una seconda chiamata è un no-op e lo
     /// stato è pronto per un eventuale `setupVideo` successivo (navigazione).
     pub fn deinit(self: *VideoState) void {
+        if (self.midi) |m| m.stopAndDestroy();
+        self.midi = null;
         if (@import("build_options").video) {
             if (self.audio) |a| a.stopAndDestroy();
             self.audio = null;
@@ -485,33 +494,70 @@ pub fn advanceVideo(sink: FrameSink, vs: *VideoState, dt: f32) bool {
     return false;
 }
 
+/// Apre un file MIDI nel player solo-audio: synth TinySoundFont al posto
+/// dell'`AudioPlayer`, poi tutto come per gli mp3 (oscilloscopio, controlli,
+/// seek, loop). error.NoMidi se manca un SoundFont o il file non è valido.
+pub fn setupMidi(vs: *VideoState, path: []const u8, gpa: std.mem.Allocator) !VideoFirst {
+    var clean: []const u8 = path;
+    if (std.mem.indexOfScalar(u8, path, '#')) |h| clean = path[0..h];
+    const m = MidiPlayer.start(clean, gpa) orelse return error.NoMidi;
+    errdefer m.stopAndDestroy();
+
+    const w: u32 = 960;
+    const h: u32 = 540;
+    const rgba = try gpa.alignedAlloc(u8, .@"4", @as(usize, w) * h * 4);
+    drawOscBackground(rgba, w, h);
+
+    vs.midi = m;
+    vs.audio_only = true;
+    vs.decoder = null;
+    vs.dur_s = m.durationSeconds();
+    vs.pos_s = 0;
+    vs.playing = true;
+    return .{ .rgba = rgba, .w = w, .h = h };
+}
+
 /// Modalità audio-only: aggiorna la temporizzazione (posizione, seek, play/pausa)
 /// dal clock audio. Non decodifica nulla — il "frame" è l'oscilloscopio, disegnato
 /// a parte con `drawOscilloscope`. Ritorna true in riproduzione (il tracciato si
 /// muove → il chiamante ripresenta) e false in pausa (frame congelato).
 pub fn advanceAudio(vs: *VideoState, dt: f32) bool {
     if (comptime @import("build_options").video) {
-        if (vs.seek_to >= 0) {
-            if (vs.audio) |a| a.seek(vs.seek_to);
+        if (vs.midi) |m| {
+            advanceSource(vs, m, dt);
+        } else if (vs.audio) |a| {
+            advanceSource(vs, a, dt);
+        } else if (vs.seek_to >= 0) {
             vs.pos_s = vs.seek_to;
             vs.seek_to = -1;
-            vs.scope_head = 0; // fuori banda → il draw riaggancia al nuovo flusso
-        } else if (vs.audio) |a| {
-            a.setPlaying(vs.playing);
-            // Il clock audio è la verità: in pausa è fermo, a fine brano l'auto-loop
-            // del thread audio lo riporta a 0 e la barra riparte da capo.
-            if (vs.playing) {
-                vs.pos_s = a.clockSeconds();
-                // Testina al wall-clock: scorre di `dt·rate` campioni. In pausa NON
-                // avanza (frame congelato). Il clamp entro la banda valida del ring
-                // (e il riaggancio se ne esce) sta nel draw, che rilegge `scope_w`.
-                vs.scope_head += @as(f64, dt) * AudioPlayer.scope_rate;
-            }
         }
         if (vs.dur_s > 0 and vs.pos_s > vs.dur_s) vs.pos_s = vs.dur_s;
         return vs.playing;
     }
     return false;
+}
+
+/// Passo di `advanceAudio` su una sorgente (`*AudioPlayer` o `*MidiPlayer`: stessa
+/// interfaccia di clock, play/pausa, seek e ring dell'oscilloscopio).
+fn advanceSource(vs: *VideoState, src: anytype, dt: f32) void {
+    const Src = @TypeOf(src.*);
+    if (vs.seek_to >= 0) {
+        src.seek(vs.seek_to);
+        vs.pos_s = vs.seek_to;
+        vs.seek_to = -1;
+        vs.scope_head = 0; // fuori banda → il draw riaggancia al nuovo flusso
+        return;
+    }
+    src.setPlaying(vs.playing);
+    // Il clock audio è la verità: in pausa è fermo, a fine brano l'auto-loop
+    // del thread audio lo riporta a 0 e la barra riparte da capo.
+    if (vs.playing) {
+        vs.pos_s = src.clockSeconds();
+        // Testina al wall-clock: scorre di `dt·rate` campioni. In pausa NON
+        // avanza (frame congelato). Il clamp entro la banda valida del ring
+        // (e il riaggancio se ne esce) sta nel draw, che rilegge `scope_w`.
+        vs.scope_head += @as(f64, dt) * Src.scope_rate;
+    }
 }
 
 // ── Oscilloscopio stile Winamp (neon glow su vetro) ─────────────────────────
@@ -576,7 +622,14 @@ pub fn drawOscilloscope(buf: []u8, W: u32, H: u32, vs: *VideoState) void {
     drawOscBackground(buf, W, H);
     if (W == 0 or H == 0) return;
     if (comptime !@import("build_options").video) return;
-    const a = vs.audio orelse return;
+    if (vs.midi) |m| return drawScopeTrace(buf, W, H, vs, m);
+    if (vs.audio) |a| drawScopeTrace(buf, W, H, vs, a);
+}
+
+/// Tracciato dell'oscilloscopio dai campioni di `a` (`*AudioPlayer` o
+/// `*MidiPlayer`), sul fondo già disegnato.
+fn drawScopeTrace(buf: []u8, W: u32, H: u32, vs: *VideoState, a: anytype) void {
+    const Src = @TypeOf(a.*);
 
     const Hi: i32 = @intCast(H);
     const cyf: f32 = @as(f32, @floatFromInt(H)) * 0.5;
@@ -613,7 +666,7 @@ pub fn drawOscilloscope(buf: []u8, W: u32, H: u32, vs: *VideoState) void {
     // del tracciato è sempre il campione più recente disponibile: media ~mezzo
     // blocco di ritardo. Se resta troppo indietro (pausa lunga/seek/underrun) →
     // riaggancio secco alla punta.
-    const cap = AudioPlayer.scope_capacity;
+    const cap = Src.scope_capacity;
     const w = a.scopeWritten();
     const min_end: usize = if (w > cap - n) w - (cap - n) else 0;
     var end: usize = if (vs.scope_head <= 0) 0 else @intFromFloat(vs.scope_head);

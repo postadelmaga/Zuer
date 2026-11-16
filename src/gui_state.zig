@@ -16,7 +16,6 @@ const print_mod = @import("print.zig");
 const text_render = @import("text_render.zig");
 // Player video nativo (libav): puntato da `GuiAppState.video`.
 const videomod = @import("video.zig");
-const midi_player = @import("midi_player.zig");
 // Ricerca YouTube (overlay tasto `y`): stato dentro `Shared`, logica nel modulo.
 const yt_search = @import("yt_search.zig");
 // Esploratore file (overlay tasto `f`): stesso schema dell'overlay YouTube.
@@ -285,11 +284,6 @@ pub const GuiAppState = struct {
     // interno del player è condiviso col worker sotto `shared.mutex`
     // (`isActive()` è letto anche senza lock dal thread finestra — storico).
     video: videomod.VideoState = .{},
-    // Player MIDI nativo (TinySoundFont; null = nessun MIDI attivo). Il
-    // puntatore è protetto da `shared.mutex` (installato/fermato da
-    // `applyDecoded`, letto dal key handler); lo stato interno del player
-    // usa atomics propri (setPlaying/seek/clock sono thread-safe).
-    midi: ?*midi_player.MidiPlayer = null,
     // Motore di resa testo: false = CPU (composizione diretta), true = atlante
     // GPU (ZUER_TEXT_ENGINE=gpu). Stessa resa, percorso diverso. Immutabile post-init.
     text_gpu: bool,

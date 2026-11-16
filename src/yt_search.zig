@@ -1009,10 +1009,6 @@ fn openWorker(state: *GuiAppState, id: []u8, title_opt: ?[]u8, resume_s: f64, he
         // player precedente PRIMA di installare il nuovo, sotto lo stesso mutex del
         // worker che chiama advanceVideo/advanceAudio.
         state.video.deinit();
-        if (state.midi) |mp| {
-            mp.stopAndDestroy();
-            state.midi = null;
-        }
         state.video = local;
         // Cambio qualità: riparti dalla posizione a cui si era (il seek pendente
         // viene applicato dal worker al primo advanceVideo).

@@ -614,6 +614,16 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
     {
+        // La serializzazione D-Bus del dialogo di stampa (portale, Linux).
+        const t = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("src/portal_print.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }) });
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
+    {
         // Lo scrim dei controlli video: solo `paint` di zicro.
         const t = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path("src/video_scrim.zig"),

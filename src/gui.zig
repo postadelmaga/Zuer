@@ -1330,7 +1330,8 @@ pub fn main(init: std.process.Init) !void {
     // basta la stima per tipo (il decode poi chiama `resizeToContent`). Prima
     // un JPEG piccolo teneva lo schermo vuoto per tutto il decode e un MP4 per
     // dlopen di libav + probe + primo frame (~440 ms), tutto sul thread main.
-    const ext_kind = layout.winKindFromExt(file_path);
+    // I MIDI suonano nel player solo-audio come gli mp3: stessa forma di finestra.
+    const ext_kind: WinKind = if (has_video and layout.isMidiPath(file_path)) .video else layout.winKindFromExt(file_path);
     var header_dims: ?layout.ImageDims = null;
     if (!yt_start and yt_id == null and (ext_kind == .image or ext_kind == .video or ext_kind == .mesh)) {
         loading = true;
@@ -1452,7 +1453,7 @@ pub fn main(init: std.process.Init) !void {
     // non partirebbe mai (video fermo sul poster). L'estensione ha la priorità.
     const win_kind: WinKind = if (yt_start)
         .generic // finestra widescreen neutra per la griglia di ricerca
-    else if (yt_id != null or layout.winKindFromExt(file_path) == .video)
+    else if (yt_id != null or ext_kind == .video)
         .video
     else if (gui_state.shared.loading)
         layout.winKindFromExt(file_path)

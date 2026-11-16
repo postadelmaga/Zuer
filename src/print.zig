@@ -9,8 +9,12 @@
 //!   evidenziazione) impaginate su A4, scure su bianco (`text_render.PrintDoc`);
 //! - markdown: la stessa impaginazione dello schermo (`md_layout`: titoli,
 //!   liste, tabelle, codice…) con i colori per la carta.
-//! Il PDF generato va alla stampante predefinita con `lp` (CUPS, Linux e macOS)
-//! o col verbo "print" della shell su Windows.
+//! Su Linux Ctrl+P apre direttamente il dialogo di stampa del desktop
+//! (xdg-desktop-portal, `portal_print.zig`), su macOS il pannello di stampa del
+//! sistema (PDFKit, `mac_print.zig`): stampante, copie, pagine e il resto li
+//! sceglie lì l'utente. Senza dialogo si resta sul pannello di conferma e il
+//! PDF va alla stampante predefinita con `lp` (CUPS) o col verbo "print" della
+//! shell su Windows.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -21,10 +25,23 @@ const yt_search = @import("yt_search.zig");
 const decoder_mod = @import("decoder.zig");
 const print_pdf = @import("print_pdf.zig");
 const vtcache = @import("vtcache.zig");
+const portal_print = @import("portal_print.zig");
+const mac_print = @import("mac_print.zig");
 const gui_state_mod = @import("gui_state.zig");
 const GuiAppState = gui_state_mod.GuiAppState;
 
 const is_win = builtin.os.tag == .windows;
+/// Dialogo di stampa del desktop via portale: solo Linux.
+const use_portal = builtin.os.tag == .linux;
+
+/// Pannello di stampa del sistema (PDFKit): solo macOS.
+const use_mac_panel = builtin.os.tag == .macos;
+
+/// Il portale ha già detto di non offrire la stampa: da lì in poi pannello e `lp`.
+var portal_missing: std.atomic.Value(bool) = .init(false);
+/// PDFKit non c'è o non stampa: da lì in poi pannello di conferma e `lp`.
+/// Solo dal thread principale.
+var mac_missing = false;
 
 pub const Phase = enum { none, confirm, working, done, failed };
 
@@ -58,6 +75,8 @@ const Job = struct {
     content: decoder_mod.Decoded = .{ .err = &.{} },
     /// Quarti di giro orari della vista (solo immagini).
     rotation: u2 = 0,
+    /// Riga di dettaglio del pannello di conferma ("PDF, 3 pagine").
+    summary: Line = .{},
 
     fn deinit(self: *Job, gpa: std.mem.Allocator) void {
         gpa.free(self.name);
@@ -108,7 +127,7 @@ pub fn buttonHit(x: f32, y: f32) bool {
 /// `shared.mutex`.
 pub fn printable(app_state: *GuiAppState) bool {
     const sh = &app_state.shared;
-    if (app_state.video.isActive() or sh.is_mesh or sh.is_table or sh.loading or sh.decoded_is_message or app_state.midi != null) return false;
+    if (app_state.video.isActive() or sh.is_mesh or sh.is_table or sh.loading or sh.decoded_is_message) return false;
     if (gui_state_mod.isPdfPath(sh.current_file_path) and !gui_state_mod.isInsideArchive(sh.current_file_path)) return true;
     return switch (sh.decoded) {
         .image, .text, .markdown => true,
@@ -146,9 +165,18 @@ pub fn onMotion(sh: *GuiAppState.Shared, x: f32, y: f32) void {
     }
 }
 
-/// Ctrl+P: prepara il job dal contenuto corrente e apre la conferma. Da
-/// chiamare SENZA `shared.mutex` (lo prende).
+/// Ctrl+P: prepara il job dal contenuto corrente e apre il dialogo di stampa
+/// (o la conferma). Da chiamare SENZA `shared.mutex` (lo prende), dal thread
+/// degli eventi della finestra: su macOS è il principale, dove il pannello di
+/// AppKit deve girare.
 pub fn request(app_state: *GuiAppState) void {
+    const job = prepareLocked(app_state) orelse return;
+    if (comptime use_mac_panel) macPanel(app_state, job);
+}
+
+/// Il job per il pannello di macOS (da aprire fuori dal lock), oppure null se
+/// la richiesta è già stata sistemata qui: errore, portale o conferma.
+fn prepareLocked(app_state: *GuiAppState) ?Job {
     const gpa = app_state.gpa;
     const busy_video = app_state.video.isActive();
     app_state.shared.mutex.lockUncancelable(app_state.io);
@@ -158,7 +186,7 @@ pub fn request(app_state: *GuiAppState) void {
     if (sh.print.busy) {
         sh.print.phase = .working;
         sh.file_changed = true;
-        return;
+        return null;
     }
     discardJob(app_state);
     sh.help = false;
@@ -173,7 +201,7 @@ pub fn request(app_state: *GuiAppState) void {
     const printable_kind = printable(app_state);
 
     // In UTF-8 valido: va nel pannello, nel titolo del lavoro e nel piè di pagina.
-    var job: Job = .{ .name = print_pdf.validUtf8(gpa, if (gui_state_mod.isInsideArchive(path)) std.fs.path.basename(path) else name) catch return };
+    var job: Job = .{ .name = print_pdf.validUtf8(gpa, if (gui_state_mod.isInsideArchive(path)) std.fs.path.basename(path) else name) catch return null };
     var what: []const u8 = "";
     var pages: u32 = 0;
     const ok = printable_kind and blk: {
@@ -212,15 +240,45 @@ pub fn request(app_state: *GuiAppState) void {
     if (!ok) {
         job.deinit(gpa);
         showResult(sh, .failed, "Stampa non disponibile", "si stampano PDF, immagini, testi e markdown", .{});
-        return;
+        return null;
     }
+    if (pages > 1)
+        job.summary.set("{s}, {d} pagine", .{ what, pages })
+    else
+        job.summary.set("{s}", .{what});
+    sh.print.title.set("Stampa «{s}»", .{job.name});
+    if (use_portal and !portal_missing.load(.monotonic)) {
+        // Dialogo del desktop: lo apre il thread (D-Bus bloccante), il pannello
+        // dice solo dove guardare.
+        sh.print.phase = .working;
+        sh.print.busy = true;
+        sh.print.detail.set("scegli la stampante nella finestra di stampa", .{});
+        const t = std.Thread.spawn(.{}, runDialog, .{ app_state, job }) catch {
+            sh.print.busy = false;
+            showConfirm(sh, job);
+            return null;
+        };
+        t.detach();
+        return null;
+    }
+    if (use_mac_panel and !mac_missing) {
+        // Il pannello lo apre il chiamante, a lock rilasciato: finché è aperto
+        // il render worker deve poter prendere lo stato.
+        sh.print.phase = .working;
+        sh.print.busy = true;
+        sh.print.detail.set("preparazione…", .{});
+        return job;
+    }
+    showConfirm(sh, job);
+    return null;
+}
+
+/// Pannello di conferma per la stampa diretta (`lp` / shell). Sotto lock.
+fn showConfirm(sh: *GuiAppState.Shared, job: Job) void {
     sh.print.job = job;
     sh.print.phase = .confirm;
-    sh.print.title.set("Stampa «{s}»", .{job.name});
-    if (pages > 1)
-        sh.print.detail.set("{s}, {d} pagine", .{ what, pages })
-    else
-        sh.print.detail.set("{s}", .{what});
+    sh.print.detail.set("{s}", .{job.summary.text()});
+    sh.file_changed = true;
 }
 
 /// Tasti col pannello aperto. true = tasto consumato. Da chiamare SENZA lock.
@@ -313,29 +371,158 @@ fn run(app_state: *GuiAppState, job_in: Job) void {
 
 fn submit(gpa: std.mem.Allocator, io: std.Io, job: *Job, msg: *Line) bool {
     if (job.pdf_path) |p| return send(gpa, p, job.name, false, msg);
-
-    const bytes = print_pdf.build(gpa, &job.content, job.name, job.rotation) catch |e| {
-        msg.set("impaginazione fallita ({s})", .{@errorName(e)});
-        return false;
-    };
-    defer gpa.free(bytes);
-    const dir = vtcache.appCacheDir(gpa, "print") orelse {
-        msg.set("cartella della cache non disponibile", .{});
-        return false;
-    };
-    defer gpa.free(dir);
-    sweepOld(io, dir);
-    const path = std.fmt.allocPrint(gpa, "{s}{c}stampa-{d}.pdf", .{ dir, std.fs.path.sep, std.Thread.getCurrentId() }) catch return false;
+    const path = writePdf(gpa, io, job, msg) orelse return false;
     defer gpa.free(path);
-    writeFile(io, path, bytes) catch |e| {
-        msg.set("scrittura del PDF fallita ({s})", .{@errorName(e)});
-        return false;
-    };
     // CUPS copia il file nella sua coda: dopo `lp` il PDF temporaneo non serve.
     // La shell di Windows lo stampa in modo asincrono: lì resta fino alla
     // stampa successiva (`sweepOld`).
     defer if (!is_win) std.Io.Dir.cwd().deleteFile(io, path) catch {};
     return send(gpa, path, job.name, true, msg);
+}
+
+/// Impagina il job in un PDF temporaneo nella cache; ritorna il percorso
+/// (del chiamante) o null con il motivo in `msg`.
+fn writePdf(gpa: std.mem.Allocator, io: std.Io, job: *Job, msg: *Line) ?[]u8 {
+    const bytes = print_pdf.build(gpa, &job.content, job.name, job.rotation) catch |e| {
+        msg.set("impaginazione fallita ({s})", .{@errorName(e)});
+        return null;
+    };
+    defer gpa.free(bytes);
+    const dir = vtcache.appCacheDir(gpa, "print") orelse {
+        msg.set("cartella della cache non disponibile", .{});
+        return null;
+    };
+    defer gpa.free(dir);
+    sweepOld(io, dir);
+    const path = std.fmt.allocPrint(gpa, "{s}{c}stampa-{d}.pdf", .{ dir, std.fs.path.sep, std.Thread.getCurrentId() }) catch return null;
+    writeFile(io, path, bytes) catch |e| {
+        gpa.free(path);
+        msg.set("scrittura del PDF fallita ({s})", .{@errorName(e)});
+        return null;
+    };
+    return path;
+}
+
+/// Thread della stampa col dialogo del desktop: il dialogo prima (annullare
+/// non costa l'impaginazione), poi il PDF passato al portale come fd. Se il
+/// portale non offre la stampa, il job torna al pannello di conferma.
+fn runDialog(app_state: *GuiAppState, job_in: Job) void {
+    var job = job_in;
+    const gpa = app_state.gpa;
+    var msg: Line = .{};
+    const res = dialogPrint(gpa, app_state.io, &job, &msg);
+    app_state.shared.mutex.lockUncancelable(app_state.io);
+    defer app_state.shared.mutex.unlock(app_state.io);
+    const sh = &app_state.shared;
+    sh.print.busy = false;
+    if (res == .unavailable) {
+        portal_missing.store(true, .monotonic);
+        // Nel frattempo un altro Ctrl+P non ha potuto partire (busy): il job
+        // è ancora questo. Il pannello riappare anche se era stato nascosto.
+        discardJob(app_state);
+        showConfirm(sh, job);
+        return;
+    }
+    job.deinit(gpa);
+    switch (res) {
+        .done => showResult(sh, .done, "Stampa inviata", "{s}", .{msg.text()}),
+        .cancelled => {
+            sh.print.phase = .none;
+            sh.file_changed = true;
+        },
+        .failed => showResult(sh, .failed, "Stampa non riuscita", "{s}", .{msg.text()}),
+        .unavailable => unreachable,
+    }
+}
+
+const DialogResult = enum { done, cancelled, failed, unavailable };
+
+fn dialogPrint(gpa: std.mem.Allocator, io: std.Io, job: *Job, msg: *Line) DialogResult {
+    if (comptime !use_portal) return .unavailable;
+    var sess = portal_print.Session.open(gpa) catch return .unavailable;
+    defer sess.deinit();
+    const chosen = sess.prepare(job.name, "Stampa") catch |e| switch (e) {
+        error.Unavailable => return .unavailable,
+        else => {
+            msg.set("il dialogo di stampa non ha risposto ({s})", .{@errorName(e)});
+            return .failed;
+        },
+    };
+    if (chosen == .cancelled) return .cancelled;
+
+    // Il PDF: l'originale o quello impaginato qui, aperto e passato come fd.
+    const tmp = if (job.pdf_path == null) (writePdf(gpa, io, job, msg) orelse return .failed) else null;
+    defer if (tmp) |p| gpa.free(p);
+    const path = tmp orelse job.pdf_path.?;
+    const path_z = gpa.dupeSentinel(u8, path, 0) catch return .failed;
+    defer gpa.free(path_z);
+    const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+    // Aperto: il file temporaneo si può già togliere, il contenuto vive nell'fd.
+    if (tmp) |p| std.Io.Dir.cwd().deleteFile(io, p) catch {};
+    if (fd < 0) {
+        msg.set("PDF non leggibile", .{});
+        return .failed;
+    }
+    defer _ = std.c.close(fd);
+    const sent = sess.print(job.name, fd) catch |e| {
+        msg.set("il portale non ha stampato ({s})", .{@errorName(e)});
+        return .failed;
+    };
+    if (sent == .cancelled) return .cancelled;
+    msg.set("alla stampante scelta", .{});
+    return .done;
+}
+
+/// Pannello di stampa di macOS sul thread principale: il PDF prima (PDFKit lo
+/// mostra in anteprima), poi il pannello, modale finché l'utente non sceglie.
+/// Se PDFKit non stampa, il job torna al pannello di conferma.
+fn macPanel(app_state: *GuiAppState, job_in: Job) void {
+    var job = job_in;
+    const gpa = app_state.gpa;
+    var msg: Line = .{};
+    const res = macPrint(gpa, app_state.io, &job, &msg);
+    app_state.shared.mutex.lockUncancelable(app_state.io);
+    defer app_state.shared.mutex.unlock(app_state.io);
+    const sh = &app_state.shared;
+    sh.print.busy = false;
+    if (res == .unavailable) {
+        mac_missing = true;
+        discardJob(app_state);
+        showConfirm(sh, job);
+        return;
+    }
+    job.deinit(gpa);
+    switch (res) {
+        .done => showResult(sh, .done, "Stampa inviata", "{s}", .{msg.text()}),
+        .cancelled => {
+            sh.print.phase = .none;
+            sh.file_changed = true;
+        },
+        .failed => showResult(sh, .failed, "Stampa non riuscita", "{s}", .{msg.text()}),
+        .unavailable => unreachable,
+    }
+}
+
+fn macPrint(gpa: std.mem.Allocator, io: std.Io, job: *Job, msg: *Line) mac_print.Result {
+    if (!mac_print.available()) return .unavailable;
+    const tmp = if (job.pdf_path == null) (writePdf(gpa, io, job, msg) orelse return .failed) else null;
+    defer if (tmp) |p| {
+        // `runOperation` torna quando il lavoro è già nella coda di CUPS.
+        std.Io.Dir.cwd().deleteFile(io, p) catch {};
+        gpa.free(p);
+    };
+    const path_z = gpa.dupeSentinel(u8, tmp orelse job.pdf_path.?, 0) catch return .failed;
+    defer gpa.free(path_z);
+    const title_z = gpa.dupeSentinel(u8, job.name, 0) catch return .failed;
+    defer gpa.free(title_z);
+    var why: []const u8 = "il pannello di stampa non ha stampato";
+    const res = mac_print.run(path_z, title_z, &why);
+    switch (res) {
+        .done => msg.set("alla stampante scelta", .{}),
+        .failed => msg.set("{s}", .{why}),
+        .cancelled, .unavailable => {},
+    }
+    return res;
 }
 
 /// Cancella i PDF temporanei delle stampe precedenti (su Windows restano

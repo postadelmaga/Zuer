@@ -12,7 +12,9 @@ Requisiti, build per ogni sistema, installer, variabili d'ambiente e strumenti d
   a runtime, facoltativi: **libmpv** (`libmpv.so.2`: senza, il video ripiega su
   libav, senza piano dmabuf), `libva` (sonda hwdec), `poppler` (`pdftoppm`) e
   LibreOffice (`soffice`) per pdf/office, ImageMagick per i formati immagine rari,
-  `yt-dlp` per i link YouTube, `lp` (CUPS) per la stampa
+  `yt-dlp` per i link YouTube; per la stampa il dialogo del desktop
+  (`xdg-desktop-portal` con un backend che offre Print, es. KDE o GTK) o, senza,
+  `lp` (CUPS)
 
 ## Build & installazione (Linux)
 

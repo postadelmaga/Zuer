@@ -51,6 +51,10 @@ const BLOCK_FRAMES: usize = 1024;
 // costante è solo il FALLBACK per i backend muti (ALSA/waveOut).
 const LATENCY_S: f64 = 0.12;
 
+/// Campioni (mono) tenuti per l'oscilloscopio, come in `audio_player.zig`:
+/// potenza di 2 (modulo = AND), ~170 ms a 48 kHz.
+const scope_len: usize = 8192;
+
 /// `tml_message` ridichiarata in Zig: la struct C usa union/struct anonime che
 /// translate-c espone con nomi generati illeggibili. Stesso layout (verificato
 /// a comptime), così i puntatori di tml si castano direttamente.
@@ -127,11 +131,19 @@ pub const MidiPlayer = struct {
     thread: ?std.Thread = null,
     stop: std.atomic.Value(bool) = .init(false),
     playing: std.atomic.Value(bool) = .init(true),
+    /// A fine brano riparte da capo (come gli mp3 nel player solo audio); se
+    /// false si mette in pausa col clock fermo sulla durata.
+    loop: std.atomic.Value(bool) = .init(true),
     seek_ms: std.atomic.Value(i64) = .init(-1), // richiesta di seek (ms), -1 = nessuna
     clock_ms: std.atomic.Value(i64) = .init(0), // posizione riprodotta stimata (ms)
     // Tempo del brano raggiunto dal render (ms, frazionario). Solo thread audio:
     // le richieste esterne passano dagli atomici qui sopra.
     song_ms: f64 = 0,
+
+    // Tap per l'oscilloscopio: stesso contratto di `AudioPlayer` (il thread di
+    // sintesi scrive, il render worker legge senza lock; solo l'indice è atomico).
+    scope: [scope_len]f32 = @splat(0),
+    scope_w: std.atomic.Value(usize) = .init(0),
 
     /// Apre il MIDI e avvia il thread di sintesi. `null` (senza errore) se manca
     /// un SoundFont sul sistema, se il file non è un MIDI valido o se il device
@@ -201,8 +213,8 @@ pub const MidiPlayer = struct {
         return @as(f64, @floatFromInt(self.duration_ms)) / 1000.0;
     }
 
-    /// Pausa/riprendi. A fine brano il player si mette in pausa da solo:
-    /// per farlo ripartire dall'inizio fare `seek(0)` + `setPlaying(true)`.
+    /// Pausa/riprendi. Con `loop` a false, a fine brano il player si mette in
+    /// pausa da solo: per farlo ripartire fare `seek(0)` + `setPlaying(true)`.
     pub fn setPlaying(self: *MidiPlayer, on: bool) void {
         self.playing.store(on, .monotonic);
     }
@@ -211,6 +223,25 @@ pub const MidiPlayer = struct {
     /// a fine brano `playing` diventa false da solo (vedi threadMain).
     pub fn isPlaying(self: *const MidiPlayer) bool {
         return self.playing.load(.monotonic);
+    }
+
+    /// Capacità del ring dell'oscilloscopio e cadenza di uscita (vedi `AudioPlayer`).
+    pub const scope_capacity: usize = scope_len;
+    pub const scope_rate: f64 = @floatFromInt(OUT_RATE);
+
+    /// Totale campioni (mono) scritti finora nel ring: indice assoluto del prossimo.
+    pub fn scopeWritten(self: *const MidiPlayer) usize {
+        return self.scope_w.load(.monotonic);
+    }
+
+    /// Copia `dst.len` campioni mono che terminano all'indice assoluto `end_abs`
+    /// (vedi `AudioPlayer.copyScopeAt`).
+    pub fn copyScopeAt(self: *const MidiPlayer, dst: []f32, end_abs: usize) void {
+        const n = dst.len;
+        for (dst, 0..) |*d, i| {
+            const back = n - i;
+            d.* = if (back > end_abs) 0 else self.scope[(end_abs - back) & (scope_len - 1)];
+        }
     }
 
     pub fn seek(self: *MidiPlayer, seconds: f64) void {
@@ -240,8 +271,12 @@ pub const MidiPlayer = struct {
                 continue;
             }
             if (self.cursor == null and c.tsf_active_voice_count(self.synth) == 0) {
-                // Fine lista e code di rilascio esaurite: il player si ferma e il
-                // clock resta sulla durata; l'eventuale loop lo decide il chiamante.
+                // Fine lista e code di rilascio esaurite: da capo (loop) oppure
+                // pausa col clock fermo sulla durata.
+                if (self.loop.load(.monotonic)) {
+                    self.applySeek(0);
+                    continue;
+                }
                 self.playing.store(false, .monotonic);
                 self.clock_ms.store(@intCast(self.duration_ms), .monotonic);
                 continue;
@@ -256,6 +291,17 @@ pub const MidiPlayer = struct {
                 self.cursor = m.next;
             }
             c.tsf_render_float(self.synth, &buf, @intCast(BLOCK_FRAMES), 0);
+
+            // Tap oscilloscopio: downmix mono nel ring PRIMA del play bloccante.
+            {
+                var w = self.scope_w.load(.monotonic);
+                var i: usize = 0;
+                while (i < BLOCK_FRAMES) : (i += 1) {
+                    self.scope[w & (scope_len - 1)] = (buf[i * OUT_CH] + buf[i * OUT_CH + 1]) * 0.5;
+                    w += 1;
+                }
+                self.scope_w.store(w, .monotonic);
+            }
 
             // Sottomissione diretta dal buffer di render: bloccante → pacing
             // real-time (backpressure), senza alloc+copy di un blocco per giro.

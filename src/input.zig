@@ -673,25 +673,6 @@ pub fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) 
             else => {},
         }
     }
-    // MIDI: Spazio = play/pausa; a fine brano (il synth si auto-pausa col
-    // clock fermo sulla durata) Spazio riparte da capo. Il puntatore
-    // `midi` è protetto dal mutex (applyDecoded può fermarlo dai worker);
-    // le operazioni sul player sono atomics interne.
-    if (key == KEY_SPACE) {
-        app_state.shared.mutex.lockUncancelable(app_state.io);
-        if (app_state.midi) |mp| {
-            const dur = mp.durationSeconds();
-            if (!mp.isPlaying() and dur > 0 and mp.clockSeconds() >= dur - 0.05) {
-                mp.seek(0);
-                mp.setPlaying(true);
-            } else {
-                mp.setPlaying(!mp.isPlaying());
-            }
-            app_state.shared.mutex.unlock(app_state.io);
-            return;
-        }
-        app_state.shared.mutex.unlock(app_state.io);
-    }
     // Ctrl+A seleziona tutto il testo; Ctrl+C copia la selezione (o tutto il
     // testo), e fuori dai testi il percorso del file.
     if (ctrl and key == KEY_A and is_text) {

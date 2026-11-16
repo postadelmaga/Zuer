@@ -14,7 +14,6 @@ const loader_mod = @import("loader.zig");
 const text_render = @import("text_render.zig");
 // Player video nativo (libav): la navigazione verso/da un video lo avvia/ferma.
 const videomod = @import("video.zig");
-const midi_player = @import("midi_player.zig");
 const yt_search = @import("yt_search.zig");
 // Content-kind classification (path/decode → WinKind) + geometria iniziale finestra.
 const layout = @import("layout.zig");
@@ -249,7 +248,6 @@ pub const Prepared = struct {
     stage: ?loader_mod.GpuStage = null,
     rgba: ?[]align(4) u8 = null,
     video: ?PreparedVideo = null,
-    midi: ?*midi_player.MidiPlayer = null,
     /// Il contenuto è un messaggio d'errore, non il file (vedi `applyMessage`).
     message: bool = false,
 
@@ -263,8 +261,6 @@ pub const Prepared = struct {
             state.gpa.free(pv.first.rgba);
         }
         self.video = null;
-        if (self.midi) |m| m.stopAndDestroy();
-        self.midi = null;
     }
 };
 
@@ -287,8 +283,7 @@ pub fn prepareFor(state: *GuiAppState, d: *decoder_mod.Decoded, path: []const u8
         else => {},
     }
     const playable = av and openableMedia(state.io, path);
-    if (has_video and playable and layout.winKindFromExt(path) == .video) pre.video = openVideo(state.gpa, path);
-    if (playable and isMidiPath(path)) pre.midi = midi_player.MidiPlayer.start(path, state.gpa);
+    if (has_video and playable and (layout.winKindFromExt(path) == .video or layout.isMidiPath(path))) pre.video = openVideo(state.gpa, path);
     return pre;
 }
 
@@ -296,6 +291,13 @@ pub fn prepareFor(state: *GuiAppState, d: *decoder_mod.Decoded, path: []const u8
 /// come fallback — stessa logica di `startVideo`, ma su una `VideoState` locale.
 fn openVideo(gpa: std.mem.Allocator, path: []const u8) ?PreparedVideo {
     var vs: videomod.VideoState = .{};
+    if (layout.isMidiPath(path)) {
+        const mf = videomod.setupMidi(&vs, path, gpa) catch |e| {
+            midiHint(e);
+            return null;
+        };
+        return .{ .vs = vs, .first = mf, .has_video = false };
+    }
     const first = videomod.setupVideo(&vs, path, gpa) catch |e| {
         const af = videomod.setupAudio(&vs, path, gpa) catch |e2| {
             std.debug.print("Media non apribile (video: {s}, audio: {s})\n", .{ @errorName(e), @errorName(e2) });
@@ -465,14 +467,6 @@ pub fn applyDecoded(state: *GuiAppState, new_decoded: decoder_mod.Decoded, pre_i
     // sottotitoli non valgono per il nuovo contenuto (tasto `o`, cue).
     yt_search.clearCurrentStream(state);
 
-    // Stessa cosa per il MIDI: navigando via, il synth precedente va fermato
-    // (il thread audio viene joinato da stopAndDestroy). Siamo sotto `mutex`,
-    // quindi serializzati col key handler che legge `state.midi`.
-    if (state.midi) |mp| {
-        mp.stopAndDestroy();
-        state.midi = null;
-    }
-
     // Refine progressivo: se il file è lo STESSO (fase full che rimpiazza la
     // coarse), preserva la camera così una rotazione fatta durante la coarse
     // non viene azzerata quando arriva il dettaglio pieno.
@@ -604,31 +598,15 @@ pub fn applyDecoded(state: *GuiAppState, new_decoded: decoder_mod.Decoded, pre_i
     // `static_rgba`. Sicuro dai worker thread: `setupVideo` tocca solo libav
     // e lo stato video/buffer condivisi, tutti protetti dal `mutex` già
     // acquisito qui (nessuna risorsa legata al thread finestra).
-    if (has_video and layout.winKindFromExt(new_path) == .video) {
+    // MIDI: synth TinySoundFont nello stesso player solo-audio degli mp3
+    // (oscilloscopio e controlli); senza SoundFont resta la card del plugin.
+    if (has_video and (layout.winKindFromExt(new_path) == .video or layout.isMidiPath(new_path))) {
         if (installVideo(state, new_path, &pre)) {
             // Instrada tastiera/compose sul percorso video (il decode può
             // aver prodotto un poster `.image` o un errore testuale).
             state.shared.is_text = false;
             state.shared.is_table = false;
         }
-    }
-
-    // Navigazione VERSO un MIDI: la card informativa del plugin media resta il
-    // contenuto mostrato; il synth (TinySoundFont) suona a lato e parte subito
-    // (autoplay, come il video). `null` = SoundFont mancante o file invalido:
-    // si resta sulla card, con un hint su stderr.
-    if (isMidiPath(new_path)) {
-        // Synth preparato fuori lock (SoundFont da ~150 MB letto su disco) se
-        // il chiamante l'ha fatto; altrimenti caricalo qui.
-        state.midi = if (pre.midi) |m| blk: {
-            pre.midi = null;
-            break :blk m;
-        } else midi_player.MidiPlayer.start(new_path, state.gpa);
-        if (state.midi == null) std.debug.print(
-            "MIDI non riproducibile: SoundFont mancante? Imposta ZUER_SOUNDFONT " ++
-                "o installa un GM .sf2 (es. soundfont-fluid) in /usr/share/soundfonts/\n",
-            .{},
-        );
     }
 
     if (!same_file) {
@@ -660,16 +638,13 @@ pub fn applyDecoded(state: *GuiAppState, new_decoded: decoder_mod.Decoded, pre_i
 /// dello spawn dei thread, come fa `main` — perché tocca il Player e i
 /// buffer condivisi col render worker. Ritorna false se il video non è
 /// apribile (si resta sul contenuto corrente, es. il poster).
-/// Estensione .mid/.midi (case-insensitive), al netto del frammento `#`.
-fn isMidiPath(path: []const u8) bool {
-    var clean = path;
-    if (std.mem.indexOfScalar(u8, path, '#')) |h| clean = path[0..h];
-    const base = std.fs.path.basename(clean);
-    const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse return false;
-    const ext = base[dot + 1 ..];
-    if (ext.len != 3 and ext.len != 4) return false;
-    if ((ext[0] | 32) != 'm' or (ext[1] | 32) != 'i' or (ext[2] | 32) != 'd') return false;
-    return ext.len == 3 or (ext[3] | 32) == 'i';
+/// Un MIDI non si è aperto nel player: il motivo più comune è il SoundFont.
+fn midiHint(e: anyerror) void {
+    std.debug.print(
+        "MIDI non riproducibile ({s}): SoundFont mancante? Imposta ZUER_SOUNDFONT " ++
+            "o installa un GM .sf2 (es. soundfont-fluid) in /usr/share/soundfonts/\n",
+        .{@errorName(e)},
+    );
 }
 
 /// Percorso senza il frammento `#…` (pagina PDF, voce d'archivio).
@@ -690,6 +665,18 @@ pub fn startVideo(state: *GuiAppState, path: []const u8) bool {
     if (!openableMedia(state.io, path)) {
         std.debug.print("Media non apribile: non è un file regolare ({s})\n", .{path});
         return false;
+    }
+    if (layout.isMidiPath(path)) {
+        const mf = videomod.setupMidi(&state.video, path, state.gpa) catch |e| {
+            midiHint(e);
+            return false;
+        };
+        gui_state_mod.setAvSrc(state, path, false);
+        state.gpa.free(state.shared.static_rgba);
+        state.shared.static_rgba = mf.rgba;
+        state.shared.static_w = mf.w;
+        state.shared.static_h = mf.h;
+        return true;
     }
     const first = videomod.setupVideo(&state.video, path, state.gpa) catch |e| {
         // Nessuno stream video (mp3, wav, flac…): apri come audio-only →
@@ -989,7 +976,7 @@ fn parkOutgoingLocked(state: *GuiAppState, new_path: []const u8) bool {
         .image, .text, .markdown, .csv, .workbook => {},
         else => return false, // mesh: dati CPU già liberati dopo l'upload; err: inutile
     }
-    if (layout.winKindFromExt(old_path) == .video) return false; // il player è già fermato
+    if (layout.winKindFromExt(old_path) == .video or layout.isMidiPath(old_path)) return false; // il player è già fermato
     if (d.* == .text and d.text.len == 0) return false;
     const bytes = decodedBytes(d);
     if (bytes > prefetchMaxBytes()) return false;
