@@ -122,6 +122,64 @@ fn applyZoomAt(app_state: *GuiAppState, factor: f32, cx: f32, cy: f32, W: u32, H
     app_state.shared.file_changed = true;
 }
 
+/// Zoom da rotella o da +/-: su un'immagine in finestra prima cresce (o cala) la
+/// FINESTRA attorno all'immagine; quando non può più (bordo dello schermo, oppure
+/// l'immagine è già zoomata dentro la finestra) si zooma dentro, verso `cx`,`cy`.
+/// A schermo intero o massimizzata si zooma sempre dentro.
+fn zoomView(app_state: *GuiAppState, win: *zrame.Window, factor: f32, cx: f32, cy: f32) void {
+    if (resizeForZoom(app_state, win, factor)) return;
+    const cpx = win.contentPx();
+    applyZoomAt(app_state, factor, cx, cy, cpx.w, cpx.h);
+}
+
+/// La parte "finestra" di `zoomView`: true se ha chiesto un resize.
+fn resizeForZoom(app_state: *GuiAppState, win: *zrame.Window, factor: f32) bool {
+    if (win.fullscreen or win.maximized) return false;
+    var sw: u32 = 0;
+    var sh: u32 = 0;
+    {
+        app_state.shared.mutex.lockUncancelable(app_state.io);
+        defer app_state.shared.mutex.unlock(app_state.io);
+        const s = &app_state.shared;
+        const plain_image = s.decoded == .image and !s.is_text and !s.is_mesh and !s.loading and
+            !isPdfPath(s.current_file_path) and !app_state.video.isActive();
+        // Già zoomata dentro la finestra: lo zoom resta dentro finché non torna a 1.
+        if (!plain_image or @abs(s.zoom - 1.0) > 0.001) return false;
+        sw = s.static_w;
+        sh = s.static_h;
+    }
+    if (sw == 0 or sh == 0) return false;
+    // Taglia logica dell'immagine adattata alla finestra di adesso (o a quella appena
+    // chiesta, se il resize è ancora in volo).
+    const now = zicro.widget.nowMs();
+    const in_flight = now - app_state.zoom_win_req_ms < 300 and app_state.zoom_win_req[0] > 0;
+    const pw: f32 = if (in_flight) app_state.zoom_win_req[0] else @floatFromInt(win.panel_w);
+    const ph: f32 = if (in_flight) app_state.zoom_win_req[1] else @floatFromInt(win.panel_h);
+    if (pw < 1 or ph < 1) return false;
+    const sa = @as(f32, @floatFromInt(sw)) / @as(f32, @floatFromInt(sh));
+    const fit_w = if (sa > pw / ph) pw else ph * sa;
+    var tw = fit_w * factor;
+    var th = tw / sa;
+    if (factor > 1.0) {
+        // Non oltre l'area utile dello schermo (o un tetto prudente se è ignota).
+        const area = win.usableArea();
+        const lw: f32 = if (area[0] > 0) @as(f32, @floatFromInt(area[0])) - 16 else 1280;
+        const lh: f32 = if (area[1] > 0) @as(f32, @floatFromInt(area[1])) - 16 else 900;
+        const k = @min(1.0, @min(lw / tw, lh / th));
+        tw *= k;
+        th *= k;
+        // Nessuno spazio per crescere: si zooma dentro.
+        if (tw <= pw + 1 and th <= ph + 1) return false;
+    } else {
+        // Sotto una taglia minima la finestra si ferma (lo zoom continua dentro).
+        if (tw < 200 or th < 150) return false;
+    }
+    win.requestResizeInPlace(@intFromFloat(@round(tw)), @intFromFloat(@round(th)));
+    app_state.zoom_win_req = .{ @round(tw), @round(th) };
+    app_state.zoom_win_req_ms = now;
+    return true;
+}
+
 /// Doppio-click su immagine: alterna fit (zoom 1) ↔ 100% (1:1 pixel), zoomando
 /// verso il cursore. `z100` è il fattore che porta il contenuto alla risoluzione
 /// nativa (rispetto al fit che riempie il viewport).
@@ -179,6 +237,74 @@ fn rotateView(app_state: *GuiAppState, clockwise: bool) void {
     sh.pan_x = 0;
     sh.pan_y = 0;
     sh.file_changed = true;
+}
+
+/// Fattore che porta una pagina dal fit (intera nel viewport) alla larghezza piena:
+/// 1 se la pagina è già larga quanto il viewport.
+pub fn widthFillFactor(W: u32, H: u32, sw: u32, sh: u32) f32 {
+    if (sw == 0 or sh == 0 or W == 0 or H == 0) return 1.0;
+    const fw: f32 = @floatFromInt(W);
+    const fh: f32 = @floatFromInt(H);
+    const sa = @as(f32, @floatFromInt(sw)) / @as(f32, @floatFromInt(sh));
+    const fit_w = if (sa > fw / fh) fw else fh * sa;
+    return @max(1.0, fw / fit_w);
+}
+
+/// Zoom con cui si compone una pagina: un PDF a schermo intero riempie la larghezza
+/// dello schermo (si legge scorrendo in verticale) invece di stare intero al centro
+/// tra due bande nere. Lo zoom dell'utente si applica sopra.
+pub fn viewZoom(zoom: f32, pdf_fullscreen: bool, W: u32, H: u32, sw: u32, sh: u32) f32 {
+    return if (pdf_fullscreen) zoom * widthFillFactor(W, H, sw, sh) else zoom;
+}
+
+/// Il contenuto corrente è una pagina PDF? (Percorso letto sotto lock.)
+fn isPdfNow(app_state: *GuiAppState) bool {
+    app_state.shared.mutex.lockUncancelable(app_state.io);
+    defer app_state.shared.mutex.unlock(app_state.io);
+    return app_state.shared.decoded == .image and isPdfPath(app_state.shared.current_file_path);
+}
+
+/// Rotella su una pagina PDF: scorre la pagina; arrivati al bordo (o se la pagina sta
+/// tutta nella finestra) passa alla successiva / precedente, che si apre dal lato
+/// giusto. `down` = rotella verso il basso.
+fn wheelPdf(app_state: *GuiAppState, win: *zrame.Window, down: bool, amount: f32) void {
+    const cpx = win.contentPx();
+    var turn: ?PageMove = null;
+    {
+        app_state.shared.mutex.lockUncancelable(app_state.io);
+        defer app_state.shared.mutex.unlock(app_state.io);
+        const sh = &app_state.shared;
+        if (sh.loading or sh.static_w == 0 or sh.static_h == 0) return;
+        const z = viewZoom(sh.zoom, win.fullscreen, cpx.w, cpx.h, sh.static_w, sh.static_h);
+        const fw: f32 = @floatFromInt(cpx.w);
+        const fh: f32 = @floatFromInt(cpx.h);
+        const sa = @as(f32, @floatFromInt(sh.static_w)) / @as(f32, @floatFromInt(sh.static_h));
+        const fit_h = if (sa > fw / fh) fw / sa else fh;
+        const max_y = @max(0.0, (fit_h * z - fh) / 2.0);
+        sh.pan_y = std.math.clamp(sh.pan_y, -max_y, max_y);
+        // pan_y = +max_y: si vede la cima; −max_y: il fondo.
+        if (down) {
+            if (sh.pan_y <= -max_y + 0.5) turn = .next else sh.pan_y = @max(-max_y, sh.pan_y - amount);
+        } else {
+            if (sh.pan_y >= max_y - 0.5) turn = .prev else sh.pan_y = @min(max_y, sh.pan_y + amount);
+        }
+        if (turn == null) sh.file_changed = true;
+    }
+    const move = turn orelse return;
+    const now = zicro.widget.nowMs();
+    if (now - app_state.pdf_wheel_turn_ms < 350) return;
+    app_state.pdf_wheel_turn_ms = now;
+    if (move == .prev) {
+        app_state.shared.mutex.lockUncancelable(app_state.io);
+        app_state.shared.pdf_land_bottom = true;
+        app_state.shared.mutex.unlock(app_state.io);
+    }
+    if (!changePdfPage(app_state, move)) {
+        // Prima/ultima pagina: niente cambio, il flag non deve restare per dopo.
+        app_state.shared.mutex.lockUncancelable(app_state.io);
+        app_state.shared.pdf_land_bottom = false;
+        app_state.shared.mutex.unlock(app_state.io);
+    }
 }
 
 /// Clampa il pan dell'immagine così non possa mai scivolare nel vuoto: quando
@@ -358,11 +484,12 @@ fn scrollTo(app_state: *GuiAppState, y: f32) void {
 
 const PageMove = enum { prev, next, first, last };
 
-fn changePdfPage(app_state: *GuiAppState, move: PageMove) void {
+/// True se ha chiesto una pagina diversa (il caricamento è asincrono).
+fn changePdfPage(app_state: *GuiAppState, move: PageMove) bool {
     app_state.shared.mutex.lockUncancelable(app_state.io);
     const path = app_state.gpa.dupe(u8, app_state.shared.current_file_path) catch {
         app_state.shared.mutex.unlock(app_state.io);
-        return;
+        return false;
     };
     // Conteggio pagine STRUTTURATO dal decoder (0 = documento non paginato o
     // sconosciuto): niente più parsing della label di presentazione
@@ -396,9 +523,9 @@ fn changePdfPage(app_state: *GuiAppState, move: PageMove) void {
         .last => if (total_pages > 0) total_pages else current_page,
     };
 
-    if (new_page == current_page) return;
+    if (new_page == current_page) return false;
 
-    const new_path = std.fmt.allocPrint(app_state.gpa, "{s}#{d}", .{ clean_path, new_page }) catch return;
+    const new_path = std.fmt.allocPrint(app_state.gpa, "{s}#{d}", .{ clean_path, new_page }) catch return false;
     defer app_state.gpa.free(new_path);
 
     // Cambio pagina in ASINCRONO sul loader thread: il decode PDF lancia un
@@ -407,6 +534,7 @@ fn changePdfPage(app_state: *GuiAppState, move: PageMove) void {
     // del percorso, quindi passa pulito per `postLoad` (latest-wins in caso
     // di spam di PgUp/PgDown) e lo spinner resta animato.
     nav.postLoad(app_state, new_path);
+    return true;
 }
 
 /// Alterna la modalità voxel. Alla prima attivazione voxelizza la mesh corrente
@@ -733,14 +861,14 @@ pub fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) 
             // PDF: ←/→ sfogliano le pagine (come il seek nei video); altrove
             // (immagini, mesh, testo) cambiano file.
             if (is_pdf) {
-                changePdfPage(app_state, if (key == KEY_RIGHT) .next else .prev);
+                _ = changePdfPage(app_state, if (key == KEY_RIGHT) .next else .prev);
             } else {
                 nav.navigate(app_state, if (key == KEY_RIGHT) 1 else -1);
             }
         },
         KEY_PGUP, KEY_PGDOWN => {
             if (is_pdf) {
-                changePdfPage(app_state, if (key == KEY_PGDOWN) .next else .prev);
+                _ = changePdfPage(app_state, if (key == KEY_PGDOWN) .next else .prev);
             } else if (is_text) {
                 scrollText(app_state, if (key == KEY_PGDOWN) scroll_step * 10 else -scroll_step * 10);
             }
@@ -750,7 +878,7 @@ pub fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) 
         KEY_HOME, KEY_END => {
             const last = key == KEY_END;
             if (is_pdf) {
-                changePdfPage(app_state, if (last) .last else .first);
+                _ = changePdfPage(app_state, if (last) .last else .first);
             } else if (is_text) {
                 scrollTo(app_state, if (last) std.math.floatMax(f32) else 0);
             } else {
@@ -778,7 +906,7 @@ fn handleSymbol(app_state: *GuiAppState, win: *zrame.Window, ch: u8) void {
         '+', '=', '-' => {
             const cpx = win.contentPx();
             const f: f32 = if (ch == '-') 1.0 / 1.1 else 1.1;
-            applyZoomAt(app_state, f, @as(f32, @floatFromInt(cpx.w)) / 2.0, @as(f32, @floatFromInt(cpx.h)) / 2.0, cpx.w, cpx.h);
+            zoomView(app_state, win, f, @as(f32, @floatFromInt(cpx.w)) / 2.0, @as(f32, @floatFromInt(cpx.h)) / 2.0);
         },
         '?' => togglePopup(app_state, .help),
         else => {},
@@ -853,12 +981,16 @@ fn handleScroll(app_state: *GuiAppState, win: *zrame.Window, axis: u32, value: f
             scrollText(app_state, val * wheel_px);
             return;
         }
+        // PDF: la rotella scorre la pagina e sfoglia ai bordi; lo zoom è su Ctrl.
+        if (!app_state.ctrl_down and isPdfNow(app_state)) {
+            wheelPdf(app_state, win, val > 0, @abs(val) * wheel_px);
+            return;
+        }
         // Rotella = zoom immagini/mesh VERSO IL CURSORE (ultima posizione nota).
-        const cpx = win.contentPx();
         if (val < 0) {
-            applyZoomAt(app_state, 1.1, app_state.last_x, app_state.last_y, cpx.w, cpx.h);
+            zoomView(app_state, win, 1.1, app_state.last_x, app_state.last_y);
         } else if (val > 0) {
-            applyZoomAt(app_state, 1.0 / 1.1, app_state.last_x, app_state.last_y, cpx.w, cpx.h);
+            zoomView(app_state, win, 1.0 / 1.1, app_state.last_x, app_state.last_y);
         }
     }
 }

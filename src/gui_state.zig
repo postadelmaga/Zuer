@@ -141,6 +141,9 @@ pub const GuiAppState = struct {
         pitch: f32 = 0,
         pan_x: f32 = 0,
         pan_y: f32 = 0,
+        /// La prossima pagina PDF si apre dal FONDO (ci si arriva scorrendo in su
+        /// dalla pagina dopo), non dall'alto. Consumato da `applyDecoded`.
+        pdf_land_bottom: bool = false,
         // Rotazione della vista (tasto R): quarti di giro orari già APPLICATI a
         // `static_rgba` (immagini/pagine PDF). Persiste tra le pagine dello stesso
         // documento (`applyDecoded` la riapplica), si azzera su un file diverso.
@@ -317,6 +320,14 @@ pub const GuiAppState = struct {
     ctrl_down: bool = false,
     // Stato del tasto Shift (Shift+rotella = scroll orizzontale). Solo thread finestra.
     shift_down: bool = false,
+    /// Ultimo cambio pagina PDF dato dalla rotella (ms): una rotellata veloce
+    /// sfoglia una pagina alla volta, non dieci.
+    pdf_wheel_turn_ms: i64 = 0,
+    /// Ultima taglia (logica) chiesta alla finestra dallo zoom e quando: gli scatti
+    /// di una rotellata arrivano prima che la finestra l'abbia applicata, e devono
+    /// partire da lì, non dalla taglia vecchia (sennò se ne perdono metà).
+    zoom_win_req: [2]f32 = .{ 0, 0 },
+    zoom_win_req_ms: i64 = 0,
 
     // Gruppi di campi per lock (vedi i doc-comment dei rispettivi tipi).
     shared: Shared = .{},
@@ -468,6 +479,19 @@ pub fn freeTextLines(state: *GuiAppState) void {
 pub fn freeTextDoc(state: *GuiAppState) void {
     if (state.shared.text_doc) |*doc| doc.deinit();
     state.shared.text_doc = null;
+}
+
+/// Proporzioni (`w << 32 | h`) a cui bloccare la finestra per un'immagine o una
+/// pagina PDF, così ridimensionandola non compaiono bande ai lati; 0 = libere
+/// (testo, tabelle, mesh, nessun contenuto). Le forme estreme (oltre 4:1) restano
+/// libere: una finestra 10:1 sarebbe inservibile, lì le bande sono il male minore.
+/// `s` è `GuiAppState.Shared`, letto con `mutex` acquisito.
+pub fn imageAspectLocked(s: anytype) u64 {
+    if (s.decoded != .image or s.is_text or s.is_mesh) return 0;
+    const w = s.static_w;
+    const h = s.static_h;
+    if (w == 0 or h == 0 or w > 4 * h or h > 4 * w) return 0;
+    return @as(u64, w) << 32 | h;
 }
 
 pub fn isPdfPath(path: []const u8) bool {

@@ -615,7 +615,12 @@ pub fn applyDecoded(state: *GuiAppState, new_decoded: decoder_mod.Decoded, pre_i
         state.shared.pitch = 0.0;
         state.shared.pan_x = 0.0;
         state.shared.pan_y = 0.0;
+        // Pagina PDF: si parte dall'alto (o dal fondo, se ci si arriva salendo).
+        // Il pan "infinito" è riportato al bordo dal clamp del worker; quando la
+        // pagina sta tutta nella finestra diventa 0, centrata come prima.
+        if (isPdfPath(new_path)) state.shared.pan_y = if (state.shared.pdf_land_bottom) -1e9 else 1e9;
     }
+    state.shared.pdf_land_bottom = false;
     state.shared.scroll_y = 0.0;
     state.shared.scroll_x = 0.0;
     resetScroll(&state.shared.sc);
@@ -1064,7 +1069,14 @@ pub fn resizeToContent(state: *GuiAppState) void {
     state.shared.mutex.lockUncancelable(state.io);
     const fit = fitFor(state, &state.shared.decoded, state.shared.static_w, state.shared.static_h);
     state.shared.zoom = fit.zoom;
+    const aspect = gui_state_mod.imageAspectLocked(&state.shared);
     state.shared.mutex.unlock(state.io);
+    // Proporzioni del contenuto NUOVO prima del resize: la finestra applica il blocco
+    // anche alle taglie chieste, e con quelle dell'immagine di prima la schiaccerebbe.
+    // (Il worker poi le ritrova uguali: nessuno snap in più.) Il video le imposta
+    // dal worker, dalla sorgente.
+    // Anche "libere" (0): passando a un testo il blocco dell'immagine non deve restare.
+    win.setContentAspect(@intCast(aspect >> 32), @intCast(aspect & 0xffff_ffff));
     // `resizeToContent` gira anche sul loadWorker (navigazione a cache-miss):
     // il resize va differito al thread finestra, le surface Wayland non sono
     // thread-safe (altrimenti `xdg_surface: attached a buffer before configure`).
