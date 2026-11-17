@@ -1,49 +1,68 @@
-# Zuer 0.3.0 — note di rilascio
+# Zuer 0.4.0 — note di rilascio
 
-Tag `v0.3.0`, dopo la 0.1.2 ([RELEASE-0.1.2.md](RELEASE-0.1.2.md)). Zicro al commit di
+Tag `v0.4.0`, dopo la 0.3.0 ([RELEASE-0.3.0.md](RELEASE-0.3.0.md)). Zicro al commit di
 `.github/zicro.ref`. Stesse parole per come è stato verificato: **verificato** (questa
-macchina Linux), **CI** (runner GitHub: per macOS sono Mac veri), **non verificato**,
-**sotto Darling** (la build macOS x86_64 eseguita su Linux da Darling) e **sotto Wine**
-(la build Windows eseguita su Linux da Wine).
+macchina Linux, su un sway di prova senza schermo con tastiera e puntatore virtuali),
+**CI** (runner GitHub: per macOS sono Mac veri), **non verificato**.
 
-## Cosa cambia rispetto a 0.1.2
+## Cosa cambia rispetto a 0.3.0
 
-### Stampa: `Ctrl+P` (`⌘P` su macOS) o l'icona in alto a destra
+### La finestra ha la forma del contenuto
 
-Accanto al nome del file c'è un'icona a forma di stampante: un clic, o `Ctrl+P`, apre un
-pannello di conferma; Invio stampa sulla stampante predefinita, Esc annulla.
+Video, immagini e pagine PDF tengono le proporzioni mentre si ridimensiona la finestra:
+non compaiono più bande nere ai lati. Trascinando un bordo comanda quel bordo, da un
+angolo la finestra segue il puntatore lungo la diagonale senza salti. Ruotando
+un'immagine (R) la finestra scambia i lati, passando a un altro file prende la forma del
+nuovo; testi, tabelle e modelli 3D restano liberi, e così le forme estreme (oltre 4:1).
+Durante il ridimensionamento il piano video segue subito la finestra, invece di sporgere
+dagli angoli arrotondati fino al frame successivo. (verificato; il trascinamento da un
+angolo e il piano video **non verificati su KWin**)
 
-- **PDF**: si stampa il file originale.
-- **Immagini**: su un foglio A4 orientato come l'immagine, centrata e adattata ai margini.
-- **Testi e codice**: testo vero (nitido e selezionabile nel PDF), monospazio con i
-  colori della sintassi, numero di pagina in fondo.
-- **Markdown**: impaginato come lo si vede a schermo, con colori adatti alla carta; le
-  pagine non spezzano una tabella o un blocco di codice e non lasciano un titolo da solo
-  in fondo.
+### Zoom che ridimensiona la finestra
 
-Linux e macOS stampano con `lp` (CUPS); su Windows il PDF va all'applicazione
-predefinita per i PDF (verbo "stampa" della shell) e, se non lo sa stampare, viene
-aperto lì. Se qualcosa manca (CUPS, una stampante predefinita, un lettore PDF) il pannello
-lo dice. Nei video, nei modelli 3D e negli archivi l'icona non compare.
-(verificato su Linux con un `lp` di prova; sotto Darling: il `lp` di macOS chiamato
-davvero, che risponde "nessuna stampante predefinita"; sotto Wine: PDF prodotto e
-messaggio "nessuna applicazione sa stampare i PDF"; **non verificato su una stampante
-reale**)
+Su un'immagine in finestra la rotella (o `+`/`-`) fa crescere o calare la finestra
+attorno all'immagine, senza spostarla né farla lampeggiare. Al bordo dello schermo lo
+zoom continua dentro la finestra; tornando indietro prima si riduce lo zoom interno, poi
+la finestra. A schermo intero lo zoom resta dentro. (verificato)
 
-### Markdown impaginato davvero
+### PDF da leggere scorrendo
 
-Il markdown prima si vedeva come testo semplice. Ora è impaginato: carattere
-proporzionale (Liberation Sans), titoli più grandi per livello, grassetto, corsivo,
-barrato, codice in linea su fondo, link colorati, elenchi puntati, annidati, numerati e
-di attività, citazioni, blocchi di codice con i colori della sintassi, righe orizzontali
-e tabelle con allineamento e celle che vanno a capo. Selezione e copia seguono la nuova
-impaginazione: il testo copiato resta pulito (elenchi coi loro segni, celle separate da
-tabulazioni). (verificato su Linux; sotto Darling e sotto Wine)
+A schermo intero la pagina riempie la larghezza dello schermo e parte dalla cima. La
+rotella scorre la pagina e, arrivata in fondo, passa alla successiva (dall'alto); salendo
+oltre l'inizio torna alla precedente (dal fondo). Lo zoom dei PDF è ora su
+`Ctrl`+rotella. (verificato)
 
-Limiti: i link `[testo][rif]` restano testo, le immagini mostrano il loro testo
-alternativo, i caratteri assenti dai due font (come `⌘`) compaiono come un riquadro.
-File costruiti apposta (migliaia di livelli annidati, migliaia di `*` o `[` aperti) non
-bloccano né fanno cadere Zuer: oltre una certa profondità il resto diventa testo.
+### Trascinare file sulla finestra
+
+Un file (o una cartella) trascinato su Zuer si apre come con "Apri con". (verificato su
+Linux con un client Wayland di prova; macOS e Windows **non verificati**, solo compilati)
+
+### YouTube ed esploratore file rifatti
+
+I due pannelli hanno lo stesso aspetto: fondo pieno, testo proporzionale con "…" quando
+non entra, miniature con gli angoli arrotondati. Nella ricerca YouTube: campo a pillola
+con caret, selezione e scorciatoie di modifica del testo, "Coda" con il contatore,
+qualità come controllo segmentato, titolo su due righe con il canale, suggerimenti solo
+quando non ci sono risultati. Le emoji nei titoli non diventano più quadratini.
+L'esploratore mostra "cartella madre / cartella" e, sotto ogni file, tipo e dimensione.
+(verificato)
+
+### YouTube più veloce
+
+La card selezionata si risolve in anticipo: con Invio il primo frame arriva in circa
+3,5 s invece di circa 15. I sottotitoli (tasto `c`) si scaricano in circa 0,6 s.
+Annullando un'apertura si ferma anche il processo che risolve la pagina. (verificato)
+
+### macOS: niente più campanella
+
+Spostandosi tra i file con le frecce macOS suonava l'avviso di sistema a ogni tasto.
+(**non verificato su un Mac**: la causa è chiara, la prova no)
+
+### Altro
+
+Ridimensionando la finestra da Zuer (cambio file) titolo e identità dell'app non vanno
+più persi: su sway la finestra perdeva le sue regole (per esempio "flottante").
+(verificato)
 
 ## Distribuzione
 
@@ -53,10 +72,10 @@ Zuer e Zicro, architettura, sha256).
 
 | Sistema | Architettura | Artefatto |
 |---|---|---|
-| macOS 13 o successivo | Apple Silicon (arm64) | `zuer-0.3.0-macos-arm64.tar.gz` (`Zuer.app`, con FFmpeg e MoltenVK in `Contents/Frameworks`) |
-| macOS 13 o successivo | Intel (x86_64) | `zuer-0.3.0-macos-x86_64.tar.gz` (stesso contenuto, compilato e provato su un Mac Intel) |
-| Windows 10/11 | x64 | `zuer-0.3.0-windows-x64-setup.exe` |
-| Ubuntu 26.04 LTS | x64 | `zuer-0.3.0-ubuntu26.04-amd64.deb` |
+| macOS 13 o successivo | Apple Silicon (arm64) | `zuer-0.4.0-macos-arm64.tar.gz` (`Zuer.app`, con FFmpeg e MoltenVK in `Contents/Frameworks`) |
+| macOS 13 o successivo | Intel (x86_64) | `zuer-0.4.0-macos-x86_64.tar.gz` (stesso contenuto, compilato e provato su un Mac Intel) |
+| Windows 10/11 | x64 | `zuer-0.4.0-windows-x64-setup.exe` |
+| Ubuntu 26.04 LTS | x64 | `zuer-0.4.0-ubuntu26.04-amd64.deb` |
 | Altre distribuzioni Linux | x64 | dai sorgenti: `zig build` + `install.sh` |
 
 Quale pacchetto macOS: menu Apple → Informazioni su questo Mac. "Chip Apple M…" →
@@ -67,7 +86,7 @@ sono pacchetti universali né Windows ARM.
 **Verifica del download**: nella cartella dei file scaricati,
 `sha256sum -c SHA256SUMS --ignore-missing` (Linux/Git Bash) oppure
 `shasum -a 256 -c SHA256SUMS` (macOS); su Windows
-`Get-FileHash .\zuer-0.3.0-windows-x64-setup.exe -Algorithm SHA256` e confronto a mano.
+`Get-FileHash .\zuer-0.4.0-windows-x64-setup.exe -Algorithm SHA256` e confronto a mano.
 
 **macOS**: estrarre l'archivio e trascinare `Zuer.app` in Applicazioni. Il pacchetto
 **non è firmato con un Developer ID né notarizzato** (la firma è solo ad-hoc): al primo
@@ -87,7 +106,7 @@ con il `tar` di sistema; `.doc` e `.rtf` con `textutil`; video con FFmpeg LGPL c
 dal sorgente (VideoToolbox, AV1 software con dav1d); 3D con MoltenVK. Disinstallazione:
 cancellare `Zuer.app` (cache in `~/.cache/zuer`).
 
-**Ubuntu**: `sudo apt install ./zuer-0.3.0-ubuntu26.04-amd64.deb` (con `./`: apt
+**Ubuntu**: `sudo apt install ./zuer-0.4.0-ubuntu26.04-amd64.deb` (con `./`: apt
 installa anche le dipendenze). Il pacchetto non è firmato né in un repository: gli
 aggiornamenti si installano allo stesso modo. Disinstallazione: `sudo apt remove zuer`
 (cache in `~/.cache/zuer`). Solo Ubuntu 26.04: sulle versioni precedenti le librerie
@@ -108,7 +127,7 @@ i modelli 3D non si vedono, con il motivo a schermo.
 (commit e opzioni di configure: la build si ripete con `scripts/build-ffmpeg.sh`);
 `THIRD-PARTY-NOTICES.txt` (libwebp, nanosvg, TinySoundFont, stb, i font Hack e Liberation Sans);
 su Windows PDFium con `PDFium-LICENSE.txt`; su macOS MoltenVK (Apache-2.0) con
-`MoltenVK-LICENSE.txt`. Il sorgente di Zuer è il tag `v0.3.0`, quello di Zicro il commit
+`MoltenVK-LICENSE.txt`. Il sorgente di Zuer è il tag `v0.4.0`, quello di Zicro il commit
 in `.github/zicro.ref`. La procedura per una nuova versione è in RELEASE-1.0.0.md,
 "Fare una nuova versione".
 
