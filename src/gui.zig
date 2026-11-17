@@ -438,6 +438,8 @@ fn renderWorker(
     // controlli vale solo se il resto del buffer è ancora quello.
     var vid_full_w: u32 = 0;
     var vid_full_h: u32 = 0;
+    // Proporzioni imposte alla finestra (`w << 32 | h`, 0 = libere).
+    var win_aspect: u64 = 0;
     // Dopo un cambio contenuto (navigazione) ripresenta per qualche frame: il
     // frame staged viene committato dal thread finestra solo su un suo "wake", e
     // se il primo redraw è differito (entrambi gli slot buffer occupati) resterebbe
@@ -487,6 +489,22 @@ fn renderWorker(
         if (state.shared.info and state.shared.info_card.seq != state.shared.load_seq) {
             info_popup.build(state);
             state.shared.file_changed = true;
+        }
+
+        // Video in finestra: la finestra tiene le proporzioni della sorgente mentre
+        // la si ridimensiona (niente bande nere ai lati). Tolto su ogni altro
+        // contenuto e sull'audio-only (l'oscilloscopio riempie qualsiasi forma).
+        if (comptime has_video) {
+            var want_aspect: u64 = 0;
+            if (state.video.isActive() and !state.video.audio_only) {
+                if (state.video.decoder) |dec| {
+                    if (dec.src_w > 0 and dec.src_h > 0) want_aspect = @as(u64, dec.src_w) << 32 | dec.src_h;
+                }
+            }
+            if (want_aspect != win_aspect) {
+                win_aspect = want_aspect;
+                win.setContentAspect(@intCast(want_aspect >> 32), @intCast(want_aspect & 0xffff_ffff));
+            }
         }
 
         // Traccia da quanto dura il caricamento per la soglia anti-flash.
