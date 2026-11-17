@@ -12,6 +12,7 @@ const builtin = @import("builtin");
 const decoder_mod = @import("decoder.zig");
 const thumbs = @import("thumbs.zig");
 const glyph = @import("glyph.zig");
+const ui = @import("overlay_ui.zig");
 const layout = @import("layout.zig");
 const nav = @import("nav.zig");
 const videomod = @import("video.zig");
@@ -460,12 +461,17 @@ pub fn handleKey(state: *GuiAppState, key: u32) bool {
 
 // ── Geometria della griglia (stessa impostazione dell'overlay YouTube) ───────
 
-const pad: i32 = 14;
-const gap: i32 = 10;
-const header_h: i32 = 40;
-const title_strip_h: i32 = 24;
-const status_h: i32 = 20;
-const panel_top: i32 = 24;
+// Il pannello copre la finestra (fondo pieno, `overlay_ui`): niente cornice, il
+// contenuto sta in una colonna centrata larga al più `max_w`.
+const pad: i32 = 0;
+const gap: i32 = 16;
+const side: i32 = 28;
+const col_max_w: i32 = 1120;
+const header_h: i32 = 48;
+/// Sotto la miniatura: nome e riga "TIPO · dimensione".
+const title_strip_h: i32 = 50;
+const status_h: i32 = 26;
+const panel_top: i32 = 16;
 
 const Layout = struct {
     xp: i32,
@@ -484,7 +490,7 @@ const Layout = struct {
 fn layoutFor(W: u32, H: u32, n: usize, status: bool) Layout {
     const wi: i32 = @intCast(W);
     const hi: i32 = @intCast(H);
-    const wp: i32 = @min(wi - 32, 1080);
+    const wp: i32 = @min(wi - 2 * side, col_max_w);
     const xp = @divTrunc(wi - wp, 2);
     const card_w = @divTrunc(wp - pad * 2 - gap * (grid_cols - 1), grid_cols);
     const thumb_h = @divTrunc(card_w * 9, 16);
@@ -516,7 +522,7 @@ fn geom(lay: Layout) card_grid.Geom {
     return .{
         .grid_x = lay.grid_x,
         .grid_y = lay.grid_y,
-        .right = lay.xp + lay.wp - 3, // la scrollbar flottante sta nel margine del pannello
+        .right = lay.xp + lay.wp + @divTrunc(side, 2) + 3, // la scrollbar flottante sta nel margine laterale
         .card_h = lay.card_h,
         .gap = gap,
         .total_rows = lay.total_rows,
@@ -651,27 +657,15 @@ pub fn handleMouse(state: *GuiAppState, win: *zrame.Window, event: zrame.MouseEv
 
 // ── Disegno dell'overlay ─────────────────────────────────────────────────────
 
-const panel_bg = paint.Color.rgba(13, 15, 22, 0.94);
-const card_bg = paint.Color.rgba(26, 30, 41, 0.98);
-const thumb_bg = paint.Color.rgba(16, 19, 27, 1.0);
-const sel_accent = paint.Color.rgba(120, 160, 255, 0.95);
-const header_bg = paint.Color.rgba(28, 32, 44, 0.9);
-const badge_bg = paint.Color.rgba(0, 0, 0, 0.72);
-const folder_body = paint.Color.rgba(222, 168, 62, 0.95);
-const folder_tab = paint.Color.rgba(240, 190, 84, 0.95);
-const text_fg = [3]u8{ 235, 238, 245 };
-const text_dim = [3]u8{ 150, 158, 175 };
-const text_err = [3]u8{ 240, 180, 110 };
-
 /// Tinta del segnaposto per tipo di contenuto (file senza miniatura).
 fn kindColor(name: []const u8) paint.Color {
-    if (extEqCi(decoder_mod.getExtension(name), "pdf")) return paint.Color.rgba(150, 62, 56, 0.95);
+    if (extEqCi(decoder_mod.getExtension(name), "pdf")) return paint.Color.rgba(196, 82, 72, 0.30);
     return switch (layout.winKindFromExt(name)) {
-        .image => paint.Color.rgba(44, 116, 108, 0.95),
-        .video => paint.Color.rgba(96, 66, 148, 0.95),
-        .table => paint.Color.rgba(146, 100, 42, 0.95),
-        .mesh => paint.Color.rgba(52, 118, 70, 0.95),
-        .document, .generic => paint.Color.rgba(52, 62, 84, 0.95),
+        .image => paint.Color.rgba(60, 170, 156, 0.26),
+        .video => paint.Color.rgba(140, 100, 214, 0.30),
+        .table => paint.Color.rgba(214, 150, 64, 0.28),
+        .mesh => paint.Color.rgba(76, 176, 104, 0.26),
+        .document, .generic => paint.Color.rgba(255, 255, 255, 0.07),
     };
 }
 
@@ -680,24 +674,29 @@ fn fmtSize(buf: []u8, bytes: u64) []const u8 {
     if (bytes < 1024) return std.fmt.bufPrint(buf, "{d} B", .{bytes}) catch "";
     const units = [_][]const u8{ "KB", "MB", "GB", "TB" };
     var v: f64 = @floatFromInt(bytes);
-    var ui: usize = 0;
+    var ui_: usize = 0;
     v /= 1024.0;
-    while (v >= 1024.0 and ui < units.len - 1) : (ui += 1) v /= 1024.0;
-    if (v < 10.0) return std.fmt.bufPrint(buf, "{d:.1} {s}", .{ v, units[ui] }) catch "";
-    return std.fmt.bufPrint(buf, "{d:.0} {s}", .{ v, units[ui] }) catch "";
+    while (v >= 1024.0 and ui_ < units.len - 1) : (ui_ += 1) v /= 1024.0;
+    if (v < 10.0) return std.fmt.bufPrint(buf, "{d:.1} {s}", .{ v, units[ui_] }) catch "";
+    return std.fmt.bufPrint(buf, "{d:.0} {s}", .{ v, units[ui_] }) catch "";
 }
 
-fn countCps(text: []const u8) i32 {
-    var cols: i32 = 0;
-    var view = std.unicode.Utf8View.init(text) catch return @intCast(text.len);
-    var it = view.iterator();
-    while (it.nextCodepoint()) |_| cols += 1;
-    return cols;
+/// Estensione in maiuscolo ("PNG"), o "FILE" se manca.
+fn extUpper(buf: []u8, name: []const u8) []const u8 {
+    const ext = decoder_mod.getExtension(name);
+    var n: usize = 0;
+    while (n < ext.len and n < buf.len) : (n += 1) buf[n] = std.ascii.toUpper(ext[n]);
+    return if (n > 0) buf[0..n] else "FILE";
+}
+
+/// La cartella madre per l'intestazione, con la home abbreviata in "~".
+fn parentLabel(dir: []const u8) []const u8 {
+    return std.fs.path.dirname(dir) orelse "";
 }
 
 /// Disegna l'overlay dell'esploratore sul frame corrente (`W`×`H`). Da chiamare
 /// con `shared.mutex` acquisito e solo se `fx.active`.
-pub fn drawOverlay(buf: []u8, W: u32, H: u32, state: *GuiAppState, raster: *glyph.Raster) void {
+pub fn drawOverlay(buf: []u8, W: u32, H: u32, state: *GuiAppState, fonts: ui.Fonts) void {
     if (W < 160 or H < 160) return;
     const fx = &state.shared.fx;
 
@@ -713,122 +712,109 @@ pub fn drawOverlay(buf: []u8, W: u32, H: u32, state: *GuiAppState, raster: *glyp
 
     const u32px: [*]u32 = @ptrCast(@alignCast(buf.ptr));
     var canvas = paint.Canvas.initRgba8(u32px[0 .. @as(usize, W) * H], W, H);
+    const body = fonts.body;
+    const small = fonts.small;
+    const body_lh = ui.Fonts.lineH(body);
+    const small_lh = ui.Fonts.lineH(small);
 
-    const line_h = raster.ascent - raster.descent;
+    ui.fillBackdrop(&canvas, W, H);
 
-    canvas.fillRoundedRect(@floatFromInt(lay.xp), @floatFromInt(lay.yp), @floatFromInt(lay.wp), @floatFromInt(lay.hp), 14.0, panel_bg);
-    canvas.fillRoundedRect(@floatFromInt(lay.xp + pad), @floatFromInt(lay.yp + pad), @floatFromInt(lay.wp - pad * 2), @floatFromInt(header_h), 9.0, header_bg);
-
-    // Header: conteggio a destra, percorso a sinistra (troncato dalla TESTA:
-    // della cartella conta la coda del percorso).
-    const head_base = lay.yp + pad + @divTrunc(header_h - line_h, 2) + raster.ascent;
+    // ── Intestazione: "madre / cartella" a sinistra, conteggio a destra ────
+    const hx = lay.xp + pad;
+    const head_base = lay.yp + pad + @divTrunc(header_h - body_lh, 2) + body.ascent;
     var cnt_buf: [32]u8 = undefined;
-    const cnt_txt = std.fmt.bufPrint(&cnt_buf, "{d} voci", .{fx.entries.len}) catch "";
-    const cnt_w = countCps(cnt_txt) * raster.advance;
-    _ = yt_search.drawText(buf, W, H, raster, lay.xp + lay.wp - pad - 12 - cnt_w, head_base, cnt_txt, text_dim, cnt_w + 4);
-
-    const path_x = lay.xp + pad + 12;
-    const path_max_w = lay.wp - pad * 2 - 24 - cnt_w - 16;
-    if (raster.advance > 0) {
-        const max_cols = @divTrunc(path_max_w, raster.advance);
-        var shown: []const u8 = fx.dir;
-        var prefix: []const u8 = "";
-        const cols = countCps(fx.dir);
-        if (cols > max_cols and max_cols > 1) {
-            // Salta i codepoint in testa finché il resto (più "…") non entra.
-            var to_skip = cols - (max_cols - 1);
-            var idx: usize = 0;
-            var view = std.unicode.Utf8View.init(fx.dir) catch null;
-            if (view) |*v| {
-                var it = v.iterator();
-                while (to_skip > 0) : (to_skip -= 1) {
-                    if (it.nextCodepoint() == null) break;
-                    idx = it.i;
+    const cnt_txt = std.fmt.bufPrint(&cnt_buf, "{d} {s}", .{ fx.entries.len, if (fx.entries.len == 1) "elemento" else "elementi" }) catch "";
+    const cnt_w = ui.measure(small, .regular, cnt_txt);
+    _ = ui.text(buf, W, H, small, lay.xp + lay.wp - pad - cnt_w, head_base, cnt_txt, ui.dim, .{});
+    {
+        const room = lay.wp - pad * 2 - cnt_w - 24;
+        const name = std.fs.path.basename(fx.dir);
+        const name_txt = if (name.len > 0) name else fx.dir;
+        const name_w = @min(ui.measure(body, .bold, name_txt), room);
+        const parent = parentLabel(fx.dir);
+        var pen = hx;
+        if (parent.len > 0 and name.len > 0) {
+            const sep = "  /  ";
+            const parent_room = room - name_w - ui.measure(body, .regular, sep);
+            if (parent_room > 40) {
+                // Della madre conta la coda: la testa sparisce dietro a un "…".
+                const pw = ui.measure(body, .regular, parent);
+                var shown_parent = parent;
+                var lead: []const u8 = "";
+                if (pw > parent_room) {
+                    lead = "…";
+                    const keep_w = parent_room - ui.measure(body, .regular, lead);
+                    var k: usize = 0;
+                    while (k < parent.len and ui.measure(body, .regular, parent[k..]) > keep_w) : (k += 1) {
+                        while (k + 1 < parent.len and parent[k + 1] & 0xC0 == 0x80) k += 1;
+                    }
+                    shown_parent = parent[@min(k + 1, parent.len)..];
                 }
+                pen += ui.text(buf, W, H, body, pen, head_base, lead, ui.faint, .{});
+                pen += ui.text(buf, W, H, body, pen, head_base, shown_parent, ui.faint, .{});
+                pen += ui.text(buf, W, H, body, pen, head_base, sep, ui.faint, .{});
             }
-            shown = fx.dir[idx..];
-            prefix = "…";
         }
-        var pen = path_x;
-        pen += yt_search.drawText(buf, W, H, raster, pen, head_base, prefix, text_dim, path_max_w);
-        _ = yt_search.drawText(buf, W, H, raster, pen, head_base, shown, text_fg, path_max_w - (pen - path_x));
+        _ = ui.text(buf, W, H, body, pen, head_base, name_txt, ui.fg, .{ .style = .bold, .max_w = room - (pen - hx) });
     }
+    canvas.fillRoundedRect(@floatFromInt(lay.xp), @floatFromInt(lay.yp + pad + header_h - 1), @floatFromInt(lay.wp), 1.0, 0, ui.divider);
 
     // Riga di stato (avvisi: cartella vuota/inaccessibile/troncata).
     if (fx.err) |e| {
         const sy = lay.yp + pad + header_h;
-        const sbase = sy + @divTrunc(status_h - line_h, 2) + raster.ascent;
-        _ = yt_search.drawText(buf, W, H, raster, path_x, sbase, e, text_err, lay.wp - pad * 2 - 24);
+        const sbase = sy + @divTrunc(status_h - small_lh, 2) + small.ascent;
+        _ = ui.text(buf, W, H, small, hx, sbase, e, ui.warn, .{ .max_w = lay.wp - pad * 2 });
     }
 
-    // Griglia di card: miniatura (o segnaposto/cartella), nome, badge dimensione.
-    // Tutto tagliato alla banda (più i 3 px del bordo di selezione): le card a
+    // ── Griglia: miniatura (o cartella / segnaposto), nome, tipo · dimensione ─
+    // Tutto tagliato alla banda (più i 5 px dell'anello di selezione): le card a
     // metà dello scroll escono dal bordo alto e basso.
-    const clip_y0 = lay.grid_y - 3;
-    const clip_y1 = lay.grid_y + geom(lay).bandH() + 3;
+    const clip_y0 = lay.grid_y - 5;
+    const clip_y1 = lay.grid_y + geom(lay).bandH() + 5;
+    const clip: ui.ClipY = .{ .y0 = clip_y0, .y1 = clip_y1 };
     const saved_clip = canvas.setClip(0, @intCast(@max(clip_y0, 0)), W, @intCast(@max(clip_y1 - @max(clip_y0, 0), 0)));
     defer canvas.clip = saved_clip;
+    const rad: f32 = 10.0;
     for (fx.entries, 0..) |e, i| {
         const rc = cardRect(lay, fx.scroll.pos(), i) orelse continue;
         const x = rc[0];
         const y = rc[1];
+        const tw = lay.card_w;
+        const th = lay.thumb_h;
+        var ext_buf: [8]u8 = undefined;
 
-        if (@as(i32, @intCast(i)) == fx.sel) {
-            canvas.fillRoundedRect(@floatFromInt(x - 3), @floatFromInt(y - 3), @floatFromInt(lay.card_w + 6), @floatFromInt(lay.card_h + 6), 10.0, sel_accent);
-        }
-        canvas.fillRoundedRect(@floatFromInt(x), @floatFromInt(y), @floatFromInt(lay.card_w), @floatFromInt(lay.card_h), 8.0, card_bg);
-
-        const tw = lay.card_w - 2;
-        const th = lay.thumb_h - 1;
         if (e.is_dir) {
-            // Cartella: icona disegnata (linguetta + corpo) centrata nella miniatura.
-            canvas.fillRoundedRect(@floatFromInt(x + 1), @floatFromInt(y + 1), @floatFromInt(tw), @floatFromInt(th), 8.0, thumb_bg);
-            const fw: i32 = @divTrunc(tw * 2, 5);
-            const fh: i32 = @divTrunc(fw * 3, 4);
-            const fx0 = x + 1 + @divTrunc(tw - fw, 2);
-            const fy0 = y + 1 + @divTrunc(th - fh, 2);
-            const tab_h = @max(6, @divTrunc(fh, 5));
-            canvas.fillRoundedRect(@floatFromInt(fx0), @floatFromInt(fy0), @floatFromInt(@divTrunc(fw * 2, 5)), @floatFromInt(tab_h * 2), 5.0, folder_tab);
-            canvas.fillRoundedRect(@floatFromInt(fx0), @floatFromInt(fy0 + tab_h), @floatFromInt(fw), @floatFromInt(fh - tab_h), 6.0, folder_body);
+            canvas.fillRoundedRect(@floatFromInt(x), @floatFromInt(y), @floatFromInt(tw), @floatFromInt(th), rad, ui.surface);
+            ui.folderIcon(&canvas, x, y, tw, th);
         } else if (e.thumb_w != 0) {
-            // Miniatura in aspect-fit su fondo scuro (mai stirata).
-            canvas.fillRoundedRect(@floatFromInt(x + 1), @floatFromInt(y + 1), @floatFromInt(tw), @floatFromInt(th), 8.0, thumb_bg);
-            const sw: f32 = @floatFromInt(e.thumb_w);
-            const sh: f32 = @floatFromInt(e.thumb_h);
-            const s = @min(@as(f32, @floatFromInt(tw)) / sw, @as(f32, @floatFromInt(th)) / sh);
-            const dw: i32 = @intFromFloat(@round(sw * s));
-            const dh: i32 = @intFromFloat(@round(sh * s));
-            const dx = x + 1 + @divTrunc(tw - dw, 2);
-            const dy = y + 1 + @divTrunc(th - dh, 2);
-            yt_search.blitThumbClip(buf, W, H, dx, dy, dw, dh, e.thumb_rgba, e.thumb_w, e.thumb_h, clip_y0, clip_y1);
+            // Proporzioni vicine alla tessera: la riempie (taglio minimo); molto
+            // diverse (pagine, panorami): intera, centrata sul fondo della tessera.
+            const ra = @as(f32, @floatFromInt(e.thumb_w)) / @as(f32, @floatFromInt(e.thumb_h));
+            const rt = @as(f32, @floatFromInt(tw)) / @as(f32, @floatFromInt(th));
+            const fit: ui.Fit = if (@max(ra / rt, rt / ra) < 1.45) .cover else .contain;
+            ui.thumb(&canvas, buf, W, H, x, y, tw, th, e.thumb_rgba, e.thumb_w, e.thumb_h, rad, fit, ui.surface, clip);
         } else {
-            // Segnaposto: tinta per tipo + estensione al centro.
-            canvas.fillRoundedRect(@floatFromInt(x + 1), @floatFromInt(y + 1), @floatFromInt(tw), @floatFromInt(th), 8.0, kindColor(e.name));
-            var ext_buf: [8]u8 = undefined;
-            const ext = decoder_mod.getExtension(e.name);
-            var n: usize = 0;
-            while (n < ext.len and n < ext_buf.len) : (n += 1) ext_buf[n] = std.ascii.toUpper(ext[n]);
-            const ext_txt: []const u8 = if (n > 0) ext_buf[0..n] else "FILE";
-            const ex = x + 1 + @divTrunc(tw - countCps(ext_txt) * raster.advance, 2);
-            const ebase = y + 1 + @divTrunc(th - line_h, 2) + raster.ascent;
-            _ = yt_search.drawTextClip(buf, W, H, raster, ex, ebase, ext_txt, text_fg, tw, clip_y0, clip_y1);
+            // Segnaposto: tinta tenue per tipo + estensione al centro.
+            canvas.fillRoundedRect(@floatFromInt(x), @floatFromInt(y), @floatFromInt(tw), @floatFromInt(th), rad, ui.surface);
+            canvas.fillRoundedRect(@floatFromInt(x), @floatFromInt(y), @floatFromInt(tw), @floatFromInt(th), rad, kindColor(e.name));
+            const ext_txt = extUpper(&ext_buf, e.name);
+            ui.textCentered(buf, W, H, body, x + @divTrunc(tw, 2), y + @divTrunc(th - body_lh, 2) + body.ascent, ext_txt, ui.dim, .{ .style = .bold, .max_w = tw - 16, .clip = clip });
         }
+        if (@as(i32, @intCast(i)) == fx.sel) ui.selectionRing(&canvas, x, y, tw, th, rad);
 
-        // Badge dimensione in basso a destra (solo file).
-        if (!e.is_dir and e.size > 0) {
+        // Nome e, sotto, tipo · dimensione.
+        const nbase = y + th + 9 + body.ascent;
+        _ = ui.text(buf, W, H, body, x + 2, nbase, e.name, ui.fg, .{ .max_w = tw - 4, .clip = clip });
+        var meta_buf: [48]u8 = undefined;
+        const meta: []const u8 = if (e.is_dir) "Cartella" else blk: {
             var sz_buf: [24]u8 = undefined;
-            const sz = fmtSize(&sz_buf, e.size);
-            const bw = countCps(sz) * raster.advance + 10;
-            const bh = line_h + 4;
-            const bx = x + lay.card_w - bw - 6;
-            const by = y + lay.thumb_h - bh - 6;
-            canvas.fillRoundedRect(@floatFromInt(bx), @floatFromInt(by), @floatFromInt(bw), @floatFromInt(bh), 4.0, badge_bg);
-            _ = yt_search.drawTextClip(buf, W, H, raster, bx + 5, by + 2 + raster.ascent, sz, text_fg, bw, clip_y0, clip_y1);
-        }
-
-        // Striscia nome sotto la miniatura.
-        const tbase = y + lay.thumb_h + @divTrunc(title_strip_h - line_h, 2) + raster.ascent;
-        _ = yt_search.drawTextClip(buf, W, H, raster, x + 8, tbase, e.name, text_fg, lay.card_w - 16, clip_y0, clip_y1);
+            const ext_txt = extUpper(&ext_buf, e.name);
+            break :blk if (e.size > 0)
+                std.fmt.bufPrint(&meta_buf, "{s} · {s}", .{ ext_txt, fmtSize(&sz_buf, e.size) }) catch ext_txt
+            else
+                ext_txt;
+        };
+        _ = ui.text(buf, W, H, small, x + 2, nbase - body.ascent + body_lh + 3 + small.ascent, meta, ui.dim, .{ .max_w = tw - 4, .clip = clip });
     }
 
     // Scrollbar flottante di zicro, come quella del testo.

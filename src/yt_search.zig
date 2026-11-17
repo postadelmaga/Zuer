@@ -10,6 +10,7 @@
 const std = @import("std");
 const decoder_mod = @import("decoder.zig");
 const glyph = @import("glyph.zig");
+const ui = @import("overlay_ui.zig");
 const clipboard = @import("clipboard.zig");
 const videomod = @import("video.zig");
 const gui_state_mod = @import("gui_state.zig");
@@ -1530,17 +1531,23 @@ pub fn currentSubText(state: *GuiAppState, pos_s: f64) ?[]const u8 {
 // ── Geometria della griglia (condivisa da draw e hit-test) ───────────────────
 
 pub const grid_cols: i32 = 3;
-const pad: i32 = 14;
-const gap: i32 = 10;
-const input_h: i32 = 42;
-const title_strip_h: i32 = 26;
-const status_h: i32 = 22;
-const panel_top: i32 = 28;
-// Riga dei chip qualità (sotto il campo query). Larghezze FISSE (niente metriche
-// font): la stessa geometria serve anche all'hit-test del mouse, che non ha raster.
-const qual_h: i32 = 30;
-const chip_w: i32 = 56;
-const chip_h: i32 = 22;
+// Il pannello copre la finestra (fondo pieno, `overlay_ui`): niente cornice, il
+// contenuto sta in una colonna centrata larga al più `max_w`.
+const pad: i32 = 0;
+const gap: i32 = 16;
+const side: i32 = 28;
+const col_max_w: i32 = 980;
+const input_h: i32 = 44;
+/// Sotto la miniatura: due righe di titolo e il canale.
+const title_strip_h: i32 = 66;
+const status_h: i32 = 28;
+const panel_top: i32 = 24;
+// Riga sotto il campo: "Coda" a sinistra, qualità (controllo segmentato) a destra.
+// Larghezze FISSE (niente metriche font): la stessa geometria serve anche
+// all'hit-test del mouse, che non ha raster.
+const qual_h: i32 = 48;
+const chip_w: i32 = 54;
+const chip_h: i32 = 28;
 
 pub const Layout = struct {
     xp: i32,
@@ -1562,7 +1569,7 @@ pub const Layout = struct {
 fn layoutFor(W: u32, H: u32, n: usize, status: bool) Layout {
     const wi: i32 = @intCast(W);
     const hi: i32 = @intCast(H);
-    const wp: i32 = @min(wi - 32, 880);
+    const wp: i32 = @min(wi - 2 * side, col_max_w);
     const xp = @divTrunc(wi - wp, 2);
     const card_w = @divTrunc(wp - pad * 2 - gap * (grid_cols - 1), grid_cols);
     const thumb_h = @divTrunc(card_w * 9, 16);
@@ -1590,17 +1597,20 @@ fn layoutFor(W: u32, H: u32, n: usize, status: bool) Layout {
 }
 
 /// Rettangolo del chip qualità `i` (riga sotto il campo query).
+/// I segmenti sono contigui e allineati a destra della colonna.
 fn chipRect(lay: Layout, i: usize) [4]i32 {
-    const x = lay.xp + pad + @as(i32, @intCast(i)) * (chip_w + 8);
+    const n: i32 = @intCast(quality_heights.len);
+    const x0 = lay.xp + lay.wp - pad - n * chip_w - 3;
+    const x = x0 + @as(i32, @intCast(i)) * chip_w;
     const y = lay.yp + pad + input_h + @divTrunc(qual_h - chip_h, 2);
     return .{ x, y, chip_w, chip_h };
 }
 
-/// Rettangolo del chip "Coda (N)", dopo quelli della qualità.
-const queue_chip_w: i32 = 84;
+/// Rettangolo del pulsante "Coda", a sinistra sotto il campo.
+const queue_chip_w: i32 = 96;
 fn queueChipRect(lay: Layout) [4]i32 {
-    const rc = chipRect(lay, quality_heights.len);
-    return .{ rc[0] + 8, rc[1], queue_chip_w, rc[3] };
+    const rc = chipRect(lay, 0);
+    return .{ lay.xp + pad, rc[1], queue_chip_w, rc[3] };
 }
 
 fn rectHit(rc: [4]i32, x: f32, y: f32) bool {
@@ -1613,7 +1623,7 @@ fn geom(lay: Layout) card_grid.Geom {
     return .{
         .grid_x = lay.grid_x,
         .grid_y = lay.grid_y,
-        .right = lay.xp + lay.wp - 3, // la scrollbar flottante sta nel margine del pannello
+        .right = lay.xp + lay.wp + @divTrunc(side, 2) + 3, // la scrollbar flottante sta nel margine laterale
         .card_h = lay.card_h,
         .gap = gap,
         .total_rows = lay.total_rows,
@@ -1800,7 +1810,7 @@ fn byteAtCol(t: []const u8, col: usize) usize {
 
 /// Il caret del campo query (barra verticale alta quanto il campo, meno i margini).
 fn drawCaret(canvas: *paint.Canvas, x: i32, field_y: i32, rgb: [3]u8) void {
-    canvas.fillRoundedRect(@floatFromInt(x + 1), @floatFromInt(field_y + 7), 2.0, @floatFromInt(input_h - 14), 1.0, paint.Color.rgba(rgb[0], rgb[1], rgb[2], 0.9));
+    canvas.fillRoundedRect(@floatFromInt(x), @floatFromInt(field_y + 12), 2.0, @floatFromInt(input_h - 24), 1.0, paint.Color.rgba(rgb[0], rgb[1], rgb[2], 0.9));
 }
 
 /// Testo monospazio troncato a `max_w` px; ritorna la larghezza usata.
@@ -1889,7 +1899,7 @@ pub fn blitThumbClip(buf: []u8, W: u32, H: u32, dx: i32, dy: i32, dw: i32, dh: i
 /// Disegna l'overlay di ricerca sul frame corrente (`W`×`H`). Da chiamare con
 /// `shared.mutex` acquisito e solo se `yt.active`. `spin_phase` in secondi
 /// anima lo spinner mentre ricerca/apertura sono in corso.
-pub fn drawOverlay(buf: []u8, W: u32, H: u32, state: *GuiAppState, raster: *glyph.Raster, spin_phase: f32) void {
+pub fn drawOverlay(buf: []u8, W: u32, H: u32, state: *GuiAppState, fonts: ui.Fonts, spin_phase: f32) void {
     if (W < 160 or H < 160) return;
     const yt = &state.shared.yt;
     tickPrefetch(state);
@@ -1906,157 +1916,156 @@ pub fn drawOverlay(buf: []u8, W: u32, H: u32, state: *GuiAppState, raster: *glyp
 
     const u32px: [*]u32 = @ptrCast(@alignCast(buf.ptr));
     var canvas = paint.Canvas.initRgba8(u32px[0 .. @as(usize, W) * H], W, H);
+    const body = fonts.body;
+    const small = fonts.small;
+    const body_lh = ui.Fonts.lineH(body);
+    const small_lh = ui.Fonts.lineH(small);
 
-    const line_h = raster.ascent - raster.descent;
+    ui.fillBackdrop(&canvas, W, H);
 
-    canvas.fillRoundedRect(@floatFromInt(lay.xp), @floatFromInt(lay.yp), @floatFromInt(lay.wp), @floatFromInt(lay.hp), 14.0, panel_bg);
-    canvas.fillRoundedRect(@floatFromInt(lay.xp + pad), @floatFromInt(lay.yp + pad), @floatFromInt(lay.wp - pad * 2), @floatFromInt(input_h), 9.0, input_bg);
-
-    // Campo query: testo digitato + caret, o placeholder.
-    const in_x = lay.xp + pad + 12;
-    const in_max = lay.wp - pad * 2 - 24 - input_h; // spazio a destra per lo spinner
-    const in_base = lay.yp + pad + @divTrunc(input_h - line_h, 2) + raster.ascent;
+    // ── Campo di ricerca: pillola con la lente, testo proporzionale ────────
+    const fx0 = lay.xp + pad;
+    const fy0 = lay.yp + pad;
+    const fw = lay.wp - pad * 2;
+    canvas.fillRoundedRect(@floatFromInt(fx0), @floatFromInt(fy0), @floatFromInt(fw), @floatFromInt(input_h), @as(f32, @floatFromInt(input_h)) / 2.0, if (yt.sel < 0) ui.surface_hi else ui.surface);
+    ui.searchIcon(&canvas, @floatFromInt(fx0 + 24), @floatFromInt(fy0 + @divTrunc(input_h, 2)), 18.0, paint.Color.rgba(ui.dim[0], ui.dim[1], ui.dim[2], 1.0));
+    const in_x = fx0 + 46;
+    const in_max = fw - 46 - input_h; // a destra lo spinner
+    const in_base = fy0 + @divTrunc(input_h - body_lh, 2) + body.ascent;
     if (yt.query.len == 0) {
-        _ = drawText(buf, W, H, raster, in_x, in_base, "Cerca su YouTube…", text_dim, in_max);
-        if (yt.sel < 0) drawCaret(&canvas, in_x, lay.yp + pad, text_fg);
+        _ = ui.text(buf, W, H, body, in_x, in_base, "Cerca su YouTube", ui.faint, .{ .max_w = in_max });
+        if (yt.sel < 0) drawCaret(&canvas, in_x - 3, fy0, ui.fg);
     } else {
-        // Glifi a cella fissa: tutto si misura in colonne (codepoint). Se il testo
-        // non entra, la vista scorre quanto basta a tenere il caret dentro.
+        // La vista scorre quanto basta a tenere il caret dentro il campo.
         const q = &yt.query;
-        const adv = raster.advance;
-        const fit: usize = if (adv > 0) @intCast(@max(1, @divTrunc(in_max, adv) - 1)) else 1;
-        const caret_col = colCount(q.text()[0..q.cursor]);
-        const first_col = caret_col -| fit;
-        const start = byteAtCol(q.text(), first_col);
-        const shown_txt = q.text()[start..];
+        const caret_px = ui.measure(body, .regular, q.text()[0..q.cursor]);
+        const shift = @max(0, caret_px - (in_max - 6));
+        const tx = in_x - shift;
         if (q.selection()) |r| {
-            const c0 = colCount(q.text()[0..r.start]) -| first_col;
-            const c1 = @min(colCount(q.text()[0..r.end]) -| first_col, fit + 1);
-            if (c1 > c0) {
-                const x0 = in_x + @as(i32, @intCast(c0)) * adv;
-                canvas.fillRoundedRect(@floatFromInt(x0 - 1), @floatFromInt(lay.yp + pad + 6), @floatFromInt(@as(i32, @intCast(c1 - c0)) * adv + 2), @floatFromInt(input_h - 12), 3.0, paint.Color.rgba(70, 110, 190, 0.55));
-            }
+            const x0 = @max(in_x, tx + ui.measure(body, .regular, q.text()[0..r.start]));
+            const x1 = @min(in_x + in_max, tx + ui.measure(body, .regular, q.text()[0..r.end]));
+            if (x1 > x0) canvas.fillRoundedRect(@floatFromInt(x0 - 1), @floatFromInt(fy0 + 10), @floatFromInt(x1 - x0 + 2), @floatFromInt(input_h - 20), 3.0, paint.Color.rgba(122, 162, 255, 0.40));
         }
-        _ = drawText(buf, W, H, raster, in_x, in_base, shown_txt, text_fg, in_max);
+        _ = ui.text(buf, W, H, body, tx, in_base, q.text(), ui.fg, .{ .x_lo = in_x, .x_hi = in_x + in_max });
         // Caret solo col fuoco sul campo (nessuna card selezionata: le frecce
         // muovono lui, non la griglia).
-        if (yt.sel < 0 and q.selection() == null)
-            drawCaret(&canvas, in_x + @as(i32, @intCast(caret_col - first_col)) * adv, lay.yp + pad, text_fg);
+        if (yt.sel < 0 and q.selection() == null) drawCaret(&canvas, tx + caret_px, fy0, ui.fg);
     }
     if (yt.searching or yt.opening) {
-        const scx: f32 = @floatFromInt(lay.xp + lay.wp - pad - @divTrunc(input_h, 2));
-        const scy: f32 = @floatFromInt(lay.yp + pad + @divTrunc(input_h, 2));
-        canvas.drawSpinner(scx, scy, @as(f32, @floatFromInt(input_h)) * 0.26, 2.5, spin_phase, paint.Color.rgba(205, 210, 230, 1.0));
+        const scx: f32 = @floatFromInt(fx0 + fw - @divTrunc(input_h, 2));
+        const scy: f32 = @floatFromInt(fy0 + @divTrunc(input_h, 2));
+        canvas.drawSpinner(scx, scy, @as(f32, @floatFromInt(input_h)) * 0.22, 2.2, spin_phase, paint.Color.rgba(205, 210, 230, 1.0));
     }
 
-    // Riga dei chip qualità (360p…1080p) + suggerimenti tasti a destra.
+    // ── Riga sotto il campo: Coda a sinistra, qualità a destra ─────────────
     {
-        const chip_base_y = chipRect(lay, 0)[1];
-        const chip_tb = chip_base_y + @divTrunc(chip_h - line_h, 2) + raster.ascent;
+        const q0 = chipRect(lay, 0);
+        const tb = q0[1] + @divTrunc(chip_h - small_lh, 2) + small.ascent;
+        // Controllo segmentato: binario comune, il segmento attivo in rilievo.
+        const n: i32 = @intCast(quality_labels.len);
+        canvas.fillRoundedRect(@floatFromInt(q0[0] - 3), @floatFromInt(q0[1] - 3), @floatFromInt(n * chip_w + 6), @floatFromInt(chip_h + 6), 9.0, ui.surface);
         for (quality_labels, 0..) |lab, qi| {
             const rc = chipRect(lay, qi);
             const selq = yt.quality == @as(u8, @intCast(qi));
-            canvas.fillRoundedRect(@floatFromInt(rc[0]), @floatFromInt(rc[1]), @floatFromInt(rc[2]), @floatFromInt(rc[3]), 6.0, if (selq) sel_accent else input_bg);
-            const tw = @as(i32, @intCast(lab.len)) * raster.advance;
-            const tx = rc[0] + @divTrunc(rc[2] - tw, 2);
-            _ = drawText(buf, W, H, raster, tx, chip_tb, lab, if (selq) [3]u8{ 14, 17, 26 } else text_dim, rc[2]);
+            if (selq) canvas.fillRoundedRect(@floatFromInt(rc[0]), @floatFromInt(rc[1]), @floatFromInt(rc[2]), @floatFromInt(rc[3]), 7.0, ui.surface_hi);
+            ui.textCentered(buf, W, H, small, rc[0] + @divTrunc(rc[2], 2), tb, lab, if (selq) ui.fg else ui.dim, .{ .max_w = rc[2] - 4 });
         }
-        {
-            const rc = queueChipRect(lay);
-            var lab_buf: [24]u8 = undefined;
-            const lab = std.fmt.bufPrint(&lab_buf, "Coda ({d})", .{yt.queue.items.len}) catch "Coda";
-            canvas.fillRoundedRect(@floatFromInt(rc[0]), @floatFromInt(rc[1]), @floatFromInt(rc[2]), @floatFromInt(rc[3]), 6.0, if (yt.show_queue) sel_accent else input_bg);
-            const tw = @as(i32, @intCast(lab.len)) * raster.advance;
-            _ = drawText(buf, W, H, raster, rc[0] + @divTrunc(rc[2] - tw, 2), chip_tb, lab, if (yt.show_queue) [3]u8{ 14, 17, 26 } else text_dim, rc[2]);
-        }
-        const hint = "tasto destro: coda · Ctrl+O YouTube";
-        var cols: i32 = 0;
-        if (std.unicode.Utf8View.init(hint)) |v| {
-            var hit = v.iterator();
-            while (hit.nextCodepoint()) |_| cols += 1;
-        } else |_| {}
-        const hw = cols * raster.advance;
-        const hx = lay.xp + lay.wp - pad - hw;
-        if (hx > queueChipRect(lay)[0] + queue_chip_w + 16) {
-            _ = drawText(buf, W, H, raster, hx, chip_tb, hint, text_dim, hw + 4);
+        const rc = queueChipRect(lay);
+        canvas.fillRoundedRect(@floatFromInt(rc[0] - 3), @floatFromInt(rc[1] - 3), @floatFromInt(rc[2] + 6), @floatFromInt(rc[3] + 6), 9.0, if (yt.show_queue) ui.surface_hi else ui.surface);
+        const lab_rgb = if (yt.show_queue) ui.fg else ui.dim;
+        const lw = ui.text(buf, W, H, small, rc[0] + 12, tb, "Coda", lab_rgb, .{});
+        if (yt.queue.items.len > 0) {
+            var nb: [12]u8 = undefined;
+            const ns = std.fmt.bufPrint(&nb, "{d}", .{yt.queue.items.len}) catch "";
+            const nw = ui.measure(small, .regular, ns);
+            const bw = @max(nw + 12, chip_h - 8);
+            const bx = rc[0] + 12 + lw + 8;
+            canvas.fillRoundedRect(@floatFromInt(bx), @floatFromInt(rc[1] + 4), @floatFromInt(bw), @floatFromInt(chip_h - 8), @as(f32, @floatFromInt(chip_h - 8)) / 2.0, ui.accent);
+            ui.textCentered(buf, W, H, small, bx + @divTrunc(bw, 2), tb, ns, ui.on_accent, .{});
         }
     }
 
-    // Riga di stato (errore o "apertura stream…").
+    // ── Riga di stato (errore, apertura in corso, coda vuota) ─────────────
     if (status) {
         const sy = lay.yp + pad + input_h + qual_h;
-        const sbase = sy + @divTrunc(status_h - line_h, 2) + raster.ascent;
+        const sbase = sy + @divTrunc(status_h - small_lh, 2) + small.ascent;
+        const sx = lay.xp + pad + 4;
+        const smax = lay.wp - pad * 2 - 8;
         if (yt.opening) {
-            _ = drawText(buf, W, H, raster, in_x, sbase, "apertura stream…", text_dim, lay.wp - pad * 2 - 24);
+            _ = ui.text(buf, W, H, small, sx, sbase, "Apertura dello stream…", ui.dim, .{ .max_w = smax });
         } else if (yt.err == null) {
-            _ = drawText(buf, W, H, raster, in_x, sbase, "Coda vuota: tasto destro (o Ctrl+Invio) su un video per aggiungerlo", text_dim, lay.wp - pad * 2 - 24);
+            _ = ui.text(buf, W, H, small, sx, sbase, "La coda è vuota: tasto destro (o Ctrl+Invio) su un video per aggiungerlo", ui.dim, .{ .max_w = smax });
         } else if (yt.err) |e| {
-            const used = drawText(buf, W, H, raster, in_x, sbase, e, text_err, lay.wp - pad * 2 - 24);
+            const used = ui.text(buf, W, H, small, sx, sbase, e, ui.err, .{ .max_w = smax });
             // Il link per esteso dopo il messaggio, se c'è posto: si legge anche
             // senza cliccare (e si copia a mano).
             if (missingShown(yt)) {
-                const lx = in_x + used + 12;
-                const room = lay.xp + lay.wp - pad - 24 - lx;
-                const lw = @as(i32, @intCast(ytdlp.download_url.len)) * raster.advance;
-                if (room >= lw) _ = drawText(buf, W, H, raster, lx, sbase, ytdlp.download_url, text_link, room);
+                const lx = sx + used + 12;
+                const room = sx + smax - lx;
+                if (room >= ui.measure(small, .regular, ytdlp.download_url)) _ = ui.text(buf, W, H, small, lx, sbase, ytdlp.download_url, ui.link, .{});
             }
         }
     }
 
-    // Griglia di card stile Netflix: miniatura 16:9, striscia titolo, badge durata.
-    // Tutto tagliato alla banda (più i 3 px del bordo di selezione): le card a metà
-    // dello scroll escono dal bordo alto e basso.
-    const clip_y0 = lay.grid_y - 3;
-    const clip_y1 = lay.grid_y + geom(lay).bandH() + 3;
+    // ── Stato vuoto: nessun risultato da mostrare ──────────────────────────
+    if (shown(yt).len == 0 and !status and !yt.searching) {
+        const top = lay.yp + pad + input_h + qual_h;
+        const cy = top + @divTrunc(@as(i32, @intCast(H)) - top, 3);
+        const cx = lay.xp + @divTrunc(lay.wp, 2);
+        ui.textCentered(buf, W, H, body, cx, cy, if (yt.query.len == 0) "Cerca un video e premi Invio" else "Premi Invio per cercare", ui.dim, .{ .max_w = lay.wp });
+        const hints = [_][]const u8{
+            "Tasto destro su un video: aggiungi alla coda",
+            "Ctrl+O: apri la pagina su YouTube",
+            "Esc: chiudi",
+        };
+        for (hints, 0..) |h, k| {
+            ui.textCentered(buf, W, H, small, cx, cy + 14 + body_lh + @as(i32, @intCast(k)) * (small_lh + 6), h, ui.faint, .{ .max_w = lay.wp });
+        }
+    }
+
+    // ── Griglia: miniatura arrotondata, durata, titolo su due righe, canale ─
+    // Tutto tagliato alla banda (più i 5 px dell'anello di selezione): le card a
+    // metà dello scroll escono dal bordo alto e basso.
+    const clip_y0 = lay.grid_y - 5;
+    const clip_y1 = lay.grid_y + geom(lay).bandH() + 5;
+    const clip: ui.ClipY = .{ .y0 = clip_y0, .y1 = clip_y1 };
     const saved_clip = canvas.setClip(0, @intCast(@max(clip_y0, 0)), W, @intCast(@max(clip_y1 - @max(clip_y0, 0), 0)));
     defer canvas.clip = saved_clip;
+    const rad: f32 = 10.0;
+    const title_step = body.lineHeight();
     for (shown(yt), 0..) |r, i| {
         const rc = cardRect(lay, yt.scroll.pos(), i) orelse continue;
         const x = rc[0];
         const y = rc[1];
-
-        if (@as(i32, @intCast(i)) == yt.sel) {
-            canvas.fillRoundedRect(@floatFromInt(x - 3), @floatFromInt(y - 3), @floatFromInt(lay.card_w + 6), @floatFromInt(lay.card_h + 6), 10.0, sel_accent);
-        }
-        canvas.fillRoundedRect(@floatFromInt(x), @floatFromInt(y), @floatFromInt(lay.card_w), @floatFromInt(lay.card_h), 8.0, card_bg);
+        const selected = @as(i32, @intCast(i)) == yt.sel;
 
         if (r.thumb_w != 0) {
-            blitThumbClip(buf, W, H, x + 1, y + 1, lay.card_w - 2, lay.thumb_h - 1, r.thumb_rgba, r.thumb_w, r.thumb_h, clip_y0, clip_y1);
+            ui.thumb(&canvas, buf, W, H, x, y, lay.card_w, lay.thumb_h, r.thumb_rgba, r.thumb_w, r.thumb_h, rad, .cover, ui.surface, clip);
         } else {
-            // Miniatura non ancora arrivata: placeholder scuro.
-            canvas.fillRoundedRect(@floatFromInt(x + 1), @floatFromInt(y + 1), @floatFromInt(lay.card_w - 2), @floatFromInt(lay.thumb_h - 1), 8.0, paint.Color.rgba(16, 19, 27, 1.0));
+            // Miniatura non ancora arrivata: segnaposto.
+            canvas.fillRoundedRect(@floatFromInt(x), @floatFromInt(y), @floatFromInt(lay.card_w), @floatFromInt(lay.thumb_h), rad, ui.surface);
         }
+        if (selected) ui.selectionRing(&canvas, x, y, lay.card_w, lay.thumb_h, rad);
 
-        // Badge durata in basso a destra della miniatura.
-        if (r.duration.len > 0) {
-            var cols: i32 = 0;
-            var view = std.unicode.Utf8View.init(r.duration) catch null;
-            if (view) |*v| {
-                var it = v.iterator();
-                while (it.nextCodepoint()) |_| cols += 1;
-            }
-            const bw = cols * raster.advance + 10;
-            const bh = line_h + 4;
-            const bx = x + lay.card_w - bw - 6;
-            const by = y + lay.thumb_h - bh - 6;
-            canvas.fillRoundedRect(@floatFromInt(bx), @floatFromInt(by), @floatFromInt(bw), @floatFromInt(bh), 4.0, badge_bg);
-            _ = drawTextClip(buf, W, H, raster, bx + 5, by + 2 + raster.ascent, r.duration, text_fg, bw, clip_y0, clip_y1);
-        }
+        if (r.duration.len > 0) ui.badgeBR(&canvas, buf, W, H, small, x + lay.card_w - 8, y + lay.thumb_h - 8, r.duration, clip);
 
-        // Badge "in coda" in alto a sinistra (nella vista coda solo il numero).
+        // "In coda" in alto a sinistra (nella vista coda solo il numero).
         const qn = queuePos(yt, r.id);
         if (qn > 0) {
             var qb: [24]u8 = undefined;
-            const qlab = (if (yt.show_queue) std.fmt.bufPrint(&qb, "#{d}", .{qn}) else std.fmt.bufPrint(&qb, "in coda #{d}", .{qn})) catch "in coda";
-            const bw = @as(i32, @intCast(qlab.len)) * raster.advance + 10;
-            const bh = line_h + 4;
-            canvas.fillRoundedRect(@floatFromInt(x + 6), @floatFromInt(y + 6), @floatFromInt(bw), @floatFromInt(bh), 4.0, sel_accent);
-            _ = drawTextClip(buf, W, H, raster, x + 11, y + 8 + raster.ascent, qlab, .{ 14, 17, 26 }, bw, clip_y0, clip_y1);
+            const qlab = (if (yt.show_queue) std.fmt.bufPrint(&qb, "#{d}", .{qn}) else std.fmt.bufPrint(&qb, "In coda · {d}", .{qn})) catch "In coda";
+            const bw = ui.measure(small, .regular, qlab) + 14;
+            const bh = small_lh + 6;
+            canvas.fillRoundedRect(@floatFromInt(x + 8), @floatFromInt(y + 8), @floatFromInt(bw), @floatFromInt(bh), @as(f32, @floatFromInt(bh)) / 2.0, ui.accent);
+            _ = ui.text(buf, W, H, small, x + 15, y + 11 + small.ascent, qlab, ui.on_accent, .{ .clip = clip });
         }
 
-        // Striscia titolo sotto la miniatura.
-        const tbase = y + lay.thumb_h + @divTrunc(title_strip_h - line_h, 2) + raster.ascent;
-        _ = drawTextClip(buf, W, H, raster, x + 8, tbase, r.title, text_fg, lay.card_w - 16, clip_y0, clip_y1);
+        const tbase = y + lay.thumb_h + 10 + body.ascent;
+        const lines = ui.text2(buf, W, H, body, x + 2, tbase, title_step, r.title, ui.fg, .{ .max_w = lay.card_w - 4, .clip = clip });
+        if (r.channel.len > 0) {
+            const cbase = tbase + @as(i32, lines) * title_step - body.ascent + 3 + small.ascent;
+            _ = ui.text(buf, W, H, small, x + 2, cbase, r.channel, ui.dim, .{ .max_w = lay.card_w - 4, .clip = clip });
+        }
     }
 
     // Scrollbar flottante di zicro, come quella del testo.

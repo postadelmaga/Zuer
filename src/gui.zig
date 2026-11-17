@@ -22,6 +22,7 @@ const WinKind = layout.WinKind;
 // CPU frame compositor (image aspect-fit + text blit + selection + tab bar).
 const compose = @import("compose.zig");
 const glyph = @import("glyph.zig");
+const overlay_ui = @import("overlay_ui.zig");
 const max_tabs = compose.max_tabs;
 // Stato condiviso dell'app (GuiAppState raggruppato per lock + helper posseduti).
 const gui_state_mod = @import("gui_state.zig");
@@ -438,6 +439,8 @@ fn renderWorker(
     // controlli vale solo se il resto del buffer è ancora quello.
     var vid_full_w: u32 = 0;
     var vid_full_h: u32 = 0;
+    // PDF a schermo intero al frame precedente (per partire dalla cima all'ingresso).
+    var prev_pdf_fs = false;
     // Proporzioni imposte alla finestra (`w << 32 | h`, 0 = libere).
     var win_aspect: u64 = 0;
     // Dopo un cambio contenuto (navigazione) ripresenta per qualche frame: il
@@ -456,6 +459,11 @@ fn renderWorker(
     // Creato una volta e riusato; null se l'init fallisce (label semplicemente omessa).
     var name_raster: ?glyph.Raster = glyph.Raster.init(state.gpa, 13.0) catch null;
     defer if (name_raster) |*r| r.deinit();
+    // Testo proporzionale dei pannelli a griglia (YouTube, esploratore): corpo e dettagli.
+    var ui_body: ?glyph.Raster = glyph.Raster.initFamily(state.gpa, 14.5, .prose) catch null;
+    defer if (ui_body) |*r| r.deinit();
+    var ui_small: ?glyph.Raster = glyph.Raster.initFamily(state.gpa, 12.5, .prose) catch null;
+    defer if (ui_small) |*r| r.deinit();
     // Raster dedicato ai sottotitoli (corpo più grande della label nome file).
     var sub_raster: ?glyph.Raster = if (has_video) glyph.Raster.init(state.gpa, 17.0) catch null else null;
     defer if (sub_raster) |*r| r.deinit();
@@ -491,16 +499,23 @@ fn renderWorker(
             state.shared.file_changed = true;
         }
 
-        // Video in finestra: la finestra tiene le proporzioni della sorgente mentre
-        // la si ridimensiona (niente bande nere ai lati). Tolto su ogni altro
-        // contenuto e sull'audio-only (l'oscilloscopio riempie qualsiasi forma).
-        if (comptime has_video) {
+        // La finestra tiene le proporzioni del contenuto mentre la si ridimensiona
+        // (niente bande nere ai lati): video (sorgente), immagini e pagine PDF.
+        // Libera su testo, tabelle, mesh e audio-only (l'oscilloscopio riempie
+        // qualsiasi forma). Durante un caricamento resta quella di prima.
+        {
             var want_aspect: u64 = 0;
-            if (state.video.isActive() and !state.video.audio_only) {
-                if (state.video.decoder) |dec| {
-                    if (dec.src_w > 0 and dec.src_h > 0) want_aspect = @as(u64, dec.src_w) << 32 | dec.src_h;
+            var video_on = false;
+            if (comptime has_video) {
+                if (state.video.isActive()) {
+                    video_on = true;
+                    if (!state.video.audio_only) if (state.video.decoder) |dec| {
+                        if (dec.src_w > 0 and dec.src_h > 0) want_aspect = @as(u64, dec.src_w) << 32 | dec.src_h;
+                    };
                 }
             }
+            if (!video_on) want_aspect = gui_state_mod.imageAspectLocked(&state.shared);
+            if (state.shared.loading) want_aspect = win_aspect;
             if (want_aspect != win_aspect) {
                 win_aspect = want_aspect;
                 win.setContentAspect(@intCast(want_aspect >> 32), @intCast(want_aspect & 0xffff_ffff));
@@ -677,10 +692,10 @@ fn renderWorker(
                     vid_full_h = fr.h;
                 }
                 if (state.shared.fx.active) {
-                    if (name_raster) |*r| file_explorer.drawOverlay(composited_rgba.*, fr.w, fr.h, state, r);
+                    if (uiFonts(&ui_body, &ui_small)) |f| file_explorer.drawOverlay(composited_rgba.*, fr.w, fr.h, state, f);
                 }
                 if (yt_active) {
-                    if (name_raster) |*r| yt_search.drawOverlay(composited_rgba.*, fr.w, fr.h, state, r, @as(f32, @floatFromInt(spin_frame)) / 60.0);
+                    if (uiFonts(&ui_body, &ui_small)) |f| yt_search.drawOverlay(composited_rgba.*, fr.w, fr.h, state, f, @as(f32, @floatFromInt(spin_frame)) / 60.0);
                     spin_frame +%= 1;
                 }
                 if (name_raster) |*r| drawPopups(state, composited_rgba.*, fr.w, fr.h, r);
@@ -931,12 +946,18 @@ fn renderWorker(
                 {
                     @memset(composited_rgba.*[0 .. @as(usize, cur_w) * cur_h * 4], 0);
                 } else {
+                    // PDF a schermo intero: la pagina riempie la larghezza (`input.viewZoom`).
+                    const pdf_fs = win.fullscreen and gui_state_mod.isPdfPath(state.shared.current_file_path);
+                    // Appena entrati a schermo intero su un PDF la lettura parte dalla cima.
+                    if (pdf_fs and !prev_pdf_fs) state.shared.pan_y = 1e9;
+                    prev_pdf_fs = pdf_fs;
+                    const vz = input.viewZoom(state.shared.zoom, pdf_fs, cur_w, cur_h, state.shared.static_w, state.shared.static_h);
                     // Mantieni l'immagine sempre centrata / dentro i bordi (no re-center manuale).
-                    input.clampImagePan(&state.shared.pan_x, &state.shared.pan_y, state.shared.zoom, cur_w, cur_h, state.shared.static_w, state.shared.static_h);
+                    input.clampImagePan(&state.shared.pan_x, &state.shared.pan_y, vz, cur_w, cur_h, state.shared.static_w, state.shared.static_h);
                     // Catena mip (pigra: si rifà solo se `static_rgba` è cambiato) →
                     // campionamento bilineare dal livello giusto: niente aliasing.
                     state.shared.mips.ensure(state.gpa, state.shared.static_rgba, state.shared.static_w, state.shared.static_h);
-                    compose.composeFrame(composited_rgba.*, cur_w, cur_h, state.shared.static_rgba, state.shared.static_w, state.shared.static_h, state.shared.zoom, state.shared.pan_x, state.shared.pan_y, &state.shared.mips);
+                    compose.composeFrame(composited_rgba.*, cur_w, cur_h, state.shared.static_rgba, state.shared.static_w, state.shared.static_h, vz, state.shared.pan_x, state.shared.pan_y, &state.shared.mips);
                 }
             }
 
@@ -946,11 +967,11 @@ fn renderWorker(
                 if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, cur_w, cur_h, r, std.fs.path.basename(state.shared.current_file_path), label_alpha, if (print_mod.printable(state)) state.shared.print.hover else null);
                 // Esploratore file sotto l'eventuale overlay YouTube (siamo sotto lock).
                 if (state.shared.fx.active) {
-                    if (name_raster) |*r| file_explorer.drawOverlay(composited_rgba.*, cur_w, cur_h, state, r);
+                    if (uiFonts(&ui_body, &ui_small)) |f| file_explorer.drawOverlay(composited_rgba.*, cur_w, cur_h, state, f);
                 }
                 // Overlay di ricerca YouTube, sopra tutto (siamo ancora sotto lock).
                 if (state.shared.yt.active) {
-                    if (name_raster) |*r| yt_search.drawOverlay(composited_rgba.*, cur_w, cur_h, state, r, @as(f32, @floatFromInt(spin_frame)) / 60.0);
+                    if (uiFonts(&ui_body, &ui_small)) |f| yt_search.drawOverlay(composited_rgba.*, cur_w, cur_h, state, f, @as(f32, @floatFromInt(spin_frame)) / 60.0);
                     spin_frame +%= 1;
                 }
                 if (name_raster) |*r| drawPopups(state, composited_rgba.*, cur_w, cur_h, r);
@@ -1039,10 +1060,10 @@ fn renderWorker(
                 // è composto fuori dal lock, quindi lo stato va riletto sotto mutex.
                 state.shared.mutex.lockUncancelable(state.io);
                 if (state.shared.fx.active) {
-                    if (name_raster) |*r| file_explorer.drawOverlay(composited_rgba.*, cur_w, cur_h, state, r);
+                    if (uiFonts(&ui_body, &ui_small)) |f| file_explorer.drawOverlay(composited_rgba.*, cur_w, cur_h, state, f);
                 }
                 if (state.shared.yt.active) {
-                    if (name_raster) |*r| yt_search.drawOverlay(composited_rgba.*, cur_w, cur_h, state, r, @as(f32, @floatFromInt(spin_frame)) / 60.0);
+                    if (uiFonts(&ui_body, &ui_small)) |f| yt_search.drawOverlay(composited_rgba.*, cur_w, cur_h, state, f, @as(f32, @floatFromInt(spin_frame)) / 60.0);
                     spin_frame +%= 1;
                 }
                 if (name_raster) |*r| drawPopups(state, composited_rgba.*, cur_w, cur_h, r);
@@ -1106,6 +1127,13 @@ fn launchArgUsable(io: std.Io, gpa: std.mem.Allocator, path: []const u8) bool {
     const eq = unicode_path.findEquivalent(io, gpa, path) catch return false;
     gpa.free(eq);
     return true;
+}
+
+/// I raster dei pannelli, se entrambi esistono.
+fn uiFonts(body: *?glyph.Raster, small: *?glyph.Raster) ?overlay_ui.Fonts {
+    const b = if (body.*) |*r| r else return null;
+    const sm = if (small.*) |*r| r else return null;
+    return .{ .body = b, .small = sm };
 }
 
 fn openFileFromSystem(_: *zrame.Window, path: []const u8, user: ?*anyopaque) void {

@@ -165,6 +165,13 @@ pub const Raster = struct {
         return self.ascent - self.descent + self.line_gap;
     }
 
+    /// Il font della faccia `style` ha un glifo per `cp`? (Altrimenti stb disegna il
+    /// .notdef, il "▯": l'UI preferisce saltare il carattere, es. le emoji nei titoli.)
+    pub fn hasGlyph(self: *const Raster, style: Style, cp: u32) bool {
+        if (cp < 128) return true;
+        return c.stbtt_FindGlyphIndex(&self.infos[@backingInt(style)], @intCast(cp)) != 0;
+    }
+
     pub fn getGlyph(self: *Raster, style: Style, cp: u32) !*const Glyph {
         const si = @backingInt(style);
         // ASCII: indice diretto, niente hashing (percorso caldo del layout).
