@@ -278,7 +278,7 @@ fn makeThumb(gpa: std.mem.Allocator, pixels: []const u8, sw: usize, sh: usize) ?
 
 const thumb_magic = "ZTH1";
 const thumb_header_len: usize = 12;
-/// Tetto di lettura: header + la miniatura più grande possibile.
+/// Dimensione della voce più grande possibile: header + miniatura `thumb_max`².
 const thumb_file_max: usize = thumb_header_len + thumb_max * thumb_max * 4;
 /// Cap LRU della directory `…/zuer/thumbs` (~870 miniature 256×144).
 const thumb_cache_cap_bytes: u64 = 128 * 1024 * 1024;
@@ -316,7 +316,10 @@ const failed_ttl_ns: i96 = 24 * std.time.ns_per_hour;
 const CacheRead = union(enum) { hit: ThumbPix, failed, miss };
 
 fn thumbCacheRead(h: *const Host, cdir: std.Io.Dir, fname: []const u8) CacheRead {
-    const raw = cdir.readFileAlloc(h.io, fname, h.gpa, .limited(thumb_file_max)) catch return .miss;
+    // `readFileAlloc` fallisce quando il file RAGGIUNGE il limite: +1, altrimenti la
+    // voce più grande (una miniatura quadrata 256×256) non si rilegge mai e
+    // l'immagine si ridecodifica a ogni visita della cartella.
+    const raw = cdir.readFileAlloc(h.io, fname, h.gpa, .limited(thumb_file_max + 1)) catch return .miss;
     defer h.gpa.free(raw);
     if (raw.len < thumb_header_len or !std.mem.startsWith(u8, raw, thumb_magic)) return .miss;
     const w = std.mem.readInt(u32, raw[4..][0..4], .little);
@@ -1223,6 +1226,27 @@ test "cache negativa: un decode fallito non si ritenta alla visita successiva" {
         try testing.expectEqual(@as(u32, 1), env.stats.failed.load(.monotonic));
         try testing.expectEqual(@as(u32, @intCast(visit)), env.stats.cache_hits.load(.monotonic));
     }
+}
+
+test "cache: la miniatura più grande (quadrata, thumb_max²) si rilegge" {
+    var th: std.Io.Threaded = .init(testing.allocator, .{});
+    defer th.deinit();
+    const io = th.io();
+    const env = try TestEnv.init(io, &.{}, false);
+    defer env.deinit();
+    const h = env.host(io, 1);
+    var cdir = try std.Io.Dir.cwd().openDir(io, env.cache, .{});
+    defer cdir.close(io);
+    const px = try testing.allocator.alignedAlloc(u8, .@"4", thumb_max * thumb_max * 4);
+    defer testing.allocator.free(px);
+    for (px, 0..) |*b, i| b.* = @truncate(i *% 31);
+    thumbCacheWrite(&h, cdir, "max.thumb", .{ .rgba = px, .w = thumb_max, .h = thumb_max });
+    const r = thumbCacheRead(&h, cdir, "max.thumb");
+    try testing.expect(r == .hit);
+    defer testing.allocator.free(r.hit.rgba);
+    try testing.expectEqual(@as(u32, thumb_max), r.hit.w);
+    try testing.expectEqual(@as(u32, thumb_max), r.hit.h);
+    try testing.expectEqualSlices(u8, px, r.hit.rgba);
 }
 
 test "decode interattivo in corso: i job in più si ritirano, l'ultimo resta" {
