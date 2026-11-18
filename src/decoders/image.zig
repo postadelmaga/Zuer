@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const decoder = @import("decoder");
 const exif = @import("exif.zig");
+const fit = @import("fit.zig");
 const ImageData = decoder.ImageData;
 const Decoded = decoder.Decoded;
 
@@ -431,35 +432,7 @@ fn resizeToFit(src: [*]const u8, ch: usize, src_w: usize, src_h: usize, orient: 
     errdefer allocator.free(name);
     const pixels = try allocator.alloc(u8, dst_w * dst_h * 3);
     errdefer allocator.free(pixels);
-
-    for (0..out_h) |oy| {
-        for (0..out_w) |ox| {
-            const sp = exif.srcCoord(orient, dst_w, dst_h, ox, oy);
-            const dx = sp[0];
-            const dy = sp[1];
-            const y0 = dy * src_h / dst_h;
-            const y1 = @max(y0 + 1, (dy + 1) * src_h / dst_h);
-            const x0 = dx * src_w / dst_w;
-            const x1 = @max(x0 + 1, (dx + 1) * src_w / dst_w);
-
-            var sum = [3]u64{ 0, 0, 0 };
-            for (y0..y1) |sy| {
-                for (x0..x1) |sx| {
-                    const s = (sy * src_w + sx) * ch;
-                    if (ch == 4 and src[s + 3] != 255) {
-                        // Composizione su bianco: c·a + 255·(255−a), in unità 1/255.
-                        const a: u64 = src[s + 3];
-                        inline for (0..3) |c| sum[c] += (@as(u64, src[s + c]) * a + 255 * (255 - a) + 127) / 255;
-                    } else {
-                        inline for (0..3) |c| sum[c] += src[s + c];
-                    }
-                }
-            }
-            const count: u64 = @intCast((y1 - y0) * (x1 - x0));
-            const d = (oy * out_w + ox) * 3;
-            inline for (0..3) |c| pixels[d + c] = @intCast(sum[c] / count);
-        }
-    }
+    try fit.boxResize(allocator, src, ch, src_w, src_h, orient, dst_w, dst_h, pixels);
 
     return .{
         .width = out_w,
