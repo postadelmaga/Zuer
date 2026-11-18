@@ -195,6 +195,13 @@ const Layouter = struct {
     marker: ?Marker = null,
     /// Il prossimo blocco è il primo di un contenitore: niente spazio sopra.
     at_start: bool = true,
+    /// Larghezza (`textWidth`) dell'ultimo tratto scritto da `addRun`, con la
+    /// chiave del suo testo (puntatore e lunghezza nell'arena: unici per tratto):
+    /// il controllo di fusione non ri-misura il tratto a ogni parola aggiunta
+    /// (era quadratico nella lunghezza della riga, ~40% del layout).
+    run_w: f32 = 0,
+    run_w_ptr: usize = 0,
+    run_w_len: usize = 0,
     /// Liste annidate attorno al blocco corrente (sceglie il pallino).
     depth: usize = 0,
 
@@ -476,20 +483,38 @@ const Layouter = struct {
         // Un salto (cella, marcatore) ha come confine sinistro l'inizio del tratto.
         if (xs.items.len == 0) try xs.append(l.arena, x) else xs.items[xs.items.len - 1] = @min(xs.items[xs.items.len - 1], x);
         var cx = x;
+        var sw: f32 = 0; // = textWidth(f, s): stessa somma, da 0, nello stesso ordine
         var it = utf8(s);
         while (it.nextCodepoint()) |cp| {
-            cx += try l.m.advance(f, cp);
+            const adv = try l.m.advance(f, cp);
+            cx += adv;
+            sw += adv;
             try xs.append(l.arena, cx);
         }
         try text.appendSlice(l.arena, s);
         if (runs.items.len > 0) {
             const last = &runs.items[runs.items.len - 1];
-            if (last.font == f and std.meta.eql(last.color, color) and last.hidden == hidden and @abs(last.x + try l.textWidth(f, last.text) - x) < 0.01) {
-                last.text = try std.mem.concat(l.arena, u8, &.{ last.text, s });
-                return;
+            if (last.font == f and std.meta.eql(last.color, color) and last.hidden == hidden) {
+                const lw = if (l.run_w_ptr == @intFromPtr(last.text.ptr) and l.run_w_len == last.text.len) l.run_w else try l.textWidth(f, last.text);
+                if (@abs(last.x + lw - x) < 0.01) {
+                    last.text = try std.mem.concat(l.arena, u8, &.{ last.text, s });
+                    // textWidth del tratto unito: la somma prosegue da `lw` sui
+                    // caratteri di `s`, come la farebbe `textWidth` dall'inizio.
+                    var w = lw;
+                    var it2 = utf8(s);
+                    while (it2.nextCodepoint()) |cp| w += try l.m.advance(f, cp);
+                    l.run_w = w;
+                    l.run_w_ptr = @intFromPtr(last.text.ptr);
+                    l.run_w_len = last.text.len;
+                    return;
+                }
             }
         }
-        try runs.append(l.arena, .{ .x = x, .text = try l.arena.dupe(u8, s), .font = f, .color = color, .hidden = hidden });
+        const owned = try l.arena.dupe(u8, s);
+        try runs.append(l.arena, .{ .x = x, .text = owned, .font = f, .color = color, .hidden = hidden });
+        l.run_w = sw;
+        l.run_w_ptr = @intFromPtr(owned.ptr);
+        l.run_w_len = owned.len;
     }
 
     fn attachMarker(l: *Layouter, runs: *std.ArrayList(Run), text: *std.ArrayList(u8), xs: *std.ArrayList(f32), baseline: f32, body_font: u16) !void {
