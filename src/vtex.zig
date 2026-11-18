@@ -106,7 +106,46 @@ fn linearToSrgb8(l: f32) u8 {
     return @intFromFloat(std.math.clamp(c * 255.0 + 0.5, 0.0, 255.0));
 }
 
-fn downsample(gpa: std.mem.Allocator, rgba: []const u8, w: u32, h: u32) !struct { img: []u8, w: u32, h: u32 } {
+/// Codifica lineare → byte sRGB con GLI STESSI risultati di `linearToSrgb8`, senza
+/// una `pow` per canale (era ~¾ del bake di una texture): `thr[k]` è il più
+/// piccolo valore che `linearToSrgb8` codifica ≥ k, trovato una volta per bake
+/// con la funzione stessa (a runtime: `pow` valutata a comptime potrebbe
+/// arrotondare diversamente), e un valore si codifica contando le soglie che
+/// raggiunge. Esatto perché `linearToSrgb8` è monotòna su [0, 1], verificato su
+/// tutti gli f32 dell'intervallo; il test sotto ricontrolla attorno a ogni soglia.
+const SrgbEncoder = struct {
+    thr: [256]f32,
+
+    fn init() SrgbEncoder {
+        var e: SrgbEncoder = .{ .thr = undefined };
+        e.thr[0] = -std.math.inf(f32);
+        // Per i float non negativi l'ordine dei bit è quello dei valori.
+        const one: u32 = @bitCast(@as(f32, 1.0));
+        var lo: u32 = 0;
+        for (1..256) |k| {
+            var a = lo;
+            var b = one + 1; // linearToSrgb8(1.0) = 255
+            while (a < b) {
+                const mid = a + (b - a) / 2;
+                if (linearToSrgb8(@bitCast(mid)) >= k) b = mid else a = mid + 1;
+            }
+            e.thr[k] = @bitCast(a);
+            lo = a;
+        }
+        return e;
+    }
+
+    /// Il k più grande con thr[k] ≤ l: ricerca binaria a passi fissi, senza salti.
+    inline fn encode(e: *const SrgbEncoder, l: f32) u8 {
+        var k: usize = 0;
+        inline for (.{ 128, 64, 32, 16, 8, 4, 2, 1 }) |step| {
+            if (l >= e.thr[k + step]) k += step;
+        }
+        return @intCast(k);
+    }
+};
+
+fn downsample(gpa: std.mem.Allocator, enc: *const SrgbEncoder, rgba: []const u8, w: u32, h: u32) !struct { img: []u8, w: u32, h: u32 } {
     const nw = @max(w / 2, 1);
     const nh = @max(h / 2, 1);
     const out = try gpa.alloc(u8, @as(usize, nw) * nh * 4);
@@ -126,7 +165,7 @@ fn downsample(gpa: std.mem.Allocator, rgba: []const u8, w: u32, h: u32) !struct 
             inline for (0..3) |c| {
                 const lin = (srgb_to_linear[rgba[p00 + c]] + srgb_to_linear[rgba[p01 + c]] +
                     srgb_to_linear[rgba[p10 + c]] + srgb_to_linear[rgba[p11 + c]]) * 0.25;
-                out[o + c] = linearToSrgb8(lin);
+                out[o + c] = enc.encode(lin);
             }
             // Alpha: lineare per definizione, media diretta.
             out[o + 3] = @intCast((@as(u32, rgba[p00 + 3]) + rgba[p01 + 3] + rgba[p10 + 3] + rgba[p11 + 3]) / 4);
@@ -170,8 +209,9 @@ pub fn bakeTiles(gpa: std.mem.Allocator, rgba: []const u8, width: u32, height: u
     const Mip = struct { img: []const u8, w: u32, h: u32 };
     const mips = try arena.alloc(Mip, n);
     mips[0] = .{ .img = rgba, .w = width, .h = height };
+    const enc: SrgbEncoder = if (n > 1) .init() else undefined;
     for (1..n) |i| {
-        const d = try downsample(arena, mips[i - 1].img, mips[i - 1].w, mips[i - 1].h);
+        const d = try downsample(arena, &enc, mips[i - 1].img, mips[i - 1].w, mips[i - 1].h);
         mips[i] = .{ .img = d.img, .w = d.w, .h = d.h };
     }
 
@@ -219,6 +259,32 @@ fn checker(gpa: std.mem.Allocator, w: u32, h: u32) ![]u8 {
         }
     }
     return v;
+}
+
+test "SrgbEncoder: stessi byte di linearToSrgb8" {
+    const e = SrgbEncoder.init();
+    const one: u32 = @bitCast(@as(f32, 1.0));
+    // Attorno a ogni soglia, dove un errore di un ulp cambierebbe il byte.
+    for (1..256) |k| {
+        const t: u32 = @bitCast(e.thr[k]);
+        var d: u32 = 0;
+        while (d < 64) : (d += 1) {
+            for ([_]u32{ t -| d, @min(t + d, one) }) |b| {
+                const l: f32 = @bitCast(b);
+                try testing.expectEqual(linearToSrgb8(l), e.encode(l));
+            }
+        }
+    }
+    // Un campione regolare di tutto [0, 1] e le medie vere di quattro texel.
+    var b: u32 = 0;
+    while (b <= one) : (b += 4093) {
+        const l: f32 = @bitCast(b);
+        try testing.expectEqual(linearToSrgb8(l), e.encode(l));
+    }
+    for (0..256) |i| for (0..256) |j| {
+        const l = (srgb_to_linear[i] + srgb_to_linear[j] + srgb_to_linear[i] + srgb_to_linear[255 - j]) * 0.25;
+        try testing.expectEqual(linearToSrgb8(l), e.encode(l));
+    };
 }
 
 test "level chain: 1x1 top, covering fine level, monotonic in between" {
