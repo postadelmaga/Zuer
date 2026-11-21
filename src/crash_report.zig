@@ -49,9 +49,10 @@ pub fn maybeReport(io: std.Io, gpa: std.mem.Allocator) void {
     std.Io.Dir.cwd().rename(log_path, std.Io.Dir.cwd(), reported, io) catch {};
 }
 
-/// POST del file di log al receiver `ZUER_CRASH_URL`. Assente = niente receiver
-/// (il default è un placeholder: senza dominio+cert curl fallirebbe comunque il
-/// TLS). curl c'è su Linux e su Windows 10+ (System32). true solo su HTTP 2xx.
+/// POST del file di log al receiver `ZUER_CRASH_URL`. Assente = niente receiver:
+/// non c'è un indirizzo predefinito finché il receiver non ha dominio e
+/// certificato (#17). curl c'è su Linux e su Windows 10+ (System32). true solo su
+/// HTTP 2xx.
 fn postToReceiver(gpa: std.mem.Allocator, log_path: []const u8) bool {
     const url = getenv("ZUER_CRASH_URL") orelse return false;
 

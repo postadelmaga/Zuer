@@ -146,64 +146,6 @@ pub const Metrics = struct {
     gutter_cols: i32 = 0,
 };
 
-/// Come `render`, ma raccoglie anche il testo semplice di ogni riga visiva
-/// (per selezione/copia, allocato con `gpa` in `out_lines`) e le metriche della
-/// griglia. Il chiamante possiede e libera le stringhe in `out_lines`.
-pub fn renderDoc(gpa: std.mem.Allocator, decoded: *const decoder_mod.Decoded, name: []const u8, opts: RenderOpts, out_lines: *std.ArrayList([]const u8), out_metrics: *Metrics) !decoder_mod.ImageData {
-    // Tabella: rendering proporzionale. Righe visive = header + righe dati (senza
-    // gutter), separate da TAB per la copia. La selezione mappa la riga (line_h =
-    // altezza riga) ma non il carattere esatto (font proporzionale).
-    const table_csv: ?decoder_mod.CsvData = switch (decoded.*) {
-        .csv => |c| c,
-        .workbook => |w| w.activeCsv(),
-        else => null,
-    };
-    if (table_csv) |c| {
-        var hdr: std.ArrayList(u8) = .empty;
-        errdefer hdr.deinit(gpa);
-        for (c.headers, 0..) |h, i| {
-            if (i > 0) try hdr.append(gpa, '\t');
-            try hdr.appendSlice(gpa, h);
-        }
-        try out_lines.append(gpa, try hdr.toOwnedSlice(gpa));
-        for (c.rows) |row| {
-            var line: std.ArrayList(u8) = .empty;
-            errdefer line.deinit(gpa);
-            for (row, 0..) |cell, i| {
-                if (i > 0) try line.append(gpa, '\t');
-                try line.appendSlice(gpa, cell);
-            }
-            try out_lines.append(gpa, try line.toOwnedSlice(gpa));
-        }
-        // Un solo Raster (parse TTF) condiviso tra metriche e pittura della tabella.
-        var sans = try glyph.Raster.initFamily(gpa, tableTextPx(opts.pointsize), .sans);
-        defer sans.deinit();
-        out_metrics.* = .{ .advance = 8, .line_h = sans.lineHeight() + row_extra, .pad_x = pad_x, .pad_y = pad_y, .gutter_cols = 0 };
-        return paintTable(gpa, &sans, c, opts);
-    }
-
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var raster = try glyph.Raster.init(gpa, docTextPx(opts.pointsize));
-    defer raster.deinit();
-
-    var rows: std.ArrayList(Row) = .empty;
-    const gutter_cols = try buildRows(arena, &rows, &raster, decoded, name, opts);
-
-    for (rows.items) |row| {
-        var line: std.ArrayList(u8) = .empty;
-        errdefer line.deinit(gpa);
-        const start_idx: usize = if (gutter_cols > 0 and row.len > 0) 1 else 0;
-        for (row[start_idx..]) |run| try line.appendSlice(gpa, run.text);
-        try out_lines.append(gpa, try line.toOwnedSlice(gpa));
-    }
-    out_metrics.* = .{ .advance = raster.advance, .line_h = raster.lineHeight(), .pad_x = pad_x, .pad_y = pad_y, .gutter_cols = @intCast(gutter_cols) };
-
-    return paint(gpa, &raster, rows.items, name, opts, bg);
-}
-
 /// Layout "ritenuto" di un documento a griglia monospazio (testo/codice/markdown):
 /// righe visive + raster dei glifi, vivi per tutta la vita del documento. La
 /// pittura avviene per viewport (`paintDocViewport`, solo le righe visibili)
@@ -258,10 +200,10 @@ pub const TableLayout = struct {
     gutter_w: i32,
 };
 
-/// Come `renderDoc` (righe di testo per selezione/copia + metriche), ma NON
-/// dipinge nulla: costruisce il layout ritenuto per `paintDocViewport`. Solo per
-/// contenuti a griglia monospazio; le tabelle (csv/workbook) restano su
-/// `renderDoc` (pittura proporzionale completa).
+/// Layout ritenuto per `paintDocViewport`, senza dipingere nulla: righe di testo
+/// per selezione/copia (allocate con `gpa` in `out_lines`, del chiamante) e
+/// metriche della griglia. Le tabelle (csv/workbook) hanno un layout ritenuto
+/// dedicato.
 pub fn layoutDoc(gpa: std.mem.Allocator, cache: *glyph.RasterCache, decoded: *const decoder_mod.Decoded, name: []const u8, opts: RenderOpts, out_lines: *std.ArrayList([]const u8), out_metrics: *Metrics) !DocLayout {
     // Tabelle (csv / foglio attivo di un workbook): layout ritenuto dedicato.
     const table_csv: ?decoder_mod.CsvData = switch (decoded.*) {
