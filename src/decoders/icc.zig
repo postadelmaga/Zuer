@@ -516,14 +516,6 @@ const Boxes = struct {
         while (it.next()) |b| if (std.mem.eql(u8, b.typ, typ)) return b.body;
         return null;
     }
-
-    /// n-esimo box, contando da 1 (gli indici di `ipma` dentro `ipco`).
-    fn nth(d: []const u8, n: u16) ?Box {
-        var it: Boxes = .{ .d = d };
-        var i: u16 = 1;
-        while (it.next()) |b| : (i += 1) if (i == n) return b;
-        return null;
-    }
 };
 
 const HeifColor = struct { icc: ?[]const u8 = null, nclx: ?Cicp = null };
@@ -543,20 +535,27 @@ fn heifColor(b: []const u8) ?HeifColor {
     var c = itemColor(iprp, ipco, primary);
     // Immagine derivata (griglia: le foto degli iPhone; `iden` sopra una
     // griglia): il colore può stare solo sugli elementi da cui deriva (`dimg`),
-    // giù fino alle tessere.
+    // giù fino alle tessere. Come libheif, profilo e nclx mancanti si prendono
+    // ciascuno per conto suo: una griglia col solo nclx e il profilo sulle
+    // tessere vale come profilo.
     var item = primary;
     var depth: u8 = 0;
-    while (c.icc == null and c.nclx == null and depth < 4) : (depth += 1) {
+    while ((c.icc == null or c.nclx == null) and depth < 4) : (depth += 1) {
         item = firstDimg(Boxes.find(m, "iref") orelse break, item) orelse break;
-        c = itemColor(iprp, ipco, item);
+        const from = itemColor(iprp, ipco, item);
+        if (c.icc == null) c.icc = from.icc;
+        if (c.nclx == null) c.nclx = from.nclx;
     }
     return if (c.icc != null or c.nclx != null) c else null;
 }
 
 fn itemColor(iprp: []const u8, ipco: []const u8, item: u32) HeifColor {
-    var out: HeifColor = .{};
+    // Prima gli indici delle proprietà dell'elemento, poi una sola passata su
+    // `ipco`: cercando ogni indice da capo, 255 rimandi all'ultima di 32767
+    // proprietà costerebbero 8 milioni di box a ogni chiamata.
+    var want: std.StaticBitSet(1 << 15) = .empty;
     var boxes: Boxes = .{ .d = iprp };
-    while (boxes.next()) |box| {
+    find: while (boxes.next()) |box| {
         if (!std.mem.eql(u8, box.typ, "ipma")) continue;
         const d = box.body;
         if (d.len < 8) continue;
@@ -580,15 +579,21 @@ fn itemColor(iprp: []const u8, ipco: []const u8, item: u32) HeifColor {
                     (be16(d, pos) orelse break :entries) & 0x7fff
                 else if (pos < d.len) d[pos] & 0x7f else break :entries;
                 pos += if (wide_idx) 2 else 1;
-                if (idx == 0) continue;
-                const prop = Boxes.nth(ipco, idx) orelse continue;
-                if (std.mem.eql(u8, prop.typ, "colr")) colr(prop.body, &out);
+                want.set(idx);
             }
             // Ogni elemento compare una volta sola fra tutti gli ipma: fermarsi
-            // qui tiene lineare il costo anche con voci ripetute ad arte
-            // (ognuna costerebbe fino a 255 scansioni di ipco).
-            return out;
+            // qui tiene lineare il costo anche con voci ripetute ad arte.
+            break :find;
         }
+    }
+    want.unset(0); // 0 = nessuna proprietà
+    var out: HeifColor = .{};
+    if (want.count() == 0) return out;
+    var it: Boxes = .{ .d = ipco };
+    var i: usize = 1;
+    while (i < 1 << 15) : (i += 1) {
+        const prop = it.next() orelse break;
+        if (want.isSet(i) and std.mem.eql(u8, prop.typ, "colr")) colr(prop.body, &out);
     }
     return out;
 }
@@ -982,6 +987,17 @@ test "HEIF/AVIF: colore dell'immagine principale" {
 
     const props = try testProps(a, prof);
     const pitm1 = "\x00\x00\x00\x00\x00\x01";
+    // Griglia col solo nclx e il profilo sulla tessera: vale il profilo.
+    const mixed = try testHeif(
+        a,
+        "\x00\x00\x00\x00\x00\x0a",
+        try testBox(a, "iref", &.{ "\x00\x00\x00\x00", try testBox(a, "dimg", &.{"\x00\x0a\x00\x01\x00\x01"}) }),
+        props,
+        "\x00\x00\x00\x00" ++ "\x00\x00\x00\x02" ++ "\x00\x0a\x01\x03" ++ "\x00\x01\x01\x02",
+    );
+    try testing.expectEqualSlices(u8, prof, extract(a, mixed).?.data);
+    try testing.expect(cicp(mixed) == null);
+
     // Colore solo su un altro elemento e nessun riferimento: niente.
     const other = try testHeif(a, pitm1, "", props, "\x00\x00\x00\x00\x00\x00\x00\x02\x00\x02\x01\x03\x00\x01\x01\x01");
     try testing.expect(extract(a, other) == null and cicp(other) == null);
@@ -1003,8 +1019,8 @@ test "HEIF/AVIF: colore dell'immagine principale" {
     try testing.expectEqual(p3, cicp(large).?);
 
     // ipma ostile: 2000 voci ripetute dell'elemento 1, ognuna con 255 rimandi
-    // all'ultima di 32767 proprietà. Si ferma alla prima voce (255 scansioni
-    // di ipco); senza, sarebbero 2000 × 255 e il test non finirebbe.
+    // all'ultima di 32767 proprietà. Si ferma alla prima voce e scorre ipco una
+    // volta sola; leggendo tutte le voci il test non finirebbe.
     var many: std.ArrayList(u8) = .empty;
     for (0..32766) |_| try many.appendSlice(a, "\x00\x00\x00\x08free");
     try many.appendSlice(a, try testBox(a, "colr", &.{"nclx\x00\x0c\x00\x0d\x00\x00\x80"}));
