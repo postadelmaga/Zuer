@@ -7,6 +7,7 @@
 //! del viewer, così la matematica del compositing sta in un modulo solo.
 
 const std = @import("std");
+const aspect_fit = @import("aspect_fit.zig");
 const text_render = @import("text_render.zig");
 
 /// Numero massimo di linguette di cui teniamo i confini per l'hit-test. Fogli
@@ -354,27 +355,11 @@ pub fn composeFrame(
         return;
     }
 
-    // Calcolo dell'aspect ratio per l'adattamento (aspect-fit) a tutto schermo
-    const src_aspect = @as(f32, @floatFromInt(src_w)) / @as(f32, @floatFromInt(src_h));
-    const win_aspect = @as(f32, @floatFromInt(W)) / @as(f32, @floatFromInt(H));
-
-    var fit_w: u32 = 0;
-    var fit_h: u32 = 0;
-    if (src_aspect > win_aspect) {
-        fit_w = W;
-        fit_h = @intFromFloat(@round(@as(f32, @floatFromInt(W)) / src_aspect));
-    } else {
-        fit_h = H;
-        fit_w = @intFromFloat(@round(@as(f32, @floatFromInt(H)) * src_aspect));
-    }
-    fit_w = @max(fit_w, 1);
-    fit_h = @max(fit_h, 1);
-
-    const zoomed_w = @as(f32, @floatFromInt(fit_w)) * zoom;
-    const zoomed_h = @as(f32, @floatFromInt(fit_h)) * zoom;
-
-    const fit_w_zoomed = @max(@as(u32, @intFromFloat(zoomed_w)), 1);
-    const fit_h_zoomed = @max(@as(u32, @intFromFloat(zoomed_h)), 1);
+    // Adattata a tutto il viewport (aspect-fit), poi zoomata: lo stesso calcolo di
+    // pan, zoom al 100% e video (aspect_fit), così al 100% è esattamente 1:1.
+    const zs = aspect_fit.pixels(aspect_fit.sizePx(src_w, src_h, W, H) orelse return, zoom);
+    const fit_w_zoomed = zs[0];
+    const fit_h_zoomed = zs[1];
 
     const fit_x = @divFloor(@as(i32, @intCast(W)) - @as(i32, @intCast(fit_w_zoomed)), 2) + @as(i32, @intFromFloat(pan_x));
     const fit_y = @divFloor(@as(i32, @intCast(H)) - @as(i32, @intCast(fit_h_zoomed)), 2) + @as(i32, @intFromFloat(pan_y));
@@ -531,5 +516,44 @@ pub fn composeFrame(
             const w32 = std.mem.readInt(u32, src[(@as(usize, s_row_offset) + sx) * 4 ..][0..4], .little);
             std.mem.writeInt(u32, dst_bytes[i * 4 ..][0..4], w32, .little);
         }
+    }
+}
+
+test "zoom al 100%: copia esatta della sorgente, senza ricampionare" {
+    const gpa = std.testing.allocator;
+    // Proporzioni che col calcolo di prima uscivano un pixel più piccole
+    // (2151×2743 in 372×250 diventava 2150×2743, ricampionato): più grandi e più
+    // piccole della finestra.
+    const cases = [_][4]u32{ .{ 2151, 2743, 372, 250 }, .{ 1001, 800, 800, 600 }, .{ 101, 77, 300, 200 }, .{ 640, 480, 640, 480 } };
+    var prng = std.Random.DefaultPrng.init(7);
+    for (cases) |c| {
+        const sw = c[0];
+        const sh = c[1];
+        const W = c[2];
+        const H = c[3];
+        const src = try gpa.alloc(u8, @as(usize, sw) * sh * 4);
+        defer gpa.free(src);
+        prng.random().bytes(src);
+        const out = try gpa.alignedAlloc(u8, .@"4", @as(usize, W) * H * 4);
+        defer gpa.free(out);
+        // Il fattore del doppio click (input.toggleFitActual).
+        const z100 = @as(f32, @floatFromInt(sw)) / aspect_fit.sizePx(sw, sh, W, H).?[0];
+        composeFrame(out, W, H, src, sw, sh, z100, 0, 0, null);
+        const fit_x = @divFloor(@as(i64, W) - sw, 2);
+        const fit_y = @divFloor(@as(i64, H) - sh, 2);
+        for (0..H) |y| for (0..W) |x| {
+            const sx = @as(i64, @intCast(x)) - fit_x;
+            const sy = @as(i64, @intCast(y)) - fit_y;
+            const got = out[(y * W + x) * 4 ..][0..4];
+            if (sx < 0 or sy < 0 or sx >= sw or sy >= sh) {
+                try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, got);
+            } else {
+                const want = src[(@as(usize, @intCast(sy)) * sw + @as(usize, @intCast(sx))) * 4 ..][0..4];
+                std.testing.expectEqualSlices(u8, want, got) catch |e| {
+                    std.debug.print("{d}x{d} in {d}x{d}: pixel ({d},{d})\n", .{ sw, sh, W, H, x, y });
+                    return e;
+                };
+            }
+        };
     }
 }

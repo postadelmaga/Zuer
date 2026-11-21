@@ -4,6 +4,7 @@
 //! Estratto da gui.zig: stesse funzioni, stesso comportamento.
 
 const std = @import("std");
+const aspect_fit = @import("aspect_fit.zig");
 const builtin = @import("builtin");
 // CPU frame compositor: qui servono la geometria del blit testo (hit-test) e cpLen.
 const compose = @import("compose.zig");
@@ -156,10 +157,9 @@ fn resizeForZoom(app_state: *GuiAppState, win: *zrame.Window, factor: f32) bool 
     const pw: f32 = if (in_flight) app_state.zoom_win_req[0] else @floatFromInt(win.panel_w);
     const ph: f32 = if (in_flight) app_state.zoom_win_req[1] else @floatFromInt(win.panel_h);
     if (pw < 1 or ph < 1) return false;
-    const sa = @as(f32, @floatFromInt(sw)) / @as(f32, @floatFromInt(sh));
-    const fit_w = if (sa > pw / ph) pw else ph * sa;
-    var tw = fit_w * factor;
-    var th = tw / sa;
+    const fit = aspect_fit.size(sw, sh, pw, ph) orelse return false;
+    var tw = fit[0] * factor;
+    var th = fit[1] * factor;
     if (factor > 1.0) {
         // Non oltre l'area utile dello schermo (o un tetto prudente se è ignota).
         const area = win.usableArea();
@@ -191,13 +191,9 @@ fn toggleFitActual(app_state: *GuiAppState, cx: f32, cy: f32, W: u32, H: u32) vo
     const sh = app_state.shared.static_h;
     const cur = app_state.shared.zoom;
     app_state.shared.mutex.unlock(app_state.io);
-    if (sw == 0 or sh == 0 or W == 0 or H == 0) return;
-    const fw: f32 = @floatFromInt(W);
-    const fh: f32 = @floatFromInt(H);
-    const sa = @as(f32, @floatFromInt(sw)) / @as(f32, @floatFromInt(sh));
-    const wa = fw / fh;
-    const fit_w = if (sa > wa) fw else fh * sa;
-    const z100 = @as(f32, @floatFromInt(sw)) / fit_w;
+    const fit = aspect_fit.sizePx(sw, sh, W, H) orelse return;
+    // Esattamente 1:1 in composeImage (aspect_fit.pixels arrotonda il prodotto).
+    const z100 = @as(f32, @floatFromInt(sw)) / fit[0];
     if (@abs(cur - 1.0) < 0.01 and @abs(z100 - 1.0) > 0.02) {
         applyZoomAt(app_state, z100 / cur, cx, cy, W, H);
     } else {
@@ -242,12 +238,8 @@ fn rotateView(app_state: *GuiAppState, clockwise: bool) void {
 /// Fattore che porta una pagina dal fit (intera nel viewport) alla larghezza piena:
 /// 1 se la pagina è già larga quanto il viewport.
 pub fn widthFillFactor(W: u32, H: u32, sw: u32, sh: u32) f32 {
-    if (sw == 0 or sh == 0 or W == 0 or H == 0) return 1.0;
-    const fw: f32 = @floatFromInt(W);
-    const fh: f32 = @floatFromInt(H);
-    const sa = @as(f32, @floatFromInt(sw)) / @as(f32, @floatFromInt(sh));
-    const fit_w = if (sa > fw / fh) fw else fh * sa;
-    return @max(1.0, fw / fit_w);
+    const fit = aspect_fit.sizePx(sw, sh, W, H) orelse return 1.0;
+    return @max(1.0, @as(f32, @floatFromInt(W)) / fit[0]);
 }
 
 /// Zoom con cui si compone una pagina: un PDF a schermo intero riempie la larghezza
@@ -276,10 +268,8 @@ fn wheelPdf(app_state: *GuiAppState, win: *zrame.Window, down: bool, amount: f32
         const sh = &app_state.shared;
         if (sh.loading or sh.static_w == 0 or sh.static_h == 0) return;
         const z = viewZoom(sh.zoom, win.fullscreen, cpx.w, cpx.h, sh.static_w, sh.static_h);
-        const fw: f32 = @floatFromInt(cpx.w);
         const fh: f32 = @floatFromInt(cpx.h);
-        const sa = @as(f32, @floatFromInt(sh.static_w)) / @as(f32, @floatFromInt(sh.static_h));
-        const fit_h = if (sa > fw / fh) fw / sa else fh;
+        const fit_h = (aspect_fit.sizePx(sh.static_w, sh.static_h, cpx.w, cpx.h) orelse return)[1];
         const max_y = @max(0.0, (fit_h * z - fh) / 2.0);
         sh.pan_y = std.math.clamp(sh.pan_y, -max_y, max_y);
         // pan_y = +max_y: si vede la cima; −max_y: il fondo.
@@ -312,15 +302,9 @@ fn wheelPdf(app_state: *GuiAppState, win: *zrame.Window, down: bool, amount: f32
 /// altrimenti impedisce ai bordi di rientrare dentro il viewport. È il comportamento
 /// standard dei viewer: a fit l'immagine è sempre centrata, si pana solo da zoomati.
 pub fn clampImagePan(pan_x: *f32, pan_y: *f32, zoom: f32, W: u32, H: u32, sw: u32, sh: u32) void {
-    if (sw == 0 or sh == 0 or W == 0 or H == 0) return;
-    const fw: f32 = @floatFromInt(W);
-    const fh: f32 = @floatFromInt(H);
-    const sa = @as(f32, @floatFromInt(sw)) / @as(f32, @floatFromInt(sh));
-    const wa = fw / fh;
-    const fit_w = if (sa > wa) fw else fh * sa;
-    const fit_h = if (sa > wa) fw / sa else fh;
-    const max_x = @max(0.0, (fit_w * zoom - fw) / 2.0);
-    const max_y = @max(0.0, (fit_h * zoom - fh) / 2.0);
+    const fit = aspect_fit.sizePx(sw, sh, W, H) orelse return;
+    const max_x = @max(0.0, (fit[0] * zoom - @as(f32, @floatFromInt(W))) / 2.0);
+    const max_y = @max(0.0, (fit[1] * zoom - @as(f32, @floatFromInt(H))) / 2.0);
     pan_x.* = std.math.clamp(pan_x.*, -max_x, max_x);
     pan_y.* = std.math.clamp(pan_y.*, -max_y, max_y);
 }

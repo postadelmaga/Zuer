@@ -10,6 +10,7 @@
 //! `has_video` è così un vero confine di modulo, non solo un flag sparso.
 
 const std = @import("std");
+const aspect_fit = @import("aspect_fit.zig");
 const compose = @import("compose.zig");
 const builtin = @import("builtin");
 const zicro = @import("zicro");
@@ -761,18 +762,10 @@ fn fillPlayTriangle(buf: []u8, W: u32, H: u32, cx: f32, cy: f32, s: f32, a: f32)
 pub const FitRect = struct { w: u32, h: u32 };
 
 pub fn videoFitRect(panel_w: u32, panel_h: u32, vid_w: u32, vid_h: u32) FitRect {
-    if (panel_w == 0 or panel_h == 0 or vid_w == 0 or vid_h == 0)
+    const fit = aspect_fit.sizePx(vid_w, vid_h, panel_w, panel_h) orelse
         return .{ .w = @max(1, panel_w), .h = @max(1, panel_h) };
-    const va = @as(f32, @floatFromInt(vid_w)) / @as(f32, @floatFromInt(vid_h));
-    const ca = @as(f32, @floatFromInt(panel_w)) / @as(f32, @floatFromInt(panel_h));
-    var w = panel_w;
-    var h = panel_h;
-    if (va > ca) {
-        h = @max(1, @as(u32, @intFromFloat(@round(@as(f32, @floatFromInt(panel_w)) / va))));
-    } else {
-        w = @max(1, @as(u32, @intFromFloat(@round(@as(f32, @floatFromInt(panel_h)) * va))));
-    }
-    return .{ .w = w, .h = h };
+    const p = aspect_fit.pixels(fit, 1);
+    return .{ .w = p[0], .h = p[1] };
 }
 
 /// Layout della riga di controlli (coordinate locali all'area video, origine in alto
