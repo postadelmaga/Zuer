@@ -398,6 +398,10 @@ pub const Renderer = struct {
     frame_cmds: [2]VkCommandBuffer = .{ null, null },
     frame_fences: [2]VkFence = .{ VK_NULL, VK_NULL },
     frame_index: u64 = 0,
+    /// Slot del readback restituito dall'ultimo `render` riuscito, per `lastFrame`.
+    /// null dopo ogni altra scrittura degli slot (render in corso o fallito,
+    /// renderSync/renderVoxel/renderText sullo slot 0) e a target distrutto.
+    last_frame_slot: ?u1 = null,
     readback_bufs: [2]VkBuffer = .{ VK_NULL, VK_NULL },
     readback_mems: [2]VkDeviceMemory = .{ VK_NULL, VK_NULL },
     readback_ptrs: [2]?[*]u8 = .{ null, null },
@@ -1010,7 +1014,8 @@ pub const Renderer = struct {
 
         // Tutte le tile del livello in un unico batch: un solo submit + fence
         // (contro un round-trip GPU per tile). In caso di errore non si tocca lo
-        // stato: il livello resta non residente e verrà ritentato al prossimo frame.
+        // stato: il livello resta non residente e verrà ritentato al prossimo render
+        // (a camera ferma la mesh non si ri-renderizza: al prossimo movimento).
         pool.uploadTilesBegin(g.vt_base, total) catch return;
         for (0..desc.tiles_y) |ty| {
             for (0..desc.tiles_x) |tx| {
@@ -1325,6 +1330,8 @@ pub const Renderer = struct {
     /// readback è saltato): il chiamante deve controllare `colorDmabuf()` PRIMA
     /// di usare il risultato di questa funzione.
     pub fn render(self: *Renderer, width: u32, height: u32, pc: *const PushConstants) ![]const u8 {
+        // Lo slot restituito la volta scorsa sta per essere riscritto.
+        self.last_frame_slot = null;
         if (self.mesh_buf == VK_NULL) return error.NoMesh;
         if (vk_loader.testDeviceLost()) return error.VulkanDeviceLost;
         if (width == 0 or height == 0) return error.EmptyTarget;
@@ -1347,12 +1354,26 @@ pub const Renderer = struct {
         if (self.frame_index == 0) {
             try check(vkWaitForFences(self.device, 1, @ptrCast(&self.frame_fences[0]), 1, 2 * std.time.ns_per_s));
             self.frame_index += 1;
+            self.last_frame_slot = 0;
             return self.readback_ptrs[0].?[0 .. @as(usize, width) * height * 4];
         }
 
         try check(vkWaitForFences(self.device, 1, @ptrCast(&self.frame_fences[prev_slot]), 1, 2 * std.time.ns_per_s));
         self.frame_index += 1;
+        self.last_frame_slot = @intCast(prev_slot);
         return self.readback_ptrs[prev_slot].?[0 .. @as(usize, width) * height * 4];
+    }
+
+    /// Lo stesso readback restituito dall'ultimo `render` riuscito, ancora valido
+    /// (nessuno ha riscritto lo slot), per ricomporre a camera ferma senza la GPU.
+    /// null se non c'è: nessun render ancora o fallito, `resetFrameSync` (voxel),
+    /// altra scrittura dello slot 0, target ricreato o di un'altra taglia, piano
+    /// dmabuf attivo (lì il readback non viene scritto).
+    pub fn lastFrame(self: *const Renderer, width: u32, height: u32) ?[]const u8 {
+        const slot = self.last_frame_slot orelse return null;
+        if (width != self.width or height != self.height or self.color_dmabuf_fd >= 0) return null;
+        const p = self.readback_ptrs[slot] orelse return null;
+        return p[0 .. @as(usize, width) * height * 4];
     }
 
     /// Render sincrono a singolo frame: invia e attende, restituendo i pixel del
@@ -1361,6 +1382,7 @@ pub const Renderer = struct {
     /// subito lo stato appena impostato. Usa lo slot 0: non mescolare con
     /// `render()` nella stessa sessione senza un `vkDeviceWaitIdle` in mezzo.
     pub fn renderSync(self: *Renderer, width: u32, height: u32, pc: *const PushConstants) ![]const u8 {
+        self.last_frame_slot = null;
         try self.recordAndSubmitFrame(0, width, height, pc);
         try check(vkWaitForFences(self.device, 1, @ptrCast(&self.frame_fences[0]), 1, 2 * std.time.ns_per_s));
         try check(vkResetFences(self.device, 1, @ptrCast(&self.frame_fences[0])));
@@ -1534,12 +1556,14 @@ pub const Renderer = struct {
         // entrambe le fence (reset di una fence già unsignaled è valido).
         _ = vkResetFences(self.device, 2, @ptrCast(&self.frame_fences));
         self.frame_index = 0;
+        self.last_frame_slot = null;
     }
 
     /// Renderizza la griglia voxel e ne fa il readback (RGBA, valido fino alla
     /// prossima chiamata).
     pub fn renderVoxel(self: *Renderer, width: u32, height: u32, pc: *const VoxelPush) ![]const u8 {
         if (vk_loader.testDeviceLost()) return error.VulkanDeviceLost;
+        self.last_frame_slot = null; // scrive lo slot 0
         try self.recordVoxel(width, height, pc);
         return self.readback_ptr.?[0 .. @as(usize, width) * height * 4];
     }
@@ -1888,6 +1912,7 @@ pub const Renderer = struct {
             }
             self.readback_ptrs[i] = null;
         }
+        self.last_frame_slot = null;
 
         self.readback_buf = VK_NULL;
         self.readback_mem = VK_NULL;
@@ -2070,6 +2095,7 @@ pub const Renderer = struct {
     pub fn renderText(self: *Renderer, vertex_bytes: []const u8, vertex_count: u32, atlas_pixels: []const u8, atlas_w: u32, atlas_h: u32, out_w: u32, out_h: u32, clear: [4]f32) ![]const u8 {
         if (out_w == 0 or out_h == 0) return error.EmptyTarget;
         if (vk_loader.testDeviceLost()) return error.VulkanDeviceLost;
+        self.last_frame_slot = null; // scrive lo slot 0
         try self.ensureTextPipe();
         try self.uploadAtlas(atlas_pixels, atlas_w, atlas_h);
         try self.ensureTextVertexBuffer(vertex_bytes);

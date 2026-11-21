@@ -404,7 +404,7 @@ fn renderWorker(
     // ZUER_TRACE=1: stampa ogni secondo quante ricomposizioni e per quale motivo.
     const trace_on = getenv("ZUER_TRACE") != null;
     var tr_acc: f32 = 0;
-    var tr: [7]u32 = @splat(0); // ticks, renders, size, file_changed, mesh, pulse, sc_tick
+    var tr: [8]u32 = @splat(0); // ticks, renders, size, file_changed, mesh, pulse, sc_tick, mesh_gpu
     var last_seq: u32 = 0;
     // Ultima camera renderizzata: le mesh si ri-renderizzano SOLO quando cambia
     // (NaN iniziale ⇒ primo frame sempre reso). Senza questo il worker presenta
@@ -449,6 +449,14 @@ fn renderWorker(
     // in sospeso finché un input non risveglia il loop → la mesh/immagine "appare
     // solo dopo un click". Più present ravvicinati garantiscono il commit.
     var present_pulse: u32 = 0;
+    // Mesh: render GPU solo quando cambia qualcosa (camera, taglia, contenuto); a
+    // camera ferma (dissolvenza dell'etichetta, spinner, present di rinforzo) si
+    // ricompone l'ultimo readback. `render` è pipelined e restituisce il frame
+    // precedente: dopo l'ultimo cambio serve UN render in più (`mesh_settle`)
+    // perché a schermo arrivi la camera finale. Col piano dmabuf si renderizza
+    // sempre, come prima (il readback lì è stantio di proposito).
+    var mesh_settle = false;
+    var last_mesh_dmabuf = false;
     // Soglia anti-flash dello spinner: mostralo solo se il caricamento supera
     // ~120 ms (i file veloci/piccoli si aprono senza far lampeggiare il loader).
     // Sotto soglia il worker continua a mostrare il contenuto PRECEDENTE.
@@ -757,11 +765,15 @@ fn renderWorker(
         var mesh_vt_zoom: f32 = 1.0;
         var mesh_name_buf: [512]u8 = undefined;
         var mesh_name_len: usize = 0;
+        var mesh_reuse = false;
         const size_changed = (cur_w != last_w or cur_h != last_h);
         // La mesh va ridisegnata solo se la camera è cambiata (drag/zoom).
         const mesh_moved = state.shared.is_mesh and
             (state.shared.yaw != last_yaw or state.shared.pitch != last_pitch or state.shared.zoom != last_zoom);
-        var need_render = size_changed or state.shared.file_changed or mesh_moved;
+        const mesh_dirty = state.shared.is_mesh and (mesh_moved or size_changed or state.shared.file_changed);
+        // Lasciata la mesh (o in modalità voxel, sotto): niente render di assestamento.
+        if (!state.shared.is_mesh) mesh_settle = false;
+        var need_render = size_changed or state.shared.file_changed or mesh_moved or mesh_settle;
         // Un cambio contenuto arma qualche present di rinforzo (vedi present_pulse).
         if (state.shared.file_changed) present_pulse = 4;
         if (present_pulse > 0) need_render = true;
@@ -867,10 +879,14 @@ fn renderWorker(
                 if (state.shared.voxel_mode and state.renderer_ready and state.renderer.hasVoxels()) {
                     // Modalità voxel (tasto V): ray-march della griglia invece
                     // della mesh triangolata.
+                    mesh_settle = false; // il voxel è sincrono: niente frame in ritardo
                     mesh_voxel_push = gpu.buildVoxelPush(state.shared.mesh_center, state.shared.mesh_max_size / state.shared.zoom, state.shared.yaw, state.shared.pitch, cur_w, cur_h, state.shared.voxel_bbox_min, state.shared.voxel_bbox_size, state.shared.voxel_dim);
+                } else if (!mesh_dirty and !mesh_settle and !last_mesh_dmabuf) {
+                    mesh_reuse = true;
                 } else {
                     mesh_push = gpu.buildPushConstants(state.shared.mesh_center, state.shared.mesh_max_size / state.shared.zoom, state.shared.yaw, state.shared.pitch, cur_w, cur_h, state.shared.mesh_material);
                     mesh_vt_zoom = state.shared.zoom; // pilota il mip dinamico delle texture virtuali
+                    mesh_settle = mesh_dirty; // un render in più dopo l'ultimo cambio
                 }
                 const bn = std.fs.path.basename(state.shared.current_file_path);
                 mesh_name_len = @min(bn.len, mesh_name_buf.len);
@@ -962,8 +978,9 @@ fn renderWorker(
             }
 
             // Nome file in alto a destra (monospazio), sopra ogni contenuto. Nel
-            // ramo mesh il frame viene composto DOPO l'unlock: label e flag lì.
-            if (mesh_push == null and mesh_voxel_push == null) {
+            // ramo mesh (render o riuso del readback) il frame viene composto DOPO
+            // l'unlock: label e flag lì.
+            if (mesh_push == null and mesh_voxel_push == null and !mesh_reuse) {
                 if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, cur_w, cur_h, r, std.fs.path.basename(state.shared.current_file_path), label_alpha, if (print_mod.printable(state)) state.shared.print.hover else null);
                 // Esploratore file sotto l'eventuale overlay YouTube (siamo sotto lock).
                 if (state.shared.fx.active) {
@@ -984,7 +1001,7 @@ fn renderWorker(
         // Render mesh FUORI da `shared.mutex` (input reattivo durante il drag),
         // sotto `renderer_mutex` che lo serializza con setMesh/setMeshMaterials
         // (applyDecoded, thread loader) e setVoxels/resetFrameSync (toggleVoxel).
-        if (native and (mesh_push != null or mesh_voxel_push != null)) {
+        if (native and (mesh_push != null or mesh_voxel_push != null or mesh_reuse)) {
             state.renderer_mutex.lockUncancelable(state.io);
             // Non-null solo per un render mesh (non voxel) riuscito con la color
             // image dmabuf-backed attiva (issue #11, opt-in ZUER_MESH_DMABUF):
@@ -997,6 +1014,10 @@ fn renderWorker(
                 // Difensivo: con push non-null il setMesh ha già inizializzato
                 // il renderer; se l'init era fallita, salta il frame GPU.
                 if (!state.renderer_ready) break :blk null;
+                // Camera ferma: l'ultimo readback (null se non è più valido, e
+                // allora il ramo sotto riarma un render vero).
+                if (mesh_reuse) break :blk state.renderer.lastFrame(cur_w, cur_h);
+                if (trace_on) tr[7] += 1;
                 if (mesh_voxel_push) |*vpc| {
                     break :blk state.renderer.renderVoxel(cur_w, cur_h, vpc) catch |e| {
                         // Errore Vulkan transitorio: non uccidere il worker (finestra
@@ -1015,6 +1036,7 @@ fn renderWorker(
                     break :blk null;
                 };
                 mesh_dmabuf = state.renderer.colorDmabuf();
+                last_mesh_dmabuf = mesh_dmabuf != null;
                 break :blk r;
             };
             // Device perso: geometria e texture sono andate con lui. Si distrugge
@@ -1069,6 +1091,10 @@ fn renderWorker(
                 if (name_raster) |*r| drawPopups(state, composited_rgba.*, cur_w, cur_h, r);
                 state.shared.mutex.unlock(state.io);
                 did_compose = true;
+            } else if (mesh_reuse) {
+                // Readback non più valido: al prossimo giro un render vero (che
+                // qui è sincrono: frame_index azzerato o target nuovo).
+                mesh_settle = true;
             } else {
                 // Riarma il redraw così il prossimo giro riprova il render.
                 state.shared.mutex.lockUncancelable(state.io);
@@ -1096,7 +1122,7 @@ fn renderWorker(
             if (need_render) tr[1] += 1;
             tr_acc += frame_dt;
             if (tr_acc >= 1.0) {
-                std.debug.print("[trace] ticks={d} renders={d} size={d} file_changed={d} pulse={d} sc_tick={d} load_seq={d} nav_gen={d} win={d}x{d} static={d}x{d} zoom={d:.2} pan={d:.0},{d:.0} scroll_y={d:.1} file={s}\n", .{ tr[0], tr[1], tr[2], tr[3], tr[5], tr[6], state.shared.load_seq, state.nav.gen, cur_w, cur_h, state.shared.static_w, state.shared.static_h, state.shared.zoom, state.shared.pan_x, state.shared.pan_y, state.shared.sc.offset[1], std.fs.path.basename(state.shared.current_file_path) });
+                std.debug.print("[trace] ticks={d} renders={d} mesh_gpu={d} size={d} file_changed={d} pulse={d} sc_tick={d} load_seq={d} nav_gen={d} win={d}x{d} static={d}x{d} zoom={d:.2} pan={d:.0},{d:.0} scroll_y={d:.1} file={s}\n", .{ tr[0], tr[1], tr[7], tr[2], tr[3], tr[5], tr[6], state.shared.load_seq, state.nav.gen, cur_w, cur_h, state.shared.static_w, state.shared.static_h, state.shared.zoom, state.shared.pan_x, state.shared.pan_y, state.shared.sc.offset[1], std.fs.path.basename(state.shared.current_file_path) });
                 tr = @splat(0);
                 tr_acc = 0;
             }
