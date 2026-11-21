@@ -60,14 +60,31 @@ must pixel "$(W "$IMG/orient3.jpg")" 0.2 0.5 0 0 255        # 180°: blu a sinis
 # Profilo ICC incorporato (un ProPhoto scritto da zero: primari ROMM, bianco D50,
 # gamma 1,8; metà sinistra 70,140,190, destra 60,150,60): i colori vanno convertiti
 # in sRGB, come fanno lcms e gli altri visualizzatori (valori attesi da lcms). Coi
-# valori grezzi il rosso sbaglierebbe di 60-70.
+# valori grezzi il rosso sbaglierebbe di 60-70; convertiti due volte (se un codec
+# di sistema convertisse già) il verde di 30. Per questo la tolleranza è ±12, non
+# ±48 (i file con perdita scartano da lcms al più di 7).
 for f in prophoto.tiff prophoto.png prophoto.jpg prophoto.webp; do
   # Su macOS il TIFF passa da ImageIO, che converte da sé verso DeviceRGB (non
   # per forza sRGB): lì si controlla solo che si apra.
   if [[ $OS == macos && $f == *.tiff ]]; then must doc "$(W "$IMG/$f")"; continue; fi
-  must pixel "$(W "$IMG/$f")" 0.25 0.5 0 169 208
-  must pixel "$(W "$IMG/$f")" 0.75 0.5 0 180 45
+  must pixel "$(W "$IMG/$f")" 0.25 0.5 0 169 208 12
+  must pixel "$(W "$IMG/$f")" 0.75 0.5 0 180 45 12
 done
+# HEIC e AVIF (4:2:0, con perdita): lo stesso ProPhoto come profilo, e un Display
+# P3 dichiarato coi codici CICP (nclx 12/13/6) invece che con un profilo, metà
+# sinistra 90,200,60, destra 60,160,230 (attesi da lcms con un profilo P3
+# equivalente; coi valori grezzi il rosso sbaglierebbe di 60-90). Su macOS li
+# decodifica ImageIO, che converte da sé: si controlla solo che si aprano.
+heif_check() {
+  local f=$1; shift
+  case $OS in
+    macos) must doc "$(W "$IMG/$f")"; return ;;
+    windows) if ! run doc "$(W "$IMG/$f")" >/dev/null; then optional "$IMG/$f"; return; fi ;;
+  esac
+  while (($#)); do must pixel "$(W "$IMG/$f")" "$1" "$2" "$3" "$4" "$5" 12; shift 5; done
+}
+for f in prophoto.heic prophoto.avif; do heif_check $f 0.25 0.5 0 169 208 0.75 0.5 0 180 45; done
+for f in p3.heic p3.avif; do heif_check $f 0.25 0.5 0 203 7 0.75 0.5 0 163 236; done
 OUT="$(run doc "$(W "$IMG/orient6.jpg")")"; echo "$OUT"
 grep -q 'immagine 80x160' <<<"$OUT" || { echo "FALLITO: orient6.jpg non ruotata (attese 80x160 da 200x100)"; FAIL=1; }
 

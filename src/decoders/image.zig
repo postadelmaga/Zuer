@@ -146,8 +146,8 @@ const is_macos = builtin.os.tag == .macos;
 /// sRGB, sui pixel già ridotti: senza, un'immagine ProPhoto appare spenta e con
 /// le tinte sbagliate (gli altri visualizzatori il profilo lo applicano). Best
 /// effort: senza profilo, con un profilo già sRGB o non gestito, o senza memoria,
-/// i pixel restano come sono. stb, libwebp, WIC e ImageMagick (con `rgb:-`)
-/// danno tutti i valori del file senza conversione.
+/// i pixel restano come sono. stb, libwebp, WIC e ImageMagick (con `rgb:-`, anche
+/// per HEIC e AVIF via libheif) danno tutti i valori del file senza conversione.
 fn toSrgb(img: ImageData, file_bytes: []const u8, filename: []const u8, allocator: std.mem.Allocator) ImageData {
     // I RAW su base TIFF (DNG, NEF, CR2, ARW…) li rende ImageMagick già in sRGB:
     // il profilo della loro IFD0 descrive l'anteprima incorporata, non quei pixel.
@@ -155,13 +155,17 @@ fn toSrgb(img: ImageData, file_bytes: []const u8, filename: []const u8, allocato
         const ext = std.fs.path.extension(filename);
         if (!std.ascii.eqlIgnoreCase(ext, ".tif") and !std.ascii.eqlIgnoreCase(ext, ".tiff")) return img;
     }
-    const emb = icc.extract(allocator, file_bytes) orelse return img;
-    defer emb.deinit(allocator);
+    // Un profilo ICC, oppure (HEIF/AVIF) i codici CICP del box `nclx`.
+    const emb = icc.extract(allocator, file_bytes);
+    defer if (emb) |e| e.deinit(allocator);
+    const nclx = if (emb == null) icc.cicp(file_bytes) else null;
+    if (emb == null and nclx == null) return img;
     const t = allocator.create(icc.Transform) catch return img;
     defer allocator.destroy(t);
-    // I pixel li ha appena allocati questo plugin (resizeToFit/ImageMagick):
+    const ok = if (emb) |e| icc.init(t, e.data) else icc.initCicp(t, nclx.?);
+    // I pixel li ha appena allocati questo plugin (resizeToFit/ImageMagick/WIC):
     // `[]const` è solo il tipo dell'ABI verso l'host.
-    if (icc.init(t, emb.data)) t.apply(@constCast(img.pixels));
+    if (ok) t.apply(@constCast(img.pixels));
     return img;
 }
 

@@ -1,9 +1,11 @@
 //! Profili colore ICC incorporati nelle immagini: estrazione (JPEG, PNG, TIFF,
-//! WebP) e conversione verso sRGB dei profili RGB a matrice e curve (ProPhoto,
-//! Adobe RGB, Display P3…), come fanno i visualizzatori con la gestione del colore.
-//! Senza conversione un'immagine ProPhoto mostrata come sRGB ha colori spenti e
-//! falsati. Puro Zig, senza lcms: i profili a tabelle (solo A2B0), quelli non RGB
-//! e quelli già sRGB restano senza conversione, come prima.
+//! WebP, HEIF/AVIF) e conversione verso sRGB dei profili RGB a matrice e curve
+//! (ProPhoto, Adobe RGB, Display P3…), come fanno i visualizzatori con la gestione
+//! del colore. Senza conversione un'immagine ProPhoto mostrata come sRGB ha colori
+//! spenti e falsati. HEIF e AVIF possono dichiarare il colore anche coi codici
+//! CICP di ITU-T H.273 (box `nclx`) invece che con un profilo. Puro Zig, senza
+//! lcms: i profili a tabelle (solo A2B0), quelli non RGB, l'HDR (PQ, HLG) e i
+//! colori già sRGB restano senza conversione, come prima.
 
 const std = @import("std");
 
@@ -15,7 +17,7 @@ const enc_n = 16385;
 pub const Transform = struct {
     /// Byte del canale → luce lineare (2^24 = 1), con la curva (TRC) del profilo.
     lin: [3][256]i64,
-    /// Lineare del profilo → lineare sRGB (entrambi con bianco D50 nel PCS), a 2^20.
+    /// Lineare del profilo → lineare sRGB (con lo stesso bianco), a 2^20.
     m: [3][3]i64,
     /// Luce lineare in [0, 1] (a passi di 1/(enc_n−1)) → byte sRGB.
     enc: [enc_n]u8,
@@ -67,14 +69,18 @@ fn linearToSrgb(x: f64) f64 {
 pub fn init(t: *Transform, profile: []const u8) bool {
     const p = Profile.parse(profile) orelse return false;
     if (p.isSrgb()) return false;
-
-    // m = S⁻¹ · P: lineare del profilo → XYZ D50 → lineare sRGB.
     var pm: [3][3]f64 = undefined; // righe X, Y, Z; colonne r, g, b
     var sm: [3][3]f64 = undefined;
     for (0..3) |row| for (0..3) |col| {
         pm[row][col] = p.colorants[col][row];
         sm[row][col] = srgb_colorants[col][row];
     };
+    return build(t, pm, sm, p.curves);
+}
+
+/// m = S⁻¹ · P: lineare della sorgente → XYZ → lineare sRGB. `pm` e `sm` sono le
+/// matrici RGB lineare → XYZ della sorgente e di sRGB, con lo stesso bianco.
+fn build(t: *Transform, pm: [3][3]f64, sm: [3][3]f64, curves: [3]Curve) bool {
     const si = invert(sm) orelse return false;
     for (0..3) |row| for (0..3) |col| {
         var s: f64 = 0;
@@ -82,7 +88,7 @@ pub fn init(t: *Transform, profile: []const u8) bool {
         t.m[row][col] = @intFromFloat(@round(s * (1 << 20)));
     };
     for (0..3) |c| for (0..256) |v| {
-        t.lin[c][v] = @intFromFloat(@round(p.curves[c].eval(@as(f64, @floatFromInt(v)) / 255.0) * (1 << 24)));
+        t.lin[c][v] = @intFromFloat(@round(curves[c].eval(@as(f64, @floatFromInt(v)) / 255.0) * (1 << 24)));
     };
     for (&t.enc, 0..) |*e, j| {
         const x = @as(f64, @floatFromInt(j)) / (enc_n - 1);
@@ -102,6 +108,80 @@ fn invert(a: [3][3]f64) ?[3][3]f64 {
         .{ (a[1][2] * a[2][0] - a[1][0] * a[2][2]) * d, (a[0][0] * a[2][2] - a[0][2] * a[2][0]) * d, (a[0][2] * a[1][0] - a[0][0] * a[1][2]) * d },
         .{ (a[1][0] * a[2][1] - a[1][1] * a[2][0]) * d, (a[0][1] * a[2][0] - a[0][0] * a[2][1]) * d, (a[0][0] * a[1][1] - a[0][1] * a[1][0]) * d },
     };
+}
+
+// ── CICP (ITU-T H.273) ──────────────────────────────────────────────────────
+
+/// Colore dichiarato coi codici di ITU-T H.273 invece che con un profilo ICC
+/// (box `colr` di tipo `nclx` di HEIF e AVIF): primari e curva di trasferimento.
+pub const Cicp = struct { primaries: u16, transfer: u16 };
+
+const d65 = [2]f64{ 0.3127, 0.3290 };
+/// Cromaticità xy di R, G, B e del bianco.
+const srgb_xy = [4][2]f64{ .{ 0.64, 0.33 }, .{ 0.30, 0.60 }, .{ 0.15, 0.06 }, d65 };
+
+/// BT.709, BT.2020 e Display P3. Gli altri (BT.601, EBU 3213, DCI-P3 col bianco
+/// del proiettore, XYZ…) restano senza conversione.
+fn cicpPrimaries(code: u16) ?[4][2]f64 {
+    return switch (code) {
+        1, 2 => srgb_xy, // BT.709 (= sRGB); 2 = non specificato, che tutti leggono come sRGB
+        9 => .{ .{ 0.708, 0.292 }, .{ 0.170, 0.797 }, .{ 0.131, 0.046 }, d65 }, // BT.2020
+        12 => .{ .{ 0.680, 0.320 }, .{ 0.265, 0.690 }, .{ 0.150, 0.060 }, d65 }, // Display P3
+        else => null,
+    };
+}
+
+/// Curve che a schermo valgono sRGB: sRGB stessa, il non specificato e le curve
+/// di ripresa BT.709/601/2020 (che i visualizzatori mostrano come sRGB).
+fn cicpSrgbLike(code: u16) bool {
+    return switch (code) {
+        1, 2, 6, 13, 14, 15 => true,
+        else => false,
+    };
+}
+
+const srgb_curve: Curve = .{ .para = .{ .func = 3, .g = .{ 2.4, 1.0 / 1.055, 0.055 / 1.055, 1.0 / 12.92, 0.04045, 0, 0 } } };
+
+fn cicpCurve(code: u16) ?Curve {
+    if (cicpSrgbLike(code)) return srgb_curve;
+    return switch (code) {
+        4 => .{ .gamma = 2.2 }, // BT.470 M
+        5 => .{ .gamma = 2.8 }, // BT.470 B/G
+        8 => .{ .gamma = 1 }, // lineare
+        else => null, // PQ e HLG (HDR: servirebbe una mappatura dei toni), logaritmiche…
+    };
+}
+
+/// Matrice RGB lineare → XYZ (righe X, Y, Z; colonne r, g, b) dalle cromaticità:
+/// ogni primario con Y = 1, poi scalato perché R + G + B dia il bianco.
+fn rgbToXyz(xy: [4][2]f64) ?[3][3]f64 {
+    var p: [3][3]f64 = undefined;
+    for (0..3) |c| {
+        const x = xy[c][0];
+        const y = xy[c][1];
+        p[0][c] = x / y;
+        p[1][c] = 1;
+        p[2][c] = (1 - x - y) / y;
+    }
+    const w = xy[3];
+    const white = [3]f64{ w[0] / w[1], 1, (1 - w[0] - w[1]) / w[1] };
+    const pi = invert(p) orelse return null;
+    for (0..3) |c| {
+        var k: f64 = 0;
+        for (0..3) |j| k += pi[c][j] * white[j];
+        for (0..3) |r| p[r][c] *= k;
+    }
+    return p;
+}
+
+/// Come `init`, per un colore CICP. false (e `t` indefinito) se è già sRGB o non
+/// è gestito.
+pub fn initCicp(t: *Transform, c: Cicp) bool {
+    const prim = cicpPrimaries(c.primaries) orelse return false;
+    const curve = cicpCurve(c.transfer) orelse return false;
+    if ((c.primaries == 1 or c.primaries == 2) and cicpSrgbLike(c.transfer)) return false;
+    // Bianco D65 da tutte e due le parti: niente adattamento cromatico.
+    return build(t, rgbToXyz(prim) orelse return false, rgbToXyz(srgb_xy) orelse return false, @splat(curve));
 }
 
 // ── Lettura del profilo ──────────────────────────────────────────────────────
@@ -266,14 +346,30 @@ pub fn isTiff(bytes: []const u8) bool {
     return bytes.len >= 4 and (std.mem.eql(u8, bytes[0..4], "II*\x00") or std.mem.eql(u8, bytes[0..4], "MM\x00*"));
 }
 
-/// Profilo ICC incorporato in un JPEG, PNG, TIFF o WebP, o null (assente,
-/// contenitore diverso, struttura non valida, memoria esaurita).
+/// Profilo ICC incorporato in un JPEG, PNG, TIFF, WebP, HEIF o AVIF, o null
+/// (assente, contenitore diverso, struttura non valida, memoria esaurita).
 pub fn extract(gpa: std.mem.Allocator, bytes: []const u8) ?Embedded {
     if (bytes.len >= 4 and bytes[0] == 0xFF and bytes[1] == 0xD8) return fromJpeg(gpa, bytes);
     if (bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], "\x89PNG\r\n\x1a\n")) return fromPng(gpa, bytes);
     if (bytes.len >= 8 and isTiff(bytes)) return fromTiff(bytes);
     if (bytes.len >= 12 and std.mem.eql(u8, bytes[0..4], "RIFF") and std.mem.eql(u8, bytes[8..12], "WEBP")) return fromWebp(bytes);
+    if (isIsoBmff(bytes)) {
+        const icc = (heifColor(bytes) orelse return null).icc orelse return null;
+        return .{ .data = icc, .owned = false };
+    }
     return null;
+}
+
+/// Colore CICP di un HEIF o AVIF senza profilo ICC (se c'è il profilo, vale
+/// quello: il `nclx` accanto serve al decoder per la matrice YCbCr), o null.
+pub fn cicp(bytes: []const u8) ?Cicp {
+    if (!isIsoBmff(bytes)) return null;
+    const c = heifColor(bytes) orelse return null;
+    return if (c.icc == null) c.nclx else null;
+}
+
+fn isIsoBmff(b: []const u8) bool {
+    return b.len >= 12 and std.mem.eql(u8, b[4..8], "ftyp");
 }
 
 /// Segmenti APP2 "ICC_PROFILE\0" + numero + totale: il profilo può essere
@@ -386,6 +482,141 @@ fn fromWebp(b: []const u8) ?Embedded {
         if (@as(u64, pos) + 8 + len > b.len) return null;
         if (std.mem.eql(u8, b[pos .. pos + 4], "ICCP")) return .{ .data = b[pos + 8 ..][0..len], .owned = false };
         pos += 8 + @as(usize, len) + (len & 1);
+    }
+    return null;
+}
+
+// ── HEIF / AVIF ──────────────────────────────────────────────────────────────
+
+/// Box ISO-BMFF: tipo e contenuto.
+const Box = struct { typ: *const [4]u8, body: []const u8 };
+
+/// Box uno dopo l'altro dentro `d`. Dimensione 1: a 64 bit; 0: fino alla fine.
+const Boxes = struct {
+    d: []const u8,
+    pos: usize = 0,
+
+    fn next(it: *Boxes) ?Box {
+        const rest = it.d[it.pos..];
+        if (rest.len < 8) return null;
+        var size: u64 = be32(rest, 0).?;
+        var hdr: usize = 8;
+        if (size == 1) {
+            if (rest.len < 16) return null;
+            size = std.mem.readInt(u64, rest[8..16], .big);
+            hdr = 16;
+        } else if (size == 0) size = rest.len;
+        if (size < hdr or size > rest.len) return null;
+        it.pos += @intCast(size);
+        return .{ .typ = rest[4..8], .body = rest[hdr..@intCast(size)] };
+    }
+
+    fn find(d: []const u8, typ: *const [4]u8) ?[]const u8 {
+        var it: Boxes = .{ .d = d };
+        while (it.next()) |b| if (std.mem.eql(u8, b.typ, typ)) return b.body;
+        return null;
+    }
+
+    /// n-esimo box, contando da 1 (gli indici di `ipma` dentro `ipco`).
+    fn nth(d: []const u8, n: u16) ?Box {
+        var it: Boxes = .{ .d = d };
+        var i: u16 = 1;
+        while (it.next()) |b| : (i += 1) if (i == n) return b;
+        return null;
+    }
+};
+
+const HeifColor = struct { icc: ?[]const u8 = null, nclx: ?Cicp = null };
+
+/// Colore dell'immagine principale: le proprietà `colr` associate all'elemento
+/// di `pitm` (`ipco` elenca le proprietà, `ipma` le assegna agli elementi).
+/// null se non ne ha.
+fn heifColor(b: []const u8) ?HeifColor {
+    const meta = Boxes.find(b, "meta") orelse return null;
+    if (meta.len < 4) return null;
+    const m = meta[4..]; // FullBox: versione e flag
+    const pitm = Boxes.find(m, "pitm") orelse return null;
+    if (pitm.len < 4) return null;
+    const primary: u32 = if (pitm[0] == 0) (be16(pitm, 4) orelse return null) else (be32(pitm, 4) orelse return null);
+    const iprp = Boxes.find(m, "iprp") orelse return null;
+    const ipco = Boxes.find(iprp, "ipco") orelse return null;
+    var c = itemColor(iprp, ipco, primary);
+    // Immagine derivata (griglia: le foto degli iPhone; `iden` sopra una
+    // griglia): il colore può stare solo sugli elementi da cui deriva (`dimg`),
+    // giù fino alle tessere.
+    var item = primary;
+    var depth: u8 = 0;
+    while (c.icc == null and c.nclx == null and depth < 4) : (depth += 1) {
+        item = firstDimg(Boxes.find(m, "iref") orelse break, item) orelse break;
+        c = itemColor(iprp, ipco, item);
+    }
+    return if (c.icc != null or c.nclx != null) c else null;
+}
+
+fn itemColor(iprp: []const u8, ipco: []const u8, item: u32) HeifColor {
+    var out: HeifColor = .{};
+    var boxes: Boxes = .{ .d = iprp };
+    while (boxes.next()) |box| {
+        if (!std.mem.eql(u8, box.typ, "ipma")) continue;
+        const d = box.body;
+        if (d.len < 8) continue;
+        const wide_id = d[0] >= 1; // versione 1: id a 32 bit
+        const wide_idx = d[3] & 1 != 0; // flag 1: indici a 15 bit
+        const count = be32(d, 4).?;
+        var pos: usize = 8;
+        entries: for (0..count) |_| {
+            const id: u32 = if (wide_id) (be32(d, pos) orelse break) else (be16(d, pos) orelse break);
+            pos += if (wide_id) 4 else 2;
+            if (pos >= d.len) break;
+            const n = d[pos];
+            pos += 1;
+            if (id != item) {
+                pos += @as(usize, n) * @as(usize, if (wide_idx) 2 else 1);
+                continue;
+            }
+            for (0..n) |_| {
+                // Il bit alto è "essenziale": non conta per l'indice.
+                const idx: u16 = if (wide_idx)
+                    (be16(d, pos) orelse break :entries) & 0x7fff
+                else if (pos < d.len) d[pos] & 0x7f else break :entries;
+                pos += if (wide_idx) 2 else 1;
+                if (idx == 0) continue;
+                const prop = Boxes.nth(ipco, idx) orelse continue;
+                if (std.mem.eql(u8, prop.typ, "colr")) colr(prop.body, &out);
+            }
+            // Ogni elemento compare una volta sola fra tutti gli ipma: fermarsi
+            // qui tiene lineare il costo anche con voci ripetute ad arte
+            // (ognuna costerebbe fino a 255 scansioni di ipco).
+            return out;
+        }
+    }
+    return out;
+}
+
+/// Proprietà `colr`: profilo ICC (`prof`, `rICC`) o codici CICP (`nclx`).
+fn colr(body: []const u8, out: *HeifColor) void {
+    if (body.len < 4) return;
+    const typ = body[0..4];
+    if (std.mem.eql(u8, typ, "prof") or std.mem.eql(u8, typ, "rICC")) {
+        if (out.icc == null) out.icc = body[4..];
+    } else if (std.mem.eql(u8, typ, "nclx") and body.len >= 8) {
+        if (out.nclx == null) out.nclx = .{ .primaries = be16(body, 4).?, .transfer = be16(body, 6).? };
+    }
+}
+
+/// Primo elemento da cui `from` è derivato (riferimento `dimg` in `iref`).
+fn firstDimg(iref: []const u8, from: u32) ?u32 {
+    if (iref.len < 4) return null;
+    const wide = iref[0] >= 1; // versione 1: id a 32 bit
+    const w: usize = if (wide) 4 else 2;
+    var it: Boxes = .{ .d = iref[4..] };
+    while (it.next()) |ref| {
+        if (!std.mem.eql(u8, ref.typ, "dimg")) continue;
+        const d = ref.body;
+        const id: u32 = if (wide) (be32(d, 0) orelse continue) else (be16(d, 0) orelse continue);
+        if (id != from or (be16(d, w) orelse 0) == 0) continue;
+        if (wide) return be32(d, w + 2);
+        return be16(d, w + 2) orelse null;
     }
     return null;
 }
@@ -601,6 +832,195 @@ test "estrazione: TIFF, JPEG a più segmenti, PNG compresso, WebP" {
     try testing.expect(extract(gpa, "\xff\xd8\xff\xe2\xff\xff") == null);
 }
 
+test "CICP: Display P3 e BT.2020 come lcms, sRGB e HDR senza conversione" {
+    const gpa = testing.allocator;
+    const t = try gpa.create(Transform);
+    defer gpa.destroy(t);
+    // Riferimento: lcms (magick -set profile … -profile sRGB.icc) con profili ICC
+    // equivalenti (primari adattati a D50 con Bradford, curva sRGB); per la curva
+    // lineare, la formula sRGB di ImageMagick.
+    const p3: Cicp = .{ .primaries = 12, .transfer = 13 };
+    const bt2020: Cicp = .{ .primaries = 9, .transfer = 14 };
+    const cases = [_]struct { c: Cicp, in: [3]u8, out: [3]u8 }{
+        .{ .c = p3, .in = .{ 90, 200, 60 }, .out = .{ 0, 203, 7 } },
+        .{ .c = p3, .in = .{ 60, 160, 230 }, .out = .{ 0, 163, 236 } },
+        .{ .c = p3, .in = .{ 200, 40, 40 }, .out = .{ 218, 0, 26 } },
+        .{ .c = p3, .in = .{ 10, 20, 30 }, .out = .{ 7, 20, 31 } },
+        .{ .c = bt2020, .in = .{ 90, 200, 60 }, .out = .{ 0, 210, 0 } },
+        .{ .c = bt2020, .in = .{ 60, 160, 230 }, .out = .{ 0, 167, 237 } },
+        .{ .c = bt2020, .in = .{ 200, 40, 40 }, .out = .{ 249, 0, 27 } },
+        .{ .c = bt2020, .in = .{ 10, 20, 30 }, .out = .{ 0, 21, 31 } },
+        .{ .c = .{ .primaries = 1, .transfer = 8 }, .in = .{ 128, 128, 128 }, .out = .{ 188, 188, 188 } },
+        .{ .c = .{ .primaries = 1, .transfer = 8 }, .in = .{ 10, 20, 30 }, .out = .{ 56, 79, 96 } },
+    };
+    for (cases) |k| {
+        try testing.expect(initCicp(t, k.c));
+        var px = k.in;
+        t.apply(&px);
+        for (0..3) |i| testing.expect(@abs(@as(i16, px[i]) - k.out[i]) <= 1) catch |e| {
+            std.debug.print("{any} {any}: {any}, atteso {any}\n", .{ k.c, k.in, px, k.out });
+            return e;
+        };
+    }
+    // Stesso bianco D65 e curva sRGB: i grigi non cambiano.
+    for ([_]Cicp{ p3, bt2020 }) |c| {
+        try testing.expect(initCicp(t, c));
+        for (0..256) |v| {
+            var px: [3]u8 = @splat(@intCast(v));
+            t.apply(&px);
+            try testing.expectEqual(@as([3]u8, @splat(@intCast(v))), px);
+        }
+    }
+    // Già sRGB, HDR (PQ, HLG), bianco DCI, codici riservati: niente conversione.
+    for ([_][2]u16{ .{ 1, 13 }, .{ 2, 2 }, .{ 1, 1 }, .{ 1, 6 }, .{ 2, 13 }, .{ 9, 16 }, .{ 9, 18 }, .{ 11, 13 }, .{ 0, 13 }, .{ 12, 17 }, .{ 0xffff, 0xffff } }) |c| {
+        try testing.expect(!initCicp(t, .{ .primaries = c[0], .transfer = c[1] }));
+    }
+    // Display P3 da CICP o dal profilo ICC equivalente (quello degli iPhone, a
+    // meno di arrotondamenti): stessi byte, entro 1.
+    const p3_d50 = [3][3]f64{ .{ 0.515119, 0.241189, -0.00105 }, .{ 0.291978, 0.692244, 0.041879 }, .{ 0.157103, 0.066567, 0.784071 } };
+    const prof = try makeProfile(gpa, p3_d50, 0);
+    defer gpa.free(prof);
+    const t2 = try gpa.create(Transform);
+    defer gpa.destroy(t2);
+    try testing.expect(init(t2, prof));
+    try testing.expect(initCicp(t, p3));
+    var prng = std.Random.DefaultPrng.init(0x93);
+    for (0..4096) |_| {
+        var a: [3]u8 = undefined;
+        prng.random().bytes(&a);
+        var b = a;
+        t.apply(&a);
+        t2.apply(&b);
+        for (0..3) |i| try testing.expect(@abs(@as(i16, a[i]) - b[i]) <= 1);
+    }
+}
+
+/// Box ISO-BMFF di prova: dimensione a 32 bit, tipo, poi le parti in fila.
+fn testBox(a: std.mem.Allocator, typ: *const [4]u8, parts: []const []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var n: usize = 8;
+    for (parts) |part| n += part.len;
+    var size: [4]u8 = undefined;
+    std.mem.writeInt(u32, &size, @intCast(n), .big);
+    try out.appendSlice(a, &size);
+    try out.appendSlice(a, typ);
+    for (parts) |part| try out.appendSlice(a, part);
+    return out.items;
+}
+
+/// HEIF minimo: `ftyp`, `meta` (con `pitm`, `iref` se non vuoto, `iprp`), `mdat`.
+fn testHeif(a: std.mem.Allocator, pitm: []const u8, iref: []const u8, props: []const []const u8, ipma: []const u8) ![]u8 {
+    const iprp = try testBox(a, "iprp", &.{ try testBox(a, "ipco", props), try testBox(a, "ipma", &.{ipma}) });
+    const meta = try testBox(a, "meta", &.{ "\x00\x00\x00\x00", try testBox(a, "pitm", &.{pitm}), iref, iprp });
+    return std.mem.concat(a, u8, &.{ try testBox(a, "ftyp", &.{"heic\x00\x00\x00\x00mif1heic"}), meta, try testBox(a, "mdat", &.{"\x00\x01\x02\x03"}) });
+}
+
+/// Proprietà di prova: 1 ispe, 2 profilo ProPhoto, 3 nclx Display P3, 4 nclx
+/// BT.2020 PQ, 5 lo stesso profilo come `rICC`.
+fn testProps(a: std.mem.Allocator, prof: []const u8) ![]const []const u8 {
+    return a.dupe([]const u8, &.{
+        try testBox(a, "ispe", &.{"\x00\x00\x00\x00\x00\x00\x00\x10\x00\x00\x00\x08"}),
+        try testBox(a, "colr", &.{ "prof", prof }),
+        try testBox(a, "colr", &.{"nclx\x00\x0c\x00\x0d\x00\x00\x80"}),
+        try testBox(a, "colr", &.{"nclx\x00\x09\x00\x10\x00\x09\x00"}),
+        try testBox(a, "colr", &.{ "rICC", prof }),
+    });
+}
+
+/// Elemento 1 con profilo e nclx (come scrive libheif); solo nclx (AVIF tipico),
+/// con un elemento 2 (alfa, mappa HDR…) di colore diverso; griglia (le foto
+/// degli iPhone) con pitm e ipma versione 1 e il colore solo sulla tessera;
+/// `iden` sopra una griglia, con iref versione 1, ipma versione 0 a indici larghi
+/// e il profilo `rICC` solo sulla tessera.
+fn testHeifs(a: std.mem.Allocator, prof: []const u8) ![4][]u8 {
+    const props = try testProps(a, prof);
+    const pitm1 = "\x00\x00\x00\x00\x00\x01";
+    return .{
+        // ipma v0, flag 0: 1 voce, elemento 1, proprietà 1, 2 (essenziale), 3.
+        try testHeif(a, pitm1, "", props, "\x00\x00\x00\x00" ++ "\x00\x00\x00\x01" ++ "\x00\x01\x03\x01\x82\x03"),
+        try testHeif(a, pitm1, "", props, "\x00\x00\x00\x00" ++ "\x00\x00\x00\x02" ++ "\x00\x02\x01\x04" ++ "\x00\x01\x02\x01\x03"),
+        // pitm v1 = 10, derivato (dimg) dalle tessere 1 e 2; ipma v1 con indici a 15 bit.
+        try testHeif(
+            a,
+            "\x01\x00\x00\x00\x00\x00\x00\x0a",
+            try testBox(a, "iref", &.{ "\x00\x00\x00\x00", try testBox(a, "dimg", &.{"\x00\x0a\x00\x02\x00\x01\x00\x02"}) }),
+            props,
+            "\x01\x00\x00\x01" ++ "\x00\x00\x00\x02" ++ "\x00\x00\x00\x0a\x01\x00\x01" ++ "\x00\x00\x00\x01\x02\x00\x01\x80\x03",
+        ),
+        // pitm 20 = iden di 10 = griglia di 1 e 2.
+        try testHeif(
+            a,
+            "\x00\x00\x00\x00\x00\x14",
+            try testBox(a, "iref", &.{
+                "\x01\x00\x00\x00",
+                try testBox(a, "dimg", &.{"\x00\x00\x00\x14\x00\x01\x00\x00\x00\x0a"}),
+                try testBox(a, "dimg", &.{"\x00\x00\x00\x0a\x00\x02\x00\x00\x00\x01\x00\x00\x00\x02"}),
+            }),
+            props,
+            "\x00\x00\x00\x01" ++ "\x00\x00\x00\x03" ++ "\x00\x14\x01\x00\x01" ++ "\x00\x0a\x01\x00\x01" ++ "\x00\x01\x01\x80\x05",
+        ),
+    };
+}
+
+test "HEIF/AVIF: colore dell'immagine principale" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const prof = try makeProfile(a, prophoto, 1.8);
+    const files = try testHeifs(a, prof);
+    const p3: Cicp = .{ .primaries = 12, .transfer = 13 };
+
+    // Profilo e nclx sulla stessa immagine: vale il profilo.
+    try testing.expectEqualSlices(u8, prof, extract(a, files[0]).?.data);
+    try testing.expect(cicp(files[0]) == null);
+    // Solo nclx: quello dell'immagine principale, non dell'elemento 2.
+    try testing.expect(extract(a, files[1]) == null);
+    try testing.expectEqual(p3, cicp(files[1]).?);
+    // Griglia: il colore della prima tessera, anche due livelli sotto.
+    try testing.expectEqual(p3, cicp(files[2]).?);
+    try testing.expectEqualSlices(u8, prof, extract(a, files[3]).?.data);
+
+    const props = try testProps(a, prof);
+    const pitm1 = "\x00\x00\x00\x00\x00\x01";
+    // Colore solo su un altro elemento e nessun riferimento: niente.
+    const other = try testHeif(a, pitm1, "", props, "\x00\x00\x00\x00\x00\x00\x00\x02\x00\x02\x01\x03\x00\x01\x01\x01");
+    try testing.expect(extract(a, other) == null and cicp(other) == null);
+    // HDR (BT.2020 PQ): letto, ma non convertito.
+    const pq = try testHeif(a, pitm1, "", props, "\x00\x00\x00\x00\x00\x00\x00\x01\x00\x01\x01\x04");
+    const t = try a.create(Transform);
+    try testing.expectEqual(Cicp{ .primaries = 9, .transfer = 16 }, cicp(pq).?);
+    try testing.expect(!initCicp(t, cicp(pq).?));
+
+    // `meta` con dimensione a 64 bit, `mdat` fino alla fine del file (dimensione 0).
+    const meta_body = try std.mem.concat(a, u8, &.{
+        "\x00\x00\x00\x00",
+        try testBox(a, "pitm", &.{pitm1}),
+        try testBox(a, "iprp", &.{ try testBox(a, "ipco", props), try testBox(a, "ipma", &.{"\x00\x00\x00\x00\x00\x00\x00\x01\x00\x01\x01\x03"}) }),
+    });
+    var size64: [8]u8 = undefined;
+    std.mem.writeInt(u64, &size64, 16 + meta_body.len, .big);
+    const large = try std.mem.concat(a, u8, &.{ try testBox(a, "ftyp", &.{"avif\x00\x00\x00\x00mif1avif"}), "\x00\x00\x00\x01meta", &size64, meta_body, "\x00\x00\x00\x00mdat\x01\x02" });
+    try testing.expectEqual(p3, cicp(large).?);
+
+    // ipma ostile: 2000 voci ripetute dell'elemento 1, ognuna con 255 rimandi
+    // all'ultima di 32767 proprietà. Si ferma alla prima voce (255 scansioni
+    // di ipco); senza, sarebbero 2000 × 255 e il test non finirebbe.
+    var many: std.ArrayList(u8) = .empty;
+    for (0..32766) |_| try many.appendSlice(a, "\x00\x00\x00\x08free");
+    try many.appendSlice(a, try testBox(a, "colr", &.{"nclx\x00\x0c\x00\x0d\x00\x00\x80"}));
+    var hostile: std.ArrayList(u8) = .empty;
+    try hostile.appendSlice(a, "\x00\x00\x00\x01\x00\x00\x07\xd0");
+    for (0..2000) |_| {
+        try hostile.appendSlice(a, "\x00\x01\xff");
+        for (0..255) |_| try hostile.appendSlice(a, "\xff\xff");
+    }
+    try testing.expectEqual(p3, cicp(try testHeif(a, pitm1, "", &.{many.items}, hostile.items)).?);
+
+    // Un MP4 (ftyp senza meta) e scatole che sforano: niente.
+    try testing.expect(cicp(try testBox(a, "ftyp", &.{"isom\x00\x00\x02\x00isomiso2"})) == null);
+    try testing.expect(cicp("\x00\x00\x00\x10ftypheic\x00\x00\x00\x00\xff\xff\xff\xffmeta") == null);
+}
+
 test "file troncati o corrotti: niente panic" {
     const gpa = testing.allocator;
     const prof = try makeProfile(gpa, prophoto, 1.8);
@@ -650,19 +1070,28 @@ test "file troncati o corrotti: niente panic" {
     try webp.appendSlice(gpa, &c4);
     try webp.appendSlice(gpa, prof);
 
+    // HEIF: profilo, solo nclx, griglia, iden sopra una griglia.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const heifs = try testHeifs(arena_state.allocator(), prof);
+
     const t = try gpa.create(Transform);
     defer gpa.destroy(t);
     var px = [_]u8{ 10, 200, 30 };
-    for ([_][]const u8{ jpg.items, tif.items, png.items, webp.items }) |file| {
-        // Integro: il profilo si estrae e si converte.
-        const e = extract(gpa, file).?;
-        try testing.expect(init(t, e.data));
-        e.deinit(gpa);
+    for ([_][]const u8{ jpg.items, tif.items, png.items, webp.items, heifs[0], heifs[1], heifs[2], heifs[3] }) |file| {
+        // Integro: il colore si estrae e si converte.
+        if (extract(gpa, file)) |e| {
+            try testing.expect(init(t, e.data));
+            e.deinit(gpa);
+        } else try testing.expect(initCicp(t, cicp(file).?));
         // Ogni troncamento.
-        for (0..file.len) |n| if (extract(gpa, file[0..n])) |x| {
-            if (init(t, x.data)) t.apply(&px);
-            x.deinit(gpa);
-        };
+        for (0..file.len) |n| {
+            if (extract(gpa, file[0..n])) |x| {
+                if (init(t, x.data)) t.apply(&px);
+                x.deinit(gpa);
+            }
+            if (cicp(file[0..n])) |c| if (initCicp(t, c)) t.apply(&px);
+        }
         // Byte a caso in posizioni a caso.
         const buf = try gpa.dupe(u8, file);
         defer gpa.free(buf);
@@ -675,6 +1104,7 @@ test "file troncati o corrotti: niente panic" {
                 if (init(t, x.data)) t.apply(&px);
                 x.deinit(gpa);
             }
+            if (cicp(buf)) |c| if (initCicp(t, c)) t.apply(&px);
         }
     }
 }

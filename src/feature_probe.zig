@@ -19,9 +19,10 @@
 //!                                       dispositivo; la riproduzione deve riprendere (ultimi
 //!                                       3 s: l'orologio avanza di almeno 2 s)
 //!   feature-probe gpu                   init renderer + render offscreen di un cubo
-//!   feature-probe pixel <file> <fx> <fy> <r> <g> <b>
+//!   feature-probe pixel <file> <fx> <fy> <r> <g> <b> [toll]
 //!                                       colore del pixel in (fx, fy) ∈ [0,1]² entro
-//!                                       ±48 per canale (ordine dei byte, orientamento)
+//!                                       ±48 per canale (ordine dei byte, orientamento),
+//!                                       o entro ±toll (gestione del colore)
 //!   feature-probe fail <file> <testo>  il decode DEVE fallire con un errore che
 //!                                       contiene <testo> (file corrotti, troppo grandi)
 //!   feature-probe contains <file> <testo>  il testo/la tabella decodificati contengono <testo>
@@ -88,7 +89,8 @@ pub fn main(init: std.process.Init) !u8 {
         const path = args.next() orelse return usage();
         var v: [5]f64 = undefined;
         for (&v) |*x| x.* = std.fmt.parseFloat(f64, args.next() orelse return usage()) catch return usage();
-        probePixel(io, gpa, path, v);
+        const tol = if (args.next()) |t| std.fmt.parseFloat(f64, t) catch return usage() else 48;
+        probePixel(io, gpa, path, v, tol);
     } else if (std.mem.eql(u8, cmd, "fail")) {
         const path = args.next() orelse return usage();
         probeFail(io, gpa, path, args.next() orelse return usage());
@@ -104,7 +106,7 @@ pub fn main(init: std.process.Init) !u8 {
 }
 
 fn usage() u8 {
-    std.debug.print("uso: feature-probe doc <file>... | page <pdf> <N> | video <file> | audio <file> | gpu | pixel <file> <fx> <fy> <r> <g> <b> | fail <file> <testo> | dump <file> <out.ppm>\n", .{});
+    std.debug.print("uso: feature-probe doc <file>... | page <pdf> <N> | video <file> | audio <file> | gpu | pixel <file> <fx> <fy> <r> <g> <b> [toll] | fail <file> <testo> | dump <file> <out.ppm>\n", .{});
     return 2;
 }
 
@@ -136,7 +138,7 @@ fn probeDoc(io: std.Io, gpa: std.mem.Allocator, path: []const u8, page: ?usize) 
     }
 }
 
-fn probePixel(io: std.Io, gpa: std.mem.Allocator, path: []const u8, v: [5]f64) void {
+fn probePixel(io: std.Io, gpa: std.mem.Allocator, path: []const u8, v: [5]f64, tol: f64) void {
     var d = decoder.decode(path, io, gpa);
     defer d.deinit(gpa);
     const base = std.fs.path.basename(path);
@@ -149,7 +151,7 @@ fn probePixel(io: std.Io, gpa: std.mem.Allocator, path: []const u8, v: [5]f64) v
     const px = im.pixels[(y * im.width + x) * 3 ..][0..3];
     var ok = true;
     for (px, v[2..5]) |got, want| {
-        if (@abs(@as(f64, @floatFromInt(got)) - want) > 48) ok = false;
+        if (@abs(@as(f64, @floatFromInt(got)) - want) > tol) ok = false;
     }
     report(ok, "{s}: pixel ({d},{d}) di {d}x{d} = {d},{d},{d} (atteso {d},{d},{d})", .{ base, x, y, im.width, im.height, px[0], px[1], px[2], v[2], v[3], v[4] });
 }
