@@ -1,9 +1,10 @@
 //! Profili colore ICC incorporati nelle immagini: estrazione (JPEG, PNG, TIFF,
-//! WebP, HEIF/AVIF) e conversione verso sRGB dei profili RGB a matrice e curve
-//! (ProPhoto, Adobe RGB, Display P3…), come fanno i visualizzatori con la gestione
-//! del colore. Senza conversione un'immagine ProPhoto mostrata come sRGB ha colori
-//! spenti e falsati. HEIF e AVIF possono dichiarare il colore anche coi codici
-//! CICP di ITU-T H.273 (box `nclx`) invece che con un profilo. Puro Zig, senza
+//! WebP, PSD, HEIF/AVIF) e conversione verso sRGB dei profili RGB a matrice e
+//! curve (ProPhoto, Adobe RGB, Display P3…) e di quelli in scala di grigi, come
+//! fanno i visualizzatori con la gestione del colore. Senza conversione
+//! un'immagine ProPhoto mostrata come sRGB ha colori spenti e falsati. HEIF, AVIF
+//! e PNG possono dichiarare il colore anche coi codici CICP di ITU-T H.273 (box
+//! `nclx`, chunk `cICP`) invece che con un profilo. Puro Zig, senza
 //! lcms: i profili a tabelle (solo A2B0), quelli non RGB, l'HDR (PQ, HLG) e i
 //! colori già sRGB restano senza conversione, come prima.
 
@@ -120,13 +121,16 @@ const d65 = [2]f64{ 0.3127, 0.3290 };
 /// Cromaticità xy di R, G, B e del bianco.
 const srgb_xy = [4][2]f64{ .{ 0.64, 0.33 }, .{ 0.30, 0.60 }, .{ 0.15, 0.06 }, d65 };
 
-/// BT.709, BT.2020 e Display P3. Gli altri (BT.601, EBU 3213, DCI-P3 col bianco
-/// del proiettore, XYZ…) restano senza conversione.
+/// Primari col bianco D65. Gli altri (BT.470 M col bianco C, DCI-P3 col bianco
+/// del proiettore, XYZ, pellicola) restano senza conversione.
 fn cicpPrimaries(code: u16) ?[4][2]f64 {
     return switch (code) {
         1, 2 => srgb_xy, // BT.709 (= sRGB); 2 = non specificato, che tutti leggono come sRGB
+        5 => .{ .{ 0.64, 0.33 }, .{ 0.29, 0.60 }, .{ 0.15, 0.06 }, d65 }, // BT.601 a 625 righe (PAL)
+        6, 7 => .{ .{ 0.630, 0.340 }, .{ 0.310, 0.595 }, .{ 0.155, 0.070 }, d65 }, // BT.601 a 525 righe, SMPTE 240M
         9 => .{ .{ 0.708, 0.292 }, .{ 0.170, 0.797 }, .{ 0.131, 0.046 }, d65 }, // BT.2020
         12 => .{ .{ 0.680, 0.320 }, .{ 0.265, 0.690 }, .{ 0.150, 0.060 }, d65 }, // Display P3
+        22 => .{ .{ 0.630, 0.340 }, .{ 0.295, 0.605 }, .{ 0.155, 0.077 }, d65 }, // EBU Tech 3213
         else => null,
     };
 }
@@ -262,7 +266,9 @@ fn powPos(base: f64, e: f64) f64 {
     return if (base <= 0) 0 else std.math.pow(f64, base, e);
 }
 
-/// Profilo RGB a matrice e curve: colori primari (colonne XYZ D50) e tre TRC.
+/// Profilo RGB a matrice e curve: colori primari (colonne XYZ D50) e tre TRC. Un
+/// profilo in scala di grigi diventa i primari sRGB con la sua curva sui tre
+/// canali: il grigio va nella luminanza Y, e in sRGB R = G = B = Y è lo stesso grigio.
 const Profile = struct {
     colorants: [3][3]f64,
     curves: [3]Curve,
@@ -272,9 +278,14 @@ const Profile = struct {
         const size = be32(d, 0) orelse return null;
         if (size < 132 or size > d.len) return null;
         const p = d[0..size];
-        if (!std.mem.eql(u8, p[16..20], "RGB ") or !std.mem.eql(u8, p[20..24], "XYZ ")) return null;
+        const gray = std.mem.eql(u8, p[16..20], "GRAY");
+        if (!(gray or std.mem.eql(u8, p[16..20], "RGB ")) or !std.mem.eql(u8, p[20..24], "XYZ ")) return null;
         const n = be32(p, 128) orelse return null;
         if (n > 1024 or 132 + @as(usize, n) * 12 > p.len) return null;
+        if (gray) {
+            const k = Curve.parse(tag(p, n, "kTRC") orelse return null) orelse return null;
+            return .{ .colorants = srgb_colorants, .curves = .{ k, k, k } };
+        }
 
         var out: Profile = undefined;
         const xyz_sigs = [_]*const [4]u8{ "rXYZ", "gXYZ", "bXYZ" };
@@ -346,13 +357,14 @@ pub fn isTiff(bytes: []const u8) bool {
     return bytes.len >= 4 and (std.mem.eql(u8, bytes[0..4], "II*\x00") or std.mem.eql(u8, bytes[0..4], "MM\x00*"));
 }
 
-/// Profilo ICC incorporato in un JPEG, PNG, TIFF, WebP, HEIF o AVIF, o null
+/// Profilo ICC incorporato in un JPEG, PNG, TIFF, WebP, PSD, HEIF o AVIF, o null
 /// (assente, contenitore diverso, struttura non valida, memoria esaurita).
 pub fn extract(gpa: std.mem.Allocator, bytes: []const u8) ?Embedded {
     if (bytes.len >= 4 and bytes[0] == 0xFF and bytes[1] == 0xD8) return fromJpeg(gpa, bytes);
-    if (bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], "\x89PNG\r\n\x1a\n")) return fromPng(gpa, bytes);
+    if (isPng(bytes)) return fromPng(gpa, bytes);
     if (bytes.len >= 8 and isTiff(bytes)) return fromTiff(bytes);
     if (bytes.len >= 12 and std.mem.eql(u8, bytes[0..4], "RIFF") and std.mem.eql(u8, bytes[8..12], "WEBP")) return fromWebp(bytes);
+    if (bytes.len >= 26 and std.mem.eql(u8, bytes[0..4], "8BPS")) return fromPsd(bytes);
     if (isIsoBmff(bytes)) {
         const icc = (heifColor(bytes) orelse return null).icc orelse return null;
         return .{ .data = icc, .owned = false };
@@ -361,8 +373,10 @@ pub fn extract(gpa: std.mem.Allocator, bytes: []const u8) ?Embedded {
 }
 
 /// Colore CICP di un HEIF o AVIF senza profilo ICC (se c'è il profilo, vale
-/// quello: il `nclx` accanto serve al decoder per la matrice YCbCr), o null.
+/// quello: il `nclx` accanto serve al decoder per la matrice YCbCr), o di un PNG
+/// col chunk `cICP` (che lì vale più dell'`iCCP`), o null.
 pub fn cicp(bytes: []const u8) ?Cicp {
+    if (isPng(bytes)) return (pngChunks(bytes) orelse return null).cicp;
     if (!isIsoBmff(bytes)) return null;
     const c = heifColor(bytes) orelse return null;
     return if (c.icc == null) c.nclx else null;
@@ -418,25 +432,67 @@ fn fromJpeg(gpa: std.mem.Allocator, b: []const u8) ?Embedded {
     return .{ .data = out, .owned = true };
 }
 
-/// Chunk iCCP: nome, 0, metodo di compressione (0 = zlib), dati zlib.
-fn fromPng(gpa: std.mem.Allocator, b: []const u8) ?Embedded {
+fn isPng(b: []const u8) bool {
+    return b.len >= 8 and std.mem.eql(u8, b[0..8], "\x89PNG\r\n\x1a\n");
+}
+
+/// Chunk di colore di un PNG, prima dei dati (IDAT).
+const PngColor = struct { iccp: ?[]const u8 = null, cicp: ?Cicp = null };
+
+fn pngChunks(b: []const u8) ?PngColor {
+    var out: PngColor = .{};
     var pos: usize = 8;
     while (pos + 12 <= b.len) {
         const len = be32(b, pos) orelse return null;
         const kind = b[pos + 4 .. pos + 8];
         if (@as(u64, pos) + 12 + len > b.len) return null;
         const data = b[pos + 8 .. pos + 8 + len];
-        if (std.mem.eql(u8, kind, "IDAT") or std.mem.eql(u8, kind, "IEND")) return null;
-        if (std.mem.eql(u8, kind, "iCCP")) {
-            const nul = std.mem.indexOfScalar(u8, data[0..@min(data.len, 80)], 0) orelse return null;
-            if (nul + 2 > data.len or data[nul + 1] != 0) return null;
-            var in: std.Io.Reader = .fixed(data[nul + 2 ..]);
-            var window: [std.compress.flate.max_window_len]u8 = undefined;
-            var d: std.compress.flate.Decompress = .init(&in, .zlib, &window);
-            const out = d.reader.allocRemaining(gpa, .limited(max_profile)) catch return null;
-            return .{ .data = out, .owned = true };
-        }
+        if (std.mem.eql(u8, kind, "IDAT") or std.mem.eql(u8, kind, "IEND")) break;
+        if (std.mem.eql(u8, kind, "iCCP") and out.iccp == null) out.iccp = data;
+        // Matrice 0: i PNG sono RGB. Le altre non sono ammesse, e il chunk si ignora.
+        if (std.mem.eql(u8, kind, "cICP") and len == 4 and data[2] == 0 and out.cicp == null)
+            out.cicp = .{ .primaries = data[0], .transfer = data[1] };
         pos += 12 + @as(usize, len);
+    }
+    return out;
+}
+
+/// Chunk iCCP (nome, metodo di compressione 0, profilo zlib). Se c'è anche un
+/// `cICP` vale quello (PNG terza edizione), e il profilo si ignora.
+fn fromPng(gpa: std.mem.Allocator, b: []const u8) ?Embedded {
+    const c = pngChunks(b) orelse return null;
+    if (c.cicp != null) return null;
+    const data = c.iccp orelse return null;
+    const nul = std.mem.indexOfScalar(u8, data[0..@min(data.len, 80)], 0) orelse return null;
+    if (nul + 2 > data.len or data[nul + 1] != 0) return null;
+    var in: std.Io.Reader = .fixed(data[nul + 2 ..]);
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var d: std.compress.flate.Decompress = .init(&in, .zlib, &window);
+    const out = d.reader.allocRemaining(gpa, .limited(max_profile)) catch return null;
+    return .{ .data = out, .owned = true };
+}
+
+/// Risorsa 1039 (profilo ICC) fra le image resources di un PSD: dopo l'header
+/// (26 byte) e i dati del modo colore, blocchi firma, id, nome Pascal pari,
+/// dimensione, dati pari.
+fn fromPsd(b: []const u8) ?Embedded {
+    const mode_len = be32(b, 26) orelse return null;
+    const res_at = 30 + @as(u64, mode_len);
+    if (res_at > b.len) return null;
+    const res_len = be32(b, @intCast(res_at)) orelse return null;
+    const end = res_at + 4 + res_len;
+    if (end > b.len) return null;
+    var pos = res_at + 4;
+    while (pos + 12 <= end) {
+        const p: usize = @intCast(pos);
+        const id = be16(b, p + 4).?;
+        const name = (@as(u64, b[p + 6]) + 2) & ~@as(u64, 1); // lunghezza, caratteri, pari
+        if (pos + 6 + name + 4 > end) return null;
+        const at: usize = @intCast(pos + 6 + name);
+        const size = be32(b, at).?;
+        if (at + 4 + @as(u64, size) > end) return null;
+        if (id == 0x040F) return .{ .data = b[at + 4 ..][0..size], .owned = false };
+        pos = at + 4 + @as(u64, size) + (size & 1);
     }
     return null;
 }
@@ -837,7 +893,7 @@ test "estrazione: TIFF, JPEG a più segmenti, PNG compresso, WebP" {
     try testing.expect(extract(gpa, "\xff\xd8\xff\xe2\xff\xff") == null);
 }
 
-test "CICP: Display P3 e BT.2020 come lcms, sRGB e HDR senza conversione" {
+test "CICP: Display P3, BT.2020, BT.601, EBU come lcms, sRGB e HDR senza conversione" {
     const gpa = testing.allocator;
     const t = try gpa.create(Transform);
     defer gpa.destroy(t);
@@ -855,6 +911,12 @@ test "CICP: Display P3 e BT.2020 come lcms, sRGB e HDR senza conversione" {
         .{ .c = bt2020, .in = .{ 60, 160, 230 }, .out = .{ 0, 167, 237 } },
         .{ .c = bt2020, .in = .{ 200, 40, 40 }, .out = .{ 249, 0, 27 } },
         .{ .c = bt2020, .in = .{ 10, 20, 30 }, .out = .{ 0, 21, 31 } },
+        .{ .c = .{ .primaries = 5, .transfer = 6 }, .in = .{ 90, 200, 60 }, .out = .{ 80, 200, 64 } },
+        .{ .c = .{ .primaries = 5, .transfer = 6 }, .in = .{ 60, 160, 230 }, .out = .{ 50, 160, 229 } },
+        .{ .c = .{ .primaries = 6, .transfer = 1 }, .in = .{ 90, 200, 60 }, .out = .{ 99, 197, 58 } },
+        .{ .c = .{ .primaries = 7, .transfer = 1 }, .in = .{ 200, 40, 40 }, .out = .{ 195, 49, 39 } },
+        .{ .c = .{ .primaries = 22, .transfer = 13 }, .in = .{ 90, 200, 60 }, .out = .{ 84, 196, 59 } },
+        .{ .c = .{ .primaries = 22, .transfer = 13 }, .in = .{ 200, 40, 40 }, .out = .{ 202, 50, 39 } },
         .{ .c = .{ .primaries = 1, .transfer = 8 }, .in = .{ 128, 128, 128 }, .out = .{ 188, 188, 188 } },
         .{ .c = .{ .primaries = 1, .transfer = 8 }, .in = .{ 10, 20, 30 }, .out = .{ 56, 79, 96 } },
     };
@@ -1037,6 +1099,97 @@ test "HEIF/AVIF: colore dell'immagine principale" {
     try testing.expect(cicp("\x00\x00\x00\x10ftypheic\x00\x00\x00\x00\xff\xff\xff\xffmeta") == null);
 }
 
+/// Profilo in scala di grigi con la sola curva `kTRC` (`trc`: tag curv o para).
+fn makeGrayProfile(a: std.mem.Allocator, trc: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.appendNTimes(a, 0, 128);
+    try buf.appendSlice(a, "\x00\x00\x00\x01kTRC\x00\x00\x00\x90");
+    var l: [4]u8 = undefined;
+    std.mem.writeInt(u32, &l, @intCast(trc.len), .big);
+    try buf.appendSlice(a, &l);
+    try buf.appendSlice(a, trc);
+    std.mem.writeInt(u32, buf.items[0..4], @intCast(buf.items.len), .big);
+    @memcpy(buf.items[16..20], "GRAY");
+    @memcpy(buf.items[20..24], "XYZ ");
+    @memcpy(buf.items[36..40], "acsp");
+    return buf.items;
+}
+
+/// PSD minimo: header RGB, niente dati del modo colore, una risorsa qualsiasi
+/// col nome dispari e la risorsa 1039 col profilo.
+fn testPsd(a: std.mem.Allocator, prof: []const u8) ![]u8 {
+    var b: std.ArrayList(u8) = .empty;
+    try b.appendSlice(a, "8BPS\x00\x01\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x08\x00\x00\x00\x10\x00\x08\x00\x03");
+    try b.appendSlice(a, "\x00\x00\x00\x00");
+    var res: std.ArrayList(u8) = .empty;
+    try res.appendSlice(a, "8BIM\x03\xed\x03abc\x00\x00\x00\x05hello\x00");
+    try res.appendSlice(a, "8BIM\x04\x0f\x00\x00");
+    var l: [4]u8 = undefined;
+    std.mem.writeInt(u32, &l, @intCast(prof.len), .big);
+    try res.appendSlice(a, &l);
+    try res.appendSlice(a, prof);
+    if (prof.len % 2 == 1) try res.append(a, 0);
+    std.mem.writeInt(u32, &l, @intCast(res.items.len), .big);
+    try b.appendSlice(a, &l);
+    try b.appendSlice(a, res.items);
+    try b.appendSlice(a, "\x00\x00\x00\x00\x00\x00");
+    return b.items;
+}
+
+/// Lo stesso PNG con un chunk `cICP` (P3, curva sRGB, matrice `matrix`) prima degli altri.
+fn withCicp(a: std.mem.Allocator, png: []const u8, matrix: u8) ![]u8 {
+    return std.mem.concat(a, u8, &.{ png[0..8], "\x00\x00\x00\x04cICP\x0c\x0d", &.{ matrix, 1 }, "\x00\x00\x00\x00", png[8..] });
+}
+
+test "scala di grigi, PSD, PNG con cICP" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const t = try a.create(Transform);
+
+    // Scala di grigi, contro lcms: curva lineare, e una tabella più scura della
+    // gamma 2,2 nei mezzitoni (come il "Dot Gain 20%" di Photoshop).
+    try testing.expect(init(t, try makeGrayProfile(a, "curv\x00\x00\x00\x00\x00\x00\x00\x00")));
+    for ([_][2]u8{ .{ 32, 99 }, .{ 128, 188 }, .{ 200, 229 } }) |k| {
+        var px: [3]u8 = @splat(k[0]);
+        t.apply(&px);
+        try testing.expectEqual(@as([3]u8, @splat(k[1])), px);
+    }
+    var table: std.ArrayList(u8) = .empty;
+    try table.appendSlice(a, "curv\x00\x00\x00\x00\x00\x00\x01\x00");
+    for (0..256) |i| {
+        const x = @as(f64, @floatFromInt(i)) / 255;
+        const y = std.math.pow(f64, 0.8 * std.math.pow(f64, x, 2.2) + 0.2 * std.math.pow(f64, x, 1.6), 1.15);
+        var v: [2]u8 = undefined;
+        std.mem.writeInt(u16, &v, @intFromFloat(@min(65535, @round(65535 * y))), .big);
+        try table.appendSlice(a, &v);
+    }
+    try testing.expect(init(t, try makeGrayProfile(a, table.items)));
+    for ([_][2]u8{ .{ 32, 23 }, .{ 128, 122 }, .{ 200, 197 } }) |k| {
+        var px: [3]u8 = @splat(k[0]);
+        t.apply(&px);
+        for (px) |c| try testing.expect(@abs(@as(i16, c) - k[1]) <= 1);
+    }
+    // Grigio con la curva sRGB: niente da convertire.
+    const srgb_rgb = try makeProfile(a, srgb_colorants, 0);
+    const para = srgb_rgb[srgb_rgb.len - 32 ..];
+    try testing.expect(std.mem.eql(u8, para[0..4], "para"));
+    try testing.expect(!init(t, try makeGrayProfile(a, para)));
+
+    // PSD: la risorsa 1039 dopo una col nome dispari.
+    const prof = try makeProfile(a, prophoto, 1.8);
+    const psd = try testPsd(a, prof);
+    try testing.expectEqualSlices(u8, prof, extract(a, psd).?.data);
+    try testing.expect(extract(a, psd[0 .. psd.len - prof.len]) == null);
+
+    // PNG: col cICP vale quello, anche se c'è il profilo; un cICP con matrice
+    // non zero non è valido e si ignora.
+    const png = try std.mem.concat(a, u8, &.{"\x89PNG\r\n\x1a\n\x00\x00\x00\x00IDAT\x00\x00\x00\x00"});
+    try testing.expectEqual(Cicp{ .primaries = 12, .transfer = 13 }, cicp(try withCicp(a, png, 0)).?);
+    try testing.expect(cicp(try withCicp(a, png, 1)) == null);
+    try testing.expect(cicp(png) == null);
+}
+
 test "file troncati o corrotti: niente panic" {
     const gpa = testing.allocator;
     const prof = try makeProfile(gpa, prophoto, 1.8);
@@ -1094,7 +1247,11 @@ test "file troncati o corrotti: niente panic" {
     const t = try gpa.create(Transform);
     defer gpa.destroy(t);
     var px = [_]u8{ 10, 200, 30 };
-    for ([_][]const u8{ jpg.items, tif.items, png.items, webp.items, heifs[0], heifs[1], heifs[2], heifs[3] }) |file| {
+    const psd = try testPsd(arena_state.allocator(), prof);
+    const png_cicp = try withCicp(arena_state.allocator(), png.items, 0);
+    const gray_prof = try makeGrayProfile(arena_state.allocator(), "curv\x00\x00\x00\x00\x00\x00\x00\x01\x01\xcd\x00\x00");
+    const gray_jpg = try std.mem.concat(arena_state.allocator(), u8, &.{ jpg.items[0..4], &.{ 0, @intCast(2 + 14 + gray_prof.len) }, "ICC_PROFILE\x00\x01\x01", gray_prof, "\xff\xda\x00\x02" });
+    for ([_][]const u8{ jpg.items, tif.items, png.items, webp.items, heifs[0], heifs[1], heifs[2], heifs[3], psd, png_cicp, gray_jpg }) |file| {
         // Integro: il colore si estrae e si converte.
         if (extract(gpa, file)) |e| {
             try testing.expect(init(t, e.data));

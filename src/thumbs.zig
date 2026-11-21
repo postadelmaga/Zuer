@@ -287,7 +287,7 @@ const thumb_pixels_rev: u8 = 2;
 /// (src/decoders/icc.zig).
 fn iccFormat(name: []const u8) bool {
     const ext = decoder_mod.getExtension(name);
-    inline for (.{ "jpg", "jpeg", "jpe", "jfif", "png", "tif", "tiff", "webp", "heic", "heif", "hif", "avif" }) |x| {
+    inline for (.{ "jpg", "jpeg", "jpe", "jfif", "png", "tif", "tiff", "webp", "heic", "heif", "hif", "avif", "psd" }) |x| {
         if (extEqCi(ext, x)) return true;
     }
     return false;

@@ -85,6 +85,16 @@ heif_check() {
 }
 for f in prophoto.heic prophoto.avif; do heif_check $f 0.25 0.5 0 169 208 0.75 0.5 0 180 45; done
 for f in p3.heic p3.avif; do heif_check $f 0.25 0.5 0 203 7 0.75 0.5 0 163 236; done
+# PSD (risorsa 1039, decodificato da stb ovunque): lo stesso ProPhoto. PNG col
+# chunk cICP (Display P3, 12/13/0), che vale più di un eventuale iCCP. JPEG in
+# scala di grigi con profilo GRAY a curva lineare: 32 → 99, 128 → 188 (lcms);
+# coi valori grezzi resterebbero 32 e 128.
+must pixel "$(W "$IMG/prophoto.psd")" 0.25 0.5 0 169 208 12
+must pixel "$(W "$IMG/prophoto.psd")" 0.75 0.5 0 180 45 12
+must pixel "$(W "$IMG/p3-cicp.png")" 0.25 0.5 0 203 7 12
+must pixel "$(W "$IMG/p3-cicp.png")" 0.75 0.5 0 163 236 12
+must pixel "$(W "$IMG/gray-linear.jpg")" 0.25 0.5 99 99 99 12
+must pixel "$(W "$IMG/gray-linear.jpg")" 0.75 0.5 188 188 188 12
 OUT="$(run doc "$(W "$IMG/orient6.jpg")")"; echo "$OUT"
 grep -q 'immagine 80x160' <<<"$OUT" || { echo "FALLITO: orient6.jpg non ruotata (attese 80x160 da 200x100)"; FAIL=1; }
 

@@ -155,7 +155,7 @@ fn toSrgb(img: ImageData, file_bytes: []const u8, filename: []const u8, allocato
         const ext = std.fs.path.extension(filename);
         if (!std.ascii.eqlIgnoreCase(ext, ".tif") and !std.ascii.eqlIgnoreCase(ext, ".tiff")) return img;
     }
-    // Un profilo ICC, oppure (HEIF/AVIF) i codici CICP del box `nclx`.
+    // Un profilo ICC, oppure i codici CICP (box `nclx` di HEIF/AVIF, chunk `cICP` dei PNG).
     const emb = icc.extract(allocator, file_bytes);
     defer if (emb) |e| e.deinit(allocator);
     const nclx = if (emb == null) icc.cicp(file_bytes) else null;
