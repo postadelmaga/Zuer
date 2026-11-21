@@ -196,3 +196,42 @@ file esisteva, ma lo scrive su un thread staccato, quindi due decode ravvicinati
 dello stesso GLB serializzavano entrambi. Ora un registro delle chiavi in scrittura
 lo impedisce: le istruzioni sono −1,3% rispetto alla versione vecchia e identiche
 in ogni esecuzione (prima variavano del 2% a seconda dei tempi).
+
+### Prestazioni della GUI (novembre 2026)
+
+Stessa macchina, Zig 0.17.1, ReleaseSafe, sway headless (pixman), `HOME` vuota per ogni
+esecuzione. I tempi vengono da una sonda temporanea (mai committata) che stampa primo
+frame, fasi decode/prep/apply, navigazione e compose per frame. Serie finale alternata
+fra la 0.4.0 (`dab62e1`) e i quattro interventi (`fde4917`…`e50c3df`), 5 round,
+mediana [min–max], carico 0,9–2,4 con una VM di un'altra sessione su un core. Le
+misure per singolo intervento sono nei messaggi di commit.
+
+| scenario | 0.4.0 | dopo |
+|---|---|---|
+| apertura JPEG 2048², primo frame | 313 [287–399] ms | **163** [124–252] ms |
+| apertura PNG enorme | 2510 [2476–3571] ms | **2040** [1978–2112] ms |
+| apertura markdown da 641 KB | 174 [156–235] ms | **104** [96–115] ms |
+| apertura glb a freddo (4 texture 1024²), fase prep | 433 [416–693] ms | **236** [225–272] ms |
+| relayout del markdown allo zoom | 157 [132–221] ms | **109** [87–183] ms |
+| frecce: markdown | 193 [156–370] ms | **141** [108–242] ms |
+| frecce: immagine non precaricata | 301 [81–647] ms | **232** [103–597] ms |
+| miniature con cache calda (57 file, 2 job) | 2547 [1993–3053] ms | **38** [18–53] ms |
+
+La riga delle miniature viene dalla serie del suo commit (`bench-thumbnails`, 5 round
+alternati). Con la cache calda costano anche meno CPU (2481 → 38 ms) e meno RSS (353 →
+91 MB): prima le miniature quadrate 256×256 non si rileggevano mai dalla cache. Il primo
+frame del glb segue di poco (1304 → 1267 ms), perché in questa serie dominava la fase
+apply (~600 ms, GPU), uguale prima e dopo. In un'altra finestra, con apply a ~200 ms,
+lo stesso intervento ha portato il primo frame da 1119 a 864 ms. Restano nella
+dispersione l'apertura di testo, CSV, PDF e archivi, il compose per frame (zoom di
+immagini: serie mirata di 8 round, 11,6 contro 11,3 ms), la CPU a riposo e la RSS. Le
+uscite non cambiano di un byte: pixel decodificati (con e senza `ZUER_GUI=1`), miniature,
+PDF di stampa e file `.vtc` sono identici alla 0.4.0.
+
+Provati e scartati, perché il guadagno non usciva dal rumore:
+- conversione RGB→RGBA più veloce: il ciclo vale ~6 ms, il resto è l'allocatore, che in
+  ReleaseSafe azzera e non riusa;
+- bilineare di `composeFrame` a due canali per moltiplicazione: il compilatore vettorizza
+  già il ciclo, la variante è più lenta del 14%;
+- tabelle di colonna precalcolate per frame: +2,5%.
+
