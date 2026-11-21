@@ -133,13 +133,18 @@ pub fn layout(arena: std.mem.Allocator, src: []const u8, opts: Options, theme: T
         text_w = opts.max_text_width;
     }
     l.y = opts.pad_y;
-    l.max_x = opts.width;
     try l.blocks(blocks, x0, text_w, .{});
+    // Il documento è più largo della pagina solo se il contenuto sporge davvero
+    // (tabelle larghe, finestra più stretta del minimo di 8 em). `max_x` partiva da
+    // `opts.width`: il documento risultava sempre largo `pad_x` in più e a schermo
+    // compariva sempre la barra di scorrimento orizzontale. Mezzo pixel di
+    // tolleranza: le somme f32 delle larghezze non devono accenderla per un ulp.
+    const content_w = l.max_x + opts.pad_x;
     return .{
         .lines = l.lines.items,
         .boxes = l.boxes.items,
         .fonts = l.fonts.items,
-        .width = @max(opts.width, l.max_x + opts.pad_x),
+        .width = if (content_w > opts.width + 0.5) content_w else opts.width,
         .height = l.y + opts.pad_y,
     };
 }
@@ -258,6 +263,7 @@ const Layouter = struct {
                 if (h.level <= 2) {
                     l.y += l.b * 0.3;
                     try l.boxes.append(l.arena, .{ .x = x0, .y = l.y, .w = w, .h = @max(1, l.b * 0.06), .color = l.t.rule });
+                    l.max_x = @max(l.max_x, x0 + w);
                     l.y += @max(1, l.b * 0.06);
                 }
             },
@@ -270,6 +276,7 @@ const Layouter = struct {
                 const th = @max(1, l.b * 0.12);
                 l.y += l.b * 0.5;
                 try l.boxes.append(l.arena, .{ .x = x0, .y = l.y, .w = w, .h = th, .color = l.t.rule });
+                l.max_x = @max(l.max_x, x0 + w);
                 l.y += th + l.b * 0.5;
             },
             .quote => |inner| {
@@ -568,6 +575,8 @@ const Layouter = struct {
         const cell = try l.m.advance(f, 'M');
         const inner_w = @max(w - 2 * pad, cell);
         const cols: usize = if (cell > 0) @max(8, @as(usize, @intFromFloat(inner_w / cell))) else 80;
+        // Riquadro largo `w`, righe fino a `cols` celle (almeno 8, anche se non ci stanno).
+        l.max_x = @max(l.max_x, x0 + @max(w, 2 * pad + @as(f32, @floatFromInt(cols)) * cell));
         const top = l.y;
         l.y += pad;
         const box_index = l.boxes.items.len;
@@ -784,4 +793,85 @@ const Layouter = struct {
 
 fn utf8(s: []const u8) std.unicode.Utf8Iterator {
     return .{ .bytes = s, .i = 0 };
+}
+
+// ── Test ─────────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+/// Measurer finto: avanzamento fisso per carattere, metriche proporzionali al corpo.
+const FakeMeasurer = struct {
+    specs: std.ArrayList(FontSpec) = .empty,
+    gpa: std.mem.Allocator,
+
+    fn measurer(self: *FakeMeasurer) Measurer {
+        return .{ .ctx = self, .fontFn = font, .advanceFn = advance, .vmetricsFn = vmetrics, .hasFn = has };
+    }
+    fn font(ctx: *anyopaque, spec: FontSpec) anyerror!u16 {
+        const self: *FakeMeasurer = @ptrCast(@alignCast(ctx));
+        for (self.specs.items, 0..) |x, i| if (std.meta.eql(x, spec)) return @intCast(i);
+        try self.specs.append(self.gpa, spec);
+        return @intCast(self.specs.items.len - 1);
+    }
+    fn advance(ctx: *anyopaque, f: u16, _: u21) anyerror!f32 {
+        const self: *FakeMeasurer = @ptrCast(@alignCast(ctx));
+        return self.specs.items[f].size * 0.55;
+    }
+    fn vmetrics(ctx: *anyopaque, f: u16) VMetrics {
+        const self: *FakeMeasurer = @ptrCast(@alignCast(ctx));
+        const size = self.specs.items[f].size;
+        return .{ .ascent = size * 0.8, .descent = -size * 0.2 };
+    }
+    fn has(_: *anyopaque, _: u16, _: u21) bool {
+        return true;
+    }
+};
+
+fn testLayout(arena: std.mem.Allocator, src: []const u8, width: f32) !Doc {
+    var fm: FakeMeasurer = .{ .gpa = arena };
+    return layout(arena, src, .{ .width = width, .body = 16, .pad_x = 21, .pad_y = 14, .max_text_width = 16 * 48 }, text_render.md_screen_theme, fm.measurer());
+}
+
+test "layout: testo che sta nella pagina, niente larghezza in più" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const src =
+        \\# Titolo
+        \\
+        \\Un paragrafo abbastanza lungo da andare a capo più volte, con **grassetto**,
+        \\`codice` e una [lista](x):
+        \\
+        \\- primo elemento
+        \\- secondo elemento con parecchie parole per riempire bene la riga intera
+        \\
+        \\| a | b |
+        \\|---|---|
+        \\| 1 | 2 |
+        \\
+        \\```
+        \\codice
+        \\```
+    ;
+    // Finestra stretta, media e più larga del testo centrato (max_text_width).
+    for ([_]f32{ 400, 800, 1920 }) |w| {
+        const doc = try testLayout(arena_state.allocator(), src, w);
+        try testing.expectEqual(w, doc.width);
+    }
+}
+
+test "layout: finestra più stretta del minimo, il documento sporge" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    // 8 em di testo minimo (128) più i margini (21) non stanno in 100: serve lo
+    // scorrimento, anche quando a sporgere non è la prosa ma un riquadro largo
+    // quanto la colonna (codice, sottolineatura dei titoli, riga orizzontale).
+    const prose = try testLayout(arena_state.allocator(), "parole parole parole parole parole parole parole parole", 100);
+    try testing.expect(prose.width > 100);
+    for ([_][]const u8{ "```\nx\n```", "# T", "---" }) |src| {
+        const doc = try testLayout(arena_state.allocator(), src, 100);
+        testing.expect(doc.width >= 21 + 128 + 21 - 0.5) catch |e| {
+            std.debug.print("{s}: larghezza {d}\n", .{ src, doc.width });
+            return e;
+        };
+    }
 }
