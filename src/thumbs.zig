@@ -280,6 +280,17 @@ const thumb_magic = "ZTH1";
 const thumb_header_len: usize = 12;
 /// Dimensione della voce più grande possibile: header + miniatura `thumb_max`².
 const thumb_file_max: usize = thumb_header_len + thumb_max * thumb_max * 4;
+/// Vedi `thumbCacheName`: entra nel nome del file di cache.
+const thumb_pixels_rev: u8 = 2;
+
+/// Formati da cui il plugin immagini legge un profilo ICC (src/decoders/icc.zig).
+fn iccFormat(name: []const u8) bool {
+    const ext = decoder_mod.getExtension(name);
+    inline for (.{ "jpg", "jpeg", "jpe", "jfif", "png", "tif", "tiff", "webp" }) |x| {
+        if (extEqCi(ext, x)) return true;
+    }
+    return false;
+}
 /// Cap LRU della directory `…/zuer/thumbs` (~870 miniature 256×144).
 const thumb_cache_cap_bytes: u64 = 128 * 1024 * 1024;
 
@@ -293,6 +304,12 @@ var tmp_seq: std.atomic.Value(u64) = .init(0);
 /// Il chiamante libera. null solo in OOM.
 fn thumbCacheName(gpa: std.mem.Allocator, real_dir: []const u8, name: []const u8, mtime_ns: i128, size: u64) ?[]u8 {
     var h = std.hash.Wyhash.init(0x7a756572); // "zuer"
+    // Revisione dei pixel delle immagini con profilo colore possibile: cambia
+    // quando il decode dà colori diversi a parità di file, così le miniature
+    // vecchie non restano in cache. 2 = profili ICC applicati (prima le immagini
+    // ProPhoto/Adobe RGB/P3 uscivano coi colori grezzi). Solo per questi formati:
+    // le miniature di video, PDF e documenti (costose) restano valide.
+    if (iccFormat(name)) h.update(&.{thumb_pixels_rev});
     h.update(real_dir);
     h.update("/");
     h.update(name);

@@ -57,6 +57,17 @@ must pixel "$(W "$IMG/orient6.jpg")" 0.5 0.2 255 0 0        # 90° orario: rosso
 must pixel "$(W "$IMG/orient6.jpg")" 0.5 0.8 0 0 255
 must pixel "$(W "$IMG/orient8.jpg")" 0.5 0.2 0 0 255        # 90° antiorario: blu in alto
 must pixel "$(W "$IMG/orient3.jpg")" 0.2 0.5 0 0 255        # 180°: blu a sinistra
+# Profilo ICC incorporato (un ProPhoto scritto da zero: primari ROMM, bianco D50,
+# gamma 1,8; metà sinistra 70,140,190, destra 60,150,60): i colori vanno convertiti
+# in sRGB, come fanno lcms e gli altri visualizzatori (valori attesi da lcms). Coi
+# valori grezzi il rosso sbaglierebbe di 60-70.
+for f in prophoto.tiff prophoto.png prophoto.jpg prophoto.webp; do
+  # Su macOS il TIFF passa da ImageIO, che converte da sé verso DeviceRGB (non
+  # per forza sRGB): lì si controlla solo che si apra.
+  if [[ $OS == macos && $f == *.tiff ]]; then must doc "$(W "$IMG/$f")"; continue; fi
+  must pixel "$(W "$IMG/$f")" 0.25 0.5 0 169 208
+  must pixel "$(W "$IMG/$f")" 0.75 0.5 0 180 45
+done
 OUT="$(run doc "$(W "$IMG/orient6.jpg")")"; echo "$OUT"
 grep -q 'immagine 80x160' <<<"$OUT" || { echo "FALLITO: orient6.jpg non ruotata (attese 80x160 da 200x100)"; FAIL=1; }
 

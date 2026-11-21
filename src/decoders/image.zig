@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const decoder = @import("decoder");
 const exif = @import("exif.zig");
 const fit = @import("fit.zig");
+const icc = @import("icc.zig");
 const ImageData = decoder.ImageData;
 const Decoded = decoder.Decoded;
 
@@ -99,21 +100,23 @@ pub fn decodeWithMax(path: []const u8, file_bytes: []const u8, filename: []const
         } else |e| last_err = e;
     } else if (isWebp(file_bytes)) {
         if (decodeWebp(file_bytes, filename, max_dim, allocator)) |img| {
-            return .{ .image = img };
+            return .{ .image = toSrgb(img, file_bytes, filename, allocator) };
         } else |e| last_err = e;
     } else if (isIco(file_bytes)) {
         if (decodeIco(file_bytes, filename, max_dim, allocator)) |img| {
             return .{ .image = img };
         } else |e| last_err = e;
     } else if (decodeNative(file_bytes, filename, max_dim, allocator)) |img| {
-        return .{ .image = img };
+        return .{ .image = toSrgb(img, file_bytes, filename, allocator) };
     } else |e| {
         last_err = e;
     }
     if (last_err == error.ImageTooLarge or last_err == error.OutOfMemory) return errResult(allocator, last_err, null);
 
     if (decodeSystem(file_bytes, filename, max_dim, allocator)) |img| {
-        return .{ .image = img };
+        // ImageIO disegna in un contesto DeviceRGB: CoreGraphics ha già applicato
+        // il profilo. WIC restituisce i valori del file come sono.
+        return .{ .image = if (comptime is_macos) img else toSrgb(img, file_bytes, filename, allocator) };
     } else |e| {
         if (e == error.ImageTooLarge or e == error.OutOfMemory) return errResult(allocator, e, null);
     }
@@ -130,7 +133,7 @@ pub fn decodeWithMax(path: []const u8, file_bytes: []const u8, filename: []const
     }
     // Formati vettoriali o non coperti: fallback a ImageMagick.
     if (decodeWithImageMagick(path, filename, max_dim, allocator)) |img| {
-        return .{ .image = img };
+        return .{ .image = toSrgb(img, file_bytes, filename, allocator) };
     } else |im_err| {
         return errResult(allocator, last_err, im_err);
     }
@@ -138,6 +141,29 @@ pub fn decodeWithMax(path: []const u8, file_bytes: []const u8, filename: []const
 
 const is_windows = builtin.os.tag == .windows;
 const is_macos = builtin.os.tag == .macos;
+
+/// Profilo colore incorporato nel file (ProPhoto, Adobe RGB, Display P3…) →
+/// sRGB, sui pixel già ridotti: senza, un'immagine ProPhoto appare spenta e con
+/// le tinte sbagliate (gli altri visualizzatori il profilo lo applicano). Best
+/// effort: senza profilo, con un profilo già sRGB o non gestito, o senza memoria,
+/// i pixel restano come sono. stb, libwebp, WIC e ImageMagick (con `rgb:-`)
+/// danno tutti i valori del file senza conversione.
+fn toSrgb(img: ImageData, file_bytes: []const u8, filename: []const u8, allocator: std.mem.Allocator) ImageData {
+    // I RAW su base TIFF (DNG, NEF, CR2, ARW…) li rende ImageMagick già in sRGB:
+    // il profilo della loro IFD0 descrive l'anteprima incorporata, non quei pixel.
+    if (icc.isTiff(file_bytes)) {
+        const ext = std.fs.path.extension(filename);
+        if (!std.ascii.eqlIgnoreCase(ext, ".tif") and !std.ascii.eqlIgnoreCase(ext, ".tiff")) return img;
+    }
+    const emb = icc.extract(allocator, file_bytes) orelse return img;
+    defer emb.deinit(allocator);
+    const t = allocator.create(icc.Transform) catch return img;
+    defer allocator.destroy(t);
+    // I pixel li ha appena allocati questo plugin (resizeToFit/ImageMagick):
+    // `[]const` è solo il tipo dell'ABI verso l'host.
+    if (icc.init(t, emb.data)) t.apply(@constCast(img.pixels));
+    return img;
+}
 
 /// Tetto sui pixel di una singola immagine SORGENTE (verificato prima di
 /// decodificare): ~150 megapixel = 600 MB di RGBA. Oltre, un errore chiaro invece
