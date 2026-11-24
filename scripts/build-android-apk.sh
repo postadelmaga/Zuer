@@ -61,26 +61,14 @@ STAGE="$ROOT/zig-out/android/stage"
 rm -rf "$STAGE"; mkdir -p "$STAGE/res/mipmap-xxhdpi" "$STAGE/lib/arm64-v8a"
 
 echo "→ [2/5] risorse (tema + icona launcher)"
-# Risorse scritte a mano (il tema fullscreen): l'icona invece è generata qui sotto.
+# Tema scritto a mano in android/res; l'icona viene da icons/ (scripts/gen-icons.sh),
+# alle densità che il launcher usa.
 cp -r "$ROOT/android/res/." "$STAGE/res/"
-if command -v magick >/dev/null; then
-  # Stessa "Z" bianca su tondo blu di Windows/macOS, alle densità che il launcher usa.
-  for d in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
-    dpi="${d%%:*}"; s="${d##*:}"
-    mkdir -p "$STAGE/res/mipmap-$dpi"
-    magick -size ${s}x${s} xc:none \
-      -fill '#2563eb' -draw "roundrectangle $((s/16)),$((s/16)) $((s-1-s/16)),$((s-1-s/16)) $((s*3/16)),$((s*3/16))" \
-      -fill white -font DejaVu-Sans-Bold -pointsize $((s*3/5)) -gravity center -annotate +0-$((s/48)) 'Z' \
-      "$STAGE/res/mipmap-$dpi/ic_launcher.png" 2>/dev/null || true
-  done
-fi
-if [[ ! -f "$STAGE/res/mipmap-xxhdpi/ic_launcher.png" ]]; then
-  # Senza ImageMagick: un PNG blu 1×1 (l'icona non è il punto di M1, ma il manifest
-  # referenzia @mipmap/ic_launcher e aapt2 fallirebbe se la risorsa non esistesse).
-  printf '\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc`\x98\xc1\x00\x00\x01\x1b\x00\x9a\x1c\x1e\xd0\x00\x00\x00\x00IEND\xaeB\x82' \
-    > "$STAGE/res/mipmap-xxhdpi/ic_launcher.png"
-  echo "  · ImageMagick assente: icona segnaposto"
-fi
+for d in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
+  dpi="${d%%:*}"; s="${d##*:}"
+  mkdir -p "$STAGE/res/mipmap-$dpi"
+  cp "$ROOT/icons/png/zuer-$s.png" "$STAGE/res/mipmap-$dpi/ic_launcher.png"
+done
 
 echo "→ [3/5] aapt2 (manifest + risorse → APK base)"
 mkdir -p "$STAGE/compiled"

@@ -81,7 +81,7 @@ ogni formato dell'elenco col player di Zuer.
 > e pronte — un singolo `.exe` autosufficiente, come qualsiasi setup Windows.
 
 Lo script cross-compila in ReleaseFast, impacchetta `zuer-gui.exe` + i decoder
-`.dll` (+ opzionalmente le DLL FFmpeg), genera un'icona e produce un installer
+`.dll` (+ opzionalmente le DLL FFmpeg), aggiunge l'icona e produce un installer
 **per-utente** (nessun admin/UAC): copia in `%LOCALAPPDATA%\Programs\Zuer`,
 aggiunge un collegamento nel menu Start e una voce in **App e funzionalità** per
 la disinstallazione. Registra le **associazioni** per tutte le estensioni note ai

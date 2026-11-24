@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Icona di Zuer: una Z a nastro piegato (un foglio che si apre) su vetro blu.
+       Solo gradienti lineari/radiali e opacità, niente filtri: si rende uguale con
+       rsvg, resvg, Qt e nanosvg (quindi anche dentro Zuer). PNG/ICO/ICNS derivati:
+       scripts/gen-icons.sh. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#57a6ff"/>
+      <stop offset="0.55" stop-color="#3466ea"/>
+      <stop offset="1" stop-color="#3a2bc4"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.28" cy="0.18" r="0.75">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.30"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.55"/>
+      <stop offset="0.45" stop-color="#ffffff" stop-opacity="0"/>
+      <stop offset="1" stop-color="#0b1260" stop-opacity="0.35"/>
+    </linearGradient>
+    <linearGradient id="fold" gradientUnits="userSpaceOnUse" x1="364" y1="162" x2="148" y2="350">
+      <stop offset="0.10" stop-color="#6f8ff0"/>
+      <stop offset="0.34" stop-color="#cfdcff"/>
+      <stop offset="0.66" stop-color="#e6edff"/>
+      <stop offset="0.90" stop-color="#8aa6f5"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#bg)"/>
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#glow)"/>
+  <rect x="19" y="19" width="474" height="474" rx="109" fill="none" stroke="url(#rim)" stroke-width="6"/>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round" stroke-width="66">
+    <path d="M148 176H364L148 364H364" stroke="#0b1260" stroke-opacity="0.20"/>
+    <path d="M364 162L148 350" stroke="url(#fold)"/>
+    <path d="M148 162H364M148 350H364" stroke="#ffffff"/>
+  </g>
+</svg>

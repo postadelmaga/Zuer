@@ -7,7 +7,7 @@
 #
 # Senza compute_vp9 (-Dcvp9=false): non è nei repository di Ubuntu, il VP9 passa da
 # libav come su macOS e Windows. Serve: zig, dpkg-dev, i -dev della build (vedi la
-# workflow di release) e, per l'icona, ImageMagick.
+# workflow di release).
 #
 # Layout: binari e plugin in /usr/lib/zuer (zuer-gui cerca i plugin in
 # <eseguibile>/decoders, risolvendo i link), link in /usr/bin, voce di menu e icona in
@@ -50,22 +50,12 @@ for f in "$LIB/zuer" "$LIB/zuer-gui" "$LIB"/decoders/*.so; do
   if readelf -d "$f" | grep -q compute_vp9; then echo "✗ $f linka compute_vp9" >&2; exit 1; fi
 done
 
-ICON=utilities-terminal
-IM="$(command -v magick || command -v convert || true)"
-if [[ -n "$IM" ]]; then
-  # Stessa "Z" su tondo blu del bundle macOS e dell'installer Windows.
-  for s in 16 32 48 64 128 256 512; do
-    d="$ROOT/usr/share/icons/hicolor/${s}x${s}/apps"
-    install -d "$d"
-    "$IM" -size ${s}x${s} xc:none \
-      -fill '#2563eb' -draw "roundrectangle $((s/32)),$((s/32)) $((s-1-s/32)),$((s-1-s/32)) $((s*3/16)),$((s*3/16))" \
-      -fill white -font "${ZUER_ICON_FONT:-DejaVu-Sans-Bold}" -pointsize $((s*3/4)) -gravity center -annotate +0-$((s/42)) 'Z' \
-      "$d/zuer.png"
-  done
-  ICON=zuer
-else
-  echo "  · ImageMagick assente: icona generica"
-fi
+# Icone già pronte in icons/ (le rigenera scripts/gen-icons.sh quando cambia l'SVG).
+ICON=zuer
+for s in 16 24 32 48 64 128 256 512; do
+  install -Dm644 "icons/png/zuer-$s.png" "$ROOT/usr/share/icons/hicolor/${s}x${s}/apps/zuer.png"
+done
+install -Dm644 icons/zuer.svg "$ROOT/usr/share/icons/hicolor/scalable/apps/zuer.svg"
 
 # Stesso nome del file di install.sh (zuer-gui.desktop): le associazioni già scelte
 # dall'utente continuano a valere.

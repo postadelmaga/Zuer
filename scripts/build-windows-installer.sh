@@ -4,7 +4,7 @@
 #      in una staging dir pulita (solo exe + DLL, niente .pdb);
 #   2. scarica pdfium.dll (PDF) e, salvo --no-ffmpeg, copia accanto all'exe le DLL
 #      FFmpeg compilate da scripts/build-ffmpeg.sh (prefisso in ZUER_FFMPEG_DIR);
-#   3. genera un'icona .ico (se ImageMagick è presente);
+#   3. copia l'icona (icons/zuer.ico);
 #   4. genera `installer/associations.nsh` con le estensioni note ai decoder
 #      effettivamente inclusi nel build Windows (text/csv/markdown/mesh/image/
 #      glb/archive/media/office/pdf);
@@ -72,18 +72,10 @@ case "$FFMPEG" in
 esac
 
 echo "→ [3/5] icona"
-if command -v magick >/dev/null || command -v convert >/dev/null; then
-  IM="$(command -v magick || command -v convert)"
-  # "Z" bianca su tondo blu, multi-risoluzione.
-  "$IM" -size 256x256 xc:none \
-    -fill '#2563eb' -draw 'roundrectangle 8,8 248,248 48,48' \
-    -fill white -font "${ZUER_ICON_FONT:-DejaVu-Sans-Bold}" -pointsize 190 -gravity center -annotate +0-6 'Z' \
-    -define icon:auto-resize=256,128,64,48,32,16 "$BIN/zuer.ico" 2>/dev/null \
-    && NSIS_DEFS+=(-DHAVE_ICON=1) && echo "  ✓ zuer.ico" \
-    || echo "  · icona non generata (uso l'icona dell'exe)"
-else
-  echo "  · ImageMagick assente: uso l'icona dell'exe"
-fi
+# Già pronta in icons/ (la rigenera scripts/gen-icons.sh quando cambia l'SVG).
+cp "$ROOT/icons/zuer.ico" "$BIN/zuer.ico"
+NSIS_DEFS+=(-DHAVE_ICON=1)
+echo "  ✓ zuer.ico"
 
 echo "→ [4/5] genero associations.nsh"
 # ── Estensioni per decoder incluso nel build Windows ────────────────────────

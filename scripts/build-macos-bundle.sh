@@ -102,36 +102,10 @@ if [[ $REQUIRE_FULL -eq 1 && ( $HAVE_FFMPEG -eq 0 || $HAVE_MOLTENVK -eq 0 ) ]]; 
   exit 1
 fi
 
-# Icona .icns (stessa "Z" su tondo blu dell'installer Windows), multi-risoluzione.
-# L'ICNS è assemblato a mano da python3 (header 'icns' + chunk PNG tipizzati):
-# l'encoder ICNS di ImageMagick non è affidabile — con certi build scrive un PNG
-# con estensione .icns senza errore, e macOS non lo mostrerebbe.
-HAVE_ICON=0
-if command -v magick >/dev/null && command -v python3 >/dev/null; then
-  TMPI="$(mktemp -d)"; trap 'rm -rf "$TMPI"' EXIT
-  for s in 16 32 128 256 512; do
-    magick -size ${s}x${s} xc:none \
-      -fill '#2563eb' -draw "roundrectangle $((s/32)),$((s/32)) $((s-1-s/32)),$((s-1-s/32)) $((s*3/16)),$((s*3/16))" \
-      -fill white -font "${ZUER_ICON_FONT:-DejaVu-Sans-Bold}" -pointsize $((s*3/4)) -gravity center -annotate +0-$((s/42)) 'Z' \
-      "$TMPI/icon_$s.png" 2>/dev/null || break
-  done
-  if [[ -f "$TMPI/icon_512.png" ]] && python3 - "$TMPI" "$APP/Contents/Resources/zuer.icns" <<'PY'
-import struct, sys
-tmp, out = sys.argv[1], sys.argv[2]
-# Tipi ICNS per PNG embedded: icp4/icp5=16/32, ic07/ic08/ic09=128/256/512.
-chunks = []
-for size, typ in ((16, b"icp4"), (32, b"icp5"), (128, b"ic07"), (256, b"ic08"), (512, b"ic09")):
-    with open(f"{tmp}/icon_{size}.png", "rb") as f:
-        data = f.read()
-    assert data[:8] == b"\x89PNG\r\n\x1a\n", f"icon_{size}.png non è un PNG"
-    chunks.append(typ + struct.pack(">I", 8 + len(data)) + data)
-body = b"".join(chunks)
-with open(out, "wb") as f:
-    f.write(b"icns" + struct.pack(">I", 8 + len(body)) + body)
-PY
-  then HAVE_ICON=1; fi
-fi
-[[ $HAVE_ICON -eq 1 ]] && echo "  ✓ zuer.icns" || echo "  · icona non generata (serve ImageMagick + python3)"
+# Icona: già pronta in icons/ (la rigenera scripts/gen-icons.sh quando cambia l'SVG).
+HAVE_ICON=1
+cp "$ROOT/icons/zuer.icns" "$APP/Contents/Resources/zuer.icns"
+echo "  ✓ zuer.icns"
 
 # Estensioni note ai decoder inclusi nel build macOS. Stessa lista dell'installer
 # Windows (fonte di verità: `zuer_extensions` in src/decoders/*.zig), PIÙ il pdf

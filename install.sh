@@ -26,6 +26,8 @@ if [ "$EUID" -eq 0 ]; then
   APP_DIR="/usr/share/applications"
 fi
 SVCMENU_DIR="$HOME/.local/share/kio/servicemenus"
+ICON_DIR="$(dirname "$APP_DIR")/icons/hicolor"
+ICON_SIZES="16 24 32 48 64 128 256 512"
 
 # Toglie zuer-gui.desktop da ogni associazione in mimeapps.list (prima di
 # registrarne di nuove, e alla disinstallazione).
@@ -64,6 +66,8 @@ if [ "$UNINSTALL" = 1 ]; then
   rm -f "$INSTALL_DIR/zuer" "$INSTALL_DIR/zuer-gui"
   rm -rf "$INSTALL_DIR/decoders"
   rm -f "$APP_DIR/zuer-gui.desktop" "$SVCMENU_DIR/zuer-quicklook.desktop"
+  for s in $ICON_SIZES; do rm -f "$ICON_DIR/${s}x${s}/apps/zuer.png"; done
+  rm -f "$ICON_DIR/scalable/apps/zuer.svg"
   clean_mime_associations
   if command -v kwriteconfig6 &> /dev/null; then
     kwriteconfig6 --file kglobalshortcutsrc --group services \
@@ -94,6 +98,13 @@ cp zig-out/lib/libdecoder_*.so "$INSTALL_DIR/decoders/"
 
 mkdir -p "$APP_DIR"
 
+# Icona (icons/, rigenerata da scripts/gen-icons.sh): tema hicolor, nome "zuer".
+for s in $ICON_SIZES; do
+  install -Dm644 "icons/png/zuer-$s.png" "$ICON_DIR/${s}x${s}/apps/zuer.png"
+done
+install -Dm644 icons/zuer.svg "$ICON_DIR/scalable/apps/zuer.svg"
+command -v gtk-update-icon-cache &> /dev/null && gtk-update-icon-cache -q -t "$ICON_DIR" 2> /dev/null || true
+
 # Create/Overwrite desktop entry for zuer-gui
 echo "Creating desktop entry for zuer-gui..."
 # UN solo lanciatore per Zuer. Lo "Sfoglia" (home nel file explorer) è
@@ -107,7 +118,7 @@ Name=Zuer
 GenericName=Visualizzatore universale
 Comment=Immagini, modelli 3D, testo, archivi e media
 Exec=$INSTALL_DIR/zuer-gui %f
-Icon=utilities-terminal
+Icon=zuer
 Terminal=false
 StartupWMClass=it.zuer.gui
 Categories=Graphics;Viewer;
