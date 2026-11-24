@@ -114,6 +114,17 @@ pub fn decode(bytes: []u8, delimiter: u8, allocator: std.mem.Allocator) Decoded 
         }
     }
 
+    // Il file finisce subito dopo un separatore ("…\n1,"): la riga è ancora aperta
+    // e la sua ultima cella è vuota. Senza questo l'intera riga andava persa.
+    if (current_row.items.len > 0) {
+        current_row.append(allocator, bytes[bytes.len..]) catch return decoder.pluginError(allocator, "Out of memory", .{});
+        const row = current_row.toOwnedSlice(allocator) catch return decoder.pluginError(allocator, "Out of memory", .{});
+        rows.append(allocator, row) catch {
+            allocator.free(row);
+            return decoder.pluginError(allocator, "Out of memory", .{});
+        };
+    }
+
     if (rows.items.len == 0) {
         const msg = allocator.dupe(u8, "Tabella CSV vuota.") catch "";
         return .{ .err = msg };

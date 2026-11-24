@@ -195,7 +195,7 @@ fn prepareLocked(app_state: *GuiAppState) ?Job {
     sh.ui_idle_s = 0;
 
     const path = sh.current_file_path;
-    const clean = if (std.mem.indexOfScalar(u8, path, '#')) |h| path[0..h] else path;
+    const clean = decoder_mod.stripFragment(path);
     const name = std.fs.path.basename(clean);
     _ = busy_video;
     const printable_kind = printable(app_state);

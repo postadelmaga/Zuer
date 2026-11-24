@@ -492,7 +492,7 @@ fn downscaleRgba(src: [*]const u8, src_w: usize, src_h: usize, max_dim: usize, a
 fn attributeIndex(attributes: std.json.Value, key: []const u8) ?usize {
     switch (attributes) {
         .object => |obj| if (obj.get(key)) |val| switch (val) {
-            .integer => |idx| return @intCast(idx),
+            .integer => |idx| return std.math.cast(usize, idx), // negativo → null
             else => return null,
         } else return null,
         else => return null,

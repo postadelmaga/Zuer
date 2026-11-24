@@ -24,8 +24,7 @@ const max_entries: usize = 10_000;
 const builtin = @import("builtin");
 
 pub fn decode(path: []const u8, io: std.Io, allocator: std.mem.Allocator) Decoded {
-    var clean_path = path;
-    if (std.mem.indexOfScalar(u8, path, '#')) |h| clean_path = path[0..h];
+    const clean_path = decoder.stripFragment(path);
     return decodeTar(clean_path, io, allocator) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "Errore lettura archivio tar: {s}", .{@errorName(err)}) catch "";
         return .{ .err = msg };
@@ -123,7 +122,7 @@ fn listFromBsdtar(text: []const u8, allocator: std.mem.Allocator) !Decoded {
         const line = std.mem.trimEnd(u8, raw, "\r");
         const e = parseBsdtarLine(line) orelse continue;
         if (e.name.len == 0 or std.mem.eql(u8, e.name, ".")) continue;
-        total_size += e.size;
+        total_size +|= e.size;
         count += 1;
         if (count > max_entries) {
             truncated = true;
@@ -267,7 +266,7 @@ fn listFromTar(src: *std.Io.Reader, allocator: std.mem.Allocator) !Decoded {
             break;
         } orelse break;
 
-        total_size += entry.size;
+        total_size +|= entry.size;
 
         if (count < max_entries) {
             const row = try makeRow(allocator, entry.name, entry.size, kindLabel(entry.kind));

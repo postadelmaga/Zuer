@@ -95,6 +95,14 @@ fn posterFrame(path: []const u8, filename: []const u8, allocator: std.mem.Alloca
     return .{ .width = frame.width, .height = frame.height, .pixels = frame.pixels, .name = name };
 }
 
+/// `n * 1000 / den` per le durate: numeratore e denominatore vengono dal file, e
+/// il prodotto può non stare in 64 bit (una durata «ignota» è tutta a 1). null se
+/// `den` è zero o se il risultato non è rappresentabile.
+fn scaleMs(n: u64, den: u64) ?u64 {
+    if (den == 0) return null;
+    return std.math.cast(u64, @as(u128, n) * 1000 / den);
+}
+
 const MediaInfo = struct {
     format: []const u8,
     kind: enum { audio, video },
@@ -139,14 +147,18 @@ fn parseWav(b: []const u8) ?MediaInfo {
             byte_rate = std.mem.readInt(u32, b[pos + 16 ..][0..4], .little);
             info.bits = @truncate(std.mem.readInt(u16, b[pos + 22 ..][0..2], .little));
         } else if (std.mem.eql(u8, id, "data")) {
-            data_size = size;
+            // 0xFFFFFFFF = lunghezza ignota (WAV scritto su pipe): niente durata
+            // inventata.
+            if (size != std.math.maxInt(u32)) data_size = size;
         }
-        pos += 8 + size + (size & 1); // i chunk RIFF sono allineati a 2 byte
+        // In usize: `size` è un u32 del file, e un WAV scritto su pipe ha il chunk
+        // `data` lungo 0xFFFFFFFF («fino alla fine»): in u32 la somma trabocca.
+        pos += 8 + @as(usize, size) + (size & 1); // i chunk RIFF sono allineati a 2 byte
     }
 
     if (byte_rate > 0 and data_size > 0) {
-        info.duration_ms = data_size * 1000 / byte_rate;
-        info.bitrate_kbps = byte_rate * 8 / 1000;
+        info.duration_ms = scaleMs(data_size, byte_rate);
+        info.bitrate_kbps = byte_rate / 125; // = byte_rate * 8 / 1000, senza overflow in u32
     }
     return info;
 }
@@ -188,7 +200,7 @@ fn parseFlac(b: []const u8) ?MediaInfo {
         .bits = bits,
     };
     if (sample_rate > 0 and total_samples > 0) {
-        info.duration_ms = total_samples * 1000 / sample_rate;
+        info.duration_ms = scaleMs(total_samples, sample_rate);
     }
     return info;
 }
@@ -231,7 +243,7 @@ fn parseOgg(b: []const u8, path: []const u8, file_size: usize, allocator: std.me
             if (last + 14 <= hay.len) {
                 const granule = std.mem.readInt(u64, hay[last + 6 ..][0..8], .little);
                 if (granule > 0 and granule != std.math.maxInt(u64)) {
-                    info.duration_ms = granule * 1000 / rate;
+                    info.duration_ms = scaleMs(granule, rate);
                 }
             }
         }
@@ -292,11 +304,12 @@ fn parseMp4(b: []const u8, path: []const u8, file_size: usize, allocator: std.me
                 if (version == 0) {
                     const timescale = std.mem.readInt(u32, p[12..16], .big);
                     const duration = std.mem.readInt(u32, p[16..20], .big);
-                    if (timescale > 0) info.duration_ms = @as(u64, duration) * 1000 / timescale;
+                    // Tutti i bit a 1 = durata ignota (ISO-BMFF), non un valore.
+                    if (duration != std.math.maxInt(u32)) info.duration_ms = scaleMs(duration, timescale);
                 } else if (version == 1 and p.len >= 32) {
                     const timescale = std.mem.readInt(u32, p[20..24], .big);
                     const duration = std.mem.readInt(u64, p[24..32], .big);
-                    if (timescale > 0) info.duration_ms = duration * 1000 / timescale;
+                    if (duration != std.math.maxInt(u64)) info.duration_ms = scaleMs(duration, timescale);
                 }
             }
         }
@@ -350,7 +363,7 @@ fn findBox(b: []const u8, start: usize, end: usize, name: *const [4]u8) ?BoxRang
             size = end - pos; // il box si estende fino alla fine
         }
         if (size < header) return null;
-        const box_end = pos + (std.math.cast(usize, size) orelse return null);
+        const box_end = std.math.add(usize, pos, std.math.cast(usize, size) orelse return null) catch return null;
         if (box_end > b.len or box_end > end) return null;
         if (std.mem.eql(u8, b[pos + 4 ..][0..4], name)) {
             return .{ .start = pos + header, .end = box_end };

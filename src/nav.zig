@@ -89,14 +89,17 @@ fn pdfPageNeighborsLocked(state: *GuiAppState, buf: *[2]?[]u8) bool {
     if (total <= 1) return false;
     var clean = cur;
     var page: usize = 1;
-    if (std.mem.indexOfScalar(u8, cur, '#')) |h| {
+    if (decoder_mod.fragmentIndex(cur)) |h| {
         clean = cur[0..h];
         var s = cur[h + 1 ..];
         if (std.mem.startsWith(u8, s, "page=")) s = s["page=".len..];
         page = std.fmt.parseInt(usize, s, 10) catch 1;
     }
-    if (page > 1) buf[0] = std.fmt.allocPrint(state.gpa, "{s}#page={d}", .{ clean, page - 1 }) catch null;
-    if (page < total) buf[1] = std.fmt.allocPrint(state.gpa, "{s}#page={d}", .{ clean, page + 1 }) catch null;
+    // Stessa forma che scrive il cambio pagina (`gui_state.pdfPagePath`): le chiavi
+    // della cache si confrontano come stringhe, e con `#page=N` qui e `#N` là le
+    // pagine vicine venivano decodificate, tenute in RAM e mai trovate.
+    if (page > 1) buf[0] = gui_state_mod.pdfPagePath(state.gpa, clean, page - 1) catch null;
+    if (page < total) buf[1] = gui_state_mod.pdfPagePath(state.gpa, clean, page + 1) catch null;
     return true;
 }
 
@@ -142,12 +145,20 @@ pub fn enqueueLoad(state: *GuiAppState, new_path: []const u8) void {
     // richiesta viene accodata, quindi `loading` non va acceso (spinner
     // infinito senza nessuno che lo spenga).
     const req = state.gpa.dupe(u8, new_path) catch return;
+    // Richiesta e spinner si pubblicano INSIEME, sotto `shared.mutex` (ordine dei
+    // lock `shared` → `nav`, lo stesso di `applyDecoded`). Prima la richiesta
+    // usciva per prima e `loading` veniva acceso dopo: se nel mezzo il loader
+    // prendeva e installava un file veloce, il suo `loading = false` arrivava
+    // PRIMA di questo `true` e lo spinner restava acceso per sempre (con le
+    // frecce ignorate). Così un `applyDecoded` o è già finito, o trova la
+    // generazione nuova: se è di una richiesta superata esce senza toccare
+    // `loading`, se è di questa lo spegne dopo che è stato acceso.
+    state.shared.mutex.lockUncancelable(state.io);
     state.nav.mutex.lockUncancelable(state.io);
     if (state.nav.req) |old| state.gpa.free(old);
     state.nav.req = req;
     state.nav.gen +%= 1;
     state.nav.mutex.unlock(state.io);
-    state.shared.mutex.lockUncancelable(state.io);
     state.shared.loading = true;
     state.shared.file_changed = true;
     state.shared.mutex.unlock(state.io);
@@ -181,13 +192,44 @@ pub fn showMessage(state: *GuiAppState, path: []const u8, msg: []const u8) void 
     resizeToContent(state);
 }
 
-/// Un modello 3D senza renderer GPU (loader/driver Vulkan assenti, device perso
-/// troppe volte) non resta su uno spinner o su una finestra vuota: al suo posto
-/// si mostra il motivo, come per un file illeggibile.
+/// Un contenuto che non si è potuto installare non resta su uno spinner, su una
+/// finestra vuota o sul file di prima col nome nuovo: al suo posto si mostra il
+/// motivo, come per un file illeggibile. In pratica sono i modelli 3D: renderer
+/// GPU assente, modello senza facce, errore del driver durante l'upload.
 fn showApplyFailure(state: *GuiAppState, err: anyerror, path: []const u8, gen: ?u32) void {
-    if (err != error.RendererInit) return;
-    const why = if (state.renderer_error) |e| @errorName(e) else "sconosciuto";
-    const msg = std.fmt.allocPrint(state.gpa, "Modello 3D non visualizzabile: renderer GPU (Vulkan) non disponibile.\nMotivo: {s}", .{why}) catch return;
+    // Device perso durante l'upload: come nel render worker, si butta il renderer
+    // e si ricarica il file su un device nuovo. Oltre i tentativi ammessi
+    // `rendererLostLocked` dà false e si mostra il messaggio.
+    if (err == error.VulkanDeviceLost) {
+        state.renderer_mutex.lockUncancelable(state.io);
+        const retry = gui_state_mod.rendererLostLocked(state);
+        state.renderer_mutex.unlock(state.io);
+        if (retry) {
+            if (gen) |g| if (navSuperseded(state, g)) return;
+            // L'install fallito ha già scritto il percorso nuovo: al secondo giro
+            // `applyDecoded` lo prende per lo STESSO file e terrebbe la camera
+            // (rotazione, pan) del modello di prima.
+            state.shared.mutex.lockUncancelable(state.io);
+            state.shared.zoom = 1.0;
+            state.shared.yaw = 0.0;
+            state.shared.pitch = 0.0;
+            state.shared.pan_x = 0.0;
+            state.shared.pan_y = 0.0;
+            state.shared.mutex.unlock(state.io);
+            enqueueLoad(state, path);
+            return;
+        }
+    }
+    const msg = switch (err) {
+        error.RendererInit, error.VulkanDeviceLost => std.fmt.allocPrint(
+            state.gpa,
+            "Modello 3D non visualizzabile: renderer GPU (Vulkan) non disponibile.\nMotivo: {s}",
+            .{if (state.renderer_error) |e| @errorName(e) else "sconosciuto"},
+        ),
+        error.EmptyMesh => state.gpa.dupe(u8, "Modello 3D senza geometria da mostrare: il file non contiene facce."),
+        error.StageFailed => state.gpa.dupe(u8, "Modello 3D non visualizzabile: il file non contiene vertici, oppure è troppo grande per la memoria disponibile."),
+        else => std.fmt.allocPrint(state.gpa, "Impossibile mostrare il file.\nMotivo: {s}", .{@errorName(err)}),
+    } catch return;
     applyMessage(state, msg, path, gen) catch {};
 }
 
@@ -250,6 +292,8 @@ pub const Prepared = struct {
     video: ?PreparedVideo = null,
     /// Il contenuto è un messaggio d'errore, non il file (vedi `applyMessage`).
     message: bool = false,
+    /// Il contenuto è l'anteprima a bassa risoluzione che precede il decode pieno.
+    coarse: bool = false,
 
     pub fn deinit(self: *Prepared, state: *GuiAppState) void {
         if (self.stage) |*s| s.buffer.deinit(state.gpa);
@@ -505,6 +549,7 @@ pub fn applyDecoded(state: *GuiAppState, new_decoded: decoder_mod.Decoded, pre_i
     // 3. Aggiorna decoded
     state.shared.decoded = new_decoded;
     state.shared.decoded_is_message = pre.message;
+    state.shared.decoded_is_coarse = pre.coarse;
 
     // 4. Aggiorna percorso file corrente
     state.gpa.free(state.shared.current_file_path);
@@ -654,7 +699,7 @@ fn midiHint(e: anyerror) void {
 
 /// Percorso senza il frammento `#…` (pagina PDF, voce d'archivio).
 fn stripFragment(path: []const u8) []const u8 {
-    return if (std.mem.indexOfScalar(u8, path, '#')) |h| path[0..h] else path;
+    return decoder_mod.stripFragment(path);
 }
 
 /// Una sorgente che i player possono aprire senza restare appesi: un URL, o un
@@ -976,6 +1021,10 @@ fn parkOutgoingLocked(state: *GuiAppState, new_path: []const u8) bool {
     // Un errore non è il contenuto del file: in cache sopravviverebbe al file creato
     // o reso leggibile dopo, e riaprendolo si rivedrebbe l'errore.
     if (state.shared.decoded_is_message) return false;
+    // Nemmeno l'anteprima a bassa risoluzione lo è: se si lascia il file prima che
+    // arrivi il decode pieno (poi scartato perché superato), in cache resterebbe una
+    // pagina PDF sfocata e senza conteggio delle pagine, che il prefetch non rifà.
+    if (state.shared.decoded_is_coarse) return false;
     const d = &state.shared.decoded;
     switch (d.*) {
         .image, .text, .markdown, .csv, .workbook => {},
@@ -1223,7 +1272,8 @@ pub fn decodeInitial(state: *GuiAppState, path: []const u8, gen: u32) void {
             var c = coarse;
             if (!navSuperseded(state, gen) and coarseAcceptable(&c, path)) {
                 awaitWindow(state, &c);
-                const pre = prepareFor(state, &c, path, false);
+                var pre = prepareFor(state, &c, path, false);
+                pre.coarse = true;
                 applyDecoded(state, c, pre, path, gen) catch |e|
                     std.debug.print("apply coarse: {s}\n", .{@errorName(e)});
             } else c.deinit(state.gpa);
@@ -1303,7 +1353,8 @@ pub fn loadWorker(state: *GuiAppState) void {
             if (decoder_mod.decodeCoarse(path, io, gpa)) |coarse| {
                 var c = coarse;
                 if (!navSuperseded(state, gen) and coarseAcceptable(&c, path)) {
-                    const pre = prepareFor(state, &c, path, false);
+                    var pre = prepareFor(state, &c, path, false);
+                    pre.coarse = true;
                     applyDecoded(state, c, pre, path, gen) catch |e|
                         std.debug.print("apply coarse (async): {s}\n", .{@errorName(e)});
                 } else c.deinit(gpa);

@@ -15,8 +15,7 @@ const max_cd_bytes: u64 = 256 * 1024 * 1024;
 /// Decodifica lavorando dal PATH (mai caricando l'intero file): individua la
 /// central directory con il seeking dello stdlib e ne legge solo i byte.
 pub fn decode(path: []const u8, io: std.Io, allocator: std.mem.Allocator) Decoded {
-    var clean_path = path;
-    if (std.mem.indexOfScalar(u8, path, '#')) |h| clean_path = path[0..h];
+    const clean_path = decoder.stripFragment(path);
     return decodeZip(clean_path, io, allocator) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "Errore lettura archivio ZIP: {s}", .{@errorName(err)}) catch "";
         return .{ .err = msg };
@@ -106,8 +105,9 @@ fn listFromCd(cd: []const u8, entry_count: u64, allocator: std.mem.Allocator) !D
             }
         }
 
-        total_size += unc_size;
-        total_comp += comp_size;
+        // Saturanti: le dimensioni ZIP64 sono a 64 bit e vengono dal file.
+        total_size +|= unc_size;
+        total_comp +|= comp_size;
 
         if (listed < max_entries) {
             const row = try makeRow(allocator, name, unc_size, comp_size, methodName(method, name));

@@ -114,7 +114,7 @@ fn decodeTier(path: []const u8, io: std.Io, filename: []const u8, allocator: std
 
     var clean_path = path;
     var page_num: usize = 1;
-    if (std.mem.indexOfScalar(u8, path, '#')) |hash_idx| {
+    if (decoder.fragmentIndex(path)) |hash_idx| {
         clean_path = path[0..hash_idx];
         const suffix = path[hash_idx + 1 ..];
         var page_str = suffix;
@@ -124,10 +124,7 @@ fn decodeTier(path: []const u8, io: std.Io, filename: []const u8, allocator: std
         page_num = std.fmt.parseInt(usize, page_str, 10) catch 1;
     }
 
-    var clean_filename = filename;
-    if (std.mem.indexOfScalar(u8, filename, '#')) |hash_idx| {
-        clean_filename = filename[0..hash_idx];
-    }
+    const clean_filename = decoder.stripFragment(filename);
 
     return decodeInner(clean_path, clean_filename, dpi, page_num, coarse, allocator) catch |err| {
         // anyerror: l'insieme degli errori cambia col motore (poppler/CoreGraphics).

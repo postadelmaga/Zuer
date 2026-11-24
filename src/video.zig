@@ -10,6 +10,7 @@
 //! `has_video` è così un vero confine di modulo, non solo un flag sparso.
 
 const std = @import("std");
+const pathfrag = @import("fragment.zig");
 const aspect_fit = @import("aspect_fit.zig");
 const compose = @import("compose.zig");
 const builtin = @import("builtin");
@@ -143,18 +144,8 @@ pub const VideoFirst = struct { rgba: []align(4) u8, w: u32, h: u32 };
 /// chiamante prende possesso di `.rgba` (→ `static_rgba`) e del decoder in
 /// `vs.decoder` (fermato/chiuso da `deinit`).
 pub fn setupVideo(vs: *VideoState, path: []const u8, gpa: std.mem.Allocator) !VideoFirst {
-    // Strippa un eventuale suffisso `#N` (pagina/frammento interno) SOLO se dopo
-    // il `#` ci sono esclusivamente cifre: un nome legittimo come "video #1.mp4"
-    // non va troncato.
-    var clean: []const u8 = path;
-    if (std.mem.indexOfScalar(u8, path, '#')) |h| {
-        const suffix = path[h + 1 ..];
-        const all_digits = suffix.len > 0 and blk: {
-            for (suffix) |ch| if (!std.ascii.isDigit(ch)) break :blk false;
-            break :blk true;
-        };
-        if (all_digits) clean = path[0..h];
-    }
+    // Un `#` nel nome ("video #1.mp4") non è un frammento: vedi fragment.zig.
+    const clean = pathfrag.strip(path);
     const path_z = try gpa.dupeSentinel(u8, clean, 0);
     defer gpa.free(path_z);
 
@@ -332,8 +323,7 @@ pub fn setupStream(vs: *VideoState, video_url: []const u8, audio_url: []const u8
 /// da `nav.startVideo` come fallback quando `setupVideo` non trova stream video.
 pub fn setupAudio(vs: *VideoState, path: []const u8, gpa: std.mem.Allocator) !VideoFirst {
     if (comptime @import("build_options").video) {
-        var clean: []const u8 = path;
-        if (std.mem.indexOfScalar(u8, path, '#')) |h| clean = path[0..h];
+        const clean = pathfrag.strip(path);
         const path_z = try gpa.dupeSentinel(u8, clean, 0);
         defer gpa.free(path_z);
 
@@ -504,8 +494,7 @@ pub fn advanceVideo(sink: FrameSink, vs: *VideoState, dt: f32) bool {
 /// dell'`AudioPlayer`, poi tutto come per gli mp3 (oscilloscopio, controlli,
 /// seek, loop). error.NoMidi se manca un SoundFont o il file non è valido.
 pub fn setupMidi(vs: *VideoState, path: []const u8, gpa: std.mem.Allocator) !VideoFirst {
-    var clean: []const u8 = path;
-    if (std.mem.indexOfScalar(u8, path, '#')) |h| clean = path[0..h];
+    const clean = pathfrag.strip(path);
     const m = MidiPlayer.start(clean, gpa) orelse return error.NoMidi;
     errdefer m.stopAndDestroy();
 

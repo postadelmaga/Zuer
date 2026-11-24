@@ -68,7 +68,7 @@ pub fn build(state: *GuiAppState) void {
     const card = &state.shared.info_card;
     card.* = .{ .seq = state.shared.load_seq };
     const path = state.shared.current_file_path;
-    const hash = std.mem.indexOfScalar(u8, path, '#');
+    const hash = decoder_mod.fragmentIndex(path);
     const clean = if (hash) |h| path[0..h] else path;
     const url = std.mem.indexOf(u8, path, "://") != null;
     const in_archive = gui_state_mod.isInsideArchive(path);

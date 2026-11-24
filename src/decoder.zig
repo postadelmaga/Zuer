@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const dynlib = @import("dynlib.zig");
 const meshcache = @import("meshcache.zig");
 const detect = @import("detect.zig");
+const pathfrag = @import("fragment.zig");
 const scheduler = @import("scheduler.zig");
 
 pub const CsvData = struct {
@@ -1626,13 +1627,12 @@ pub fn decodeCoarse(path: []const u8, io: std.Io, allocator: std.mem.Allocator) 
 
 /// Estensioni degli archivi "navigabili" dentro (anteprima delle voci). Deve
 /// restare allineata alle estensioni dichiarate da archive.zig e tar.zig.
-pub fn isArchiveExt(ext: []const u8) bool {
-    const list = [_][]const u8{ "zip", "jar", "apk", "cbz", "epub", "xpi", "whl", "tar", "tgz", "tar.gz" };
-    for (list) |e| {
-        if (asciiEqualIgnoreCase(ext, e)) return true;
-    }
-    return false;
-}
+pub const isArchiveExt = pathfrag.isArchiveExt;
+
+/// Il frammento `#…` in coda a un percorso (pagina, foglio, voce d'archivio): vedi
+/// fragment.zig. Un `#` nel nome di un file o di una cartella non è un frammento.
+pub const fragmentIndex = pathfrag.index;
+pub const stripFragment = pathfrag.strip;
 
 fn isTarExt(ext: []const u8) bool {
     return asciiEqualIgnoreCase(ext, "tar") or
@@ -1878,12 +1878,8 @@ fn createDestFile(dest: std.Io.Dir, io: std.Io, name: []const u8) !std.Io.File {
 }
 
 fn decodeImpl(path: []const u8, io: std.Io, allocator: std.mem.Allocator, coarse: bool) ?Decoded {
-    var clean_path = path;
-    var fragment: ?[]const u8 = null;
-    if (std.mem.indexOfScalar(u8, path, '#')) |hash_idx| {
-        clean_path = path[0..hash_idx];
-        if (hash_idx + 1 < path.len) fragment = path[hash_idx + 1 ..];
-    }
+    const clean_path = pathfrag.strip(path);
+    const entry_frag = pathfrag.of(path);
 
     // Limite di dimensione proporzionale alla memoria disponibile; ZUER_MAX_MB lo
     // forza a un valore assoluto. Pre-check via stat per rifiutare i file troppo
@@ -1901,7 +1897,7 @@ fn decodeImpl(path: []const u8, io: std.Io, allocator: std.mem.Allocator, coarse
     // decoder giusto per la sua estensione → immagini/testo/pdf/… interni si aprono
     // col loro viewer nativo. In fase coarse si salta: l'host farà il full decode.
     if (!coarse) {
-        if (fragment) |entry| {
+        if (entry_frag) |entry| {
             if (entry.len > 0 and isArchiveExt(getExtension(clean_path)))
                 return decodeArchiveEntry(clean_path, entry, io, allocator, max_size);
         }
@@ -2096,7 +2092,7 @@ fn decodeImpl(path: []const u8, io: std.Io, allocator: std.mem.Allocator, coarse
     // sapere quale linguetta è selezionata. Indice clampato ai fogli davvero
     // presenti: un frammento fuori range non deve mai sfondare `activeCsv`.
     if (decoded_data == .workbook) {
-        if (fragment) |f| {
+        if (entry_frag) |f| {
             if (sheetFromFragment(f)) |n| {
                 const wb = &decoded_data.workbook;
                 if (n - 1 < wb.sheets.len) wb.active = n - 1;
@@ -2121,14 +2117,4 @@ fn asciiEqualIgnoreCase(a: []const u8, b: []const u8) bool {
     return true;
 }
 
-pub fn getExtension(path: []const u8) []const u8 {
-    const filename = std.fs.path.basename(path);
-    // Doppio suffisso `.tar.gz`: l'estensione utile è "tar.gz", non "gz" (un `.gz`
-    // semplice resta invece "gz", non dirottato sul decoder tar).
-    if (filename.len >= 7 and asciiEqualIgnoreCase(filename[filename.len - 7 ..], ".tar.gz"))
-        return "tar.gz";
-    if (std.mem.lastIndexOfScalar(u8, filename, '.')) |dot_index| {
-        return filename[dot_index + 1 ..];
-    }
-    return "";
-}
+pub const getExtension = pathfrag.extension;

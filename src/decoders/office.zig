@@ -45,7 +45,7 @@ fn decodeTextutil(path: []const u8, allocator: std.mem.Allocator) Decoded {
 /// Foglio richiesto dal frammento `#sheet=N` del percorso (N 1-based). Null se
 /// il frammento manca o non è un riferimento a foglio: allora si mostra il primo.
 pub fn sheetFromPath(path: []const u8) ?usize {
-    const hash = std.mem.indexOfScalar(u8, path, '#') orelse return null;
+    const hash = decoder.fragmentIndex(path) orelse return null;
     const frag = path[hash + 1 ..];
     if (!std.mem.startsWith(u8, frag, "sheet=")) return null;
     const n = std.fmt.parseInt(usize, frag["sheet=".len..], 10) catch return null;
@@ -1105,7 +1105,7 @@ export fn zuer_decode(
     // lascia passare intatto. Va tolto prima di guardare l'estensione, altrimenti
     // `hasExtension` non riconoscerebbe più il formato.
     const want_sheet = sheetFromPath(path_slice);
-    const clean_path = if (std.mem.indexOfScalar(u8, path_slice, '#')) |h| path_slice[0..h] else path_slice;
+    const clean_path = decoder.stripFragment(path_slice);
     const filename = std.fs.path.basename(clean_path);
     if (comptime builtin.os.tag == .macos) {
         inline for (textutil_exts) |e| if (hasExtension(filename, e)) {

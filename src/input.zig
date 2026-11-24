@@ -17,6 +17,7 @@ const yt_search = @import("yt_search.zig");
 const file_explorer = @import("file_explorer.zig");
 const print_mod = @import("print.zig");
 const gui_state_mod = @import("gui_state.zig");
+const decoder_mod = @import("decoder.zig");
 const GuiAppState = gui_state_mod.GuiAppState;
 const resetScroll = gui_state_mod.resetScroll;
 const isPdfPath = gui_state_mod.isPdfPath;
@@ -361,7 +362,7 @@ fn handleArchiveKey(app_state: *GuiAppState, win: *zrame.Window, key: u32) bool 
 
     // Esc dentro una voce → ricarica l'archivio base (strip del frammento).
     if (key == KEY_ESC and gui_state_mod.isInsideArchive(path)) {
-        const hash = std.mem.indexOfScalar(u8, path, '#') orelse {
+        const hash = decoder_mod.fragmentIndex(path) orelse {
             app_state.shared.mutex.unlock(app_state.io);
             return false;
         };
@@ -487,7 +488,7 @@ fn changePdfPage(app_state: *GuiAppState, move: PageMove) bool {
 
     var clean_path = path;
     var current_page: usize = 1;
-    if (std.mem.indexOfScalar(u8, path, '#')) |hash_idx| {
+    if (decoder_mod.fragmentIndex(path)) |hash_idx| {
         clean_path = path[0..hash_idx];
         const suffix = path[hash_idx + 1 ..];
         var page_str = suffix;
@@ -509,7 +510,7 @@ fn changePdfPage(app_state: *GuiAppState, move: PageMove) bool {
 
     if (new_page == current_page) return false;
 
-    const new_path = std.fmt.allocPrint(app_state.gpa, "{s}#{d}", .{ clean_path, new_page }) catch return false;
+    const new_path = gui_state_mod.pdfPagePath(app_state.gpa, clean_path, new_page) catch return false;
     defer app_state.gpa.free(new_path);
 
     // Cambio pagina in ASINCRONO sul loader thread: il decode PDF lancia un
@@ -927,7 +928,7 @@ fn closePopup(app_state: *GuiAppState) bool {
 fn stripFragment(path: []const u8) []const u8 {
     // Il frammento `#…` dei PDF è la pagina; dentro un archivio è la voce, e lì il
     // percorso utile resta quello dell'archivio.
-    return if (std.mem.indexOfScalar(u8, path, '#')) |h| path[0..h] else path;
+    return decoder_mod.stripFragment(path);
 }
 
 /// La rotella (`.scroll` di `on_mouse`): `value` in unità d'asse Wayland, positivo =
@@ -1133,7 +1134,7 @@ pub fn mouseCallback(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopa
                                 // differiscono solo per il frammento, e l'host rilegge
                                 // di lì il foglio attivo.
                                 const cur = app_state.shared.current_file_path;
-                                const base = if (std.mem.indexOfScalar(u8, cur, '#')) |h| cur[0..h] else cur;
+                                const base = decoder_mod.stripFragment(cur);
                                 lazy_req = std.fmt.allocPrint(app_state.gpa, "{s}#sheet={d}", .{ base, idx + 1 }) catch null;
                             } else {
                                 // Foglio già in memoria (tipicamente il primo): cambio

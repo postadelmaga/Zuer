@@ -284,12 +284,15 @@ fn decodeSvgNano(file_bytes: []const u8, filename: []const u8, max_dim: usize, a
         var in: std.Io.Reader = .fixed(file_bytes);
         var window: [std.compress.flate.max_window_len]u8 = undefined;
         var dec: std.compress.flate.Decompress = .init(&in, .gzip, &window);
-        var out: std.Io.Writer.Allocating = .init(allocator);
-        defer out.deinit();
-        _ = dec.reader.streamRemaining(&out.writer) catch return error.UnsupportedImageFormat;
-        if (out.written().len > max_svg_bytes) return error.ImageTooLarge;
-        text = try allocator.alloc(u8, out.written().len + 1);
-        @memcpy(text[0 .. text.len - 1], out.written());
+        // Il tetto vale MENTRE si decomprime: 10 MB di zeri compressi sono 10 GB.
+        const raw = dec.reader.allocRemaining(allocator, .limited(max_svg_bytes)) catch |err| return switch (err) {
+            error.StreamTooLong => error.ImageTooLarge,
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.UnsupportedImageFormat,
+        };
+        defer allocator.free(raw);
+        text = try allocator.alloc(u8, raw.len + 1);
+        @memcpy(text[0 .. text.len - 1], raw);
     } else {
         if (file_bytes.len > max_svg_bytes) return error.ImageTooLarge;
         text = try allocator.alloc(u8, file_bytes.len + 1);
@@ -406,6 +409,9 @@ fn decodeIcoDib(dib: []const u8, filename: []const u8, max_dim: usize, allocator
     const uw: usize = @intCast(w);
     const uh: usize = @intCast(@divExact(h2, 2));
     const colors: usize = if (bpp <= 8) (if (clr_used != 0) clr_used else @as(usize, 1) << @intCast(bpp)) else clr_used;
+    // `biClrUsed` viene dal file: una tavolozza ha al più 256 voci, e un valore
+    // enorme farebbe uscire `pix_off` dai 32 bit dell'intestazione BMP.
+    if (colors > 256) return error.UnsupportedImageFormat;
     const pix_off = 14 + hdr_size + colors * 4;
     const xor_row = ((uw * bpp + 31) / 32) * 4;
     const and_row = ((uw + 31) / 32) * 4;
@@ -509,7 +515,10 @@ fn decodeWithImageMagick(path: []const u8, filename: []const u8, max_dim: usize,
 
     // 2. convert path -resize <width>x<height> rgb:-
     var resize_buf: [32]u8 = undefined;
-    const resize_str = try std.fmt.bufPrint(&resize_buf, "{d}x{d}", .{ width, height });
+    // Il `!` impone ESATTAMENTE queste dimensioni: senza, ImageMagick rifà il suo
+    // adattamento e può arrotondare un pixel in meno (6000×4001 → 4095×2731 invece
+    // di 4096×2731), i byte non bastano più e un file valido non si apre.
+    const resize_str = try std.fmt.bufPrint(&resize_buf, "{d}x{d}!", .{ width, height });
 
     // `rgb:-` scarta l'alpha: senza flatten esplicito il trasparente diventa
     // nero. Stesso sfondo bianco del percorso rsvg.

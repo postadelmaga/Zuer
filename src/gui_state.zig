@@ -85,6 +85,9 @@ pub const GuiAppState = struct {
         /// posto del contenuto del file: non va parcheggiato nella cache di prefetch,
         /// dove riaprendo lo stesso percorso prevarrebbe sul file ormai disponibile.
         decoded_is_message: bool = false,
+        /// `decoded` è l'anteprima a bassa risoluzione (tier coarse) di un file il
+        /// cui decode pieno deve ancora arrivare: non va messa nella cache di prefetch.
+        decoded_is_coarse: bool = false,
         // Pin del decode per il raster fuori-lock (vedi rasterizeText in gui.zig):
         // il render worker pinna `decoded` e rilascia il lock per layout/raster;
         // `applyDecoded`, se swappa nel frattempo, NON libera il vecchio valore ma
@@ -494,31 +497,36 @@ pub fn imageAspectLocked(s: anytype) u64 {
     return @as(u64, w) << 32 | h;
 }
 
+/// Percorso della pagina `page` (1-based) del PDF `clean_path` (senza frammento).
+/// L'unico punto che scrive il frammento di pagina: navigazione e prefetch devono
+/// produrre la stessa stringa, perché è la chiave della cache.
+pub fn pdfPagePath(gpa: std.mem.Allocator, clean_path: []const u8, page: usize) ![]u8 {
+    // La prima pagina è il file stesso: un PDF aperto dalla cartella ha il percorso
+    // senza frammento, e tornandoci da pagina 2 si deve ritrovare quella voce.
+    if (page <= 1) return gpa.dupe(u8, clean_path);
+    return std.fmt.allocPrint(gpa, "{s}#{d}", .{ clean_path, page });
+}
+
 pub fn isPdfPath(path: []const u8) bool {
-    var clean_path = path;
-    if (std.mem.indexOfScalar(u8, path, '#')) |hash_idx| {
-        clean_path = path[0..hash_idx];
-    }
+    const clean_path = decoder_mod.stripFragment(path);
     return std.mem.endsWith(u8, clean_path, ".pdf") or std.mem.endsWith(u8, clean_path, ".PDF");
 }
 
 /// Vero se il path (ignorando l'eventuale frammento `#voce`) è un archivio
 /// navigabile (zip/tar/…).
 pub fn isArchivePath(path: []const u8) bool {
-    var clean = path;
-    if (std.mem.indexOfScalar(u8, path, '#')) |h| clean = path[0..h];
-    return decoder_mod.isArchiveExt(decoder_mod.getExtension(clean));
+    return decoder_mod.isArchiveExt(decoder_mod.getExtension(decoder_mod.stripFragment(path)));
 }
 
 /// Vero quando è mostrato il LISTATO di un archivio (nessuna voce selezionata nel
 /// path): abilita selezione di riga + Invio per aprire la voce.
 pub fn isArchiveListing(path: []const u8) bool {
-    return std.mem.indexOfScalar(u8, path, '#') == null and isArchivePath(path);
+    return decoder_mod.fragmentIndex(path) == null and isArchivePath(path);
 }
 
 /// Vero quando si è DENTRO un archivio (`archivio#voce`): Esc torna al listato.
 pub fn isInsideArchive(path: []const u8) bool {
-    return std.mem.indexOfScalar(u8, path, '#') != null and isArchivePath(path);
+    return decoder_mod.fragmentIndex(path) != null and isArchivePath(path);
 }
 
 /// Zoom "contain": scala il frame così che stia interamente nella finestra

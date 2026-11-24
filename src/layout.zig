@@ -120,9 +120,7 @@ pub fn imageDimsFromFile(gpa: std.mem.Allocator, path: []const u8) ?ImageDims {
 /// Estensione .mid/.midi (case-insensitive), al netto del frammento `#`: questi
 /// file suonano nel player solo-audio col synth MIDI (vedi `video.setupMidi`).
 pub fn isMidiPath(path: []const u8) bool {
-    var clean = path;
-    if (std.mem.indexOfScalar(u8, path, '#')) |h| clean = path[0..h];
-    const base = std.fs.path.basename(clean);
+    const base = std.fs.path.basename(decoder_mod.stripFragment(path));
     const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse return false;
     const ext = base[dot + 1 ..];
     return extLowerEql(ext, "mid") or extLowerEql(ext, "midi");
@@ -130,9 +128,7 @@ pub fn isMidiPath(path: []const u8) bool {
 
 /// Riconoscimento del tipo dall'estensione (percorso async: prima del decode).
 pub fn winKindFromExt(path: []const u8) WinKind {
-    var clean = path;
-    if (std.mem.indexOfScalar(u8, path, '#')) |h| clean = path[0..h];
-    const base = std.fs.path.basename(clean);
+    const base = std.fs.path.basename(decoder_mod.stripFragment(path));
     const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse return .generic;
     const ext = base[dot + 1 ..];
     inline for (.{ "png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "avif", "heic", "heif", "jxl", "jp2", "exr", "ico", "dng", "cr2", "cr3", "nef", "arw", "orf", "rw2", "raf" }) |e| {

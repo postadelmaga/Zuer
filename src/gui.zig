@@ -219,8 +219,7 @@ fn rasterizeTextGpu(state: *GuiAppState, name: []const u8, opts: text_render.Ren
 /// nuovo. Ritorna true se lo scroll era agganciato al fondo PRIMA della crescita:
 /// il chiamante lo riaggancia dopo il re-layout.
 fn followPoll(state: *GuiAppState, viewport_h: u32) bool {
-    var path: []const u8 = state.shared.current_file_path;
-    if (std.mem.indexOfScalar(u8, path, '#')) |h| path = path[0..h];
+    const path = decoder_mod.stripFragment(state.shared.current_file_path);
 
     var f = std.Io.Dir.cwd().openFile(state.io, path, .{}) catch return false;
     defer f.close(state.io);
@@ -1364,8 +1363,7 @@ pub fn main(init: std.process.Init) !void {
     // background mentre il worker mostra uno spinner; i file piccoli si
     // decodificano qui sotto in modo sincrono, così la finestra può ancora
     // dimensionarsi sull'immagine (nessuna regressione di sizing).
-    var clean_path: []const u8 = file_path;
-    if (std.mem.indexOfScalar(u8, file_path, '#')) |h| clean_path = file_path[0..h];
+    const clean_path = decoder_mod.stripFragment(file_path);
     var loader_threshold_mb: u64 = 4;
     if (getenv("ZUER_LOADER_MB")) |v| {
         if (std.fmt.parseInt(u64, std.mem.span(v), 10)) |mb| {
