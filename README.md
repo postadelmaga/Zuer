@@ -72,6 +72,7 @@ zig build -Doptimize=ReleaseFast   # compila
 
 Dipendenze di sistema, build per Windows e macOS, opzioni e strumenti:
 [docs/sviluppo.md](docs/sviluppo.md). Come è fatto dentro: [docs/architettura.md](docs/architettura.md).
+Cosa viene dopo: [docs/roadmap.md](docs/roadmap.md).
 
 ## Licenza
 
