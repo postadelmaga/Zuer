@@ -131,8 +131,10 @@ pub fn decodeWithMax(path: []const u8, file_bytes: []const u8, filename: []const
         }
         return errResult(allocator, last_err, null);
     }
-    // Formati vettoriali o non coperti: fallback a ImageMagick.
-    if (decodeWithImageMagick(path, filename, max_dim, allocator)) |img| {
+    // Formati rari (TIFF, HEIC, JPEG XL, RAW…): ImageMagick, ma solo per ciò che
+    // riconosciamo noi e con il coder imposto (vedi `magickCoder`).
+    const coder = magickCoder(file_bytes, filename) orelse return errResult(allocator, last_err, null);
+    if (decodeWithImageMagick(path, coder, filename, max_dim, allocator)) |img| {
         return .{ .image = toSrgb(img, file_bytes, filename, allocator) };
     } else |im_err| {
         return errResult(allocator, last_err, im_err);
@@ -478,16 +480,87 @@ fn resizeToFit(src: [*]const u8, ch: usize, src_w: usize, src_h: usize, orient: 
     };
 }
 
-fn decodeWithImageMagick(path: []const u8, filename: []const u8, max_dim: usize, allocator: std.mem.Allocator) !ImageData {
-    // Path assoluto (neutralizza i prefissi coder di ImageMagick) + selettore
-    // `[0]` esplicito: ImageMagick interpreta un suffisso `[N]` anche su path
+const raw_exts = [_][]const u8{ "dng", "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "orf", "rw2", "raf", "pef", "srw", "x3f", "erf", "3fr", "mos", "mrw", "dcr", "kdc", "rwl", "iiq" };
+
+fn extIs(filename: []const u8, comptime list: []const []const u8) bool {
+    const ext = decoder.getExtension(filename);
+    inline for (list) |e| if (std.ascii.eqlIgnoreCase(ext, e)) return true;
+    return false;
+}
+
+/// Coder con cui passare il file a ImageMagick, o null se non ci va passato.
+///
+/// ImageMagick sceglie il coder dai BYTE del file, non dall'estensione: un
+/// `foto.png` che contiene PostScript finirebbe a Ghostscript, un `.tif` con
+/// dentro SVG al coder SVG e ai suoi delegati esterni — e basta aprire la
+/// cartella, perché di qui passano anche le miniature. Quindi ci vanno solo i
+/// formati che riconosciamo NOI (byte magici di detect.zig), e con il coder
+/// scritto nell'argomento (`tiff:/percorso[0]`): col prefisso ImageMagick non
+/// annusa più il contenuto, e un file che mente dà «improper image header».
+fn magickCoder(file_bytes: []const u8, filename: []const u8) ?[]const u8 {
+    const probe = file_bytes[0..@min(file_bytes.len, decoder.detect.probe_bytes)];
+    switch (decoder.detect.detect(probe, file_bytes.len).format) {
+        // Ciò che stb non regge (JPEG aritmetici, BMP RLE, PNG rari).
+        .png => return "png",
+        .jpeg => return "jpeg",
+        .gif => return "gif",
+        .bmp => return "bmp",
+        .webp => return "webp",
+        .ico => return "ico",
+        .psd => return "psd",
+        .hdr => return "hdr",
+        .heif => return "heic",
+        .avif => return "avif",
+        .jxl => return "jxl",
+        .jp2 => return if (probe[0] == 0xff) "j2k" else "jp2", // codestream nudo o contenitore
+        .exr => return "exr",
+        .dds => return "dds",
+        // Molti RAW hanno il contenitore del TIFF (DNG, CR2, NEF, ARW…): il coder
+        // dei RAW (libraw) li distingue da sé. Lo si sceglie solo se lo dice il nome.
+        .tiff => return if (extIs(filename, &raw_exts)) "dng" else "tiff",
+        .cr3 => return "dng",
+        .unknown => {},
+        // Riconosciuto, ma come altro (PDF, ZIP, eseguibile…): non è un'immagine.
+        else => return null,
+    }
+    // BigTIFF (versione 43 invece di 42): detect.zig non lo conosce.
+    if (std.mem.startsWith(u8, probe, "II+\x00") or std.mem.startsWith(u8, probe, "MM\x00+"))
+        return if (extIs(filename, &raw_exts)) "dng" else "tiff";
+    // Senza firma in detect.zig: i RAW con contenitore proprio (dal nome E dai
+    // byte) e i formati che una firma non ce l'hanno (dal nome: con il coder
+    // imposto un contenuto diverso viene solo rifiutato).
+    if (extIs(filename, &raw_exts)) {
+        inline for (.{ "IIRO", "IIRS", "MMOR", "IIU\x00", "FUJIFILM", "FOVb", "\x00MRM", "II\x1a\x00\x00\x00HEAPCCDR" }) |magic| {
+            if (std.mem.startsWith(u8, probe, magic)) return "dng";
+        }
+        return null;
+    }
+    if (extIs(filename, &.{"tga"})) return "tga";
+    if (extIs(filename, &.{ "pct", "pict" })) return "pict";
+    if (extIs(filename, &.{"sgi"}) and std.mem.startsWith(u8, probe, "\x01\xda")) return "sgi";
+    if (extIs(filename, &.{ "pnm", "pbm", "pgm", "ppm" }) and probe.len >= 2 and probe[0] == 'P') {
+        if (probe[1] >= '1' and probe[1] <= '7') return "pnm";
+        if (probe[1] == 'F' or probe[1] == 'f') return "pfm"; // in virgola mobile
+    }
+    // DIB senza l'intestazione di file del BMP: comincia dalla taglia
+    // dell'intestazione dell'immagine (12, 40, 52, 56, 108 o 124).
+    if (extIs(filename, &.{"dib"}) and probe.len >= 4) {
+        const header_size = std.mem.readInt(u32, probe[0..4], .little);
+        inline for (.{ 12, 40, 52, 56, 108, 124 }) |n| if (header_size == n) return "dib";
+    }
+    return null;
+}
+
+fn decodeWithImageMagick(path: []const u8, coder: []const u8, filename: []const u8, max_dim: usize, allocator: std.mem.Allocator) !ImageData {
+    // Coder imposto (vedi `magickCoder`) + path assoluto + selettore `[0]`
+    // esplicito: ImageMagick interpreta un suffisso `[N]` anche su path
     // assoluti, quindi lo fissiamo noi al primo frame. La semantica non cambia:
     // il codice sotto usava già solo il primo frame (primi due token di
     // identify, primi expected_bytes di convert) — con `[0]` identify non
     // concatena più le misure dei frame successivi e convert decodifica meno.
     const abs_path = try absPath(allocator, path);
     defer allocator.free(abs_path);
-    const first_frame = try std.fmt.allocPrint(allocator, "{s}[0]", .{abs_path});
+    const first_frame = try std.fmt.allocPrint(allocator, "{s}:{s}[0]", .{ coder, abs_path });
     defer allocator.free(first_frame);
 
     // 1. identify to get original size

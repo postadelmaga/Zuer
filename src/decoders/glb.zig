@@ -16,6 +16,31 @@ extern fn stbi_load_from_memory(
     desired_channels: c_int,
 ) ?[*]u8;
 extern fn stbi_image_free(retval_from_stbi_load: ?*anyopaque) void;
+extern fn stbi_info_from_memory(buffer: [*]const u8, len: c_int, x: *c_int, y: *c_int, comp: *c_int) c_int;
+
+/// Tetto sui pixel di una texture sorgente, lo stesso delle immagini (600 MB di
+/// RGBA mentre la si decodifica): le dimensioni stanno nell'header, quindi si
+/// controllano PRIMA di decodificare. Senza, un JPEG 65535² dentro il BIN chiedeva
+/// decine di GB.
+const max_tex_source_pixels: usize = 150_000_000;
+
+/// Oltre questa taglia (4096², 64 MB di RGBA) una texture non si decodifica in
+/// parallelo con le altre ma da sola, dopo: il picco è una texture grande alla
+/// volta invece di una per core.
+const max_parallel_tex_pixels: usize = 4096 * 4096;
+
+/// Tetto sui pixel di TUTTE le texture di un modello dopo la riduzione a
+/// `max_tex_dim` (64 texture 2048², 1 GiB): il tetto per immagine non basta, perché
+/// cento voci di `images` possono puntare allo stesso PNG da 6 KB. Le texture
+/// oltre il budget si perdono (quelle parti restano col colore del materiale).
+const max_tex_total_pixels: usize = 64 * 2048 * 2048;
+
+/// Vertici di tutta la scena (48 byte l'uno fra posizioni, normali, UV e
+/// tangenti: 768 MB). È il tetto per i file che ISTANZIANO: un file piccolo può
+/// ripetere la stessa mesh da decine di migliaia di nodi. Un file che i vertici li
+/// contiene davvero ne ha diritto al doppio di quanti ne stanno nel suo BIN (vedi
+/// `Builder.max_vertices`), quindi un modello grande ma onesto si apre comunque.
+const min_scene_vertices: usize = 16 * 1024 * 1024;
 
 // Limite di risoluzione della texture caricata sulla GPU: oltre, si sottocampiona.
 const max_tex_dim: usize = 2048;
@@ -197,6 +222,9 @@ fn decodeImageSource(
     out_w: *usize,
     out_h: *usize,
     coarse: bool,
+    /// null = decodifica qualunque taglia. Altrimenti le texture oltre
+    /// `max_parallel_tex_pixels` non si decodificano: si segnala qui e si torna null.
+    too_big: ?*bool,
 ) ?[]u8 {
     const images = gltf.images orelse return null;
     if (source >= images.len) return null;
@@ -219,6 +247,14 @@ fn decodeImageSource(
     var w: c_int = 0;
     var h: c_int = 0;
     var channels: c_int = 0;
+    if (stbi_info_from_memory(encoded.ptr, @intCast(encoded.len), &w, &h, &channels) == 0) return null;
+    if (w <= 0 or h <= 0) return null;
+    const src_pixels = @as(usize, @intCast(w)) * @as(usize, @intCast(h));
+    if (src_pixels > max_tex_source_pixels) return null;
+    if (too_big) |flag| if (src_pixels > max_parallel_tex_pixels) {
+        flag.* = true;
+        return null;
+    };
     const data = stbi_load_from_memory(encoded.ptr, @intCast(encoded.len), &w, &h, &channels, 4) orelse return null;
     defer stbi_image_free(data);
     if (w <= 0 or h <= 0) return null;
@@ -254,13 +290,26 @@ const TexJob = struct {
     next: std.atomic.Value(usize),
     coarse: bool,
     missed: std.atomic.Value(bool), // coarse: una texture non era in cache 256²
+    /// Texture troppo grandi per la fase parallela: le decodifica dopo, una alla
+    /// volta, il thread che ha lanciato il job. Ogni indice lo scrive un solo worker.
+    deferred: []bool,
+    /// Pixel ancora disponibili (vedi `max_tex_total_pixels`).
+    pixels_left: std.atomic.Value(isize),
 };
 
-fn decodeTex(job: *TexJob, i: usize) void {
+fn decodeTex(job: *TexJob, i: usize, parallel: bool) void {
     var w: usize = 0;
     var h: usize = 0;
-    if (decodeImageSource(job.gltf, job.bin, job.srcs[i], std.heap.page_allocator, &w, &h, job.coarse)) |px| {
+    var too_big = false;
+    if (decodeImageSource(job.gltf, job.bin, job.srcs[i], std.heap.page_allocator, &w, &h, job.coarse, if (parallel) &too_big else null)) |px| {
+        const n: isize = @intCast(w * h);
+        if (job.pixels_left.fetchSub(n, .monotonic) < n) {
+            std.heap.page_allocator.free(px); // budget finito: questa texture si perde
+            return;
+        }
         job.results[i] = .{ .pixels = px, .w = w, .h = h };
+    } else if (too_big) {
+        job.deferred[i] = true;
     } else if (job.coarse) {
         // Cache coarse mancante per questa texture: la fase coarse non è
         // completabile senza decodificare (ciò che vogliamo evitare) → segnala.
@@ -272,14 +321,14 @@ fn texWorker(job: *TexJob) void {
     while (true) {
         const i = job.next.fetchAdd(1, .monotonic);
         if (i >= job.srcs.len) break;
-        decodeTex(job, i);
+        decodeTex(job, i, true);
     }
 }
 
 /// Corpo per `HostServices.parallel_for`: ogni indice è una texture sorgente,
 /// ognuna scrive solo il proprio `results[i]`.
 fn texBody(ctx: ?*anyopaque, i: usize) callconv(.c) void {
-    decodeTex(@ptrCast(@alignCast(ctx.?)), i);
+    decodeTex(@ptrCast(@alignCast(ctx.?)), i, true);
 }
 
 /// Servizi dell'host (scheduler condiviso), impostati da `zuer_set_host` al
@@ -387,7 +436,11 @@ fn buildTexCache(gltf: GltfStructure, bin_data: []const u8, allocator: std.mem.A
     defer allocator.free(results);
     @memset(results, null);
 
-    var job = TexJob{ .gltf = gltf, .bin = bin_data, .srcs = srcs, .results = results, .next = .init(0), .coarse = coarse, .missed = .init(false) };
+    const deferred = try allocator.alloc(bool, n);
+    defer allocator.free(deferred);
+    @memset(deferred, false);
+
+    var job = TexJob{ .gltf = gltf, .bin = bin_data, .srcs = srcs, .results = results, .next = .init(0), .coarse = coarse, .missed = .init(false), .deferred = deferred, .pixels_left = .init(max_tex_total_pixels) };
 
     // Spawn fino a un budget condiviso da TUTTE le decode in volo (contro
     // (core−1) thread PER CHIAMATA: il decode in primo piano e il prefetch dei
@@ -410,6 +463,8 @@ fn buildTexCache(gltf: GltfStructure, bin_data: []const u8, allocator: std.mem.A
         texWorker(&job);
         for (0..spawn_n) |i| if (pool[i]) |t| t.join();
     }
+    // Le texture grandi, una alla volta (i worker hanno finito: nessuna corsa).
+    for (deferred, 0..) |d, i| if (d) decodeTex(&job, i, false);
 
     // Fase coarse con cache 256² incompleta: aborta (il chiamante farà il full).
     // I risultati parziali (hit di cache) non sono ancora nella map → liberali qui.
@@ -438,8 +493,13 @@ fn takeCachedTex(b: *Builder, tex_ref: GltfTextureRef, out_w: *usize, out_h: *us
         out_h.* = st.h;
         return st.pixels;
     }
-    const dt = b.tex_cache.get(s) orelse return null;
+    const dt = b.tex_cache.getPtr(s) orelse return null;
+    if (dt.pixels.len == 0) return null; // già ceduta, e la memoizzazione era fallita
     const px = b.allocator.dupe(u8, dt.pixels) catch return null;
+    // La copia decodificata non serve più: tenerla fino alla fine raddoppiava il
+    // picco di ogni modello con texture (`freeTexCache` libera ciò che resta).
+    std.heap.page_allocator.free(dt.pixels);
+    dt.pixels = &.{};
     // Se la memoizzazione fallisce il submesh possiede la copia da solo:
     // corretto comunque (solo meno condivisione).
     b.shared_tex.put(b.allocator, s, .{ .pixels = px, .w = dt.w, .h = dt.h }) catch {};
@@ -531,6 +591,9 @@ fn readFloatAccessor(
     // elemento stia dentro il BIN (così il loop non ha bisogno di controlli).
     const base = std.math.add(usize, bv.byteOffset orelse 0, acc.byteOffset orelse 0) catch return null;
     const stride = bv.byteStride orelse (comps * 4);
+    // Uno stride più corto dell'elemento (0 compreso) farebbe stare nel BIN
+    // qualunque `count`: l'allocazione qui sotto non avrebbe più un limite.
+    if (stride < comps * 4) return null;
     if (expected_count == 0) return null;
     const span = std.math.mul(usize, expected_count - 1, stride) catch return null;
     const last = std.math.add(usize, base, span) catch return null;
@@ -613,6 +676,14 @@ const Builder = struct {
     submeshes: std.ArrayList(decoder.SubMesh),
     bbox_min: [3]f32,
     bbox_max: [3]f32,
+    /// Nodi già attraversati. In glTF la gerarchia è un albero (un nodo ha al più
+    /// un genitore): un nodo raggiunto due volte è un ciclo o un ventaglio
+    /// (`children: [0, 0]`), e senza questo erano 2^64 visite.
+    visited: []bool,
+    /// Tetti della scena: il doppio dei vertici che stanno nel BIN, e mai meno di
+    /// `min_scene_vertices`; due facce per vertice (24 byte l'una).
+    max_vertices: usize,
+    max_faces: usize,
     all_normals: bool, // false appena una primitiva è priva di NORMAL affidabili
     all_tangents: bool, // false appena una primitiva è priva di TANGENT
 };
@@ -639,6 +710,7 @@ fn addPrimitive(b: *Builder, prim: GltfPrimitive, world: Mat4) !void {
     const pos_idx = attributeIndex(prim.attributes, "POSITION") orelse return;
     const count = accessorCount(b.gltf, pos_idx) orelse return;
     if (count == 0) return;
+    if (count > b.max_vertices - b.vertices.items.len) return error.SceneTooLarge;
     const positions = (try readFloatAccessor(3, b.gltf, b.bin, pos_idx, count, b.allocator)) orelse return;
     defer b.allocator.free(positions);
 
@@ -653,7 +725,8 @@ fn addPrimitive(b: *Builder, prim: GltfPrimitive, world: Mat4) !void {
     try b.tangents.ensureUnusedCapacity(b.allocator, count);
 
     for (positions) |p| {
-        const wp = transformPoint(world, p);
+        const t = transformPoint(world, p);
+        const wp: [3]f32 = .{ decoder.finiteOrZero(t[0]), decoder.finiteOrZero(t[1]), decoder.finiteOrZero(t[2]) };
         b.vertices.appendAssumeCapacity(wp);
         inline for (0..3) |c| {
             b.bbox_min[c] = @min(b.bbox_min[c], wp[c]);
@@ -681,7 +754,8 @@ fn addPrimitive(b: *Builder, prim: GltfPrimitive, world: Mat4) !void {
         if (try readFloatAccessor(2, b.gltf, b.bin, ui, count, b.allocator)) |us| {
             defer b.allocator.free(us);
             had_uv = true;
-            for (us) |u| b.uvs.appendAssumeCapacity(u);
+            // Non finite → 0: a valle le UV diventano indici di pixel.
+            for (us) |u| b.uvs.appendAssumeCapacity(.{ decoder.finiteOrZero(u[0]), decoder.finiteOrZero(u[1]) });
         } else {
             @memset(b.uvs.addManyAsSliceAssumeCapacity(count), .{ 0, 0 });
         }
@@ -766,7 +840,10 @@ fn addFaces(b: *Builder, prim: GltfPrimitive, pos_count: usize, vertex_offset: u
         const bv = bvs[bv_idx];
         // Somma controllata: gli offset arrivano dal JSON (usize ostili).
         const ind_offset = std.math.add(usize, bv.byteOffset orelse 0, acc.byteOffset orelse 0) catch return error.OutOfBounds;
-        // Numero di triangoli noto a priori dall'accessor: una riserva sola.
+        // Numero di triangoli noto a priori dall'accessor: una riserva sola. Il
+        // tetto conta le facce di tutta la scena: ogni nodo che istanzia la mesh
+        // le riaggiunge, e `count` da solo è limitato appena dalla taglia del BIN.
+        if (acc.count / 3 > b.max_faces - b.faces.items.len) return error.SceneTooLarge;
         try b.faces.ensureUnusedCapacity(b.allocator, acc.count / 3);
         var j: usize = 0;
         while (j + 2 < acc.count) : (j += 3) {
@@ -786,9 +863,11 @@ fn addFaces(b: *Builder, prim: GltfPrimitive, pos_count: usize, vertex_offset: u
 }
 
 fn addNode(b: *Builder, node_idx: usize, parent: Mat4, depth: u32) !void {
-    if (depth > 64) return; // guardia anti-cicli
+    if (depth > 64) return; // profondità della ricorsione
     const nodes = b.gltf.nodes orelse return;
     if (node_idx >= nodes.len) return;
+    if (b.visited[node_idx]) return;
+    b.visited[node_idx] = true;
     const node = nodes[node_idx];
     const world = mat4Mul(parent, nodeLocalMatrix(node));
     if (node.mesh) |mi| {
@@ -811,6 +890,11 @@ fn decodeGltfScene(gltf: GltfStructure, bin_data: []const u8, filename: []const 
     var tex_cache = try buildTexCache(gltf, bin_data, allocator, coarse);
     defer freeTexCache(&tex_cache, allocator);
 
+    const max_vertices = @max(min_scene_vertices, bin_data.len / 12 * 2);
+    const visited = try allocator.alloc(bool, if (gltf.nodes) |n| n.len else 0);
+    defer allocator.free(visited);
+    @memset(visited, false);
+
     var b = Builder{
         .gltf = gltf,
         .bin = bin_data,
@@ -825,6 +909,9 @@ fn decodeGltfScene(gltf: GltfStructure, bin_data: []const u8, filename: []const 
         .submeshes = .empty,
         .bbox_min = .{ std.math.inf(f32), std.math.inf(f32), std.math.inf(f32) },
         .bbox_max = .{ -std.math.inf(f32), -std.math.inf(f32), -std.math.inf(f32) },
+        .visited = visited,
+        .max_vertices = max_vertices,
+        .max_faces = max_vertices * 2,
         .all_normals = true,
         .all_tangents = true,
     };

@@ -137,8 +137,8 @@ pub fn openBrowser(gpa: std.mem.Allocator, url: []const u8) bool {
         defer res.deinit(gpa);
         return res.exit_code == 0;
     } else {
-        var res = decoder_mod.runCaptureTimeout(gpa, &.{ "xdg-open", url }, 10_000) catch return false;
-        defer res.deinit(gpa);
-        return res.exit_code == 0;
+        // Non `runCaptureTimeout`: vedi `runDetached` (il browser lanciato da
+        // xdg-open ne erediterebbe la pipe).
+        return decoder_mod.runDetached(gpa, &.{ "xdg-open", url }, 5_000);
     }
 }

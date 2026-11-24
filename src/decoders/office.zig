@@ -56,6 +56,7 @@ pub fn sheetFromPath(path: []const u8) ?usize {
 /// `want_sheet` è il foglio 1-based da decodificare per intero (null = il primo).
 pub fn decode(bytes: []const u8, filename: []const u8, want_sheet: ?usize, allocator: std.mem.Allocator) Decoded {
     defer allocator.free(bytes);
+    budget = .{};
 
     // Contenitore OLE/CFB invece di ZIP: un docx/xlsx/pptx cifrato con password
     // (Office lo incapsula così) o un vecchio formato binario rinominato.
@@ -243,15 +244,75 @@ fn readZipEntry(bytes: []const u8, entries: []const ZipEntry, wanted: []const u8
     const comp = bytes[data_off .. data_off + e.comp_size];
 
     return switch (e.method) {
-        0 => allocator.dupe(u8, comp),
+        0 => blk: {
+            try budget.takeInflated(comp.len);
+            break :blk allocator.dupe(u8, comp);
+        },
         8 => inflateRaw(comp, e.uncomp_size, allocator),
         else => error.UnsupportedCompression,
     };
 }
 
+/// Quanto un documento può ancora costare in memoria. I tetti per singola voce
+/// (512 MiB) e per riga/colonna non bastano: 200 voci di central directory
+/// possono puntare allo stesso stream da 512 MiB, e una stringa condivisa da
+/// 1 MiB può essere copiata in ogni cella. Un budget per `decode`, scalato a ogni
+/// decompressione e a ogni cella; esaurito, il documento si tronca lì (come già
+/// fanno i tetti di righe, colonne e slide).
+const Budget = struct {
+    /// Byte decompressi dalle voci dello ZIP, in tutto.
+    inflated: usize = 0,
+    /// Celle create, e byte di testo copiati dentro le celle.
+    cells: usize = 0,
+    cell_bytes: usize = 0,
+    /// Una richiesta è stata rifiutata: da qui il documento è troncato, e non si
+    /// riprova a ogni riga (rifiutare una cella da 65 MiB alla volta, copiandola
+    /// prima, teneva occupato il decode per ore).
+    spent: bool = false,
+
+    const max_inflated: usize = 512 * 1024 * 1024;
+    /// 16 byte per cella vuota: 256 MiB. Un foglio vero da 100.000 righe per 50
+    /// colonne (5 milioni di celle) ci sta.
+    const max_cells: usize = 16 * 1024 * 1024;
+    const max_cell_bytes: usize = 256 * 1024 * 1024;
+
+    fn takeInflated(self: *Budget, n: usize) !void {
+        if (n > max_inflated - self.inflated) return error.DocumentTooLarge;
+        self.inflated += n;
+    }
+
+    /// false = budget finito: la cella non va creata e il foglio si ferma.
+    fn takeCell(self: *Budget, text_len: usize) bool {
+        if (!self.fits(text_len)) return false;
+        self.cells += 1;
+        self.cell_bytes += text_len;
+        return true;
+    }
+
+    /// Come `takeCell` ma senza prendere nulla: da chiamare PRIMA di copiare un
+    /// testo grande, così la copia rifiutata non si fa nemmeno.
+    fn fits(self: *Budget, text_len: usize) bool {
+        if (self.spent) return false;
+        if (self.cells >= max_cells or text_len > max_cell_bytes - self.cell_bytes) {
+            self.spent = true;
+            return false;
+        }
+        return true;
+    }
+
+    fn cellsExhausted(self: *const Budget) bool {
+        return self.spent;
+    }
+};
+
+/// Uno per thread: più decode possono girare insieme (miniature, prefetch), ma
+/// ognuno sta tutto sul suo thread. `decode` lo azzera all'ingresso.
+threadlocal var budget: Budget = .{};
+
 fn inflateRaw(comp: []const u8, uncomp_size: usize, allocator: std.mem.Allocator) ![]u8 {
     // Tetto di sicurezza contro dichiarazioni assurde nell'header ZIP
     if (uncomp_size > 512 * 1024 * 1024) return error.EntryTooLarge;
+    try budget.takeInflated(uncomp_size);
 
     var in: std.Io.Reader = .fixed(comp);
     var window: [std.compress.flate.max_window_len]u8 = undefined;
@@ -854,7 +915,7 @@ fn parseSheetRows(sheet_xml: []const u8, shared: []const []const u8, allocator: 
 
     var pos: usize = 0;
     while (ns.tag(sheet_xml, pos, "row")) |r_at| {
-        if (builder.rows.items.len >= max_sheet_rows) break;
+        if (builder.rows.items.len >= max_sheet_rows or budget.cellsExhausted()) break;
         const open_end = std.mem.indexOfScalarPos(u8, sheet_xml, r_at, '>') orelse break;
         if (sheet_xml[open_end - 1] == '/') {
             // riga vuota auto-chiusa
@@ -885,8 +946,10 @@ fn parseSheetRows(sheet_xml: []const u8, shared: []const []const u8, allocator: 
 
             // celle mancanti tra l'ultima e questa → vuote
             while (cells.items.len < @min(col, max_sheet_cols)) {
+                if (!budget.takeCell(0)) break;
                 cells.append(allocator, allocator.dupe(u8, "") catch break) catch break;
             }
+            if (budget.cellsExhausted()) break;
 
             var value: []const u8 = allocator.dupe(u8, "") catch break;
             if (!self_closing) {
@@ -903,6 +966,7 @@ fn parseSheetRows(sheet_xml: []const u8, shared: []const []const u8, allocator: 
                         if (std.fmt.parseInt(usize, raw, 10) catch null) |idx| {
                             if (idx < shared.len) {
                                 allocator.free(value);
+                                if (!budget.fits(shared[idx].len)) break;
                                 value = allocator.dupe(u8, shared[idx]) catch break;
                             }
                         }
@@ -926,6 +990,12 @@ fn parseSheetRows(sheet_xml: []const u8, shared: []const []const u8, allocator: 
                 cpos = c_open_end + 1;
             }
 
+            // Il budget conta la cella col suo testo: una stringa condivisa enorme
+            // ripetuta in ogni cella è l'amplificazione che deve fermare.
+            if (!budget.takeCell(value.len)) {
+                allocator.free(value);
+                break;
+            }
             cells.append(allocator, value) catch {
                 allocator.free(value);
                 break;
@@ -975,7 +1045,7 @@ fn decodeOds(bytes: []const u8, entries: []const ZipEntry, allocator: std.mem.Al
 
     var pos: usize = 0;
     while (findTag(table, pos, "table:table-row")) |r_at| {
-        if (builder.rows.items.len >= max_sheet_rows) break;
+        if (builder.rows.items.len >= max_sheet_rows or budget.cellsExhausted()) break;
         const open_end = std.mem.indexOfScalarPos(u8, table, r_at, '>') orelse break;
         if (table[open_end - 1] == '/') {
             pos = open_end + 1;
@@ -1007,6 +1077,7 @@ fn decodeOds(bytes: []const u8, entries: []const ZipEntry, allocator: std.mem.Al
 
             var r: usize = 0;
             while (r < repeat) : (r += 1) {
+                if (!budget.takeCell(cell.text.len)) break;
                 const dup = allocator.dupe(u8, cell.text) catch break;
                 cells.append(allocator, dup) catch {
                     allocator.free(dup);

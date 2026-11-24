@@ -429,7 +429,10 @@ fn searchWorker(state: *GuiAppState, query: []u8, gen: u32) void {
         const title = fields.next() orelse continue;
         const dur = fields.next() orelse "";
         const chan = fields.next() orelse "";
-        if (id.len == 0) continue;
+        // L'id arriva dallo stdout di yt-dlp e finisce nei percorsi della cache
+        // (`<id>.jpg`, `<id>.<lingua>.vtt`) e nel file della coda: solo la forma
+        // canonica, come per i link incollati. Un `../` qui scriverebbe fuori.
+        if (validVideoId(id) == null or id.len != 11) continue;
         const rid = state.gpa.dupe(u8, id) catch continue;
         const rtitle = state.gpa.dupe(u8, if (title.len > 0) title else "(senza titolo)") catch {
             state.gpa.free(rid);
@@ -799,6 +802,8 @@ fn queueIndex(yt: *YtState, id: []const u8) ?usize {
 /// Accoda una copia dei campi (la miniatura, se c'è, si copia: niente download).
 fn appendQueue(state: *GuiAppState, f: yt_queue.Fields, thumb: []const u8, tw: u32, th: u32) !void {
     const gpa = state.gpa;
+    // Anche gli id letti dal file della coda finiscono nei percorsi della cache.
+    if (validVideoId(f.id) == null or f.id.len != 11) return error.InvalidVideoId;
     var r: Result = .{ .id = try gpa.dupe(u8, f.id), .title = &.{}, .duration = &.{}, .channel = &.{} };
     errdefer freeResult(gpa, r);
     r.title = try gpa.dupe(u8, f.title);

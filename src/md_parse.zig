@@ -50,7 +50,8 @@ pub fn parse(arena: std.mem.Allocator, src: []const u8) ![]const Block {
     var lines: std.ArrayList([]const u8) = .empty;
     var it = std.mem.splitScalar(u8, src, '\n');
     while (it.next()) |l| try lines.append(arena, try expandTabs(arena, std.mem.trimEnd(u8, l, "\r")));
-    return parseBlocks(arena, lines.items, 0);
+    var doc: DocState = .{};
+    return parseBlocks(arena, lines.items, 0, &doc);
 }
 
 // --- Blocchi ---------------------------------------------------------------
@@ -191,6 +192,14 @@ fn listMarker(l: []const u8) ?Marker {
 }
 
 /// Una riga di tabella spezzata in celle (bordi `|` facoltativi, `\|` escluso).
+/// Tetti delle tabelle: oltre `max_table_cols` colonne non è una tabella (resta
+/// testo); oltre `max_table_cells` celle IN TUTTO IL DOCUMENTO la tabella si chiude
+/// lì e il resto prosegue come testo. Senza, 50.000 colonne per 100.000 righe da un
+/// carattere (400 KB di file) chiedevano decine di GB; e il tetto è del documento
+/// perché una riga vuota e una nuova intestazione bastano a ricominciare.
+const max_table_cols: usize = 256;
+const max_table_cells: usize = 256 * 1024;
+
 fn tableCells(arena: std.mem.Allocator, l: []const u8) ![]const []const u8 {
     var t = std.mem.trim(u8, l, " ");
     if (t.len > 0 and t[0] == '|') t = t[1..];
@@ -250,7 +259,13 @@ fn interruptsParagraph(l: []const u8) bool {
 /// ricorsione senza fondo (stack) su file costruiti apposta.
 const max_block_depth = 24;
 
-fn parseBlocks(arena: std.mem.Allocator, lines: []const []const u8, depth: usize) anyerror![]const Block {
+/// Ciò che si conta su tutto il documento, attraverso citazioni e liste annidate.
+const DocState = struct {
+    /// Celle di tabella già create (vedi `max_table_cells`).
+    table_cells: usize = 0,
+};
+
+fn parseBlocks(arena: std.mem.Allocator, lines: []const []const u8, depth: usize, doc: *DocState) anyerror![]const Block {
     const nest_ok = depth < max_block_depth;
     var blocks: std.ArrayList(Block) = .empty;
     var i: usize = 0;
@@ -309,24 +324,28 @@ fn parseBlocks(arena: std.mem.Allocator, lines: []const []const u8, depth: usize
                     try inner.append(arena, ql); // continuazione pigra del paragrafo
                 } else break;
             }
-            try blocks.append(arena, .{ .quote = try parseBlocks(arena, inner.items, depth + 1) });
+            try blocks.append(arena, .{ .quote = try parseBlocks(arena, inner.items, depth + 1, doc) });
             continue;
         }
         if (listMarker(l)) |m0| {
             if (nest_ok and m0.indent <= 3) {
-                i = try parseList(arena, lines, i, m0, &blocks, depth);
+                i = try parseList(arena, lines, i, m0, &blocks, depth, doc);
                 continue;
             }
         }
         if (std.mem.indexOfScalar(u8, l, '|') != null and i + 1 < lines.len) {
             if (try delimiterRow(arena, lines[i + 1])) |aligns| {
                 const head_cells = try tableCells(arena, l);
-                if (head_cells.len == aligns.len) {
+                if (head_cells.len == aligns.len and aligns.len <= max_table_cols) {
                     const header = try arena.alloc([]const Span, aligns.len);
                     for (header, head_cells) |*h, c| h.* = try parseInline(arena, c);
                     var rows: std.ArrayList([]const []const Span) = .empty;
                     i += 2;
                     while (i < lines.len and !isBlank(lines[i]) and !interruptsParagraph(lines[i])) : (i += 1) {
+                        // Ogni riga costa `aligns.len` celle anche se ne scrive una,
+                        // qui e (molto di più) nell'impaginazione.
+                        if (aligns.len > max_table_cells - doc.table_cells) break;
+                        doc.table_cells += aligns.len;
                         const cells = try tableCells(arena, lines[i]);
                         const row = try arena.alloc([]const Span, aligns.len);
                         for (row, 0..) |*r, k| r.* = if (k < cells.len) try parseInline(arena, cells[k]) else &.{};
@@ -373,7 +392,7 @@ fn parseBlocks(arena: std.mem.Allocator, lines: []const []const u8, depth: usize
 }
 
 /// Raccoglie una lista che parte alla riga `start`; restituisce la prima riga dopo.
-fn parseList(arena: std.mem.Allocator, lines: []const []const u8, start: usize, m0: Marker, out: *std.ArrayList(Block), depth: usize) !usize {
+fn parseList(arena: std.mem.Allocator, lines: []const []const u8, start: usize, m0: Marker, out: *std.ArrayList(Block), depth: usize, doc: *DocState) !usize {
     var items: std.ArrayList(Item) = .empty;
     var i = start;
     while (i < lines.len) {
@@ -383,14 +402,23 @@ fn parseList(arena: std.mem.Allocator, lines: []const []const u8, start: usize, 
         const first = lines[i];
         try body.append(arena, if (m.content <= first.len) first[m.content..] else "");
         i += 1;
+        // Fine della sequenza di righe vuote in corso, e se resta nell'elemento:
+        // si misura una volta per sequenza, non una per riga (un milione di righe
+        // vuote dopo `- a` erano 5·10^11 passi).
+        var blank_end: usize = 0;
+        var blank_kept = false;
         while (i < lines.len) : (i += 1) {
             const l = lines[i];
             if (isBlank(l)) {
                 // Una riga vuota resta nell'elemento se la successiva non vuota
                 // è indentata quanto il contenuto.
-                var j = i + 1;
-                while (j < lines.len and isBlank(lines[j])) j += 1;
-                if (j < lines.len and indentOf(lines[j]) >= m.content) {
+                if (i >= blank_end) {
+                    var j = i + 1;
+                    while (j < lines.len and isBlank(lines[j])) j += 1;
+                    blank_end = j;
+                    blank_kept = j < lines.len and indentOf(lines[j]) >= m.content;
+                }
+                if (blank_kept) {
                     try body.append(arena, "");
                     continue;
                 }
@@ -415,7 +443,7 @@ fn parseList(arena: std.mem.Allocator, lines: []const []const u8, start: usize, 
             if (b0[1] == ' ') checked = false else if (b0[1] == 'x' or b0[1] == 'X') checked = true;
             if (checked != null) body.items[0] = if (b0.len > 4) b0[4..] else "";
         }
-        try items.append(arena, .{ .blocks = try parseBlocks(arena, body.items, depth + 1), .checked = checked });
+        try items.append(arena, .{ .blocks = try parseBlocks(arena, body.items, depth + 1, doc), .checked = checked });
         // Elementi separati da righe vuote restano nella stessa lista.
         var j = i;
         while (j < lines.len and isBlank(lines[j])) j += 1;
@@ -752,7 +780,10 @@ fn inlineInto(b: *Builder, text: []const u8) anyerror!void {
             '<' => {
                 if (nextGt(b, text, i + 1)) |gt| {
                     const inner = text[i + 1 .. gt];
-                    if (std.mem.indexOfScalar(u8, inner, ' ') == null and (std.mem.indexOf(u8, inner, "://") != null or (std.mem.indexOfScalar(u8, inner, '@') != null and std.mem.indexOfScalar(u8, inner, '.') != null))) {
+                    // Un autolink non contiene spazi né `<`: fermarsi al primo dei due
+                    // tiene lineare `<<<…<>` (ogni `<` vede subito il successivo)
+                    // senza mettere un tetto alla lunghezza degli indirizzi veri.
+                    if (std.mem.indexOfAny(u8, inner, " <") == null and (std.mem.indexOf(u8, inner, "://") != null or (std.mem.indexOfScalar(u8, inner, '@') != null and std.mem.indexOfScalar(u8, inner, '.') != null))) {
                         try b.flush();
                         const saved = b.url;
                         b.url = if (std.mem.indexOfScalar(u8, inner, '@') != null and std.mem.indexOf(u8, inner, "://") == null) try std.fmt.allocPrint(b.arena, "mailto:{s}", .{inner}) else inner;
@@ -1012,4 +1043,107 @@ test "input ostili: niente panic, niente ricorsione senza fondo, tempo lineare" 
         if (std.mem.eql(u8, pat, "[")) for (0..20_000) |_| try deep.appendSlice(a, "](u)");
         _ = try parseInline(a, deep.items);
     }
+    // `<` a raffica con la `>` lontana: l'autolink non si cerca oltre il suo tetto.
+    deep.clearRetainingCapacity();
+    try deep.appendNTimes(a, '<', 300_000);
+    try deep.append(a, '>');
+    _ = try parseInline(a, deep.items);
+}
+
+test "liste: una lunga sequenza di righe vuote si misura una volta sola" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var src: std.ArrayList(u8) = .empty;
+    try src.appendSlice(a, "- a\n");
+    try src.appendNTimes(a, '\n', 300_000);
+    try src.appendSlice(a, "  b\n- c\n");
+    const blocks = try parse(a, src.items);
+    // Le righe vuote restano nell'elemento (la riga dopo è indentata): una lista
+    // sola, due elementi, e `b` è nel primo.
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expectEqual(@as(usize, 2), blocks[0].list.items.len);
+    // Sequenza vuota NON seguita da una riga indentata: la lista finisce lì.
+    src.clearRetainingCapacity();
+    try src.appendSlice(a, "- a\n");
+    try src.appendNTimes(a, '\n', 300_000);
+    try src.appendSlice(a, "b\n");
+    const two = try parse(a, src.items);
+    try std.testing.expectEqual(@as(usize, 2), two.len);
+    try std.testing.expect(two[0] == .list and two[1] == .paragraph);
+}
+
+test "tabelle: tetto a colonne e celle" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var src: std.ArrayList(u8) = .empty;
+    // Troppe colonne: non è una tabella, resta testo.
+    const wide = max_table_cols + 1;
+    for (0..wide) |_| try src.appendSlice(a, "a|");
+    try src.appendSlice(a, "a\n");
+    for (0..wide) |_| try src.appendSlice(a, "-|");
+    try src.appendSlice(a, "-\n|\n");
+    for (try parse(a, src.items)) |b| try std.testing.expect(b != .table);
+    // Al limite delle colonne, con righe da una cella sola: la tabella si chiude
+    // al tetto delle celle e le righe dopo non si perdono (diventano testo).
+    src.clearRetainingCapacity();
+    for (0..max_table_cols - 1) |_| try src.appendSlice(a, "a|");
+    try src.appendSlice(a, "a\n");
+    for (0..max_table_cols - 1) |_| try src.appendSlice(a, "-|");
+    try src.appendSlice(a, "-\n");
+    const n_rows = max_table_cells / max_table_cols + 50;
+    for (0..n_rows) |_| try src.appendSlice(a, "|x\n");
+    const blocks = try parse(a, src.items);
+    try std.testing.expect(blocks[0] == .table);
+    try std.testing.expectEqual(max_table_cells / max_table_cols, blocks[0].table.rows.len);
+    try std.testing.expect(blocks.len > 1);
+    // Il tetto è del documento: tante tabelle una dopo l'altra (anche dentro
+    // citazioni e liste) non ricominciano ciascuna da capo.
+    src.clearRetainingCapacity();
+    for (0..40) |k| {
+        const prefix: []const u8 = if (k % 3 == 1) "> " else if (k % 3 == 2) "- " else "";
+        const cont: []const u8 = if (k % 3 == 2) "  " else prefix;
+        try src.appendSlice(a, prefix);
+        for (0..max_table_cols - 1) |_| try src.appendSlice(a, "a|");
+        try src.appendSlice(a, "a\n");
+        try src.appendSlice(a, cont);
+        for (0..max_table_cols - 1) |_| try src.appendSlice(a, "-|");
+        try src.appendSlice(a, "-\n");
+        for (0..200) |_| {
+            try src.appendSlice(a, cont);
+            try src.appendSlice(a, "|x\n");
+        }
+        try src.appendSlice(a, "\n");
+    }
+    try std.testing.expect(countTableCells(try parse(a, src.items)) <= max_table_cells);
+}
+
+fn countTableCells(blocks: []const Block) usize {
+    var n: usize = 0;
+    for (blocks) |b| switch (b) {
+        .table => |t| n += t.rows.len * t.aligns.len,
+        .quote => |q| n += countTableCells(q),
+        .list => |l| for (l.items) |it| {
+            n += countTableCells(it.blocks);
+        },
+        else => {},
+    };
+    return n;
+}
+
+test "autolink: lungo quanto serve, ma senza `<` dentro" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var src: std.ArrayList(u8) = .empty;
+    try src.appendSlice(a, "vedi <https://example.org/?q=");
+    try src.appendNTimes(a, 'x', 3000);
+    try src.appendSlice(a, "> fine");
+    const spans = try parseInline(a, src.items);
+    var linked: usize = 0;
+    for (spans) |s| {
+        if (s.url.len > 0) linked += s.text.len;
+    }
+    try std.testing.expect(linked > 3000);
 }

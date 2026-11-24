@@ -20,7 +20,7 @@ invece di rincorrere i sintomi:
 | Passo | Cosa | Issue | Finito quando |
 |---|---|---|---|
 | 0 | Correzioni rapide: una o poche righe, effetto subito visibile | 11 issue (sotto) | **fatto** il 24 novembre 2026 |
-| 1 | [File ostili e robustezza dei decoder](https://github.com/postadelmaga/Zuer/milestone/2) + budget di memoria (A1) | #26–#36 | nessun file della raccolta ostile fa cadere il processo o supera il budget |
+| 1 | [File ostili e robustezza dei decoder](https://github.com/postadelmaga/Zuer/milestone/2) + budget di memoria (A1) | #26–#36 | **issue fatte** il 24 novembre 2026; di A1 resta il tetto generale (sotto) |
 | 2 | [Navigazione, apertura e GUI](https://github.com/postadelmaga/Zuer/milestone/3) + riferimento a documento (A2) + punto unico di installazione (A3) | #37–#50 | i frammenti passano da un solo parser; un solo commit dello stato |
 | 3 | [Media e YouTube](https://github.com/postadelmaga/Zuer/milestone/4) | #51–#57 | `scripts/video-check.sh` copre seek a fine file, TS con partenza ≠ 0, stream che cade |
 | 4 | [Cache, plugin e piattaforme](https://github.com/postadelmaga/Zuer/milestone/5) | #58–#64 | Android provato su un dispositivo; anteprima delle voci d'archivio su Windows |
@@ -49,6 +49,37 @@ Da sole giustificano una 0.4.1. Resta da aggiungere un caso per ciascuna a
 | #40 | un messaggio per ogni errore di installazione della mesh |
 | #38 + #39 | un solo formato per il frammento di pagina **e**, nello stesso cambio, non mettere in cache la pagina a bassa risoluzione (sistemare solo #38 rende #39 molto più frequente) |
 
+## Passo 1 — File ostili e robustezza dei decoder
+
+**Issue fatte il 24 novembre 2026** (#26, #29 e #31 erano già nel passo 0). Ogni
+difetto è stato riprodotto sul binario precedente e riprovato su quello nuovo; i file
+li scrive `scripts/hostile-gen.py` e li verifica `scripts/hostile-check.sh` (esito
+atteso entro 60 s e 4 GB, senza crash).
+
+| Issue | Correzione |
+|---|---|
+| #27 | a ImageMagick vanno solo i formati riconosciuti dai byte magici, con il coder scritto nell'argomento (`tiff:/percorso[0]`): un PostScript chiamato `.png` non arriva più a Ghostscript |
+| #28 | glTF: stride minimo, ogni nodo visitato una volta sola, tetto a vertici e facce della scena (il doppio di ciò che sta nel BIN, mai meno di 16 milioni di vertici), tetto ai pixel di una texture letto dall'header, budget sulle texture di tutto il modello, texture oltre 4096² decodificate una alla volta |
+| #30 | office: un budget per documento su byte decompressi, celle e testo delle celle; esaurito, il documento si tronca lì (senza avviso, come già i tetti di righe e slide) |
+| #32 | il testo dei plugin è validato dall'host una volta sola; stampa, layout e disegno del testo decodificano con `src/utf8_lossy.zig` (una sequenza tagliata a fine cella faceva cadere la GUI anche con un `.csv`) |
+| #33 | Markdown: la sequenza di righe vuote di una lista si misura una volta, tetto a colonne e a celle di tabella su tutto il documento, autolink senza `<` dentro |
+| #34 | coordinate e UV non finite a 0 in OBJ, STL e glTF; nella TUI e nel voxelizzatore la conversione a intero non può più fallire |
+| #35 | id dei video validati anche dalla ricerca e dalla coda; tetto di 512 MiB allo stdout catturato; `xdg-open` lanciato senza pipe |
+| #36 | il receiver accetta solo righe `panic <epoch>s @ 0x…: …` in ASCII e senza link, le pubblica in un blocco di codice che non si può chiudere, tiene dedup e contatori sotto lock e ha un tetto per indirizzo (per /64 con IPv6) |
+
+Cosa resta, e non è in nessuna issue aperta:
+
+- **il tetto generale di A1**: le correzioni qui sopra sono limiti mirati, uno per
+  formato. Un formato nuovo, o un caso non previsto, non ne è coperto;
+- **avviso di troncamento**: un foglio o un modello tagliato da un budget si apre
+  senza dire che manca qualcosa;
+- **`policy.xml` per ImageMagick**: i coder ammessi sono scelti da noi, ma dentro
+  ImageMagick valgono ancora i limiti della macchina;
+- **il receiver non distingue un panic vero da uno inventato** (vedi l'intestazione
+  di `server/zuer-crash.php`): serve un segreto nel client, da decidere con #17;
+- **non provato**: i RAW attraverso il coder `dng:` (nessun campione), il
+  `threadlocal` del plugin office su Windows e Android (compila, non eseguito).
+
 ## Fase A — Tre cambi che tolgono la causa
 
 **A1 · Budget di memoria per decode** (passo 1; chiude alla radice #28, #29, #30, #33).
@@ -58,10 +89,9 @@ L'host conosce già `max_size` (`decoder.zig:1891`) ma non lo passa ai plugin.
   dell'OOM killer.
 - Mettere `max_size` in `HostServices`, per i plugin che devono decidere prima di
   allocare (pixel di una texture, celle di un foglio).
-- Raccolta di file ostili in `tests/` + un passo di `edge-check.sh`: uno per issue
-  della milestone 1.
-- Il ripiego ImageMagick (#27) è a parte: è un processo esterno, serve la lista dei
-  formati ammessi e il coder esplicito.
+- La raccolta di file ostili c'è (`scripts/hostile-check.sh`): è il banco di prova
+  per questo cambio, i casi di #28 e #30 devono restare verdi anche col solo tetto
+  generale.
 
 **A2 · Riferimento a documento** (passo 2; chiude alla radice #37, #38, e parte di #42).
 Il primo pezzo c'è già: `src/fragment.zig` decide in un solo punto dove finisce il

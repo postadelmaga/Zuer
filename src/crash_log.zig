@@ -89,5 +89,11 @@ pub fn writeCrash(msg: []const u8, first_trace_addr: ?usize) void {
     const line = std.fmt.bufPrint(&line_buf, "panic {d}s @ 0x{x}: {s}\n", .{
         time(null), first_trace_addr orelse 0, msg,
     }) catch return;
+    // Una riga per panic, solo ASCII stampabile: è la forma che il receiver
+    // accetta (server/zuer-crash.php), e un messaggio con un a capo dentro la
+    // spezzerebbe.
+    for (line[0 .. line.len - 1]) |*ch| {
+        if (ch.* < 0x20) ch.* = ' ' else if (ch.* >= 0x7f) ch.* = '?';
+    }
     appendLine(path, line);
 }

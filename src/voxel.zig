@@ -19,21 +19,30 @@ pub const Grid = struct {
     }
 };
 
+/// Da float a indice in [0, max], qualunque cosa arrivi: NaN e negativi a 0, valori
+/// enormi e infiniti a `max`. I conti qui partono dai vertici e dalle UV del file:
+/// `@intFromFloat` su un valore non rappresentabile è un panic in ReleaseSafe.
+fn toIndex(v: f32, max: usize) usize {
+    if (!(v > 0)) return 0;
+    if (v >= @as(f32, @floatFromInt(max))) return max;
+    return @intFromFloat(v);
+}
+
 /// Colore albedo di un punto del triangolo: campiona la baseColor texture del
 /// submesh alle UV (repeat) se presente, altrimenti usa il fattore base_color.
 fn sampleAlbedo(s: SubMesh, u: f32, v: f32) [3]u8 {
     if (s.tex_width > 0 and s.tex_height > 0 and s.tex_pixels.len >= s.tex_width * s.tex_height * 4) {
         const uu = u - @floor(u);
         const vv = v - @floor(v);
-        const x = @min(s.tex_width - 1, @as(usize, @intFromFloat(uu * @as(f32, @floatFromInt(s.tex_width)))));
-        const y = @min(s.tex_height - 1, @as(usize, @intFromFloat(vv * @as(f32, @floatFromInt(s.tex_height)))));
+        const x = toIndex(uu * @as(f32, @floatFromInt(s.tex_width)), s.tex_width - 1);
+        const y = toIndex(vv * @as(f32, @floatFromInt(s.tex_height)), s.tex_height - 1);
         const idx = (y * s.tex_width + x) * 4;
         return .{ s.tex_pixels[idx], s.tex_pixels[idx + 1], s.tex_pixels[idx + 2] };
     }
     return .{
-        @intFromFloat(std.math.clamp(s.base_color[0], 0, 1) * 255),
-        @intFromFloat(std.math.clamp(s.base_color[1], 0, 1) * 255),
-        @intFromFloat(std.math.clamp(s.base_color[2], 0, 1) * 255),
+        @intCast(toIndex(s.base_color[0] * 255, 255)),
+        @intCast(toIndex(s.base_color[1] * 255, 255)),
+        @intCast(toIndex(s.base_color[2] * 255, 255)),
     };
 }
 
@@ -95,7 +104,7 @@ pub fn voxelize(gpa: std.mem.Allocator, m: MeshData, dim: u32) ?Grid {
             const t2: [2]f32 = if (has_uv) m.uvs[face.v3] else .{ 0, 0 };
 
             const maxe = @max(dist(p0, p1), @max(dist(p0, p2), dist(p1, p2)));
-            const n: usize = std.math.clamp(@as(usize, @intFromFloat(@ceil(maxe / min_vox))), 1, max_steps);
+            const n: usize = @max(1, toIndex(@ceil(maxe / min_vox), max_steps));
             const nf: f32 = @floatFromInt(n);
 
             var i: usize = 0;
@@ -108,9 +117,9 @@ pub fn voxelize(gpa: std.mem.Allocator, m: MeshData, dim: u32) ?Grid {
                     const px = a * p0[0] + b * p1[0] + c * p2[0];
                     const py = a * p0[1] + b * p1[1] + c * p2[1];
                     const pz = a * p0[2] + b * p1[2] + c * p2[2];
-                    const cx = @min(dim - 1, @as(u32, @intFromFloat(@max(0.0, (px - m.bbox_min[0]) / size[0] * dimf))));
-                    const cy = @min(dim - 1, @as(u32, @intFromFloat(@max(0.0, (py - m.bbox_min[1]) / size[1] * dimf))));
-                    const cz = @min(dim - 1, @as(u32, @intFromFloat(@max(0.0, (pz - m.bbox_min[2]) / size[2] * dimf))));
+                    const cx: u32 = @intCast(toIndex((px - m.bbox_min[0]) / size[0] * dimf, dim - 1));
+                    const cy: u32 = @intCast(toIndex((py - m.bbox_min[1]) / size[1] * dimf, dim - 1));
+                    const cz: u32 = @intCast(toIndex((pz - m.bbox_min[2]) / size[2] * dimf, dim - 1));
                     const u = a * t0[0] + b * t1[0] + c * t2[0];
                     const v = a * t0[1] + b * t1[1] + c * t2[1];
                     const col = sampleAlbedo(s, u, v);

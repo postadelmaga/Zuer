@@ -2,8 +2,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const dynlib = @import("dynlib.zig");
 const meshcache = @import("meshcache.zig");
-const detect = @import("detect.zig");
+/// Rilevamento del formato dai byte magici: pubblico, lo usano anche i plugin.
+pub const detect = @import("detect.zig");
 const pathfrag = @import("fragment.zig");
+const utf8_lossy = @import("utf8_lossy.zig");
 const scheduler = @import("scheduler.zig");
 
 pub const CsvData = struct {
@@ -1015,6 +1017,13 @@ pub const default_run_timeout_ms: u32 = 60_000;
 /// stampano quattro byte (pdfinfo, ffprobe) non pagano nulla di permanente.
 pub const default_capture_capacity: usize = 1024 * 1024;
 
+/// Tetto sullo stdout catturato da `runCapture`: oltre, il processo viene terminato
+/// e si ritorna `error.OutputTooLarge`. Senza, l'unico limite era il timeout: un
+/// archivio con milioni di voci (bsdtar), appunti enormi (wl-paste) o un tool
+/// impazzito potevano riempire la RAM in 60 secondi. Gli output leciti più grandi
+/// sono i pixel grezzi di un'immagine (4096² × 3 = 50 MB).
+pub const max_capture_bytes: usize = 512 * 1024 * 1024;
+
 /// Esegue un comando catturandone lo stdout, senza dipendere da `std.Io`
 /// (`std.process.run` si blocca dentro i plugin dinamici: l'`io` dell'host non
 /// attraversa il confine DynLib). L'implementazione è per-OS: `posix_spawn` +
@@ -1044,6 +1053,20 @@ pub fn runCaptureCancel(allocator: std.mem.Allocator, argv: []const []const u8, 
 /// altezza × 3 di un PPM) evita del tutto le riallocazioni intermedie.
 pub fn runCaptureCapacity(allocator: std.mem.Allocator, argv: []const []const u8, timeout_ms: u32, capacity_hint: usize) !RunResult {
     return sub.runCapture(allocator, argv, timeout_ms, capacity_hint, null);
+}
+
+/// Lancia un programma che deve solo PARTIRE (`xdg-open`): stdout e stderr su
+/// /dev/null, e si aspetta la sua uscita per al più `wait_ms`. true se è uscito
+/// con 0, o se alla scadenza sta ancora girando.
+///
+/// Non si usa `runCapture` perché cattura lo stdout con una pipe: se il programma
+/// lancia a sua volta un processo che resta vivo (il browser, quando `xdg-open`
+/// non ha un desktop a cui delegare), quello eredita la pipe e la fine del flusso
+/// non arriva mai. Si aspettava il timeout intero e l'apertura riuscita veniva
+/// presa per un fallimento. Solo POSIX: su Windows c'è ShellExecute.
+pub fn runDetached(allocator: std.mem.Allocator, argv: []const []const u8, wait_ms: u32) bool {
+    if (comptime builtin.os.tag == .windows) return false;
+    return sub.runDetached(allocator, argv, wait_ms) catch false;
 }
 
 /// Legge un intero file senza `std.Io` (open/read/close libc su Unix,
@@ -1185,6 +1208,11 @@ const sub = switch (builtin.os.tag) {
                     _ = WaitForSingleObject(pi.hProcess, 5000);
                     return error.Canceled;
                 };
+                if (out.items.len > max_capture_bytes) {
+                    _ = TerminateProcess(pi.hProcess, 1);
+                    _ = WaitForSingleObject(pi.hProcess, 5000);
+                    return error.OutputTooLarge;
+                }
                 var avail: u32 = 0;
                 if (PeekNamedPipe(h_read, null, 0, null, &avail, null) == 0) break; // pipe chiusa → EOF
                 if (avail > 0) {
@@ -1364,6 +1392,7 @@ const sub = switch (builtin.os.tag) {
                 for (argvZ[0..argv.len]) |a| if (a) |p| allocator.free(std.mem.span(p));
                 allocator.free(argvZ);
             }
+            @memset(argvZ[0..argv.len], null); // il defer libera solo ciò che è stato duplicato
             for (argv, 0..) |a, i| argvZ[i] = (try allocator.dupeSentinel(u8, a, 0)).ptr;
 
             var fds: [2]c_int = undefined;
@@ -1429,6 +1458,8 @@ const sub = switch (builtin.os.tag) {
             var pfd = [1]PollFd{.{ .fd = read_fd, .events = POLLIN, .revents = 0 }};
             while (true) {
                 if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
+                // L'errdefer sopra termina e reap-a il figlio.
+                if (out.items.len > max_capture_bytes) return error.OutputTooLarge;
                 const remaining = deadline - nowMs();
                 if (remaining <= 0) return error.Timeout;
                 // Con un flag d'annullamento il poll dura al più 50 ms.
@@ -1456,6 +1487,43 @@ const sub = switch (builtin.os.tag) {
             // WIFEXITED / WEXITSTATUS espansi a mano (glibc): byte basso = segnale.
             const code: u8 = if ((status & 0x7f) == 0) @intCast((status >> 8) & 0xff) else 1;
             return .{ .stdout = try out.toOwnedSlice(allocator), .exit_code = code };
+        }
+
+        const WNOHANG: c_int = 1;
+
+        fn runDetached(allocator: std.mem.Allocator, argv: []const []const u8, wait_ms: u32) !bool {
+            if (argv.len == 0) return error.EmptyArgv;
+            const argvZ = try allocator.allocSentinel(?[*:0]const u8, argv.len, null);
+            defer {
+                for (argvZ[0..argv.len]) |a| if (a) |p| allocator.free(std.mem.span(p));
+                allocator.free(argvZ);
+            }
+            @memset(argvZ[0..argv.len], null);
+            for (argv, 0..) |a, i| argvZ[i] = (try allocator.dupeSentinel(u8, a, 0)).ptr;
+
+            var fa: [256]u8 align(16) = undefined;
+            if (posix_spawn_file_actions_init(&fa) != 0) return error.SpawnInit;
+            defer _ = posix_spawn_file_actions_destroy(&fa);
+            _ = posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", 1, 0); // O_WRONLY
+            _ = posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", 1, 0);
+
+            var pid: c_int = 0;
+            const rc = posix_spawnp(&pid, argvZ[0].?, &fa, null, argvZ.ptr, environ);
+            if (rc != 0) return if (rc == 2) error.CommandNotFound else error.SpawnFailed;
+
+            const deadline: i64 = nowMs() + wait_ms;
+            var none: [1]PollFd = undefined;
+            while (true) {
+                var status: c_int = 0;
+                const w = waitpid(pid, &status, WNOHANG);
+                if (w == pid) return (status & 0x7f) == 0 and ((status >> 8) & 0xff) == 0;
+                if (w < 0) return false;
+                // Ancora vivo alla scadenza: sta tenendo in primo piano ciò che ha
+                // lanciato. Lo si lascia girare (resterà uno zombie fino alla nostra
+                // uscita, se finisce prima): ucciderlo chiuderebbe il browser.
+                if (nowMs() >= deadline) return true;
+                _ = poll(&none, 0, 20); // attesa di 20 ms senza `std.Io`
+            }
         }
 
         fn readFile(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
@@ -1623,6 +1691,13 @@ pub fn decode(path: []const u8, io: std.Io, allocator: std.mem.Allocator) Decode
 /// risolto non offre `zuer_decode_coarse` (l'host allora fa solo `decode`).
 pub fn decodeCoarse(path: []const u8, io: std.Io, allocator: std.mem.Allocator) ?Decoded {
     return decodeImpl(path, io, allocator, true);
+}
+
+/// Coordinata letta da un file: NaN e infiniti diventano 0. Un vertice non finito
+/// avvelena il bounding box (centro e scala NaN) e a valle arriva a conversioni a
+/// intero che su NaN vanno in panic (la proiezione della TUI).
+pub fn finiteOrZero(x: f32) f32 {
+    return if (std.math.isFinite(x)) x else 0;
 }
 
 /// Estensioni degli archivi "navigabili" dentro (anteprima delle voci). Deve
@@ -1877,6 +1952,20 @@ fn createDestFile(dest: std.Io.Dir, io: std.Io, name: []const u8) !std.Io.File {
     return dest.createFile(io, name, .{});
 }
 
+/// Sostituisce il testo di `d` con una copia sanificata se non è UTF-8 valido
+/// (byte non validi → U+FFFD). Senza memoria resta com'è: i consumatori che
+/// iterano per codepoint usano comunque `utf8_lossy`.
+fn ensureValidText(d: *Decoded, allocator: std.mem.Allocator) void {
+    const text: *[]const u8 = switch (d.*) {
+        .text => |*t| t,
+        .markdown => |*m| &m.content,
+        else => return,
+    };
+    const clean = (utf8_lossy.sanitized(allocator, text.*) catch return) orelse return;
+    allocator.free(text.*);
+    text.* = clean;
+}
+
 fn decodeImpl(path: []const u8, io: std.Io, allocator: std.mem.Allocator, coarse: bool) ?Decoded {
     const clean_path = pathfrag.strip(path);
     const entry_frag = pathfrag.of(path);
@@ -2086,6 +2175,12 @@ fn decodeImpl(path: []const u8, io: std.Io, allocator: std.mem.Allocator, coarse
         return .{ .err = msg };
     };
 
+    // Il testo dei plugin deve essere UTF-8 valido: chi lo consuma (la stampa in
+    // PDF, per dire) lo itera per codepoint, e office copia i byte dell'XML così
+    // come sono. Si controlla qui, una volta sola e per tutti: su un testo già
+    // valido (il plugin `text` sanifica da sé) è una sola passata senza copie.
+    ensureValidText(&decoded_data, allocator);
+
     // Foglio attivo di un workbook: `DecodedC` non lo trasporta (`toDecoded`
     // mette sempre 0), viaggia nel frammento `#sheet=N` del percorso. Il plugin
     // lo usa per decidere QUALE foglio decodificare per intero, l'host per
@@ -2118,3 +2213,21 @@ fn asciiEqualIgnoreCase(a: []const u8, b: []const u8) bool {
 }
 
 pub const getExtension = pathfrag.extension;
+
+test "runDetached: esito, attesa limitata, comando assente" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    try std.testing.expect(runDetached(a, &.{"true"}, 2000));
+    try std.testing.expect(!runDetached(a, &.{"false"}, 2000));
+    try std.testing.expect(!runDetached(a, &.{"zuer-comando-che-non-esiste"}, 2000));
+    // Il caso di xdg-open senza desktop: il lanciatore esce subito ma lascia un
+    // processo vivo che ha ereditato il suo stdout. Con una pipe si aspettava
+    // quel processo; qui conta solo il lanciatore.
+    const t0 = sub.nowMs();
+    try std.testing.expect(runDetached(a, &.{ "sh", "-c", "sleep 3 & exit 0" }, 2000));
+    try std.testing.expect(sub.nowMs() - t0 < 1500);
+    // Lanciatore che resta in primo piano oltre l'attesa: riuscito, e non lo si aspetta.
+    const t1 = sub.nowMs();
+    try std.testing.expect(runDetached(a, &.{ "sleep", "2" }, 200));
+    try std.testing.expect(sub.nowMs() - t1 < 1500);
+}

@@ -6,6 +6,7 @@
 //! resa combacia con il viewer di riferimento.
 
 const std = @import("std");
+const utf8_lossy = @import("utf8_lossy.zig");
 const decoder_mod = @import("decoder.zig");
 const glyph = @import("glyph.zig");
 const md_layout = @import("md_layout.zig");
@@ -378,7 +379,7 @@ pub fn paintDocViewport(dl: *DocLayout, buf: []u8, W: u32, H: u32, off_y: u32, x
             while (i < run.text.len) {
                 const seq = std.unicode.utf8ByteSequenceLength(run.text[i]) catch 1;
                 const end = @min(i + seq, run.text.len);
-                const cp: u32 = std.unicode.utf8Decode(run.text[i..end]) catch run.text[i];
+                const cp: u32 = utf8_lossy.decode(run.text[i..end]) orelse run.text[i];
                 const pen_x = pad_x + col * advance + dx;
                 col += 1;
                 i = end;
@@ -550,7 +551,7 @@ fn drawTextRgbaClip(raster: *glyph.Raster, buf: []u8, Wi: i32, cx0: i32, cx1: i3
     while (i < s.len) {
         const seq = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
         const end = @min(i + seq, s.len);
-        const cp: u32 = std.unicode.utf8Decode(s[i..end]) catch s[i];
+        const cp: u32 = utf8_lossy.decode(s[i..end]) orelse s[i];
         const g = try raster.getGlyph(style, cp);
         if (pen + g.advance > max_x) break;
         if (pen >= cx1) break;
@@ -693,7 +694,7 @@ pub fn buildTextMesh(gpa: std.mem.Allocator, decoded: *const decoder_mod.Decoded
             while (i < run.text.len) {
                 const seq = std.unicode.utf8ByteSequenceLength(run.text[i]) catch 1;
                 const end = @min(i + seq, run.text.len);
-                const cp: u32 = std.unicode.utf8Decode(run.text[i..end]) catch run.text[i];
+                const cp: u32 = utf8_lossy.decode(run.text[i..end]) orelse run.text[i];
                 _ = try raster.getGlyph(run.style, cp);
                 i = end;
             }
@@ -726,7 +727,7 @@ pub fn buildTextMesh(gpa: std.mem.Allocator, decoded: *const decoder_mod.Decoded
             while (i < run.text.len) {
                 const seq = std.unicode.utf8ByteSequenceLength(run.text[i]) catch 1;
                 const end = @min(i + seq, run.text.len);
-                const cp: u32 = std.unicode.utf8Decode(run.text[i..end]) catch run.text[i];
+                const cp: u32 = utf8_lossy.decode(run.text[i..end]) orelse run.text[i];
                 i = end;
                 const pen_x = pad_x + col * advance;
                 col += 1;
@@ -785,7 +786,7 @@ fn paint(gpa: std.mem.Allocator, raster: *glyph.Raster, rows: []const Row, name:
             while (i < run.text.len) {
                 const seq = std.unicode.utf8ByteSequenceLength(run.text[i]) catch 1;
                 const end = @min(i + seq, run.text.len);
-                const cp: u32 = std.unicode.utf8Decode(run.text[i..end]) catch run.text[i];
+                const cp: u32 = utf8_lossy.decode(run.text[i..end]) orelse run.text[i];
                 const pen_x = pad_x + col * advance;
                 try raster.drawCodepoint(pixels, w_i, h_i, pen_x, baseline, run.style, cp, run.color);
                 col += 1;
@@ -847,7 +848,7 @@ fn measureText(raster: *glyph.Raster, style: glyph.Style, s: []const u8) !i32 {
     while (i < s.len) {
         const seq = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
         const end = @min(i + seq, s.len);
-        const cp: u32 = std.unicode.utf8Decode(s[i..end]) catch s[i];
+        const cp: u32 = utf8_lossy.decode(s[i..end]) orelse s[i];
         const g = try raster.getGlyph(style, cp);
         wsum += g.advance;
         i = end;
@@ -863,7 +864,7 @@ fn drawText(raster: *glyph.Raster, pixels: []u8, w: i32, h: i32, x: i32, baselin
     while (i < s.len) {
         const seq = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
         const end = @min(i + seq, s.len);
-        const cp: u32 = std.unicode.utf8Decode(s[i..end]) catch s[i];
+        const cp: u32 = utf8_lossy.decode(s[i..end]) orelse s[i];
         const g = try raster.getGlyph(style, cp);
         if (pen + g.advance > max_x) break;
         try raster.drawCodepoint(pixels, w, h, pen, baseline, style, cp, color);
@@ -1990,8 +1991,8 @@ pub fn paintMdViewport(dl: *DocLayout, buf: []u8, W: u32, H: u32, off_y: u32, x_
                 const r = mdv.rasters[run.font];
                 const style = doc.fonts[run.font].style;
                 var pen: i32 = @intFromFloat(@round(run.x + dx));
-                var it = std.unicode.Utf8View.initUnchecked(run.text).iterator();
-                while (it.nextCodepoint()) |cp| {
+                var it = utf8_lossy.iterate(run.text);
+                while (it.next()) |cp| {
                     const g = try r.getGlyph(style, cp);
                     if (pen >= Wi) break;
                     if (pen + g.advance >= 0) try drawCodepointRgba(r, buf, Wi, Hi, pen, baseline, style, cp, run.color);

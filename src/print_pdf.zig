@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const decoder_mod = @import("decoder.zig");
+const utf8_lossy = @import("utf8_lossy.zig");
 const text_render = @import("text_render.zig");
 const pdf_writer = @import("pdf_writer.zig");
 const glyph = @import("glyph.zig");
@@ -147,8 +148,8 @@ fn buildText(gpa: std.mem.Allocator, w: *pdf_writer.Writer, content: *const deco
             const x = @as(f32, @floatFromInt(run.x)) * k;
             const y = (page_h - @as(f32, @floatFromInt(run.baseline))) * k;
             try cs.print(gpa, "1 0 0 1 {d:.3} {d:.3} Tm <", .{ x, y });
-            var it = (std.unicode.Utf8View.init(run.text) catch std.unicode.Utf8View.initUnchecked(run.text)).iterator();
-            while (it.nextCodepoint()) |cp| {
+            var it = utf8_lossy.iterate(run.text);
+            while (it.next()) |cp| {
                 const gid: u16 = @intCast(@max(0, stb.stbtt_FindGlyphIndex(&f.info, @intCast(cp))));
                 if (gid != 0) try f.used.put(gpa, gid, cp);
                 try cs.print(gpa, "{X:0>4}", .{gid});
@@ -346,8 +347,9 @@ fn buildMarkdown(gpa: std.mem.Allocator, w: *pdf_writer.Writer, src: []const u8,
             // Piè di pagina: nome e numero, allineati a destra.
             const label = try std.fmt.allocPrint(arena, "{s} · {d} / {d}", .{ name, p + 1, n_pages });
             var lw: f32 = 0;
-            var it = std.unicode.Utf8View.initUnchecked(label).iterator();
-            while (it.nextCodepoint()) |cp| lw += try PrintMeasurer.advance(&pm, footer_font, cp);
+            // `name` è il nome di un file: su Linux può non essere UTF-8 valido.
+            var it = utf8_lossy.iterate(label);
+            while (it.next()) |cp| lw += try PrintMeasurer.advance(&pm, footer_font, cp);
             try textRun(arena, &cs, &pm, &used, footer_font, text_render.md_paper_theme.muted, page_w - margin - lw, margin * 0.6, label);
             try cs.appendSlice(arena, "ET\n");
         }
@@ -412,8 +414,8 @@ fn textRun(arena: std.mem.Allocator, cs: *std.ArrayList(u8), pm: *PrintMeasurer,
     const fam = @backingInt(sp.family);
     const st = @backingInt(sp.style);
     try cs.print(arena, "/F{d}{d} {d:.3} Tf {d:.3} {d:.3} {d:.3} rg 1 0 0 1 {d:.3} {d:.3} Tm <", .{ fam, st, pm.emSize(f), rgbF(color.r), rgbF(color.g), rgbF(color.b), x, y });
-    var it = std.unicode.Utf8View.initUnchecked(text).iterator();
-    while (it.nextCodepoint()) |cp| {
+    var it = utf8_lossy.iterate(text);
+    while (it.next()) |cp| {
         const gid: u16 = @intCast(@max(0, stb.stbtt_FindGlyphIndex(&pm.faces[fam][st], @intCast(cp))));
         if (gid != 0) try used[fam][st].put(arena, gid, cp);
         if (gid == 0 and used[fam][st].count() == 0) try used[fam][st].put(arena, 0, 0xFFFD);

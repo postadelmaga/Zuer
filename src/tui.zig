@@ -589,10 +589,13 @@ pub const TuiSink = struct {
             const ry = cy * cos_p - rz * sin_p;
             const rz2 = cy * sin_p + rz * cos_p;
 
-            const px = @as(i32, @intFromFloat(@round(@as(f32, @floatFromInt(pw)) / 2.0 + rx * scale)));
-            const py = @as(i32, @intFromFloat(@round(@as(f32, @floatFromInt(ph)) / 2.0 - ry * scale)));
+            // Coordinate finite ma enormi (1e38) traboccano a infinito o NaN già
+            // nei conti qui sopra: `pixelCoord` non le lascia arrivare al cast.
+            const px = pixelCoord(@as(f32, @floatFromInt(pw)) / 2.0 + rx * scale);
+            const py = pixelCoord(@as(f32, @floatFromInt(ph)) / 2.0 - ry * scale);
 
-            proj_vertices[i] = .{ .x = px, .y = py, .z = rz2 };
+            // Anche la profondità: da lì si calcola il colore (un altro cast a intero).
+            proj_vertices[i] = .{ .x = px, .y = py, .z = if (std.math.isFinite(rz2)) std.math.clamp(rz2, -1e18, 1e18) else 0 };
         }
 
         var min_z = std.math.inf(f32);
@@ -825,3 +828,11 @@ pub const TuiSink = struct {
         }
     }
 };
+
+/// Coordinata di schermo da un float che può essere qualunque cosa (NaN, infinito,
+/// 1e38): fuori schermo, ma dentro l'i32 e senza linee da miliardi di passi.
+/// `@intFromFloat` su un valore non rappresentabile è un panic in ReleaseSafe.
+fn pixelCoord(v: f32) i32 {
+    if (!std.math.isFinite(v)) return -32768;
+    return @intFromFloat(@round(std.math.clamp(v, -32768.0, 32767.0)));
+}

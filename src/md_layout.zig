@@ -11,6 +11,7 @@
 const std = @import("std");
 const glyph = @import("glyph.zig");
 const md = @import("md_parse.zig");
+const utf8_lossy = @import("utf8_lossy.zig");
 const text_render = @import("text_render.zig");
 const Rgb = glyph.Rgb;
 
@@ -220,7 +221,7 @@ const Layouter = struct {
     fn textWidth(l: *Layouter, f: u16, s: []const u8) !f32 {
         var w: f32 = 0;
         var it = utf8(s);
-        while (it.nextCodepoint()) |cp| w += try l.m.advance(f, cp);
+        while (it.next()) |cp| w += try l.m.advance(f, cp);
         return w;
     }
 
@@ -420,7 +421,7 @@ const Layouter = struct {
             var k: usize = 0;
             var acc: f32 = 0;
             var it = utf8(a.text);
-            while (it.nextCodepoint()) |cp| {
+            while (it.next()) |cp| {
                 const cw = try l.m.advance(a.font, cp);
                 if (acc + cw > w and k > 0) break;
                 acc += cw;
@@ -492,7 +493,7 @@ const Layouter = struct {
         var cx = x;
         var sw: f32 = 0; // = textWidth(f, s): stessa somma, da 0, nello stesso ordine
         var it = utf8(s);
-        while (it.nextCodepoint()) |cp| {
+        while (it.next()) |cp| {
             const adv = try l.m.advance(f, cp);
             cx += adv;
             sw += adv;
@@ -509,7 +510,7 @@ const Layouter = struct {
                     // caratteri di `s`, come la farebbe `textWidth` dall'inizio.
                     var w = lw;
                     var it2 = utf8(s);
-                    while (it2.nextCodepoint()) |cp| w += try l.m.advance(f, cp);
+                    while (it2.next()) |cp| w += try l.m.advance(f, cp);
                     l.run_w = w;
                     l.run_w_ptr = @intFromPtr(last.text.ptr);
                     l.run_w_len = last.text.len;
@@ -618,7 +619,7 @@ const Layouter = struct {
                     var k: usize = 0;
                     var it = utf8(rest);
                     while (col + n < cols) {
-                        _ = it.nextCodepoint() orelse break;
+                        _ = it.next() orelse break;
                         n += 1;
                         k = it.i;
                     }
@@ -791,8 +792,10 @@ const Layouter = struct {
     }
 };
 
-fn utf8(s: []const u8) std.unicode.Utf8Iterator {
-    return .{ .bytes = s, .i = 0 };
+/// Il testo arriva dal file: l'iteratore di `std` su UTF-8 non valido arriva a
+/// `unreachable`, questo dà U+FFFD.
+fn utf8(s: []const u8) utf8_lossy.Iterator {
+    return utf8_lossy.iterate(s);
 }
 
 // ── Test ─────────────────────────────────────────────────────────────────────

@@ -51,9 +51,10 @@ fn decodeObj(bytes: []const u8, filename: []const u8, allocator: std.mem.Allocat
             const y_str = token_it.next() orelse continue;
             const z_str = token_it.next() orelse continue;
 
-            const x = std.fmt.parseFloat(f32, x_str) catch continue;
-            const y = std.fmt.parseFloat(f32, y_str) catch continue;
-            const z = std.fmt.parseFloat(f32, z_str) catch continue;
+            // `parseFloat` accetta "nan" e "inf": vedi `decoder.finiteOrZero`.
+            const x = decoder.finiteOrZero(std.fmt.parseFloat(f32, x_str) catch continue);
+            const y = decoder.finiteOrZero(std.fmt.parseFloat(f32, y_str) catch continue);
+            const z = decoder.finiteOrZero(std.fmt.parseFloat(f32, z_str) catch continue);
 
             vertices.append(allocator, .{ x, y, z }) catch continue;
 
@@ -160,9 +161,9 @@ fn decodeStl(bytes: []const u8, filename: []const u8, allocator: std.mem.Allocat
             var v: usize = 0;
             while (v < 3) : (v += 1) {
                 const off = 12 + v * 12;
-                const x: f32 = @bitCast(std.mem.readInt(u32, tri[off..][0..4], .little));
-                const y: f32 = @bitCast(std.mem.readInt(u32, tri[off + 4 ..][0..4], .little));
-                const z: f32 = @bitCast(std.mem.readInt(u32, tri[off + 8 ..][0..4], .little));
+                const x = decoder.finiteOrZero(@bitCast(std.mem.readInt(u32, tri[off..][0..4], .little)));
+                const y = decoder.finiteOrZero(@bitCast(std.mem.readInt(u32, tri[off + 4 ..][0..4], .little)));
+                const z = decoder.finiteOrZero(@bitCast(std.mem.readInt(u32, tri[off + 8 ..][0..4], .little)));
                 vertices.append(allocator, .{ x, y, z }) catch break;
                 bbox_min = .{ @min(bbox_min[0], x), @min(bbox_min[1], y), @min(bbox_min[2], z) };
                 bbox_max = .{ @max(bbox_max[0], x), @max(bbox_max[1], y), @max(bbox_max[2], z) };
@@ -182,9 +183,9 @@ fn decodeStl(bytes: []const u8, filename: []const u8, allocator: std.mem.Allocat
             if (std.mem.eql(u8, prefix, "facet")) {
                 num_normals += 1;
             } else if (std.mem.eql(u8, prefix, "vertex")) {
-                const x = std.fmt.parseFloat(f32, token_it.next() orelse continue) catch continue;
-                const y = std.fmt.parseFloat(f32, token_it.next() orelse continue) catch continue;
-                const z = std.fmt.parseFloat(f32, token_it.next() orelse continue) catch continue;
+                const x = decoder.finiteOrZero(std.fmt.parseFloat(f32, token_it.next() orelse continue) catch continue);
+                const y = decoder.finiteOrZero(std.fmt.parseFloat(f32, token_it.next() orelse continue) catch continue);
+                const z = decoder.finiteOrZero(std.fmt.parseFloat(f32, token_it.next() orelse continue) catch continue);
                 vertices.append(allocator, .{ x, y, z }) catch continue;
                 bbox_min = .{ @min(bbox_min[0], x), @min(bbox_min[1], y), @min(bbox_min[2], z) };
                 bbox_max = .{ @max(bbox_max[0], x), @max(bbox_max[1], y), @max(bbox_max[2], z) };
