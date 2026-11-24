@@ -1,21 +1,20 @@
-# CLAUDE.md — Guida all'uso dei Tool in questo Progetto Zig
+# CLAUDE.md — Zuer (Zig 0.17)
 
-Questo file guida Claude Code sulle regole del progetto e su come cooperare con la CLI `agy` (Gemini) tramite l'MCP server `agy-bridge`.
+## Regole
 
-## 1. Regole del Progetto (Zig)
-- **Compilazione**: Usa `zig build` per verificare che non ci siano errori di compilazione.
-- **Formattazione**: Usa `zig fmt <file>` prima di salvare le modifiche.
-- **Stile**: Segui le convenzioni standard di Zig (camelCase per le funzioni, PascalCase per i tipi, costanti maiuscole/snake_case).
-- **Gestione Errori**: Usa sempre la gestione esplicita degli errori con `try`, `catch`, o `if (err) |e|`.
+- **Compila**: `zig build` deve passare prima di chiudere una modifica (`zig build test` per i test).
+- **Formatta**: `zig fmt <file>` sui file toccati.
+- **Stile**: convenzioni standard di Zig — funzioni `camelCase`, tipi `PascalCase`, variabili `snake_case`, costanti `snake_case` o `MAIUSCOLE`.
+- **Errori**: sempre gestiti in modo esplicito (`try`, `catch`, `if (x) |v| … else |err| …`).
 
-## 2. Delegazione a `agy-bridge` (Gemini)
-Per risparmiare token e velocizzare lo sviluppo, delega i seguenti compiti a Gemini tramite gli strumenti MCP di `agy-bridge`:
+Com'è fatto il progetto: [docs/architettura.md](docs/architettura.md). Come si compila e si impacchetta: [docs/sviluppo.md](docs/sviluppo.md).
 
-### A. Documentazione e Ricerca Web (`web_lookup`)
-- Zig evolve rapidamente e la documentazione online è spesso frammentata. Se hai dubbi sulle API della Standard Library di Zig (es. `std.mem`, `std.fs`, `std.json`) o su librerie esterne, **usa `web_lookup`** per cercare informazioni aggiornate sul web anziché tentare di indovinarle. Nota: il print mode di agy (CLI 1.0.x) può bloccarsi sulle chiamate al tool di ricerca web — se `web_lookup` fallisce, usa la WebSearch integrata di Claude invece di riprovare.
+## Delega a Gemini (MCP `agy-bridge`)
 
-### B. Analisi di File Grandi (`analyze_files`)
-- Se devi ispezionare log di build o file sorgente superiori a 800 righe, **usa `analyze_files`**. Lascia che sia Gemini a riassumere i punti chiave per te, evitando di riempire la tua finestra di contesto.
+| Quando | Strumento |
+|---|---|
+| Dubbi su API di `std` o di librerie esterne (Zig cambia in fretta: non indovinare) | `web_lookup` |
+| Log di build o sorgenti oltre 800 righe da ispezionare | `analyze_files` |
+| Prima di chiudere patch complesse o che toccano l'allocazione di memoria | `adversarial_review` sul diff git |
 
-### C. Doppio Controllo del Codice (`adversarial_review`)
-- Prima di finalizzare patch complesse o modifiche all'allocazione di memoria (essenziale in Zig), richiedi una revisione indipendente a Gemini con `adversarial_review` sul diff git.
+Se `web_lookup` fallisce (il print mode di agy può bloccarsi sulla ricerca web) o l'MCP non è in sessione, usa WebSearch e i subagenti di Claude invece di riprovare.
