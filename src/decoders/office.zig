@@ -388,9 +388,27 @@ const RowsBuilder = struct {
         const final_rows = self.rows.toOwnedSlice(allocator) catch {
             for (headers) |h| allocator.free(h);
             allocator.free(headers);
+            self.deinitAll(allocator); // le altre righe sono ancora nella lista
             return .{ .err = allocator.dupe(u8, "Memoria esaurita.") catch "" };
         };
         return .{ .csv = .{ .headers = headers, .rows = final_rows } };
+    }
+
+    /// Aggiunge come riga le celle accumulate in `cells`, che resta vuota. Se manca
+    /// la memoria libera le celle e ritorna false: la riga non è entrata e non è
+    /// più di nessuno.
+    fn pushRow(self: *RowsBuilder, allocator: std.mem.Allocator, cells: *std.ArrayList([]const u8)) bool {
+        const row = cells.toOwnedSlice(allocator) catch {
+            for (cells.items) |c| allocator.free(c);
+            cells.clearAndFree(allocator);
+            return false;
+        };
+        self.rows.append(allocator, row) catch {
+            for (row) |c| allocator.free(c);
+            allocator.free(row);
+            return false;
+        };
+        return true;
     }
 };
 
@@ -927,10 +945,6 @@ fn parseSheetRows(sheet_xml: []const u8, shared: []const []const u8, allocator: 
         const inner = sheet_xml[open_end + 1 .. r_close[0]];
 
         var cells = std.ArrayList([]const u8).empty;
-        errdefer {
-            for (cells.items) |c| allocator.free(c);
-            cells.deinit(allocator);
-        }
 
         var cpos: usize = 0;
         while (ns.tag(inner, cpos, "c")) |c_at| {
@@ -1002,7 +1016,7 @@ fn parseSheetRows(sheet_xml: []const u8, shared: []const []const u8, allocator: 
             };
         }
 
-        builder.rows.append(allocator, cells.toOwnedSlice(allocator) catch break) catch break;
+        if (!builder.pushRow(allocator, &cells)) break;
         pos = r_close[1];
     }
 
@@ -1034,6 +1048,11 @@ fn decodeOds(bytes: []const u8, entries: []const ZipEntry, allocator: std.mem.Al
     };
     defer allocator.free(content);
 
+    return parseOdsTable(content, allocator);
+}
+
+/// La prima `<table:table>` di un `content.xml` già decompresso, in `.csv`.
+fn parseOdsTable(content: []const u8, allocator: std.mem.Allocator) Decoded {
     const table_at = findTag(content, 0, "table:table") orelse {
         return .{ .err = allocator.dupe(u8, "Nessuna tabella nel documento ODS.") catch "" };
     };
@@ -1055,15 +1074,14 @@ fn decodeOds(bytes: []const u8, entries: []const ZipEntry, allocator: std.mem.Al
         const inner = table[open_end + 1 .. r_end];
 
         var cells = std.ArrayList([]const u8).empty;
-        errdefer {
-            for (cells.items) |c| allocator.free(c);
-            cells.deinit(allocator);
-        }
 
         var cpos: usize = 0;
         while (nextOdsCell(inner, cpos, allocator)) |cell| {
             cpos = cell.next_pos;
-            if (cells.items.len >= max_sheet_cols) break;
+            if (cells.items.len >= max_sheet_cols) {
+                allocator.free(cell.text); // `nextOdsCell` l'ha allocato per noi
+                break;
+            }
 
             // LibreOffice riempie la riga fino a 16k colonne con un'unica
             // cella vuota ripetuta: le ripetizioni vuote oltre poche unità
@@ -1092,7 +1110,7 @@ fn decodeOds(bytes: []const u8, entries: []const ZipEntry, allocator: std.mem.Al
             allocator.free(cells.pop().?);
         }
 
-        builder.rows.append(allocator, cells.toOwnedSlice(allocator) catch break) catch break;
+        if (!builder.pushRow(allocator, &cells)) break;
         pos = r_end + "</table:table-row>".len;
     }
 
@@ -1182,17 +1200,11 @@ export fn zuer_decode(
         inline for (textutil_exts) |e| if (hasExtension(filename, e)) {
             allocator.free(content.toSlice()); // contratto: il plugin libera `content`
             const d = decodeTextutil(clean_path, allocator);
-            return d.toDecodedC(allocator) catch .{ .tag = .err, .payload = .{ .err = decoder.SliceC.fromSlice("") } };
+            return d.intoC(allocator);
         };
     }
     const decoded = decode(content.toSlice(), filename, want_sheet, allocator);
-    return decoded.toDecodedC(allocator) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "";
-        return .{
-            .tag = .err,
-            .payload = .{ .err = decoder.SliceC.fromSlice(msg) },
-        };
-    };
+    return decoded.intoC(allocator);
 }
 
 /// Su macOS anche i formati di `textutil`. Stessa lista del manifest in decoder.zig.
@@ -1269,4 +1281,29 @@ test "Ns senza prefisso: stesso risultato del percorso comptime" {
     try std.testing.expectEqualStrings("</row>", xml[c[0]..c[1]]);
     try std.testing.expectEqualStrings("3", ns.text(xml[r..c[0]], "v").?);
     try std.testing.expect(std.mem.startsWith(u8, xml[ns.tag(xml, c[1], "row").?..], "<row/>"));
+}
+
+test "ods: le celle oltre il tetto di colonne non restano allocate" {
+    const a = std.testing.allocator;
+    budget = .{};
+    var xml: std.Io.Writer.Allocating = .init(a);
+    defer xml.deinit();
+    try xml.writer.writeAll("<office:document-content><table:table table:name=\"F\">");
+    // Due righe più larghe del tetto, con testo in ogni cella: la cella che supera
+    // il tetto è già stata copiata quando ci si accorge che non entra.
+    for (0..2) |r| {
+        try xml.writer.writeAll("<table:table-row>");
+        for (0..max_sheet_cols + 40) |c| {
+            try xml.writer.print("<table:table-cell><text:p>r{d}c{d}</text:p></table:table-cell>", .{ r, c });
+        }
+        try xml.writer.writeAll("</table:table-row>");
+    }
+    try xml.writer.writeAll("</table:table></office:document-content>");
+
+    var d = parseOdsTable(xml.written(), a);
+    defer d.deinit(a);
+    try std.testing.expect(d == .csv);
+    try std.testing.expectEqual(@as(usize, max_sheet_cols), d.csv.headers.len);
+    try std.testing.expectEqual(@as(usize, 1), d.csv.rows.len);
+    try std.testing.expectEqualStrings("r1c1023", d.csv.rows[0][max_sheet_cols - 1]);
 }

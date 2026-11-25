@@ -80,10 +80,13 @@ pub const TuiSink = struct {
                 const state_parsed = msg.env().decode(AppState, ctx.gpa) catch continue;
                 defer state_parsed.deinit();
 
+                // Prima la copia, poi il vecchio: se la copia fallisce `current_state`
+                // resta valido per il `defer` che lo libera all'uscita.
+                const fresh = try state_parsed.value.clone(self.gpa);
                 if (current_state) |*cs| {
                     cs.deinit(self.gpa);
                 }
-                current_state = try state_parsed.value.clone(self.gpa);
+                current_state = fresh;
             }
 
             // Check if there is a new decoded file waiting

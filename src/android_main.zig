@@ -118,6 +118,11 @@ export fn android_main(app: *android.android_app) void {
     const io = threaded.io();
 
     const activity: *anyopaque = app.activity orelse return;
+    // Questo thread chiama JNI (fullscreen, permesso, intent) e muore al ritorno di
+    // `android_main`: va sganciato, o la ART aborta il processo all'uscita con Indietro.
+    // Dichiarato qui, prima della finestra e della UI: gira per ultimo, quando nessuno
+    // dei loro `deinit` può più chiamare Java.
+    defer jni.detach(activity);
 
     const win = zicro.window.Window.init(gpa, io, .{
         .title = "Zuer",

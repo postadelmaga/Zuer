@@ -172,13 +172,7 @@ fn zuer_decode(
     // il buffer è quindi scrivibile, ed è lecito de-escapare le celle quotate
     // compattandole al suo interno. Il `const` è solo del layout C `SliceC`.
     const decoded = decode(@constCast(content_slice), delimiter, allocator);
-    return decoded.toDecodedC(allocator) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "";
-        return .{
-            .tag = .err,
-            .payload = .{ .err = decoder.SliceC.fromSlice(msg) },
-        };
-    };
+    return decoded.intoC(allocator);
 }
 
 pub const extensions = "csv,tsv";

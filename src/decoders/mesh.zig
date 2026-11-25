@@ -19,6 +19,29 @@ fn hasExtension(filename: []const u8, comptime ext: []const u8) bool {
     return true;
 }
 
+/// Chiude un decode: le due liste diventano le slice di `mesh` (che arriva con nome e
+/// misure già a posto), e i conteggi si prendono dalle slice. Se manca la memoria per
+/// restringere una lista si libera tutto e si ritorna un errore: mai una mesh che
+/// dichiara N vertici con la slice vuota (chi la disegna indicizza senza controllare).
+fn finishMesh(allocator: std.mem.Allocator, vertices: *std.ArrayList([3]f32), faces: *std.ArrayList(Face), mesh: decoder.MeshData) Decoded {
+    var out = mesh;
+    out.vertices = vertices.toOwnedSlice(allocator) catch {
+        vertices.deinit(allocator);
+        faces.deinit(allocator);
+        allocator.free(out.name);
+        return .{ .err = "" };
+    };
+    out.faces = faces.toOwnedSlice(allocator) catch {
+        allocator.free(out.vertices);
+        faces.deinit(allocator);
+        allocator.free(out.name);
+        return .{ .err = "" };
+    };
+    out.num_vertices = out.vertices.len;
+    out.num_faces = out.faces.len;
+    return .{ .mesh = out };
+}
+
 fn decodeObj(bytes: []const u8, filename: []const u8, allocator: std.mem.Allocator) Decoded {
     defer allocator.free(bytes);
 
@@ -102,7 +125,8 @@ fn decodeObj(bytes: []const u8, filename: []const u8, allocator: std.mem.Allocat
         }
     }
 
-    const name = allocator.dupe(u8, filename) catch "unknown_mesh";
+    // Mai un letterale: `MeshData.deinit` libera il nome. Senza memoria resta vuoto.
+    const name = allocator.dupe(u8, filename) catch "";
 
     var center = [3]f32{ 0, 0, 0 };
     if (vertices.items.len > 0) {
@@ -114,17 +138,17 @@ fn decodeObj(bytes: []const u8, filename: []const u8, allocator: std.mem.Allocat
         bbox_max = .{ 0, 0, 0 };
     }
 
-    return .{ .mesh = .{
-        .num_vertices = vertices.items.len,
-        .num_faces = faces.items.len,
+    return finishMesh(allocator, &vertices, &faces, .{
+        .num_vertices = 0,
+        .num_faces = 0,
         .num_normals = num_normals,
         .bbox_min = bbox_min,
         .bbox_max = bbox_max,
         .center = center,
         .name = name,
-        .vertices = vertices.toOwnedSlice(allocator) catch &.{},
-        .faces = faces.toOwnedSlice(allocator) catch &.{},
-    } };
+        .vertices = &.{},
+        .faces = &.{},
+    });
 }
 
 /// STL binario e ASCII. La discriminazione è per coerenza di dimensione
@@ -205,7 +229,8 @@ fn decodeStl(bytes: []const u8, filename: []const u8, allocator: std.mem.Allocat
         }
     }
 
-    const name = allocator.dupe(u8, filename) catch "unknown_mesh";
+    // Mai un letterale: `MeshData.deinit` libera il nome. Senza memoria resta vuoto.
+    const name = allocator.dupe(u8, filename) catch "";
 
     var center = [3]f32{ 0, 0, 0 };
     if (vertices.items.len > 0) {
@@ -219,17 +244,17 @@ fn decodeStl(bytes: []const u8, filename: []const u8, allocator: std.mem.Allocat
         bbox_max = .{ 0, 0, 0 };
     }
 
-    return .{ .mesh = .{
-        .num_vertices = vertices.items.len,
-        .num_faces = faces.items.len,
+    return finishMesh(allocator, &vertices, &faces, .{
+        .num_vertices = 0,
+        .num_faces = 0,
         .num_normals = num_normals,
         .bbox_min = bbox_min,
         .bbox_max = bbox_max,
         .center = center,
         .name = name,
-        .vertices = vertices.toOwnedSlice(allocator) catch &.{},
-        .faces = faces.toOwnedSlice(allocator) catch &.{},
-    } };
+        .vertices = &.{},
+        .faces = &.{},
+    });
 }
 
 fn zuer_decode(
@@ -244,13 +269,7 @@ fn zuer_decode(
     const content_slice = content.toSlice();
     const filename = std.fs.path.basename(path_slice);
     const decoded = decode(content_slice, filename, allocator);
-    return decoded.toDecodedC(allocator) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "";
-        return .{
-            .tag = .err,
-            .payload = .{ .err = decoder.SliceC.fromSlice(msg) },
-        };
-    };
+    return decoded.intoC(allocator);
 }
 
 pub const extensions = "obj,stl";

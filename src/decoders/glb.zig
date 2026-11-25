@@ -961,14 +961,20 @@ fn decodeGltfScene(gltf: GltfStructure, bin_data: []const u8, filename: []const 
         (b.bbox_min[2] + b.bbox_max[2]) / 2.0,
     };
 
+    // Le liste diventano slice una alla volta, ognuna col suo `errdefer`: se una
+    // conversione fallisce, quelle già fatte non restano orfane. Una lista svuotata
+    // da `toOwnedSlice` o da `clearAndFree` resta valida per l'`errdefer` in cima
+    // (con `deinit` sarebbe stata liberata due volte).
+
     // Normali solo se ogni primitiva le aveva; altrimenti si scartano e il
     // loader le ricostruisce smooth sull'intera geometria fusa.
     var normals_slice: [][3]f32 = &.{};
     if (b.all_normals and b.normals.items.len == vcount) {
         normals_slice = try b.normals.toOwnedSlice(allocator);
     } else {
-        b.normals.deinit(allocator);
+        b.normals.clearAndFree(allocator);
     }
+    errdefer allocator.free(normals_slice);
 
     // Tangenti: solo se ogni primitiva le aveva; altrimenti si scartano e il
     // loader le ricostruisce da UV/posizioni (serve solo dove c'è normal map).
@@ -976,23 +982,34 @@ fn decodeGltfScene(gltf: GltfStructure, bin_data: []const u8, filename: []const 
     if (b.all_tangents and b.tangents.items.len == vcount) {
         tangents_slice = try b.tangents.toOwnedSlice(allocator);
     } else {
-        b.tangents.deinit(allocator);
+        b.tangents.clearAndFree(allocator);
     }
+    errdefer allocator.free(tangents_slice);
+
+    const num_faces = b.faces.items.len;
+    const vertices_slice = try b.vertices.toOwnedSlice(allocator);
+    errdefer allocator.free(vertices_slice);
+    const faces_slice = try b.faces.toOwnedSlice(allocator);
+    errdefer allocator.free(faces_slice);
+    const uvs_slice = try b.uvs.toOwnedSlice(allocator);
+    errdefer allocator.free(uvs_slice);
+    // Ultima: dopo questa niente fallisce più (le texture restano dei submesh).
+    const submeshes_slice = try b.submeshes.toOwnedSlice(allocator);
 
     return .{
         .num_vertices = vcount,
-        .num_faces = b.faces.items.len,
+        .num_faces = num_faces,
         .num_normals = normals_slice.len,
         .bbox_min = b.bbox_min,
         .bbox_max = b.bbox_max,
         .center = center,
         .name = name,
-        .vertices = try b.vertices.toOwnedSlice(allocator),
-        .faces = try b.faces.toOwnedSlice(allocator),
+        .vertices = vertices_slice,
+        .faces = faces_slice,
         .normals = normals_slice,
-        .uvs = try b.uvs.toOwnedSlice(allocator),
+        .uvs = uvs_slice,
         .tangents = tangents_slice,
-        .submeshes = try b.submeshes.toOwnedSlice(allocator),
+        .submeshes = submeshes_slice,
     };
 }
 
@@ -1031,13 +1048,7 @@ fn decodeExport(
     const allocator = @as(*const std.mem.Allocator, @ptrCast(@alignCast(allocator_ptr))).*;
     const filename = std.fs.path.basename(path.toSlice());
     const decoded = decode(content.toSlice(), filename, allocator, coarse);
-    return decoded.toDecodedC(allocator) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "";
-        return .{
-            .tag = .err,
-            .payload = .{ .err = decoder.SliceC.fromSlice(msg) },
-        };
-    };
+    return decoded.intoC(allocator);
 }
 
 fn zuer_decode(

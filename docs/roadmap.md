@@ -23,7 +23,7 @@ invece di rincorrere i sintomi:
 | 1 | [File ostili e robustezza dei decoder](https://github.com/postadelmaga/Zuer/milestone/2) + budget di memoria (A1) | #26–#36 | **issue fatte** il 24 novembre 2026; di A1 resta il tetto generale (sotto) |
 | 2 | [Navigazione, apertura e GUI](https://github.com/postadelmaga/Zuer/milestone/3) + riferimento a documento (A2) + punto unico di installazione (A3) | #37–#50 | **issue fatte** il 25 novembre 2026; restano A2 e A3 (sotto): i frammenti non passano ancora da un solo parser, lo stato non ha ancora un solo commit |
 | 3 | [Media e YouTube](https://github.com/postadelmaga/Zuer/milestone/4) | #51–#57 | **issue fatte** il 25 novembre 2026: `scripts/video-check.sh` copre seek a fine file e TS con partenza ≠ 0, `scripts/net-check.sh` lo stream che cade |
-| 4 | [Cache, plugin e piattaforme](https://github.com/postadelmaga/Zuer/milestone/5) | #58–#64 | Android provato su un dispositivo; anteprima delle voci d'archivio su Windows |
+| 4 | [Cache, plugin e piattaforme](https://github.com/postadelmaga/Zuer/milestone/5) | #58–#64 | **issue fatte** il 25 novembre 2026; le voci d'archivio su Windows sono provate sotto wine, Android resta da provare su un dispositivo (sotto) |
 | 5 | Riordino (fase B) | da aprire | vedi sotto |
 | 6 | Già in programma prima della revisione | #5, #13, #14, #16, #17, #20–#25 | — |
 
@@ -146,6 +146,62 @@ Cosa resta, e non è in nessuna issue aperta:
 - **le prove video in sway senza schermo** falliscono su CPU in pausa, clip troncati
   e passaggio hardware→software allo stesso modo sul commit precedente: lì non c'è
   GPU né scheda audio, vanno rifatte su una sessione vera.
+
+## Passo 4 — Cache, plugin e piattaforme
+
+**Issue fatte il 25 novembre 2026** (#58 era già nel passo 0). Windows è provato
+sotto wine con il binario compilato da Linux, non su una macchina vera; Android solo
+compilato.
+
+| Issue | Correzione | Prova (prima → dopo) |
+|---|---|---|
+| #59 | ogni funzione di `android_jni.zig` apre e chiude un frame di riferimenti locali (`enter`/`leave`), che ripulisce anche un'eccezione rimasta pendente; `android_main` stacca il thread prima di uscire | **solo compilato** (`zig build android`): nessun dispositivo collegato |
+| #60 | la cache d'estrazione sta in `src/extract_cache.zig`: cartella per sistema (`%LOCALAPPDATA%\zuer\extract` su Windows), tetto di 2 GiB con pulizia delle cartelle d'archivio usate meno di recente (l'uso si segna su un file `<chiave>.used`, la data delle voci non si tocca), temporanei con PID e sequenza e un nome che non dipende dalla voce, chiave calcolata su byte definiti; su Windows si rifiutano i nomi con `:`, i nomi di dispositivo e quelli che finiscono con punto o spazio | wine, `prova.zip#a.txt`: `NoHomeDir` → il testo della voce; `C:evil.txt`, `nul.txt`, `coda.txt.` rifiutati. Su Linux un PDF dentro un archivio riaperto quattro volte: una sola pagina in cache. La pulizia è provata da un test su una cartella temporanea, non su una cache vera da 2 GiB |
+| #61 | scrittura a metà o rename fallito: il temporaneo si toglie subito (mesh, texture, tile VT, pagine PDF, coda di YouTube) | scritture limitate a 100 KiB (`ulimit -f`), cache mesh: un `.tmp` da 100 KiB lasciato → nessuno. Texture, tile e pagine PDF: stessa correzione, solo letta sul codice |
+| #62 | un plugin assente, con ABI diversa o senza `zuer_decode` non si ritenta più nel processo (`failed_plugins`); uno che c'è ma non si carica si riprova tre volte; la memoria esaurita non conta come verdetto | plugin `csv` finto con ABI 0 e sei file: 13 tentativi di caricamento → 1 |
+| #63 | i convertitori fra `Decoded` e `DecodedC` sono tutto o niente: se manca la memoria l'ingresso resta intero e lo libera chi ha chiamato (`Decoded.intoC` nei plugin, `DecodedC.deinit` nell'host); niente più letterali in `.err` e nei nomi delle mesh; glb non libera due volte le liste e non perde le slice già prese; OBJ e STL non ritornano più una mesh con i conteggi pieni e le slice vuote; office libera la cella ODS oltre il tetto di colonne e le righe rimaste a metà; la TUI copia lo stato prima di liberare il vecchio | test con un allocatore che fallisce a ogni allocazione, una alla volta, su tutte le forme di `Decoded` (tolto un `errdefer`, il test segnala il leak); test sul foglio ODS più largo del tetto. glb, mesh e TUI: solo codice |
+| #64 | i plugin si caricano con `LoadLibraryExW` e la ricerca limitata a cartella del plugin, cartella dell'eseguibile e System32; così anche FFmpeg quando si carica a runtime (`player.zig`) | wine, una `avutil-61.dll` finta accanto al documento: caricata da lì → non caricata |
+
+Trovato strada facendo, e corretto:
+
+- **la coda di YouTube non si salvava mai** (dal 9 novembre): `saveQueue` creava una
+  cartella col nome del file, il rename finale falliva sempre e la coda restava nel
+  `.tmp`, mai riletto. Ora si crea solo la cartella che lo contiene, e al primo
+  caricamento la cartella sbagliata si toglie e il `.tmp` rimasto diventa il file
+  (provato nella sessione sway: la coda ricompare);
+- **`Dir.setTimestamps` su Windows va in panic** (non è implementata nella libreria
+  standard di Zig 0.17): la prima stesura la usava per segnare il riuso di una voce.
+  L'ha trovato la prova sotto wine; su Linux non si vedeva;
+- **segnare il riuso sulla voce stessa** ne cambiava la data, che a valle fa da chiave
+  alla cache delle pagine PDF e a quella delle mesh: ogni riapertura rifaceva tutto.
+  L'ha trovato la revisione indipendente; da qui il file `.used`.
+
+Cosa resta, e non è in nessuna issue aperta:
+
+- **Android su un dispositivo**: #58 e #59 sono corretti sul codice e compilano, ma
+  l'APK non è mai stato eseguito dopo queste modifiche;
+- **Windows vero**: wine carica le DLL con le stesse regole, ma l'installer e
+  `zuer-gui.exe` non sono stati provati su Windows;
+- **le altre cache non hanno ancora la cartella per sistema**: mesh, texture e pagine
+  PDF usano solo `HOME` e sono spente fuori da Linux. Si sistemano insieme, con il
+  `diskcache.zig` della fase B;
+- **un plugin installato a programma aperto** si vede al prossimo avvio: è il prezzo
+  di non ritentare;
+- **la pulizia può ancora buttare una cartella che qualcuno sta per aprire**: la
+  rimisura subito prima di cancellarla, ma fra le due c'è un istante. Chi perde vede
+  un errore di apertura e riapre;
+- **la prima estrazione di ogni processo cammina tutta la cache** prima di ritornare:
+  con una cache piena può ritardare la prima anteprima (non misurato);
+- **su Windows si rifiutano anche nomi legittimi**: qualunque voce con `:` nel nome e
+  `aux.c`, `con.h`, `nul.txt`. È la scelta prudente; l'alternativa è estrarle con un
+  nome diverso su disco;
+- **`texture_tante.glb` di `hostile-check.sh` è al limite**: in Debug prende 54 s dei
+  60 concessi, e con la macchina carica li supera (64 s; il commit precedente, nello
+  stesso momento, 70 s);
+- **overlay di YouTube in una finestra stretta**: il pulsante «Coda» si sovrappone ai
+  pulsanti di qualità (visto in prova, c'era già);
+- **Android, `pdfPage`**: se il PDF è cifrato il descrittore del file resta aperto
+  finché non passa il garbage collector (c'era già).
 
 ## Fase A — Tre cambi che tolgono la causa
 

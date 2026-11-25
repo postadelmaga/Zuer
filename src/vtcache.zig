@@ -47,6 +47,7 @@ extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
 extern "c" fn lseek(fd: c_int, off: i64, whence: c_int) i64;
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 extern "c" fn rename(old: [*:0]const u8, new: [*:0]const u8) c_int;
+extern "c" fn unlink(path: [*:0]const u8) c_int;
 extern "c" fn getpid() c_int;
 
 const O_RDONLY: c_int = 0;
@@ -84,6 +85,7 @@ const win = if (is_win) struct {
     extern "kernel32" fn GetEnvironmentVariableW(name: [*:0]const u16, buf: [*]u16, size: u32) callconv(.winapi) u32;
     extern "kernel32" fn MoveFileExW(from: [*:0]const u16, to: [*:0]const u16, flags: u32) callconv(.winapi) i32;
     extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+    extern "kernel32" fn DeleteFileW(name: [*:0]const u16) callconv(.winapi) i32;
 } else struct {};
 
 /// Sequenza per i nomi temporanei (unica per-processo; il PID li rende unici
@@ -91,7 +93,7 @@ const win = if (is_win) struct {
 var tmp_seq: std.atomic.Value(u64) = .init(0);
 
 /// PID del processo corrente, per nomi tmp che non collidono tra istanze.
-fn processId() u32 {
+pub fn processId() u32 {
     if (is_win) return win.GetCurrentProcessId();
     return @intCast(getpid());
 }
@@ -146,6 +148,17 @@ fn renamePath(from: [:0]const u8, to: [:0]const u8) bool {
         return win.MoveFileExW(f, t, win.MOVEFILE_REPLACE_EXISTING) != 0;
     } else {
         return rename(from.ptr, to.ptr) == 0;
+    }
+}
+
+/// Cancella un file (best-effort: assente o non cancellabile, si ignora).
+fn deletePath(path: [:0]const u8) void {
+    if (is_win) {
+        var wbuf: [520]u16 = undefined;
+        const w = toW(path, &wbuf) orelse return;
+        _ = win.DeleteFileW(w);
+    } else {
+        _ = unlink(path.ptr);
     }
 }
 
@@ -347,6 +360,11 @@ fn writeVtc(gpa: std.mem.Allocator, path: [:0]const u8, baked: *const vtex.Baked
     defer gpa.free(tmp);
 
     const handle = openWrite(tmp) orelse return error.CreateFailed;
+    // Scrittura a metà (disco pieno) o rename fallito: il temporaneo va tolto qui.
+    // Lo sweep lo vedrebbe solo fra un'ora, e l'eviction i `.tmp` non li conta.
+    // Dichiarato prima della chiusura: a ritroso gira dopo, a file già chiuso
+    // (su Windows un file aperto non si cancella).
+    errdefer deletePath(tmp);
     var closed = false;
     errdefer if (!closed) closeH(handle);
     try writeAll(handle, magic);

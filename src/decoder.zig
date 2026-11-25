@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const dynlib = @import("dynlib.zig");
 const meshcache = @import("meshcache.zig");
+const extract_cache = @import("extract_cache.zig");
 /// Rilevamento del formato dai byte magici: pubblico, lo usano anche i plugin.
 pub const detect = @import("detect.zig");
 const pathfrag = @import("fragment.zig");
@@ -103,17 +104,23 @@ pub const SubMesh = struct {
 /// a UN solo buffer (niente N copie da decine di MB) — ogni puntatore va
 /// quindi liberato una volta sola, alla sua prima occorrenza.
 pub fn freeSubmeshTextures(subs: []const SubMesh, allocator: std.mem.Allocator) void {
+    freeSubmeshTexturesOf(SubMesh, subs, allocator);
+}
+
+/// `T` è `SubMesh` o `SubMeshC`: stessi campi, e sia `[]const u8` sia `SliceC` hanno
+/// `ptr` e `len`.
+fn freeSubmeshTexturesOf(comptime T: type, subs: []const T, allocator: std.mem.Allocator) void {
     for (subs, 0..) |s, i| {
-        if (s.tex_pixels.len > 0 and firstTexOccurrence(subs, i, false, s.tex_pixels.ptr))
-            allocator.free(s.tex_pixels);
-        if (s.nrm_tex_pixels.len > 0 and firstTexOccurrence(subs, i, true, s.nrm_tex_pixels.ptr))
-            allocator.free(s.nrm_tex_pixels);
+        if (s.tex_pixels.len > 0 and firstTexOccurrence(T, subs, i, false, s.tex_pixels.ptr))
+            allocator.free(s.tex_pixels.ptr[0..s.tex_pixels.len]);
+        if (s.nrm_tex_pixels.len > 0 and firstTexOccurrence(T, subs, i, true, s.nrm_tex_pixels.ptr))
+            allocator.free(s.nrm_tex_pixels.ptr[0..s.nrm_tex_pixels.len]);
     }
 }
 
 /// True se (i, campo) è la prima occorrenza di `ptr` scandendo i submesh in
 /// ordine (per ciascuno: prima baseColor, poi normal map).
-fn firstTexOccurrence(subs: []const SubMesh, i: usize, is_nrm: bool, ptr: [*]const u8) bool {
+fn firstTexOccurrence(comptime T: type, subs: []const T, i: usize, is_nrm: bool, ptr: [*]const u8) bool {
     for (subs[0 .. i + 1], 0..) |p, j| {
         if (p.tex_pixels.len > 0 and p.tex_pixels.ptr == ptr)
             return j == i and !is_nrm;
@@ -201,6 +208,10 @@ pub const Decoded = union(enum) {
         }
     }
 
+    /// Converte nel layout C **consumando** `self`: i contenitori Zig si liberano, le
+    /// foglie (testi, celle, pixel) passano al `DecodedC`. Tutto o niente: se manca
+    /// la memoria non si è liberato né ceduto nulla e `self` resta intero, del
+    /// chiamante. I plugin usano `intoC`, che in quel caso lo libera.
     pub fn toDecodedC(self: Decoded, allocator: std.mem.Allocator) !DecodedC {
         switch (self) {
             .text => |t| {
@@ -210,21 +221,28 @@ pub const Decoded = union(enum) {
                 };
             },
             .csv => |c| {
+                const csv_c = try csvBuildC(allocator, c);
+                csvFreeContainers(allocator, c);
                 return .{
                     .tag = .csv,
-                    .payload = .{ .csv = try csvToC(allocator, c) },
+                    .payload = .{ .csv = csv_c },
                 };
             },
             .workbook => |w| {
                 const sheets_c = try allocator.alloc(SheetC, w.sheets.len);
+                errdefer allocator.free(sheets_c);
+                var built: usize = 0;
+                errdefer for (sheets_c[0..built]) |s| csvFreeContainersC(allocator, s.data);
                 for (w.sheets, 0..) |s, i| {
                     sheets_c[i] = .{
                         .name = SliceC.fromSlice(s.name),
-                        .data = try csvToC(allocator, s.data),
+                        .data = try csvBuildC(allocator, s.data),
                     };
+                    built = i + 1;
                 }
-                // Il container []Sheet si libera (le leaf name/celle restano vive,
-                // ora possedute da DecodedC via i SliceC).
+                // Da qui niente può più fallire: i contenitori Zig si liberano (le
+                // leaf name/celle restano vive, ora possedute da DecodedC via i SliceC).
+                for (w.sheets) |s| csvFreeContainers(allocator, s.data);
                 allocator.free(w.sheets);
                 return .{
                     .tag = .workbook,
@@ -309,27 +327,41 @@ pub const Decoded = union(enum) {
             },
         }
     }
+
+    /// `toDecodedC` per l'uscita di un plugin: non fallisce. Se manca la memoria per
+    /// i contenitori C, libera `self` e ritorna un `.err` (vuoto se non ce n'è
+    /// nemmeno per il messaggio).
+    pub fn intoC(self: Decoded, allocator: std.mem.Allocator) DecodedC {
+        return self.toDecodedC(allocator) catch |err| {
+            var owned = self;
+            owned.deinit(allocator);
+            const msg = std.fmt.allocPrint(allocator, "Errore di conversione del risultato: {s}", .{@errorName(err)}) catch "";
+            return .{ .tag = .err, .payload = .{ .err = SliceC.fromSlice(msg) } };
+        };
+    }
 };
 
-/// Converte una CsvData Zig nel layout C: alloca i container SliceC/RowC e
-/// libera i container Zig originali (le leaf — header/celle — restano vive,
-/// ora possedute dal chiamante via i SliceC).
-fn csvToC(allocator: std.mem.Allocator, c: CsvData) !CsvDataC {
+/// Costruisce il layout C di una `CsvData`: alloca i container SliceC/RowC e non
+/// tocca l'originale (lo libera il chiamante con `csvFreeContainers`, quando non può
+/// più fallire niente). Se manca la memoria non resta allocato nulla.
+fn csvBuildC(allocator: std.mem.Allocator, c: CsvData) !CsvDataC {
     const headers_c = try allocator.alloc(SliceC, c.headers.len);
+    errdefer allocator.free(headers_c);
     for (c.headers, 0..) |h, i| {
         headers_c[i] = SliceC.fromSlice(h);
     }
     const rows_c = try allocator.alloc(RowC, c.rows.len);
+    errdefer allocator.free(rows_c);
+    var built: usize = 0;
+    errdefer for (rows_c[0..built]) |r| allocator.free(r.ptr[0..r.len]);
     for (c.rows, 0..) |row, r_idx| {
         const row_cells_c = try allocator.alloc(SliceC, row.len);
         for (row, 0..) |cell, c_idx| {
             row_cells_c[c_idx] = SliceC.fromSlice(cell);
         }
         rows_c[r_idx] = .{ .ptr = row_cells_c.ptr, .len = row_cells_c.len };
+        built = r_idx + 1;
     }
-    allocator.free(c.headers);
-    for (c.rows) |row| allocator.free(row);
-    allocator.free(c.rows);
     return .{
         .headers = .{ .ptr = headers_c.ptr, .len = headers_c.len },
         .rows = .{ .ptr = rows_c.ptr, .len = rows_c.len },
@@ -339,26 +371,55 @@ fn csvToC(allocator: std.mem.Allocator, c: CsvData) !CsvDataC {
     };
 }
 
-/// Converte un CsvDataC nel layout Zig: ricostruisce i container slice e libera
-/// i container C (le leaf restano possedute dal CsvData risultante).
-fn csvFromC(allocator: std.mem.Allocator, c: CsvDataC) !CsvData {
+/// Libera i soli container di una `CsvData` (le leaf — header, celle, `backing` —
+/// restano vive: sono passate al layout C).
+fn csvFreeContainers(allocator: std.mem.Allocator, c: CsvData) void {
+    allocator.free(c.headers);
+    for (c.rows) |row| allocator.free(row);
+    allocator.free(c.rows);
+}
+
+/// Il contrario di `csvBuildC`: ricostruisce i container slice Zig senza toccare
+/// quelli C (li libera il chiamante con `csvFreeContainersC`).
+fn csvBuildZig(allocator: std.mem.Allocator, c: CsvDataC) !CsvData {
     const headers = try allocator.alloc([]const u8, c.headers.len);
+    errdefer allocator.free(headers);
     for (c.headers.ptr[0..c.headers.len], 0..) |h, i| {
         headers[i] = h.toSlice();
     }
-    allocator.free(c.headers.ptr[0..c.headers.len]);
-
     const rows = try allocator.alloc([][]const u8, c.rows.len);
+    errdefer allocator.free(rows);
+    var built: usize = 0;
+    errdefer for (rows[0..built]) |row| allocator.free(row);
     for (c.rows.ptr[0..c.rows.len], 0..) |row_c, r_idx| {
         const row = try allocator.alloc([]const u8, row_c.len);
         for (row_c.ptr[0..row_c.len], 0..) |cell, c_idx| {
             row[c_idx] = cell.toSlice();
         }
         rows[r_idx] = row;
-        allocator.free(row_c.ptr[0..row_c.len]);
+        built = r_idx + 1;
     }
-    allocator.free(c.rows.ptr[0..c.rows.len]);
     return .{ .headers = headers, .rows = rows, .backing = c.backing.toSlice() };
+}
+
+/// Libera i soli container di una `CsvDataC` (le leaf restano vive).
+fn csvFreeContainersC(allocator: std.mem.Allocator, c: CsvDataC) void {
+    allocator.free(c.headers.ptr[0..c.headers.len]);
+    for (c.rows.ptr[0..c.rows.len]) |row_c| allocator.free(row_c.ptr[0..row_c.len]);
+    allocator.free(c.rows.ptr[0..c.rows.len]);
+}
+
+/// Libera una `CsvDataC` per intero, leaf comprese: come `CsvData.deinit`, con gli
+/// stessi due modelli di ownership (celle a sé, oppure slice dentro `backing`).
+fn csvDeinitC(allocator: std.mem.Allocator, c: CsvDataC) void {
+    if (c.backing.len == 0) {
+        for (c.headers.ptr[0..c.headers.len]) |h| allocator.free(h.toSlice());
+        for (c.rows.ptr[0..c.rows.len]) |row_c| {
+            for (row_c.ptr[0..row_c.len]) |cell| allocator.free(cell.toSlice());
+        }
+    }
+    csvFreeContainersC(allocator, c);
+    if (c.backing.len > 0) allocator.free(c.backing.toSlice());
 }
 
 // C-compatible Layouts for Plugins
@@ -470,6 +531,9 @@ pub const DecodedC = extern struct {
         err: SliceC,
     },
 
+    /// Converte nel layout Zig **consumando** `self`: i contenitori C si liberano, le
+    /// foglie passano al `Decoded`. Tutto o niente, come `Decoded.toDecodedC`: se
+    /// manca la memoria `self` resta intero e va liberato con `deinit`.
     pub fn toDecoded(self: DecodedC, allocator: std.mem.Allocator) !Decoded {
         switch (self.tag) {
             .text => {
@@ -477,18 +541,26 @@ pub const DecodedC = extern struct {
                 return .{ .text = t.toSlice() };
             },
             .csv => {
-                return .{ .csv = try csvFromC(allocator, self.payload.csv) };
+                const csv = try csvBuildZig(allocator, self.payload.csv);
+                csvFreeContainersC(allocator, self.payload.csv);
+                return .{ .csv = csv };
             },
             .workbook => {
                 const w = self.payload.workbook;
-                const sheets = try allocator.alloc(Sheet, w.sheets.len);
-                for (w.sheets.ptr[0..w.sheets.len], 0..) |s_c, i| {
+                const sheets_c = w.sheets.ptr[0..w.sheets.len];
+                const sheets = try allocator.alloc(Sheet, sheets_c.len);
+                errdefer allocator.free(sheets);
+                var built: usize = 0;
+                errdefer for (sheets[0..built]) |s| csvFreeContainers(allocator, s.data);
+                for (sheets_c, 0..) |s_c, i| {
                     sheets[i] = .{
                         .name = s_c.name.toSlice(),
-                        .data = try csvFromC(allocator, s_c.data),
+                        .data = try csvBuildZig(allocator, s_c.data),
                     };
+                    built = i + 1;
                 }
-                allocator.free(w.sheets.ptr[0..w.sheets.len]);
+                for (sheets_c) |s_c| csvFreeContainersC(allocator, s_c.data);
+                allocator.free(sheets_c);
                 return .{ .workbook = .{ .sheets = sheets, .active = 0 } };
             },
             .markdown => {
@@ -560,6 +632,46 @@ pub const DecodedC = extern struct {
                 // Contratto v6: il messaggio è allocato con `allocator` (o vuoto),
                 // l'host ne prende possesso e lo libera in `Decoded.deinit`.
                 return .{ .err = self.payload.err.toSlice() };
+            },
+        }
+    }
+
+    /// Libera tutto ciò che un `DecodedC` possiede, senza convertirlo. Serve all'host
+    /// quando `toDecoded` fallisce: il risultato del plugin (anche centinaia di MB di
+    /// geometria e texture) altrimenti resterebbe allocato proprio quando la memoria
+    /// è finita. Speculare a `Decoded.deinit`.
+    pub fn deinit(self: DecodedC, allocator: std.mem.Allocator) void {
+        switch (self.tag) {
+            .text => allocator.free(self.payload.text.toSlice()),
+            .markdown => allocator.free(self.payload.markdown.content.toSlice()),
+            .err => allocator.free(self.payload.err.toSlice()),
+            .csv => csvDeinitC(allocator, self.payload.csv),
+            .workbook => {
+                const w = self.payload.workbook;
+                const sheets_c = w.sheets.ptr[0..w.sheets.len];
+                for (sheets_c) |s_c| {
+                    allocator.free(s_c.name.toSlice());
+                    csvDeinitC(allocator, s_c.data);
+                }
+                allocator.free(sheets_c);
+            },
+            .mesh => {
+                const m = self.payload.mesh;
+                allocator.free(m.name.toSlice());
+                allocator.free(m.vertices.ptr[0..m.vertices.len]);
+                allocator.free(m.faces.ptr[0..m.faces.len]);
+                if (m.normals.len > 0) allocator.free(m.normals.ptr[0..m.normals.len]);
+                if (m.uvs.len > 0) allocator.free(m.uvs.ptr[0..m.uvs.len]);
+                if (m.tangents.len > 0) allocator.free(m.tangents.ptr[0..m.tangents.len]);
+                if (m.tex_pixels.len > 0) allocator.free(m.tex_pixels.toSlice());
+                const subs = m.submeshes.ptr[0..m.submeshes.len];
+                freeSubmeshTexturesOf(SubMeshC, subs, allocator);
+                if (subs.len > 0) allocator.free(subs);
+            },
+            .image => {
+                const i = self.payload.image;
+                allocator.free(i.pixels.toSlice());
+                allocator.free(i.name.toSlice());
             },
         }
     }
@@ -692,6 +804,44 @@ const LoadedPlugin = struct {
 
 var plugin_registry: std.ArrayList(LoadedPlugin) = .empty;
 var third_party_scanned = false;
+/// Plugin che in questo processo non si sono potuti caricare. Senza questa memoria
+/// ogni decode rifaceva dlopen e dlclose su tre cartelle, sotto il mutex e con una
+/// riga su stderr — e dopo un cambio di Zig, con i plugin rimasti quelli vecchi, sono
+/// due decode per miniatura. Un plugin installato a programma aperto si vede al
+/// prossimo avvio. Sotto `plugin_cache_mutex`.
+var failed_plugins: std.ArrayList(FailedPlugin) = .empty;
+
+const FailedPlugin = struct {
+    name: []const u8,
+    tries: u8,
+
+    /// Un file che manca ovunque, o che si carica ma ha un'altra ABI, è un verdetto:
+    /// basta una volta. Un file che c'è ma non si carica no — dlopen riduce a «non
+    /// trovato» anche i descrittori finiti, la memoria esaurita, il file a metà di
+    /// un aggiornamento — quindi si riprova, ma non all'infinito: una dipendenza
+    /// che manca (libav non installata) fallisce uguale a ogni file multimediale.
+    const max_tries: u8 = 3;
+};
+
+fn pluginGivenUpLocked(name: []const u8) bool {
+    for (failed_plugins.items) |f| {
+        if (std.mem.eql(u8, f.name, name)) return f.tries >= FailedPlugin.max_tries;
+    }
+    return false;
+}
+
+fn notePluginFailureLocked(name: []const u8, definitive: bool, allocator: std.mem.Allocator) void {
+    for (failed_plugins.items) |*f| {
+        if (!std.mem.eql(u8, f.name, name)) continue;
+        f.tries = if (definitive) FailedPlugin.max_tries else f.tries +| 1;
+        return;
+    }
+    const owned = allocator.dupe(u8, name) catch return;
+    failed_plugins.append(allocator, .{
+        .name = owned,
+        .tries = if (definitive) FailedPlugin.max_tries else 1,
+    }) catch allocator.free(owned);
+}
 /// Mutex BLOCCANTE del registro plugin (`std.Io.Mutex`, lo stesso tipo usato
 /// ovunque nella GUI): sotto questo lock si fanno dlopen e readdir, cioè
 /// decine di millisecondi di I/O — lo spin-lock precedente
@@ -727,6 +877,9 @@ fn closePluginCacheLocked(allocator: std.mem.Allocator) void {
     }
     plugin_registry.deinit(allocator);
     plugin_registry = .empty;
+    for (failed_plugins.items) |f| allocator.free(f.name);
+    failed_plugins.deinit(allocator);
+    failed_plugins = .empty;
     third_party_scanned = false;
     if (exe_dir_cache) |d| {
         allocator.free(d);
@@ -833,21 +986,28 @@ fn scanPluginDir(dir_path: []const u8, io: std.Io, allocator: std.mem.Allocator,
         const type_name = entry.name[plugin_prefix.len .. entry.name.len - plugin_suffix.len];
         if (type_name.len == 0) continue;
         if (skip_manifested and manifestHasName(type_name)) continue;
-        registerPluginFile(dir_path, entry.name, type_name, io, allocator);
+        _ = registerPluginFile(dir_path, entry.name, type_name, io, allocator);
     }
 }
 
+/// Esito di `registerPluginFile`. `missing` (il file non c'è) e `rejected` (si carica,
+/// ma ha un'altra ABI o gli manca `zuer_decode`) sono verdetti: riprovare darebbe lo
+/// stesso risultato. `load_failed` (c'è ma non si carica) e `out_of_memory` no.
+const RegisterOutcome = enum { registered, missing, rejected, load_failed, out_of_memory };
+
 /// Apre e registra il singolo file plugin `file_name` (in `dir_path`) come
 /// `type_name`, con verifica ABI e lettura di `zuer_extensions`. No-op se un
-/// plugin con quel nome è già registrato o il file non è caricabile.
-fn registerPluginFile(dir_path: []const u8, file_name: []const u8, type_name: []const u8, io: std.Io, allocator: std.mem.Allocator) void {
-    _ = io;
-    if (findPluginByName(type_name) != null) return;
+/// plugin con quel nome è già registrato.
+fn registerPluginFile(dir_path: []const u8, file_name: []const u8, type_name: []const u8, io: std.Io, allocator: std.mem.Allocator) RegisterOutcome {
+    if (findPluginByName(type_name) != null) return .registered;
 
-    const full_path = std.fs.path.join(allocator, &.{ dir_path, file_name }) catch return;
+    const full_path = std.fs.path.join(allocator, &.{ dir_path, file_name }) catch return .out_of_memory;
     defer allocator.free(full_path);
 
-    var lib = dynlib.Lib.open(full_path) catch return;
+    var lib = dynlib.Lib.open(full_path) catch {
+        std.Io.Dir.cwd().access(io, full_path, .{}) catch return .missing;
+        return .load_failed;
+    };
     // Verifica dell'ABI: un plugin senza `zuer_abi_version` o compilato
     // contro un'altra versione del contratto C va scartato subito (il
     // layout di `DecodedC` potrebbe non combaciare → corruzione di memoria).
@@ -862,11 +1022,11 @@ fn registerPluginFile(dir_path: []const u8, file_name: []const u8, type_name: []
     };
     if (!abi_ok) {
         lib.close();
-        return;
+        return .rejected;
     }
     const decode_fn = lib.lookup(DecodeFn, "zuer_decode") orelse {
         lib.close();
-        return;
+        return .rejected;
     };
     const decode_coarse_fn = lib.lookup(DecodeFn, "zuer_decode_coarse");
     if (lib.lookup(SetHostFn, "zuer_set_host")) |set_host| set_host(&host_services);
@@ -893,10 +1053,10 @@ fn registerPluginFile(dir_path: []const u8, file_name: []const u8, type_name: []
         lib.close();
     };
 
-    const type_name_dup = allocator.dupe(u8, type_name) catch return;
+    const type_name_dup = allocator.dupe(u8, type_name) catch return .out_of_memory;
     const exts_owned = exts.toOwnedSlice(allocator) catch {
         allocator.free(type_name_dup);
-        return;
+        return .out_of_memory;
     };
     plugin_registry.append(allocator, .{
         .type_name = type_name_dup,
@@ -909,9 +1069,10 @@ fn registerPluginFile(dir_path: []const u8, file_name: []const u8, type_name: []
         allocator.free(type_name_dup);
         for (exts_owned) |e| allocator.free(e);
         allocator.free(exts_owned);
-        return;
+        return .out_of_memory;
     };
     registered = true;
+    return .registered;
 }
 
 /// Cartelle dei plugin, in ordine, tutte relative all'ESEGUIBILE: `<exe>/decoders`
@@ -943,19 +1104,29 @@ fn ensureThirdPartyLocked(io: std.Io, allocator: std.mem.Allocator) void {
 }
 
 /// Carica il SOLO plugin `name` cercandolo nelle stesse directory (e ordine)
-/// dello scan completo. No-op se già registrato o introvabile. Con
-/// `plugin_cache_mutex` acquisito.
+/// dello scan completo. No-op se già registrato, introvabile o dato per perso in
+/// questo processo (`failed_plugins`). Con `plugin_cache_mutex` acquisito.
 fn loadPluginByNameLocked(name: []const u8, io: std.Io, allocator: std.mem.Allocator) void {
     if (findPluginByName(name) != null) return;
+    if (pluginGivenUpLocked(name)) return;
     var fname_buf: [160]u8 = undefined;
     const fname = std.fmt.bufPrint(&fname_buf, "{s}{s}{s}", .{ plugin_prefix, name, plugin_suffix }) catch return;
     var buf: [3][]u8 = undefined;
     const dirs = pluginDirsLocked(io, allocator, &buf);
     defer for (dirs) |d| allocator.free(d);
+    // Senza le tre cartelle (o senza quella dell'eseguibile) è mancata la memoria,
+    // non il plugin: niente verdetto.
+    var conclusive = dirs.len == buf.len;
+    var definitive = true;
     for (dirs) |d| {
-        registerPluginFile(d, fname, name, io, allocator);
-        if (findPluginByName(name) != null) return;
+        switch (registerPluginFile(d, fname, name, io, allocator)) {
+            .registered => return,
+            .missing, .rejected => {},
+            .load_failed => definitive = false,
+            .out_of_memory => conclusive = false,
+        }
     }
+    if (conclusive) notePluginFailureLocked(name, definitive, allocator);
 }
 
 /// Risoluzione LAZY per estensione: carica solo il plugin che (da manifest)
@@ -1715,20 +1886,8 @@ fn isTarExt(ext: []const u8) bool {
         asciiEqualIgnoreCase(ext, "tar.gz");
 }
 
-/// Nome voce sicuro = relativo e senza componenti `..` (anti path-traversal /
-/// zip-slip quando lo si materializza su disco).
-fn isSafeEntryName(name: []const u8) bool {
-    if (name.len == 0) return false;
-    if (name[0] == '/' or name[0] == '\\') return false;
-    var it = std.mem.splitAny(u8, name, "/\\");
-    while (it.next()) |comp| {
-        if (std.mem.eql(u8, comp, "..")) return false;
-    }
-    return true;
-}
-
 /// Apre un file DENTRO un archivio (`archivio.zip#voce`): estrae la voce in
-/// `~/.cache/zuer/extract/<hash>/<voce>` in streaming (memoria costante, cap =
+/// `<cache>/extract/<chiave>/<voce>` in streaming (memoria costante, cap =
 /// `max_size` sulla dimensione decompressa) e la ridecodifica col decoder giusto
 /// per la sua estensione, riusando l'intera pipeline. Riaperture della stessa
 /// voce riusano il file già estratto (chiave = path archivio + mtime).
@@ -1745,42 +1904,45 @@ fn decodeArchiveEntry(base_path: []const u8, entry: []const u8, io: std.Io, allo
 
 /// Materializza la voce dell'archivio su disco e ne ritorna il path assoluto
 /// (posseduto dal chiamante). Riusa il file se già estratto per questa versione.
+/// Dove sta la cache, i nomi ammessi e la pulizia: extract_cache.zig.
 fn extractArchiveEntry(base_path: []const u8, entry: []const u8, io: std.Io, allocator: std.mem.Allocator, max_size: usize) ![]u8 {
-    if (!isSafeEntryName(entry)) return error.UnsafeEntryName;
+    if (!extract_cache.isSafeEntryName(entry)) return error.UnsafeEntryName;
 
-    const home_c = getenv("HOME") orelse return error.NoHomeDir;
-    const home = std.mem.span(home_c);
+    const root_path = extract_cache.rootDir(allocator) orelse return error.NoCacheDir;
+    defer allocator.free(root_path);
 
-    // Chiave cache = hash(path archivio + mtime): un archivio modificato cambia
-    // chiave → riestrazione automatica.
+    // Una cartella per versione dell'archivio: modificato → chiave nuova →
+    // riestrazione automatica.
     const bstat = try std.Io.Dir.cwd().statFile(io, base_path, .{});
-    var hasher = std.hash.Wyhash.init(0x2571ee7c0de);
-    hasher.update(base_path);
-    hasher.update(std.mem.asBytes(&bstat.mtime.nanoseconds));
-    const key = hasher.final();
+    var key_buf: [16]u8 = undefined;
+    const key_name = std.fmt.bufPrint(&key_buf, "{x}", .{extract_cache.key(base_path, bstat.mtime)}) catch unreachable;
 
-    const rel_dir = try std.fmt.allocPrint(allocator, ".cache/zuer/extract/{x}", .{key});
-    defer allocator.free(rel_dir);
-    const rel_out = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ rel_dir, entry });
+    const rel_out = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ key_name, entry });
     defer allocator.free(rel_out);
-    const out_abs = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, rel_out });
+    const out_abs = try std.fs.path.join(allocator, &.{ root_path, rel_out });
     errdefer allocator.free(out_abs);
 
-    var home_dir = try std.Io.Dir.openDirAbsolute(io, home, .{});
-    defer home_dir.close(io);
+    var root = try std.Io.Dir.cwd().openDir(io, root_path, .{});
+    defer root.close(io);
 
-    // Già estratta (stessa versione dell'archivio)? Riusa senza rileggere.
-    if (home_dir.statFile(io, rel_out, .{})) |_| return out_abs else |_| {}
+    // Già estratta (stessa versione dell'archivio)? Riusa senza rileggere, e
+    // segnala l'uso alla pulizia (sul file `.used`: la voce non si tocca).
+    if (root.statFile(io, rel_out, .{})) |st| {
+        if (st.kind == .file) {
+            extract_cache.markUsed(io, root, key_name);
+            return out_abs;
+        }
+    } else |_| {}
 
-    var dest = try home_dir.createDirPathOpen(io, rel_dir, .{});
+    var dest = try root.createDirPathOpen(io, key_name, .{});
     defer dest.close(io);
 
-    // Estrazione ATOMICA: scrivi su `<voce>.part` e rinomina solo a estrazione
-    // completa. La statFile di riuso sopra cerca `entry` (mai `.part`), quindi un
+    // Estrazione ATOMICA: scrivi su un `.part` e rinomina solo a estrazione
+    // completa. La statFile di riuso sopra cerca `entry` (mai il `.part`), quindi un
     // file parziale lasciato da un crash duro (SIGKILL, kernel panic) non viene mai
     // riusato come cache valida: alla riapertura manca `entry` → riestrazione.
-    const tmp_name = try std.fmt.allocPrint(allocator, "{s}.part", .{entry});
-    defer allocator.free(tmp_name);
+    var tmp_buf: [extract_cache.part_name_max]u8 = undefined;
+    const tmp_name = extract_cache.partName(&tmp_buf);
 
     const ext = getExtension(base_path);
     (if (isTarExt(ext))
@@ -1792,11 +1954,22 @@ fn extractArchiveEntry(base_path: []const u8, entry: []const u8, io: std.Io, all
         dest.deleteFile(io, tmp_name) catch {};
         return err;
     };
+    // Il `.part` sta in cima alla cartella dell'archivio: la sottocartella della
+    // voce (`dir/b.txt`) va creata prima di rinominarlo lì.
+    if (std.fs.path.dirname(entry)) |dn| dest.createDirPath(io, dn) catch {};
     dest.rename(tmp_name, dest, entry, io) catch |err| {
         dest.deleteFile(io, tmp_name) catch {};
+        // Un'altra estrazione della stessa voce è arrivata prima e qualcuno la sta
+        // già leggendo: su Windows un file aperto non si sostituisce. La voce c'è,
+        // ed è quella buona.
+        if (dest.statFile(io, entry, .{})) |st| {
+            if (st.kind == .file) return out_abs;
+        } else |_| {}
         return err;
     };
 
+    const written: u64 = if (dest.statFile(io, entry, .{})) |st| st.size else |_| 0;
+    extract_cache.noteExtracted(io, allocator, root_path, written);
     return out_abs;
 }
 
@@ -2139,7 +2312,8 @@ fn decodeImpl(path: []const u8, io: std.Io, allocator: std.mem.Allocator, coarse
     }
     const content: []u8 = if (to_read == 0) &.{} else if (to_read < file_size) blk: {
         // Prefisso parziale: si legge esattamente to_read byte dall'inizio.
-        const buf = allocator.alloc(u8, to_read) catch return .{ .err = "Out of memory" };
+        // Mai un letterale in `.err`: `Decoded.deinit` lo libera. Vuoto, come altrove.
+        const buf = allocator.alloc(u8, to_read) catch return .{ .err = "" };
         var file = std.Io.Dir.cwd().openFile(io, clean_path, .{}) catch |err| {
             allocator.free(buf);
             const msg = std.fmt.allocPrint(allocator, "Impossibile aprire o leggere il file: {s} ({s})", .{ clean_path, @errorName(err) }) catch "";
@@ -2171,6 +2345,9 @@ fn decodeImpl(path: []const u8, io: std.Io, allocator: std.mem.Allocator, coarse
 
     // Convert the C-compatible decoded structure back to Zig union
     var decoded_data = decoded_c.toDecoded(allocator) catch |err| {
+        // La conversione non ha toccato nulla: il risultato è ancora tutto del plugin
+        // e va liberato qui.
+        decoded_c.deinit(allocator);
         const msg = std.fmt.allocPrint(allocator, "Errore conversione struttura C in plugin: {s}", .{@errorName(err)}) catch "";
         return .{ .err = msg };
     };
@@ -2230,4 +2407,183 @@ test "runDetached: esito, attesa limitata, comando assente" {
     const t1 = sub.nowMs();
     try std.testing.expect(runDetached(a, &.{ "sleep", "2" }, 200));
     try std.testing.expect(sub.nowMs() - t1 < 1500);
+}
+
+/// Un `Decoded` di prova per ogni forma che attraversa l'ABI, con ogni foglia
+/// allocata da `a` come farebbe un plugin.
+fn sampleDecodedForTest(a: std.mem.Allocator, kind: u8) !Decoded {
+    const S = struct {
+        fn csv(al: std.mem.Allocator, cols: usize, rows: usize) !CsvData {
+            const headers = try al.alloc([]const u8, cols);
+            for (headers, 0..) |*h, i| h.* = try std.fmt.allocPrint(al, "col{d}", .{i});
+            const out = try al.alloc([][]const u8, rows);
+            for (out, 0..) |*row, r| {
+                row.* = try al.alloc([]const u8, cols);
+                for (row.*, 0..) |*cell, c| cell.* = try std.fmt.allocPrint(al, "r{d}c{d}", .{ r, c });
+            }
+            return .{ .headers = headers, .rows = out };
+        }
+    };
+    switch (kind) {
+        0 => return .{ .text = try a.dupe(u8, "testo") },
+        1 => return .{ .markdown = .{ .content = try a.dupe(u8, "# titolo") } },
+        2 => return .{ .err = try a.dupe(u8, "errore") },
+        3 => return .{ .csv = try S.csv(a, 3, 4) },
+        4 => {
+            // Celle zero-copy: slice dentro `backing`, mai liberate una per una.
+            const backing = try a.dupe(u8, "a,b\n1,2\n");
+            const headers = try a.alloc([]const u8, 2);
+            headers[0] = backing[0..1];
+            headers[1] = backing[2..3];
+            const rows = try a.alloc([][]const u8, 1);
+            rows[0] = try a.alloc([]const u8, 2);
+            rows[0][0] = backing[4..5];
+            rows[0][1] = backing[6..7];
+            return .{ .csv = .{ .headers = headers, .rows = rows, .backing = backing } };
+        },
+        5 => {
+            const sheets = try a.alloc(Sheet, 3);
+            for (sheets, 0..) |*s, i| s.* = .{
+                .name = try std.fmt.allocPrint(a, "Foglio {d}", .{i + 1}),
+                .data = try S.csv(a, 2, i + 1),
+            };
+            return .{ .workbook = .{ .sheets = sheets } };
+        },
+        6 => {
+            // Due submesh sullo stesso atlas (un solo buffer) più una normal map.
+            const atlas = try a.alloc(u8, 16);
+            const nrm = try a.alloc(u8, 16);
+            const subs = try a.alloc(SubMesh, 2);
+            subs[0] = .{ .first_index = 0, .index_count = 3, .tex_width = 2, .tex_height = 2, .tex_pixels = atlas };
+            subs[1] = .{ .first_index = 3, .index_count = 3, .tex_width = 2, .tex_height = 2, .tex_pixels = atlas, .nrm_tex_width = 2, .nrm_tex_height = 2, .nrm_tex_pixels = nrm };
+            const vertices = try a.alloc([3]f32, 4);
+            @memset(vertices, .{ 1, 2, 3 });
+            const faces = try a.alloc(Face, 2);
+            @memset(faces, .{ .v1 = 0, .v2 = 1, .v3 = 2 });
+            const uvs = try a.alloc([2]f32, 4);
+            @memset(uvs, .{ 0, 1 });
+            return .{ .mesh = .{
+                .num_vertices = 4,
+                .num_faces = 2,
+                .num_normals = 0,
+                .bbox_min = .{ 0, 0, 0 },
+                .bbox_max = .{ 1, 1, 1 },
+                .center = .{ 0.5, 0.5, 0.5 },
+                .name = try a.dupe(u8, "modello.glb"),
+                .vertices = vertices,
+                .faces = faces,
+                .uvs = uvs,
+                .tex_width = 1,
+                .tex_height = 1,
+                .tex_pixels = try a.alloc(u8, 4),
+                .submeshes = subs,
+            } };
+        },
+        7 => {
+            // OBJ/STL: nessun submesh, nessun attributo opzionale.
+            const vertices = try a.alloc([3]f32, 3);
+            @memset(vertices, .{ 0, 0, 0 });
+            const faces = try a.alloc(Face, 1);
+            faces[0] = .{ .v1 = 0, .v2 = 1, .v3 = 2 };
+            return .{ .mesh = .{
+                .num_vertices = 3,
+                .num_faces = 1,
+                .num_normals = 0,
+                .bbox_min = .{ 0, 0, 0 },
+                .bbox_max = .{ 0, 0, 0 },
+                .center = .{ 0, 0, 0 },
+                .name = try a.dupe(u8, "cubo.obj"),
+                .vertices = vertices,
+                .faces = faces,
+            } };
+        },
+        else => return .{ .image = .{
+            .width = 2,
+            .height = 1,
+            .pixels = try a.alloc(u8, 6),
+            .name = try a.dupe(u8, "foto.png"),
+            .total_pages = 7,
+        } },
+    }
+}
+
+test "convertitori ABI: andata e ritorno senza perdere nulla" {
+    const a = std.testing.allocator;
+    var kind: u8 = 0;
+    while (kind <= 8) : (kind += 1) {
+        const d = try sampleDecodedForTest(a, kind);
+        const c = try d.toDecodedC(a);
+        var back = try c.toDecoded(a);
+        defer back.deinit(a);
+        try std.testing.expectEqual(std.meta.activeTag(d), std.meta.activeTag(back));
+        switch (back) {
+            .csv => |t| {
+                if (kind == 3) {
+                    try std.testing.expectEqual(@as(usize, 4), t.rows.len);
+                    try std.testing.expectEqualStrings("col2", t.headers[2]);
+                    try std.testing.expectEqualStrings("r3c1", t.rows[3][1]);
+                } else {
+                    try std.testing.expect(t.backing.len > 0);
+                    try std.testing.expectEqualStrings("2", t.rows[0][1]);
+                }
+            },
+            .workbook => |w| {
+                try std.testing.expectEqual(@as(usize, 3), w.sheets.len);
+                try std.testing.expectEqualStrings("Foglio 3", w.sheets[2].name);
+                try std.testing.expectEqualStrings("r2c1", w.sheets[2].data.rows[2][1]);
+            },
+            .mesh => |m| if (kind == 6) {
+                try std.testing.expectEqual(@as(usize, 2), m.submeshes.len);
+                try std.testing.expectEqual(m.submeshes[0].tex_pixels.ptr, m.submeshes[1].tex_pixels.ptr);
+                try std.testing.expectEqual(@as(usize, 16), m.submeshes[1].nrm_tex_pixels.len);
+            } else try std.testing.expectEqual(@as(usize, 0), m.submeshes.len),
+            .image => |i| try std.testing.expectEqual(@as(u32, 7), i.total_pages),
+            else => {},
+        }
+    }
+}
+
+test "convertitori ABI: a memoria esaurita niente leak e niente doppie liberazioni" {
+    // Il campione nasce dall'allocatore dei test (che non fallisce e conta i leak);
+    // la conversione passa da uno che fallisce all'allocazione numero `fail_index`,
+    // provate tutte fino alla prima corsa che arriva in fondo. A ogni fallimento
+    // l'ingresso deve essere ancora intero: lo libera chi ha chiamato, come fanno
+    // `intoC` nei plugin e `decodeImpl` nell'host.
+    const base = std.testing.allocator;
+    var kind: u8 = 0;
+    while (kind <= 8) : (kind += 1) {
+        var failures: usize = 0;
+        var fail_index: usize = 0;
+        while (true) : (fail_index += 1) {
+            var d = try sampleDecodedForTest(base, kind);
+            var failing = std.testing.FailingAllocator.init(base, .{ .fail_index = fail_index });
+            const a = failing.allocator();
+            const c = d.toDecodedC(a) catch {
+                d.deinit(a);
+                failures += 1;
+                continue;
+            };
+            var back = c.toDecoded(a) catch {
+                c.deinit(a);
+                failures += 1;
+                continue;
+            };
+            back.deinit(a);
+            break;
+        }
+        // Tabelle e mesh con submesh allocano contenitori: lì almeno un fallimento
+        // va provato davvero (una mesh senza submesh non alloca nulla).
+        if (kind >= 3 and kind <= 6) try std.testing.expect(failures > 0);
+    }
+}
+
+test "intoC: senza memoria libera il risultato e ritorna un errore" {
+    const base = std.testing.allocator;
+    const d = try sampleDecodedForTest(base, 5);
+    var failing = std.testing.FailingAllocator.init(base, .{ .fail_index = 0 });
+    const c = d.intoC(failing.allocator());
+    defer c.deinit(base);
+    try std.testing.expectEqual(DecodedTag.err, c.tag);
+    // Nemmeno il messaggio ha trovato memoria: vuoto, mai un letterale.
+    try std.testing.expectEqual(@as(usize, 0), c.payload.err.len);
 }

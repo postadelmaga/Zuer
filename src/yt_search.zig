@@ -895,6 +895,7 @@ pub fn ensureQueueLoaded(state: *GuiAppState) void {
     yt.queue_loaded = true;
     const path = queuePath(state) orelse return;
     defer state.gpa.free(path);
+    recoverQueueFile(state, path);
     const bytes = std.Io.Dir.cwd().readFileAlloc(state.io, path, state.gpa, .limited(1 << 20)) catch return;
     defer state.gpa.free(bytes);
     var it = std.mem.splitScalar(u8, bytes, '\n');
@@ -904,6 +905,20 @@ pub fn ensureQueueLoaded(state: *GuiAppState) void {
         appendQueue(state, f, &.{}, 0, 0) catch break;
     }
     startQueueThumbs(state);
+}
+
+/// Rimedia a un difetto rimasto fino al 25 novembre 2026: `saveQueue` creava una
+/// CARTELLA col nome del file della coda, quindi il rename finale falliva sempre e
+/// la coda restava nel solo `.tmp`, mai riletta. Se la cartella c'è (vuota) si toglie,
+/// e il `.tmp` rimasto diventa il file.
+fn recoverQueueFile(state: *GuiAppState, path: []const u8) void {
+    const cwd = std.Io.Dir.cwd();
+    const st = cwd.statFile(state.io, path, .{}) catch return;
+    if (st.kind != .directory) return;
+    cwd.deleteDir(state.io, path) catch return;
+    const tmp = std.fmt.allocPrint(state.gpa, "{s}.tmp", .{path}) catch return;
+    defer state.gpa.free(tmp);
+    cwd.rename(tmp, cwd, path, state.io) catch {};
 }
 
 /// Riscrive il file della coda (su un temporaneo, poi rinominato: un'uscita a
@@ -918,12 +933,23 @@ fn saveQueue(state: *GuiAppState) void {
     for (state.shared.yt.queue.items) |r| {
         yt_queue.writeLine(w, .{ .id = r.id, .title = r.title, .duration = r.duration, .channel = r.channel }) catch return;
     }
-    vtcache.makeDirs(path);
+    // La cartella che lo contiene, non il percorso intero: `makeDirs` crea anche
+    // l'ultimo componente.
+    vtcache.makeDirs(std.fs.path.dirname(path) orelse return);
     const tmp = std.fmt.allocPrint(state.gpa, "{s}.tmp", .{path}) catch return;
     defer state.gpa.free(tmp);
     const cwd = std.Io.Dir.cwd();
-    cwd.writeFile(state.io, .{ .sub_path = tmp, .data = aw.written() }) catch return;
-    cwd.rename(tmp, cwd, path, state.io) catch {};
+    // Su ogni errore il temporaneo va tolto: una coda scritta a metà non serve.
+    cwd.writeFile(state.io, .{ .sub_path = tmp, .data = aw.written() }) catch {
+        cwd.deleteFile(state.io, tmp) catch {};
+        return;
+    };
+    // Se `ensureQueueLoaded` non è ancora passata, la cartella lasciata dal vecchio
+    // difetto è ancora lì (vedi `recoverQueueFile`); su un file non fa nulla.
+    cwd.deleteDir(state.io, path) catch {};
+    cwd.rename(tmp, cwd, path, state.io) catch {
+        cwd.deleteFile(state.io, tmp) catch {};
+    };
 }
 
 /// Aggiunge alla coda la card `i` della griglia, o la toglie se c'è già.

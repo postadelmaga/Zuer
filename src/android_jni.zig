@@ -41,6 +41,38 @@ fn attach(activity: *c.ANativeActivity) ?*c.JNIEnv {
     return env;
 }
 
+/// Quanti riferimenti locali può creare una funzione di questo file prima che il
+/// frame debba crescere (`pdfPage`, la più lunga, ne usa tredici).
+const frame_refs: c.jint = 32;
+
+/// Aggancia il thread e apre un frame di riferimenti locali: da chiudere con `leave`
+/// (in `defer`, dichiarato per primo così gira per ultimo, dopo i `release`/`close`
+/// che usano ancora quei riferimenti).
+///
+/// Su un thread agganciato con `AttachCurrentThread` i riferimenti locali NON si
+/// liberano al ritorno della funzione, come accade a un metodo nativo chiamato da
+/// Java: vivono fino al detach. Il thread principale non si stacca mai finché l'app è
+/// aperta e quello delle anteprime solo all'uscita: senza frame ogni `videoFrame` o
+/// `decodeImageFile` teneva vivo il suo Bitmap a piena risoluzione, e `goFullscreen`
+/// (ogni 120 frame) riempiva la tabella dei riferimenti, che su Android 7 ha 512
+/// posti e a tabella piena fa abortire il processo.
+fn enter(activity: *c.ANativeActivity) ?*c.JNIEnv {
+    const env = attach(activity) orelse return null;
+    if (env.*.*.PushLocalFrame.?(env, frame_refs) != 0) {
+        clearException(env); // OutOfMemoryError pendente: senza frame non si prosegue
+        return null;
+    }
+    return env;
+}
+
+/// Chiude il frame aperto da `enter`: tutti i riferimenti locali creati nel frattempo
+/// tornano liberi. Ripulisce prima un'eccezione rimasta pendente (un `FindClass` o un
+/// `GetMethodID` falliti la lasciano, e la chiamata JNI successiva abortirebbe).
+fn leave(env: *c.JNIEnv) void {
+    clearException(env);
+    _ = env.*.*.PopLocalFrame.?(env, null);
+}
+
 /// Fullscreen immersivo (status bar + barra di navigazione nascoste, contenuto sotto il
 /// notch). I flag sono quelli di `View`: il valore combinato equivale a
 /// IMMERSIVE_STICKY | HIDE_NAVIGATION | FULLSCREEN | LAYOUT_STABLE |
@@ -65,7 +97,8 @@ pub fn goFullscreen(activity_ptr: *anyopaque) void {
         0,
     );
 
-    const env = attach(activity) orelse return;
+    const env = enter(activity) orelse return;
+    defer leave(env);
     const fns = env.*.*;
 
     const flags: c.jint = 0x1000 | 0x0002 | 0x0004 | 0x0100 | 0x0200 | 0x0400;
@@ -95,7 +128,8 @@ pub fn goFullscreen(activity_ptr: *anyopaque) void {
 /// da aprire, e comunque il vecchio modello di storage non lo richiede).
 pub fn hasAllFilesAccess(activity_ptr: *anyopaque) bool {
     const activity: *c.ANativeActivity = @ptrCast(@alignCast(activity_ptr));
-    const env = attach(activity) orelse return false;
+    const env = enter(activity) orelse return false;
+    defer leave(env);
     const fns = env.*.*;
 
     const env_cls = fns.FindClass.?(env, "android/os/Environment") orelse {
@@ -116,13 +150,14 @@ pub fn hasAllFilesAccess(activity_ptr: *anyopaque) bool {
 /// `hasAllFilesAccess` diventa true e l'explorer si ripopola).
 pub fn requestAllFilesAccess(activity_ptr: *anyopaque) void {
     const activity: *c.ANativeActivity = @ptrCast(@alignCast(activity_ptr));
-    const env = attach(activity) orelse return;
+    const env = enter(activity) orelse return;
+    defer leave(env);
     const fns = env.*.*;
 
     // Uri.parse("package:" + getPackageName())
     const activity_cls = fns.GetObjectClass.?(env, activity.clazz) orelse return;
     const get_pkg = fns.GetMethodID.?(env, activity_cls, "getPackageName", "()Ljava/lang/String;") orelse return;
-    const pkg: c.jstring = @ptrCast(fns.CallObjectMethod.?(env, activity.clazz, get_pkg));
+    const pkg: c.jstring = @ptrCast(fns.CallObjectMethod.?(env, activity.clazz, get_pkg) orelse return);
     const chars = fns.GetStringUTFChars.?(env, pkg, null) orelse return;
     var buf: [256]u8 = undefined;
     const uri_str = std.mem.printSentinel(&buf, "package:{s}", .{std.mem.span(chars)}, 0) catch "package:dev.zuer.viewer";
@@ -200,7 +235,8 @@ fn bitmapToRgba(env: *c.JNIEnv, gpa: std.mem.Allocator, bmp: c.jobject) ?Image {
 /// Il fotogramma di apertura di un video (`MediaMetadataRetriever.getFrameAtTime`).
 pub fn videoFrame(activity_ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) ?Image {
     const activity: *c.ANativeActivity = @ptrCast(@alignCast(activity_ptr));
-    const env = attach(activity) orelse return null;
+    const env = enter(activity) orelse return null;
+    defer leave(env);
     const fns = env.*.*;
 
     const mmr_cls = fns.FindClass.?(env, "android/media/MediaMetadataRetriever") orelse return null;
@@ -228,7 +264,8 @@ pub fn videoFrame(activity_ptr: *anyopaque, gpa: std.mem.Allocator, path: []cons
 /// che nella .so c'è già). null se il file non ne ha.
 pub fn embeddedArt(activity_ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
     const activity: *c.ANativeActivity = @ptrCast(@alignCast(activity_ptr));
-    const env = attach(activity) orelse return null;
+    const env = enter(activity) orelse return null;
+    defer leave(env);
     const fns = env.*.*;
 
     const mmr_cls = fns.FindClass.?(env, "android/media/MediaMetadataRetriever") orelse return null;
@@ -277,7 +314,8 @@ fn setDataSource(env: *c.JNIEnv, cls: c.jclass, obj: c.jobject, path: []const u8
 /// La prima pagina di un PDF, rasterizzata da `android.graphics.pdf.PdfRenderer` (API 21+).
 pub fn pdfPage(activity_ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8, max_px: u32) ?Image {
     const activity: *c.ANativeActivity = @ptrCast(@alignCast(activity_ptr));
-    const env = attach(activity) orelse return null;
+    const env = enter(activity) orelse return null;
+    defer leave(env);
     const fns = env.*.*;
 
     // ParcelFileDescriptor.open(new File(path), MODE_READ_ONLY)
@@ -369,7 +407,8 @@ fn createBitmap(env: *c.JNIEnv, w: u32, h: u32) ?c.jobject {
 /// `BitmapFactory`, che sul telefono passa dai decoder hardware.
 pub fn decodeImageFile(activity_ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) ?Image {
     const activity: *c.ANativeActivity = @ptrCast(@alignCast(activity_ptr));
-    const env = attach(activity) orelse return null;
+    const env = enter(activity) orelse return null;
+    defer leave(env);
     const fns = env.*.*;
 
     var buf: [512]u8 = undefined;
@@ -388,7 +427,8 @@ pub fn decodeImageFile(activity_ptr: *anyopaque, gpa: std.mem.Allocator, path: [
 
 /// Sgancia il thread corrente dalla JVM. **Obbligatorio** prima che un thread nativo che ha
 /// chiamato JNI muoia: la ART aborta il processo con "native thread exited without calling
-/// DetachCurrentThread". Chiamarla su un thread mai agganciato è innocuo.
+/// DetachCurrentThread". Chiamarla su un thread mai agganciato è innocuo. La chiamano il
+/// thread delle anteprime (`android_ui.zig`) e `android_main`, ognuno alla propria uscita.
 pub fn detach(activity_ptr: *anyopaque) void {
     const activity: *c.ANativeActivity = @ptrCast(@alignCast(activity_ptr));
     const vm = activity.vm orelse return;
@@ -403,7 +443,8 @@ pub fn detach(activity_ptr: *anyopaque) void {
 /// l'app è stata lanciata dall'icona (allora si parte dalla memoria interna).
 pub fn intentPath(activity_ptr: *anyopaque, gpa: std.mem.Allocator) ?[]u8 {
     const activity: *c.ANativeActivity = @ptrCast(@alignCast(activity_ptr));
-    const env = attach(activity) orelse return null;
+    const env = enter(activity) orelse return null;
+    defer leave(env);
     const fns = env.*.*;
 
     const act_cls = fns.GetObjectClass.?(env, activity.clazz) orelse return null;

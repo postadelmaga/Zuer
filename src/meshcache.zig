@@ -27,6 +27,7 @@ extern "c" fn close(fd: c_int) c_int;
 extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
 extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
 extern "c" fn rename(old: [*:0]const u8, new: [*:0]const u8) c_int;
+extern "c" fn unlink(path: [*:0]const u8) c_int;
 extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
 extern "c" fn lseek(fd: c_int, off: i64, whence: c_int) i64;
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
@@ -437,8 +438,12 @@ fn writeBlob(kp: [:0]u8, blob: []u8, key: u64, claim: Inflight.Claim) void {
     if (fd < 0) return;
     const ok = writeAll(fd, blob);
     _ = close(fd);
-    if (!ok) return;
-    if (rename(tmp.ptr, kp.ptr) != 0) return;
+    // Scrittura a metà (disco pieno) o rename fallito: il temporaneo va tolto qui.
+    // Lo sweep lo vedrebbe solo fra un'ora, e l'eviction i `.tmp` non li conta.
+    if (!ok or rename(tmp.ptr, kp.ptr) != 0) {
+        _ = unlink(tmp.ptr);
+        return;
+    }
     // Manutenzione post-scrittura (best-effort, siamo già su un thread detached):
     // sweep una-tantum dei tmp orfani + cap LRU della directory.
     if (std.fs.path.dirname(kp)) |dir| {

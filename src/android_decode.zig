@@ -72,7 +72,7 @@ pub fn decode(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ?Decoded {
     }
 
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, std.Io.Limit.limited(max_bytes)) catch |err| {
-        const msg = std.fmt.allocPrint(gpa, "Impossibile leggere il file: {s}", .{@errorName(err)}) catch "Errore di lettura";
+        const msg = std.fmt.allocPrint(gpa, "Impossibile leggere il file: {s}", .{@errorName(err)}) catch ""; // mai un letterale: `Decoded.deinit` lo libera
         return Decoded{ .err = msg };
     };
     // Possesso dei byte: lo prende il decoder in tutti i casi tranne le immagini.

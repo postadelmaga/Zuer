@@ -630,13 +630,7 @@ fn decodeExport(path: decoder.SliceC, content: decoder.SliceC, allocator_ptr: *c
     // ridimensionato, ImageMagick rilegge dal path): vanno liberati qui o
     // trapelano a ogni immagine.
     allocator.free(content_slice);
-    return decoded.toDecodedC(allocator) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "";
-        return .{
-            .tag = .err,
-            .payload = .{ .err = decoder.SliceC.fromSlice(msg) },
-        };
-    };
+    return decoded.intoC(allocator);
 }
 
 fn zuer_decode(

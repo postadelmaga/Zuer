@@ -186,13 +186,7 @@ fn zuer_decode(
     _ = io_ptr;
     const allocator = @as(*const std.mem.Allocator, @ptrCast(@alignCast(allocator_ptr))).*;
     const decoded = decode(content.toSlice(), allocator);
-    return decoded.toDecodedC(allocator) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "";
-        return .{
-            .tag = .err,
-            .payload = .{ .err = decoder.SliceC.fromSlice(msg) },
-        };
-    };
+    return decoded.intoC(allocator);
 }
 
 // Estensioni testuali note (parità con viewer); il plugin "text" resta comunque

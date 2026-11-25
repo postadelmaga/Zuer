@@ -696,8 +696,12 @@ fn cacheWrite(gpa: std.mem.Allocator, key: u64, p: Page, total_pages: usize) voi
         ok = writeAll(fd, &hdr) and writeAll(fd, p.pixels);
     }
     _ = close(fd);
-    if (!ok) return;
-    if (rename(tmp.ptr, path.ptr) != 0) return;
+    // Scrittura a metà (disco pieno) o rename fallito: il temporaneo va tolto qui.
+    // Lo sweep lo vedrebbe solo fra un'ora, e l'eviction i `.tmp` non li conta.
+    if (!ok or rename(tmp.ptr, path.ptr) != 0) {
+        _ = unlink(tmp.ptr);
+        return;
+    }
     // Manutenzione post-scrittura: sweep una-tantum dei tmp orfani + cap LRU.
     evict.sweepTmpOnce(&tmp_sweep_done, dir);
     evict.evictLru(dir, cache_cap_bytes);
@@ -719,13 +723,7 @@ fn decodeExport(
     // pdftoppm rilegge il PDF dal path: i byte già letti dall'host non servono.
     allocator.free(content.toSlice());
     const decoded = decodeTier(path_slice, io, filename, allocator, coarse);
-    return decoded.toDecodedC(allocator) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "";
-        return .{
-            .tag = .err,
-            .payload = .{ .err = decoder.SliceC.fromSlice(msg) },
-        };
-    };
+    return decoded.intoC(allocator);
 }
 
 export fn zuer_decode(

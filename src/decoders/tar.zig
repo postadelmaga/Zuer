@@ -382,13 +382,7 @@ fn zuer_decode(
     allocator.free(content.toSlice());
 
     const decoded = decode(path.toSlice(), io, allocator);
-    return decoded.toDecodedC(allocator) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "";
-        return .{
-            .tag = .err,
-            .payload = .{ .err = decoder.SliceC.fromSlice(msg) },
-        };
-    };
+    return decoded.intoC(allocator);
 }
 
 /// Le ultime voci passano da bsdtar (vedi il commento del file). Stessa lista del

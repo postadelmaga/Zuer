@@ -73,7 +73,9 @@ fn loadLocked() Error!void {
     const override: ?[]const u8 = if (getenv("ZUER_VULKAN_LOADER")) |p| std.mem.sliceTo(p, 0) else null;
     if (override) |o| {
         if (std.mem.eql(u8, o, "none")) return error.VulkanLoaderMissing;
-        lib = dynlib.Lib.open(o) catch return error.VulkanLoaderMissing;
+        // `open` vuole un percorso assoluto (su Windows lo pretende); un nome nudo
+        // segue la ricerca delle librerie di sistema, come i candidati qui sotto.
+        lib = (if (std.fs.path.isAbsolute(o)) dynlib.Lib.open(o) else dynlib.Lib.openSystem(o)) catch return error.VulkanLoaderMissing;
         loaded_name = o;
     } else {
         for (candidates) |name| {

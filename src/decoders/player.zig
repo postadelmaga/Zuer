@@ -168,7 +168,13 @@ fn ensureAvRuntime() bool {
     // Externs locali (niente import di dynlib.zig: nel plugin media quel file
     // appartiene al modulo `decoder` e l'import da qui dividerebbe i moduli).
     const win = struct {
-        extern "kernel32" fn LoadLibraryW(name: [*:0]const u16) callconv(.winapi) ?*anyopaque;
+        extern "kernel32" fn LoadLibraryExW(name: [*:0]const u16, file: ?*anyopaque, flags: u32) callconv(.winapi) ?*anyopaque;
+        /// Cartella dell'eseguibile (dove l'installer mette le DLL di FFmpeg), System32
+        /// e cartelle aggiunte con AddDllDirectory. MAI la cartella corrente né il
+        /// PATH: con `LoadLibraryW` e un nome nudo, aperto un video col doppio clic,
+        /// una `avutil-NN.dll` messa accanto al video veniva caricata al posto di
+        /// quella che manca (installer `--no-ffmpeg`). Come pdfium in pdf_pdfium.zig.
+        const LOAD_LIBRARY_SEARCH_DEFAULT_DIRS: u32 = 0x00001000;
         extern "kernel32" fn FreeLibrary(mod: *anyopaque) callconv(.winapi) i32;
         extern "kernel32" fn GetProcAddress(mod: *anyopaque, name: [*:0]const u8) callconv(.winapi) ?*anyopaque;
     };
@@ -190,7 +196,7 @@ fn ensureAvRuntime() bool {
     inline for (av_lib_names, 0..) |n, i| {
         libs[i] = (if (is_win) blk: {
             const wide = comptime std.unicode.utf8ToUtf16LeStringLiteral(n);
-            break :blk win.LoadLibraryW(wide);
+            break :blk win.LoadLibraryExW(wide, null, win.LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
         } else std.c.dlopen(n.ptr, .{ .NOW = true }) orelse
             (if (comptime builtin.os.tag == .macos)
                 std.c.dlopen(comptime n[std.mem.lastIndexOfScalar(u8, n, '/').? + 1 ..].ptr, .{ .NOW = true })

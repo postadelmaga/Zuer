@@ -526,13 +526,7 @@ fn decodeExport(
     const filename = std.fs.path.basename(path.toSlice());
 
     const decoded = decodeTier(path.toSlice(), content.toSlice(), filename, allocator, coarse);
-    return decoded.toDecodedC(allocator) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "Conversion error: {s}", .{@errorName(err)}) catch "";
-        return .{
-            .tag = .err,
-            .payload = .{ .err = decoder.SliceC.fromSlice(msg) },
-        };
-    };
+    return decoded.intoC(allocator);
 }
 
 export fn zuer_decode(

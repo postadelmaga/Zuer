@@ -27,6 +27,7 @@ extern "c" fn close(fd: c_int) c_int;
 extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
 extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
 extern "c" fn rename(old: [*:0]const u8, new: [*:0]const u8) c_int;
+extern "c" fn unlink(path: [*:0]const u8) c_int;
 extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
@@ -148,8 +149,12 @@ pub fn write_cached(gpa: std.mem.Allocator, encoded: []const u8, w: usize, h: us
         ok = writeAll(fd, &hdr) and writeAll(fd, rgba);
     }
     _ = close(fd);
-    if (!ok) return;
-    if (rename(tmp.ptr, path.ptr) != 0) return;
+    // Scrittura a metà (disco pieno) o rename fallito: il temporaneo va tolto qui.
+    // Lo sweep lo vedrebbe solo fra un'ora, e l'eviction i `.tmp` non li conta.
+    if (!ok or rename(tmp.ptr, path.ptr) != 0) {
+        _ = unlink(tmp.ptr);
+        return;
+    }
     // Manutenzione post-scrittura: sweep una-tantum dei tmp orfani + cap LRU.
     evict.sweepTmpOnce(&tmp_sweep_done, dir);
     evict.evictLru(dir, evict_cap_bytes);
