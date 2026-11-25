@@ -108,7 +108,7 @@ cp "$ROOT/icons/zuer.icns" "$APP/Contents/Resources/zuer.icns"
 echo "  ✓ zuer.icns"
 
 # Estensioni note ai decoder inclusi nel build macOS. Stessa lista dell'installer
-# Windows (fonte di verità: `zuer_extensions` in src/decoders/*.zig), PIÙ il pdf
+# Windows (fonte di verità: la tabella di src/formats.zig), PIÙ il pdf
 # (CoreGraphics). I media si dichiarano solo se le dylib FFmpeg sono nel bundle:
 # aprire file che non si possono decodificare sarebbe solo rumore in "Apri con".
 EXTS="$(cat <<'LIST'

@@ -5,28 +5,117 @@ Come è fatto dentro: moduli, plugin, concorrenza, miniature e misure. Per compi
 Due frontend condividono lo stesso stack di decodifica e rendering:
 
 ```
- zuer (TUI)  ─┐                        ┌─ decoder.zig ──┬─ decoders/*.zig  (plugin .so/.dll:
- zuer-gui  ──┼─ loader.zig (data plane)┤                │   text, csv, markdown, image, glb,
-             │                         └─ (dispatch)    │   mesh, archive, media, pdf, office)
-             │
-             ├─ rendering GPU:  gpu_renderer.zig (Vulkan) · renderer/vk.zig (binding) · voxel.zig
-             ├─ rendering CPU:  text_render.zig · glyph.zig (stb_truetype) · compose.zig
-             └─ seam per-OS:    terminal.zig · clipboard.zig · dynlib.zig · (finestra: zrame)
+ zuer (TUI)   tui.zig ── loader.zig ─┐
+                                     ├─ decoder.zig ── plugin (decoders/*.zig → .so/.dll):
+ zuer-gui     gui.zig ── nav.zig ────┘   registro,       text, csv, markdown, image, glb, mesh,
+                                         dispatch,       archive, tar, media, pdf, office
+                                         estrazione
+
+ rendering GPU:  gpu_renderer.zig (Vulkan) · renderer/vk.zig (binding) · voxel.zig · vtex.zig
+ rendering CPU:  text_render.zig · md_layout.zig · glyph.zig (stb_truetype) · compose.zig
+ per sistema:    terminal.zig · clipboard.zig · dynlib.zig · proc.zig · diskcache.zig
+                 (finestra, input e audio: zicro/zrame)
 ```
 
-Il **GUI** (`gui.zig`) è organizzato in moduli coesi:
+## Moduli
 
-- **`compose.zig`** — compositing CPU dei frame (immagini aspect-fit + zoom/pan, testo
-  blittato 1:1 con header ancorato, selezione, barra linguette)
-- **`layout.zig`** — dal percorso/decodifica al tipo di contenuto (`WinKind`) e da lì
-  a zoom e dimensione iniziale della finestra
-- **`video.zig`** — player video nativo (apertura container, riproduzione, controlli
-  overlay); possiede l'import condizionale di libav
-- **`loader.zig`** — piano dati: decodifica su thread worker + staging GPU della geometria
-  (memfd zero-copy su Linux, buffer CPU altrove)
+**TUI** (`main.zig`): un documento zicro con lo stato in `state.zig`, la vista in
+`tui.zig` e il piano dati in `loader.zig` (decodifica su un thread, risultato come
+azione).
 
-I **decoder** sono librerie dinamiche caricate a runtime (`decoder_<fmt>.so`/`.dll`):
-aggiungerne uno = un nuovo file in `src/decoders/` più una voce nella lista di `build.zig`.
+**GUI** (`gui.zig`: avvio, finestra, render worker), divisa per mestiere:
+
+- **`gui_state.zig`** — `GuiAppState`, lo stato condiviso fra thread finestra, render
+  worker, loader e prefetch. I campi sono raggruppati per lock (`shared`, `nav`, `pf`):
+  quale mutex protegge cosa si legge lì.
+- **`nav.zig`** — il piano dati della GUI: navigazione fra i file della cartella,
+  caricamento asincrono «vince l'ultimo» (`postLoad`/`loadWorker`), decode iniziale,
+  prefetch dei vicini, e `applyDecoded`, l'unico punto che installa un contenuto nel
+  renderer. Da `loader.zig` prende solo lo staging della geometria verso la GPU
+  (`GpuStage`: memfd zero-copy su Linux, buffer CPU altrove).
+- **`input.zig`** — i tre callback di zrame (tastiera, rotella, mouse), doppio click,
+  selezione del testo e comandi di vista (zoom, pan, scorrimento, pagina PDF).
+- **`layout.zig`** — dal percorso o dal contenuto decodificato al tipo di finestra
+  (`WinKind`), e da lì a zoom e dimensione iniziale.
+- **`compose.zig`** — composizione CPU dei frame (immagini adattate con zoom e pan,
+  testo 1:1 con intestazione ancorata, selezione, barra delle linguette).
+- **overlay** — `file_explorer.zig` (tasto `e`, con le miniature di `thumbs.zig`),
+  `yt_search.zig` (tasto `y`, attraverso `ytdlp.zig`), `print.zig` (Ctrl+P).
+- **media** — `video.zig`, `video_decoder.zig` e i due motori: vedi [Media](#media).
+
+## Plugin e formati
+
+I **decoder** sono librerie dinamiche caricate a richiesta (`libdecoder_<nome>.so`,
+`decoder_<nome>.dll`); su Android sono linkati nell'unica libreria dell'APK. Il
+contratto sta in tre file:
+
+- **`formats.zig`** — l'unica tabella «quale plugin apre quale estensione». Da lì
+  vengono le estensioni che ogni plugin dichiara, il manifest con cui l'host carica il
+  solo plugin che serve (invece di aprirli tutti), gli archivi di cui si apre una voce
+  (`fragment.zig`) e le liste con cui la GUI sceglie la forma della finestra prima del
+  decode. Un test lega le une alle altre.
+- **`decoder_abi.zig`** — i tipi del risultato (`Decoded`), il loro layout C
+  (`DecodedC`) con i convertitori nelle due direzioni, la versione dell'ABI (impronta
+  a comptime della versione di Zig: host e plugin compilati con Zig diversi non si
+  caricano) e `exportPlugin`.
+- **`decoder.zig`** — l'host: registro dei plugin, dispatch per estensione e per
+  contenuto (`detect.zig`), estrazione delle voci d'archivio (`extract_cache.zig`).
+  Riesporta tutto il contratto: i plugin importano solo `decoder`.
+
+Aggiungere un decoder = un file in `src/decoders/` con `plugin_name`, `pluginDecode`
+e `comptime { decoder.exportPlugin(@This()); }`, una riga in `formats.zig` e una voce
+nella lista di `build.zig`. Facoltativi: `pluginDecodeCoarse` (prima fase veloce),
+`plugin_content_prefix` (quanti byte del file servono; 0 = solo il percorso),
+`pluginSetHost` (servizi dell'host, vedi [Concorrenza](#concorrenza)).
+
+Dentro un plugin l'`io` dell'host non funziona (non attraversa il confine della
+libreria dinamica): file e processi passano da chiamate grezze, raccolte in due file.
+
+- **`proc.zig`** — l'unico posto da cui si lanciano processi: `runCapture…` (stdout
+  catturato, scadenza, tetto sui byte, annullamento), `runDetached` (deve solo
+  partire: `xdg-open`), `runFeed` (gli si scrive lo stdin: `wl-copy`). Sempre argv,
+  mai una shell. Su Unix il figlio ha un gruppo di processi suo e alla scadenza muore
+  tutto il gruppo.
+- **`diskcache.zig`** — le primitive delle cache su disco: cartella per sistema
+  (`~/.cache/zuer/<nome>`, `%LOCALAPPDATA%\zuer\<nome>`), scrittura atomica con
+  pulizia del temporaneo (`AtomicWriter`), tetto LRU e sweep dei temporanei orfani
+  (solo Linux).
+
+| Cache | Dove | Tetto | Chiave |
+|---|---|---|---|
+| mesh coarse (`meshcache.zig`) | `mesh/` | 1 GiB | percorso reale; valida per mtime + dimensione + checksum |
+| texture decodificate (`decoders/texcache.zig`) | `tex/` | 256 MiB | hash dei byte codificati |
+| pagine PDF (`decoders/pdf.zig`) | `pdf/` | 256 MiB | percorso, dimensione, mtime, pagina, risoluzione |
+| tile delle texture (`vtcache.zig`) | `vt/` | 512 MiB | dimensioni e hash dei pixel |
+| miniature (`thumbs.zig`) | `thumbs/` | 128 MiB | cartella reale, nome, mtime, dimensione |
+| voci estratte dagli archivi (`extract_cache.zig`) | `extract/` | 2 GiB | percorso + mtime dell'archivio |
+
+Mesh, texture e pagine PDF sono attive solo su Linux. Le altre ovunque; il tetto di
+tile e miniature però si applica solo su Linux (la cache d'estrazione ha il suo).
+
+## Media
+
+Un file audio o video non passa dal decode come gli altri: il plugin `media` ne
+produce solo la scheda (poster, durata, tag), e la riproduzione è una **sessione**.
+
+- **`video.zig`** — il lato GUI: apre e chiude la sessione, avanza la riproduzione
+  dentro il render loop, disegna controlli, oscilloscopio e sottotitoli.
+- **`video_decoder.zig`** — la sessione: un thread dedicato che possiede il motore e
+  produce frame per il present attraverso una coda SPSC senza lock (`wake.zig` per le
+  sveglie). Un seek non svuota la coda: alza una generazione, e i frame vecchi
+  vengono scartati.
+- **Due motori**, scelti all'apertura:
+  - **mpv** (`decoders/mpv_video.zig`, Linux, preferito): demux, decodifica (hardware
+    quando c'è), audio, sincronia, seek, rete. Il suo clock è l'autorità. Rende in un
+    FBO su un contesto EGL suo; il motore sopravvive alla sessione e il video dopo lo
+    riusa.
+  - **FFmpeg** (`decoders/player.zig`, ripiego: niente libmpv, Windows, macOS):
+    decodifica in anticipo una coda di frame con il loro pts; l'audio e il clock sono
+    di `audio_player.zig`, pilotato da `video.zig`.
+- **Solo audio**: stesso percorso, senza traccia video si disegna l'oscilloscopio.
+  I MIDI suonano con il synth incluso (TinySoundFont).
+- **YouTube**: `yt_search.zig` risolve gli URL con `yt-dlp` e li passa alla sessione;
+  video e audio DASH separati li unisce mpv.
 
 ## Concorrenza
 
@@ -155,7 +244,8 @@ decode in primo piano).
 Portabilità: zicro e zrame nascondono le differenze di OS (finestra, input,
 dynamic loading) dietro API uniformi, così zuer resta in gran parte agnostico rispetto
 alla piattaforma. I punti che restano specifici sono isolati in file per-OS
-(`terminal.zig`, `clipboard.zig`, `dynlib.zig`) o dietro flag comptime.
+(`terminal.zig`, `clipboard.zig`, `dynlib.zig`, `proc.zig`, `diskcache.zig`) o dietro
+flag comptime.
 
 ## Benchmark (riferimento)
 

@@ -79,7 +79,7 @@ echo "  ✓ zuer.ico"
 
 echo "→ [4/5] genero associations.nsh"
 # ── Estensioni per decoder incluso nel build Windows ────────────────────────
-# Fonte di verità: le stringhe `zuer_extensions` in src/decoders/*.zig. Escluse
+# Fonte di verità: la tabella di src/formats.zig. Escluse
 # le voci senza estensione reale (gitignore/editorconfig/dockerfile/make…).
 EXTS="$(cat <<'LIST'
 txt text log nfo rst adoc asciidoc org tex bib srt vtt diff patch
