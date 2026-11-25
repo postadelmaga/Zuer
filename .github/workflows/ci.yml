@@ -1,0 +1,86 @@
+# Controlli a ogni push su main e a ogni pull request: i test unitari e le prove sui
+# file limite. Prima giravano solo nel workflow di release, cioè a tag già messo: un
+# difetto entrato su main si vedeva settimane dopo (#26 e #31 sarebbero stati fermati
+# qui).
+#
+# Stessi ingredienti del gate Linux di release.yml: Zig scaricato da ziglang.org con
+# sha256 verificato, Zicro al commit scritto in .github/zicro.ref. Se main comincia a
+# richiedere uno Zicro più nuovo, questo workflow fallisce finché il riferimento non
+# viene aggiornato — che è ciò che serve sapere prima di un rilascio.
+name: ci
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["docs/**", "**.md", "icons/**"]
+  pull_request:
+    paths-ignore: ["docs/**", "**.md", "icons/**"]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ZIG_VERSION: "0.17.0"
+
+jobs:
+  linux:
+    name: Test e file limite (Linux)
+    runs-on: ubuntu-26.04 # wayland-scanner recente: gli XML vendored usano deprecated-since
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: Zuer
+          persist-credentials: false
+      - id: zicro
+        name: Commit di Zicro
+        run: |
+          set -euo pipefail
+          ZICRO="$(tr -d '[:space:]' < Zuer/.github/zicro.ref)"
+          [[ "$ZICRO" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::.github/zicro.ref non è uno SHA completo"; exit 1; }
+          echo "ref=$ZICRO" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: postadelmaga/zicro
+          ref: ${{ steps.zicro.outputs.ref }}
+          path: Zicro
+          persist-credentials: false
+      - name: Zig
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 6 --retry-delay 20 --retry-all-errors -o zig.tar.xz "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz"
+          echo "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026  zig.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/zig" && tar -xJf zig.tar.xz -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+      - name: Dipendenze
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends glslc pkg-config \
+            libwayland-dev libxkbcommon-dev libpipewire-0.3-dev libasound2-dev \
+            libharfbuzz-dev libfreetype-dev libvulkan-dev libegl-dev libgl-dev libgbm-dev \
+            libsystemd-dev wayland-protocols
+      # Dipendenze Zig (libwebp da GitHub): a volte 503/504, si riprova prima della build.
+      - name: Dipendenze Zig
+        shell: bash
+        run: |
+          for i in 1 2 3 4 5 6; do (cd Zuer && zig build --fetch=all) && break
+            [ $i = 6 ] && exit 1; echo "fetch: tentativo $i fallito, riprovo"; sleep $((20 * i)); done
+      - name: Formattazione
+        working-directory: Zuer
+        run: zig fmt --check src build.zig
+      - name: Test unitari
+        working-directory: Zuer
+        run: zig build test --summary all
+      - name: Build
+        working-directory: Zuer
+        run: zig build
+      # Senza display: lo script salta da sé la prova della GUI.
+      - name: File limite (scripts/edge-check.sh)
+        working-directory: Zuer
+        run: scripts/edge-check.sh
