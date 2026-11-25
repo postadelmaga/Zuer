@@ -395,12 +395,15 @@ pub const Ui = struct {
         var buf: [512]u8 = undefined;
         const path = self.pathOf(idx, &buf) orelse return;
         const e = self.entries.items[idx];
-        switch (e.kind) {
+        // Un file che il nome non classifica si guarda per quello che contiene: una foto
+        // senza estensione è una foto, non una scheda.
+        const kind = if (e.kind == .other) kindByContent(self.io, path) orelse .other else e.kind;
+        switch (kind) {
             // Tutto ciò che si guarda come un'immagine — una foto, la copertina di un MP3, il
             // fotogramma di un video, la prima pagina di un PDF — passa da qui: un percorso
             // solo, e la sorgente (stb o il framework) la sceglie `rasterize`.
             .image, .audio, .video, .doc => {
-                const img = self.rasterize(path, e.kind, 0) orelse return;
+                const img = self.rasterize(path, kind, 0) orelse return;
                 self.view_img = img.pixels;
                 self.view_w = img.w;
                 self.view_h = img.h;
@@ -447,6 +450,17 @@ pub const Ui = struct {
     }
 
     // ── Anteprime ──────────────────────────────────────────────────────────────
+
+    /// Il tipo di un file dai suoi primi byte, per quelli che si guardano come immagine
+    /// (`rasterize`); gli altri formati li riconosce già `decode`.
+    fn kindByContent(io: std.Io, path: []const u8) ?Kind {
+        const d = dec.sniff(io, path) orelse return null;
+        const plugin = d.plugin orelse return null;
+        if (std.mem.eql(u8, plugin, "image")) return .image;
+        if (std.mem.eql(u8, plugin, "pdf")) return .doc;
+        if (std.mem.eql(u8, plugin, "media")) return if (std.mem.startsWith(u8, d.mime, "video/")) .video else .audio;
+        return null;
+    }
 
     const Raster = struct { pixels: []u8, w: u32, h: u32 };
 

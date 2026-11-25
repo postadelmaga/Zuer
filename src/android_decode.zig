@@ -36,10 +36,13 @@ const linked = [_]decoder.LinkedPlugin{
 var installed = std.atomic.Value(bool).init(false);
 
 /// Consegna la tabella all'host. Da chiamare all'avvio, prima che qualunque thread
-/// decodifichi (la chiama `android_main`); le chiamate successive non fanno nulla.
+/// decodifichi (la chiama `android_main`); dopo, non fa nulla. Il segnale si alza solo
+/// a tabella consegnata: chi lo vede alzato trova la tabella; due primi chiamanti
+/// insieme la consegnerebbero entrambi, identica.
 pub fn init() void {
-    if (installed.swap(true, .acq_rel)) return;
+    if (installed.load(.acquire)) return;
     decoder.useLinkedPlugins(&linked);
+    installed.store(true, .release);
 }
 
 /// True se `ext` (senza punto, maiuscole indifferenti) ha un decoder in questa build.
@@ -56,13 +59,29 @@ fn isLinked(name: []const u8) bool {
     return false;
 }
 
+/// Il formato di `path` dai suoi primi byte (`detect.zig`), per i file il cui nome non
+/// lo dice. null se non si legge o non si riconosce.
+pub fn sniff(io: std.Io, path: []const u8) ?decoder.detect.Detection {
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return null;
+    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+    defer file.close(io);
+    var buf: [decoder.detect.probe_bytes]u8 = undefined;
+    var rbuf: [256]u8 = undefined;
+    var reader = file.readerStreaming(io, &rbuf);
+    const n = reader.interface.readSliceShort(&buf) catch return null;
+    const d = decoder.detect.detect(buf[0..n], st.size);
+    if (d.format == .unknown or d.truncated) return null;
+    return d;
+}
+
 /// Decodifica `path`. Il chiamante possiede il risultato (`Decoded.deinit`).
 /// `null` = nessun decoder per questo file: la UI mostrerà la scheda informativa.
 ///
 /// Un file senza un'estensione nota passa comunque dal rilevamento per contenuto
-/// (un PNG senza estensione, un `README`, un `Makefile` si aprono). Se nemmeno quello
+/// (un `README`, un `Makefile`, uno ZIP senza estensione si aprono). Se nemmeno quello
 /// lo riconosce, l'errore dell'host diventa `null`: per un tipo che l'app non conosce
-/// la scheda dice di più di un «formato non riconosciuto».
+/// la scheda dice di più di un «formato non riconosciuto». Le immagini, i video e i PDF
+/// senza estensione la UI li riconosce prima con `sniff` e li apre coi suoi mezzi.
 pub fn decode(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ?Decoded {
     init();
     var d = decoder.decode(path, io, gpa);
@@ -215,6 +234,19 @@ test "decode: i decoder linkati, dal percorso del desktop" {
             return error.TestUnexpectedResult;
         }
     }
+    // Il TSV con l'estensione maiuscola si divide al TAB, non alla virgola.
+    const tsv = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/TABELLA.TSV", .{tmp.sub_path});
+    defer gpa.free(tsv);
+    var t = decode(io, gpa, tsv) orelse return error.TestUnexpectedResult;
+    defer t.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 2), t.csv.headers.len);
+    // La UI riconosce dal contenuto la foto senza estensione (e non il README).
+    const foto = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/foto", .{tmp.sub_path});
+    defer gpa.free(foto);
+    try std.testing.expectEqualStrings("image", (sniff(io, foto) orelse return error.TestUnexpectedResult).plugin.?);
+    const readme = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/README", .{tmp.sub_path});
+    defer gpa.free(readme);
+    try std.testing.expect(sniff(io, readme) == null);
     // Un errore vero di un tipo che il telefono apre resta un messaggio.
     try writeFile(tmp.dir, "rotto.bmp", "BM\x00\x01");
     const rotto = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/rotto.bmp", .{tmp.sub_path});

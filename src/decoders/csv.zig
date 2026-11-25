@@ -153,7 +153,7 @@ pub fn pluginDecode(req: decoder.PluginRequest) decoder.Decoded {
     const filename = std.fs.path.basename(req.path);
     if (std.mem.lastIndexOfScalar(u8, filename, '.')) |dot_index| {
         const ext = filename[dot_index + 1 ..];
-        if (std.mem.eql(u8, ext, "tsv")) {
+        if (std.ascii.eqlIgnoreCase(ext, "tsv")) {
             delimiter = '\t';
         }
     }

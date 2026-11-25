@@ -199,6 +199,9 @@ pub fn closePluginCache(allocator: std.mem.Allocator) void {
         plugin_cache_mutex.lockUncancelable(io);
         defer plugin_cache_mutex.unlock(io);
         closePluginCacheLocked(allocator);
+        // L'io era di chi ha decodificato: può non sopravvivere (Android rientra nello
+        // stesso processo con un `Threaded` nuovo). Il prossimo uso lo riscrive.
+        plugin_cache_io = null;
     } else {
         // Nessuna decodifica è mai avvenuta: il registro è vuoto e nessun altro
         // thread può contendere il lock, quindi non serve prenderlo.
@@ -1173,7 +1176,8 @@ fn decodeImpl(path: []const u8, io: std.Io, allocator: std.mem.Allocator, coarse
     // In fase coarse un plugin senza `zuer_decode_coarse` → null: l'host farà il full.
     if (coarse and decode_fn == null) return null;
     const decode_fn_val = decode_fn orelse {
-        const msg = std.fmt.allocPrint(allocator, "Nessun plugin decoder disponibile per '.{s}' (cartella decoders/ vuota o mancante)", .{ext}) catch "";
+        const why = if (linked_plugins.len > 0 or !plugin_abi) "non incluso in questa build" else "cartella decoders/ vuota o mancante";
+        const msg = std.fmt.allocPrint(allocator, "Nessun plugin decoder disponibile per '.{s}' ({s})", .{ ext, why }) catch "";
         return .{ .err = msg };
     };
 
@@ -1189,7 +1193,7 @@ fn decodeImpl(path: []const u8, io: std.Io, allocator: std.mem.Allocator, coarse
     // mentre i plugin whole-file (`content_prefix=maxInt`, `to_read=file_size`)
     // restano protetti esattamente come prima.
     if (to_read > max_size) {
-        const msg = std.fmt.allocPrint(allocator, "File troppo grande: {d} MB (limite {d} MB, ~metà della memoria disponibile).\nIl caricamento rischierebbe di esaurire la memoria.", .{ to_read / (1024 * 1024), max_size / (1024 * 1024) }) catch "";
+        const msg = std.fmt.allocPrint(allocator, "File troppo grande: {d} MB (limite {d} MB{s}).\nIl caricamento rischierebbe di esaurire la memoria.", .{ to_read / (1024 * 1024), max_size / (1024 * 1024), if (plugin_abi) ", ~metà della memoria disponibile" else "" }) catch "";
         return .{ .err = msg };
     }
     const content: []u8 = if (to_read == 0) &.{} else if (to_read < file_size) blk: {
