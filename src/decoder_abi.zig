@@ -854,6 +854,25 @@ pub fn exportPlugin(comptime Impl: type) void {
     if (@hasDecl(Impl, "pluginSetHost")) @export(&Glue.setHost, .{ .name = "zuer_set_host", .linkage = .strong });
 }
 
+/// Per i test dei decoder: esegue `run` facendo fallire, una alla volta, ogni
+/// allocazione che compie (la prima, poi la seconda…) finché non ne fallisce più
+/// nessuna. `run` deve decodificare e poi liberare tutto ciò che ha ottenuto, con
+/// l'allocator che riceve. A ogni giro i byte allocati devono tornare tutti: un
+/// percorso d'errore che perde memoria fa fallire il test con l'indice del colpevole.
+pub fn expectNoLeakOnAllocFailure(context: anytype, comptime run: fn (@TypeOf(context), std.mem.Allocator) void) !void {
+    var index: usize = 0;
+    while (index < 100_000) : (index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = index });
+        run(context, failing.allocator());
+        if (failing.allocated_bytes != failing.freed_bytes) {
+            std.debug.print("allocazione n. {d} fallita: {d} byte allocati, {d} liberati\n", .{ index, failing.allocated_bytes, failing.freed_bytes });
+            return error.MemoryLeakDetected;
+        }
+        if (!failing.has_induced_failure) return; // nessuna allocazione rimasta da far fallire
+    }
+    return error.TooManyAllocations;
+}
+
 /// Un `Decoded` di prova per ogni forma che attraversa l'ABI, con ogni foglia
 /// allocata da `a` come farebbe un plugin.
 fn sampleDecodedForTest(a: std.mem.Allocator, kind: u8) !Decoded {

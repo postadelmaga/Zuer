@@ -46,6 +46,7 @@ pub const ExtensionsFn = abi.ExtensionsFn;
 pub const ContentPrefixFn = abi.ContentPrefixFn;
 pub const PluginRequest = abi.PluginRequest;
 pub const exportPlugin = abi.exportPlugin;
+pub const expectNoLeakOnAllocFailure = abi.expectNoLeakOnAllocFailure;
 /// Quale plugin apre quale estensione: formats.zig.
 pub const formats = @import("formats.zig");
 /// Le primitive delle cache su disco: i plugin le raggiungono da qui, così il file

@@ -135,3 +135,17 @@ pub fn pluginDecode(req: decoder.PluginRequest) decoder.Decoded {
 comptime {
     decoder.exportPlugin(@This());
 }
+
+test "decode: nessuna perdita se un'allocazione fallisce" {
+    const Case = struct {
+        fn run(text: []const u8, a: std.mem.Allocator) void {
+            // `decode` prende possesso dei byte, come nel plugin.
+            const bytes = a.dupe(u8, text) catch return;
+            var d = decode(bytes, a);
+            d.deinit(a);
+        }
+    };
+    try decoder.expectNoLeakOnAllocFailure(@as([]const u8, "# Titolo\n\ntesto *pulito*\n"), Case.run);
+    try decoder.expectNoLeakOnAllocFailure(@as([]const u8, "# byte non validi \xff\xfe\n\ne un \xc3\x28\n"), Case.run);
+    try decoder.expectNoLeakOnAllocFailure(@as([]const u8, ""), Case.run);
+}

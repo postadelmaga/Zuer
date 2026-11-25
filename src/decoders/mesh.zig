@@ -266,3 +266,26 @@ pub fn pluginDecode(req: decoder.PluginRequest) decoder.Decoded {
 comptime {
     decoder.exportPlugin(@This());
 }
+
+test "decode: nessuna perdita se un'allocazione fallisce" {
+    const Case = struct {
+        text: []const u8,
+        name: []const u8,
+        fn run(self: @This(), a: std.mem.Allocator) void {
+            // `decode` prende possesso dei byte, come nel plugin.
+            const bytes = a.dupe(u8, self.text) catch return;
+            var d = decode(bytes, self.name, a);
+            d.deinit(a);
+        }
+    };
+    const obj = "o cubo\nv 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nvn 0 0 1\nf 1 2 3\nf 1//1 3//1 4//1\nf 1 2 3 4\n";
+    try decoder.expectNoLeakOnAllocFailure(Case{ .text = obj, .name = "cubo.obj" }, Case.run);
+    try decoder.expectNoLeakOnAllocFailure(Case{ .text = "v 0 0 0\nf 1 2 99\n", .name = "rotto.obj" }, Case.run);
+    const stl = "solid t\nfacet normal 0 0 1\nouter loop\nvertex 0 0 0\nvertex 1 0 0\nvertex 0 1 0\nendloop\nendfacet\nendsolid t\n";
+    try decoder.expectNoLeakOnAllocFailure(Case{ .text = stl, .name = "t.stl" }, Case.run);
+    // STL binario: intestazione di 80 byte, un triangolo.
+    var bin: [80 + 4 + 50]u8 = @splat(0);
+    bin[80] = 1;
+    try decoder.expectNoLeakOnAllocFailure(Case{ .text = &bin, .name = "b.stl" }, Case.run);
+    try decoder.expectNoLeakOnAllocFailure(Case{ .text = "", .name = "vuoto.obj" }, Case.run);
+}

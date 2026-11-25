@@ -167,3 +167,20 @@ pub fn pluginDecode(req: decoder.PluginRequest) decoder.Decoded {
 comptime {
     decoder.exportPlugin(@This());
 }
+
+test "decode: nessuna perdita se un'allocazione fallisce" {
+    const Case = struct {
+        text: []const u8,
+        delimiter: u8,
+        fn run(self: @This(), a: std.mem.Allocator) void {
+            // `decode` prende possesso dei byte, come nel plugin.
+            const bytes = a.dupe(u8, self.text) catch return;
+            var d = decode(bytes, self.delimiter, a);
+            d.deinit(a);
+        }
+    };
+    try decoder.expectNoLeakOnAllocFailure(Case{ .text = "a,b,c\n1,\"due, con virgola\",3\n\"x\"\"y\",,\n4,5\n", .delimiter = ',' }, Case.run);
+    try decoder.expectNoLeakOnAllocFailure(Case{ .text = "a\tb\n1\t2\n", .delimiter = '\t' }, Case.run);
+    try decoder.expectNoLeakOnAllocFailure(Case{ .text = "", .delimiter = ',' }, Case.run);
+    try decoder.expectNoLeakOnAllocFailure(Case{ .text = "\"mai chiusa,1\n2,3\n", .delimiter = ',' }, Case.run);
+}
