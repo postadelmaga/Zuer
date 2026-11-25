@@ -1027,8 +1027,6 @@ pub const Renderer = struct {
         pool.uploadTilesEnd() catch return;
 
         for (0..total) |cell| g.vt_slots_ptr[cell] = g.vt_base + @as(u32, @intCast(cell));
-        g.vt_tiles_x = desc.tiles_x;
-        g.vt_tiles_y = desc.tiles_y;
         const dims = vtex.levelDims(m.width, m.height, level, m.levels.len);
         g.vt_level_w = dims.w;
         g.vt_level_h = dims.h;
@@ -1755,8 +1753,6 @@ pub const Renderer = struct {
         vt_mem: VkDeviceMemory = VK_NULL,
         vt_slots_ptr: [*]u32 = undefined, // SSBO mappato (budget entry)
         vt_base: u32 = 0,
-        vt_tiles_x: u32 = 0,
-        vt_tiles_y: u32 = 0,
         vt_level_w: u32 = 0, // larghezza in texel del livello residente (per mappare uv→texel esatto)
         vt_level_h: u32 = 0,
         vt_level: i32 = -1, // livello attualmente residente (-1 = nessuno)

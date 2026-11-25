@@ -47,8 +47,6 @@ const App = struct {
     quit: bool = false,
 };
 
-var app_state: ?*App = null;
-
 fn onDraw(canvas: *paint.Canvas, content: zicro.window.Rect, user: ?*anyopaque) void {
     const self: *App = @ptrCast(@alignCast(user orelse return));
 
@@ -155,7 +153,6 @@ export fn android_main(app: *android.android_app) void {
     state.ui.activity = activity;
     state.ui.start(); // thread delle anteprime (decodifica fuori dal frame)
     defer state.ui.deinit();
-    app_state = &state;
 
     // Senza "accesso a tutti i file" (Android 11+) una cartella condivisa non si apre
     // nemmeno in lettura: si parte dalla scheda che lo spiega, non da una griglia vuota.

@@ -988,10 +988,6 @@ pub const MpvVideo = struct {
         return self.video_id != null;
     }
 
-    pub fn hasAudio(self: *const MpvVideo) bool {
-        return self.audio_id != null;
-    }
-
     /// Dimensione di visualizzazione (aspect applicato), null finché ignota.
     pub fn displaySize(self: *const MpvVideo) ?[2]u32 {
         if (self.disp_w <= 0 or self.disp_h <= 0) return null;

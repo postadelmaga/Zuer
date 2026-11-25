@@ -96,11 +96,12 @@ pub fn main(init: std.process.Init) !void {
         report.deinit();
     }
 
-    // 3. World: the single source of truth, reduced transactionally with undo depth 100.
+    // 3. World: the single source of truth, reduced transactionally. Undo depth 0: no
+    // action undoes anything, and a depth of 100 kept a hundred past copies of the state.
     const doc = zicro.Doc(AppState, AppAction).initDepth(
         gpa,
         state_mod.initial_state,
-        100,
+        0,
         state_mod.reduce,
         @ptrCast(&reducer_gpa),
     );
