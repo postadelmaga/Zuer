@@ -7,6 +7,7 @@
 //! (`prefetchWorker`). Estratto da gui.zig: stesse funzioni, stesso comportamento.
 
 const std = @import("std");
+const zicro = @import("zicro");
 const decoder_mod = @import("decoder.zig");
 const scheduler = @import("scheduler.zig");
 const compose = @import("compose.zig");
@@ -109,18 +110,64 @@ fn folderNeighborsLocked(state: *GuiAppState, buf: *[2]?[]u8) !void {
         const idx = state.current_file_index orelse return error.NoIndex;
         const n = state.file_list.items.len;
         if (n <= 1) return error.NoNeighbors;
-        const dir_path = std.fs.path.dirname(state.shared.current_file_path);
         const prev_i = if (idx == 0) n - 1 else idx - 1;
         const next_i = (idx + 1) % n;
         for (buf, [2]usize{ prev_i, next_i }) |*out, i| {
             if (i == idx) continue; // liste di 2: prev==next==state va evitato
-            const filename = state.file_list.items[i];
-            out.* = if (dir_path) |dp|
-                std.fs.path.join(state.gpa, &.{ dp, filename }) catch null
-            else
-                state.gpa.dupe(u8, filename) catch null;
+            // Il player di un file multimediale non si prepara in anticipo, e
+            // senza quello il resto (poster, scheda) non serve: vedi `needsPlayer`.
+            if (needsPlayer(state.file_list.items[i])) continue;
+            out.* = listedPath(state, i) catch null;
         }
     }
+}
+
+/// Percorso del file `i` della lista: `list_dir` + nome. Con `shared.mutex`
+/// acquisito (lista e cartella cambiano insieme). Il chiamante libera.
+fn listedPath(state: *GuiAppState, i: usize) ![]u8 {
+    const filename = state.file_list.items[i];
+    if (state.list_dir.len == 0) return state.gpa.dupe(u8, filename);
+    return std.fs.path.join(state.gpa, &.{ state.list_dir, filename });
+}
+
+/// Percorso del file a cui sono agganciate le frecce, o null se non c'è una
+/// lista. Con `shared.mutex` acquisito. Serve quando `current_file_path` è vuoto
+/// (stream in riproduzione) e occorre comunque sapere «dove si era».
+pub fn anchorPathLocked(state: *GuiAppState) ?[]u8 {
+    const i = state.current_file_index orelse return null;
+    if (i >= state.file_list.items.len) return null;
+    return listedPath(state, i) catch null;
+}
+
+/// Il file si apre con un player (video, audio, MIDI)? Per questi la cache dei
+/// vicini non si usa: il prefetch non può preparare il player (suonerebbe), e un
+/// cache-hit lo farebbe aprire ad `applyDecoded` sul thread finestra, dentro
+/// `shared.mutex` — finestra e render fermi per tutta l'apertura, timeout
+/// compresi. Passano sempre dal loader, che lo apre fuori dal lock (e se lì
+/// fallisce non si riprova sotto: vedi `Prepared.video_failed`).
+pub fn needsPlayer(path: []const u8) bool {
+    return layout.winKindFromExt(path) == .video or layout.isMidiPath(path);
+}
+
+/// Butta l'eventuale voce di cache di `path` (non verrà usata).
+fn cacheDrop(state: *GuiAppState, path: []const u8) void {
+    var pf = cacheTake(state, path) orelse return;
+    pf.deinit(state.gpa);
+}
+
+/// Invalida ogni caricamento in volo e restituisce la generazione nuova: chi sta
+/// per installare un contenuto che non passa dal loader (uno stream) la prende
+/// alla richiesta e la riverifica con `navSuperseded` prima di installare. Con
+/// `shared.mutex` acquisito (ordine dei lock `shared` → `nav`).
+pub fn claimGeneration(state: *GuiAppState) u32 {
+    state.nav.mutex.lockUncancelable(state.io);
+    defer state.nav.mutex.unlock(state.io);
+    if (state.nav.req) |old| {
+        state.gpa.free(old);
+        state.nav.req = null;
+    }
+    state.nav.gen +%= 1;
+    return state.nav.gen;
 }
 
 /// Posta una richiesta di caricamento asincrono al `loadWorker` e accende lo
@@ -130,7 +177,9 @@ pub fn postLoad(state: *GuiAppState, new_path: []const u8) void {
     // Cache-hit (pagina PDF ±1 prefetchata, file appena lasciato, vicino già
     // pronto): swap sincrono senza spinner. Tutti i chiamanti sono sul thread
     // finestra, quello designato per `applyDecoded`.
-    if (cacheTake(state, new_path)) |pf| {
+    if (needsPlayer(new_path)) {
+        cacheDrop(state, new_path);
+    } else if (cacheTake(state, new_path)) |pf| {
         installFromCache(state, pf, new_path);
         return;
     }
@@ -290,6 +339,9 @@ pub const Prepared = struct {
     stage: ?loader_mod.GpuStage = null,
     rgba: ?[]align(4) u8 = null,
     video: ?PreparedVideo = null,
+    /// Il player è già stato provato fuori dal lock ed è fallito: `installVideo`
+    /// non riprova (sarebbe un secondo giro di timeout con la finestra ferma).
+    video_failed: bool = false,
     /// Il contenuto è un messaggio d'errore, non il file (vedi `applyMessage`).
     message: bool = false,
     /// Il contenuto è l'anteprima a bassa risoluzione che precede il decode pieno.
@@ -327,7 +379,10 @@ pub fn prepareFor(state: *GuiAppState, d: *decoder_mod.Decoded, path: []const u8
         else => {},
     }
     const playable = av and openableMedia(state.io, path);
-    if (has_video and playable and (layout.winKindFromExt(path) == .video or layout.isMidiPath(path))) pre.video = openVideo(state.gpa, path);
+    if (has_video and playable and (layout.winKindFromExt(path) == .video or layout.isMidiPath(path))) {
+        pre.video = openVideo(state.gpa, path);
+        pre.video_failed = pre.video == null;
+    }
     return pre;
 }
 
@@ -382,11 +437,13 @@ fn installVideo(state: *GuiAppState, path: []const u8, pre: *Prepared) bool {
         state.video = pv.vs;
         gui_state_mod.setAvSrc(state, path, pv.has_video);
         state.gpa.free(state.shared.static_rgba);
+        state.shared.static_serial +%= 1;
         state.shared.static_rgba = pv.first.rgba;
         state.shared.static_w = pv.first.w;
         state.shared.static_h = pv.first.h;
         return true;
     }
+    if (pre.video_failed) return false;
     return startVideo(state, path);
 }
 
@@ -610,12 +667,14 @@ pub fn applyDecoded(state: *GuiAppState, new_decoded: decoder_mod.Decoded, pre_i
     } else if (state.shared.decoded == .image) {
         const img = state.shared.decoded.image;
         state.gpa.free(state.shared.static_rgba);
+        state.shared.static_serial +%= 1;
         state.shared.static_rgba = &.{};
         // Dimensioni azzerate finché l'alloc non riesce: mai dims ≠ 0 con
         // pixel vuoti (il compose andrebbe out-of-bounds).
         state.shared.static_w = 0;
         state.shared.static_h = 0;
         // RGBA già pronta dal thread di decode/prefetch (fuori lock): swap.
+        state.shared.static_serial +%= 1;
         state.shared.static_rgba = if (pre.rgba) |r| blk: {
             pre.rgba = null;
             break :blk r;
@@ -626,11 +685,13 @@ pub fn applyDecoded(state: *GuiAppState, new_decoded: decoder_mod.Decoded, pre_i
         if (state.shared.rotation != 0) {
             const rot = try compose.rotateRgba(state.gpa, state.shared.static_rgba, state.shared.static_w, state.shared.static_h, state.shared.rotation);
             state.gpa.free(state.shared.static_rgba);
+            state.shared.static_serial +%= 1;
             state.shared.static_rgba = rot;
             if (state.shared.rotation != 2) std.mem.swap(u32, &state.shared.static_w, &state.shared.static_h);
         }
     } else {
         state.gpa.free(state.shared.static_rgba);
+        state.shared.static_serial +%= 1;
         state.shared.static_rgba = &.{};
         state.shared.static_w = 0;
         state.shared.static_h = 0;
@@ -723,6 +784,7 @@ pub fn startVideo(state: *GuiAppState, path: []const u8) bool {
         };
         gui_state_mod.setAvSrc(state, path, false);
         state.gpa.free(state.shared.static_rgba);
+        state.shared.static_serial +%= 1;
         state.shared.static_rgba = mf.rgba;
         state.shared.static_w = mf.w;
         state.shared.static_h = mf.h;
@@ -737,6 +799,7 @@ pub fn startVideo(state: *GuiAppState, path: []const u8) bool {
         };
         gui_state_mod.setAvSrc(state, path, false);
         state.gpa.free(state.shared.static_rgba);
+        state.shared.static_serial +%= 1;
         state.shared.static_rgba = af.rgba;
         state.shared.static_w = af.w;
         state.shared.static_h = af.h;
@@ -744,6 +807,7 @@ pub fn startVideo(state: *GuiAppState, path: []const u8) bool {
     };
     gui_state_mod.setAvSrc(state, path, true);
     state.gpa.free(state.shared.static_rgba);
+    state.shared.static_serial +%= 1;
     state.shared.static_rgba = first.rgba;
     state.shared.static_w = first.w;
     state.shared.static_h = first.h;
@@ -803,6 +867,42 @@ pub fn toggleVideoTrack(state: *GuiAppState) void {
         return;
     };
     t.detach();
+}
+
+/// La sorgente del video in riproduzione è finita o caduta a regime (vedi
+/// `VideoDecoder.stream_failed`). Uno stream YouTube si riapre dov'era, con
+/// indirizzi nuovi; un file si ricarica dal loader: se non è più leggibile ne
+/// esce il messaggio d'errore, se lo è riparte. Una seconda caduta a breve
+/// distanza non si ritenta (una sorgente che cade sempre non deve diventare un
+/// ciclo di riaperture). `at_s` = posizione della caduta. Con `mutex` preso.
+pub fn streamFailedLocked(state: *GuiAppState, at_s: f64) void {
+    if (comptime !has_video) return;
+    if (yt_search.streamFailed(state, at_s)) return;
+    const path = state.shared.current_file_path;
+    if (path.len == 0) return;
+    const now = zicro.widget.nowMs();
+    const again = state.shared.stream_fail_ms != 0 and now - state.shared.stream_fail_ms < yt_search.fail_retry_ms;
+    state.shared.stream_fail_ms = now;
+    if (again) {
+        std.log.warn("zuer video: la sorgente è caduta di nuovo: non la riapro", .{});
+        return;
+    }
+    const dup = state.gpa.dupe(u8, path) catch return;
+    // `enqueueLoad` prende `shared.mutex`, che qui è già nostro: da un thread.
+    const t = std.Thread.spawn(.{}, reloadWorker, .{ state, dup }) catch {
+        state.gpa.free(dup);
+        return;
+    };
+    t.detach();
+}
+
+fn reloadWorker(state: *GuiAppState, path: []u8) void {
+    defer state.gpa.free(path);
+    // Se intanto si è navigato altrove non c'è nulla da ricaricare.
+    state.shared.mutex.lockUncancelable(state.io);
+    const still = std.mem.eql(u8, state.shared.current_file_path, path);
+    state.shared.mutex.unlock(state.io);
+    if (still) enqueueLoad(state, path);
 }
 
 /// Il motore video ha perso il contesto GPU (reset del driver, sospensione su
@@ -903,6 +1003,7 @@ fn videoReopenWorker(state: *GuiAppState, src: []u8, audio_src: ?[]u8, pos: f64)
     }
     vo.dec.setPlaying(vs.playing);
     state.gpa.free(state.shared.static_rgba);
+    state.shared.static_serial +%= 1;
     state.shared.static_rgba = vo.rgba;
     state.shared.static_w = vo.w;
     state.shared.static_h = vo.h;
@@ -931,6 +1032,9 @@ pub fn initFileList(state: *GuiAppState) !void {
     }.compare);
 
     state.current_file_index = indexOfFile(state.io, dir_path, state.file_list.items, std.fs.path.basename(state.shared.current_file_path));
+    // Prima dello spawn dei thread: nessun lock da prendere.
+    state.gpa.free(state.list_dir);
+    state.list_dir = try state.gpa.dupe(u8, std.fs.path.dirname(state.shared.current_file_path) orelse "");
 }
 
 pub const indexOfFile = @import("dir_match.zig").indexOfFile;
@@ -975,19 +1079,15 @@ fn navigateTo(state: *GuiAppState, next_idx: usize) void {
     // `current_file_path` è liberato/riassegnato da `applyDecoded` (anche sui
     // thread loader) sotto `mutex`: leggilo — e usa la slice di dirname —
     // solo sotto lock, costruendo qui il nuovo percorso.
-    const filename = state.file_list.items[next_idx];
+    // La cartella è quella della LISTA (`list_dir`), non quella del percorso
+    // corrente: con uno stream aperto il percorso corrente è vuoto, e prima
+    // (quando conteneva il titolo) le frecce cercavano il file per solo nome
+    // nella cartella corrente del processo.
     state.shared.mutex.lockUncancelable(state.io);
-    const dir_path = std.fs.path.dirname(state.shared.current_file_path);
-    const new_path = if (dir_path) |dp|
-        std.fs.path.join(state.gpa, &.{ dp, filename }) catch {
-            state.shared.mutex.unlock(state.io);
-            return;
-        }
-    else
-        state.gpa.dupe(u8, filename) catch {
-            state.shared.mutex.unlock(state.io);
-            return;
-        };
+    const new_path = listedPath(state, next_idx) catch {
+        state.shared.mutex.unlock(state.io);
+        return;
+    };
     // L'indice è letto da `schedulePrefetchAround` (thread loader) sotto
     // `shared.mutex`: scriverlo qui, nella stessa sezione critica, evita il
     // prefetch dei vicini sbagliati durante uno spam di frecce.
@@ -996,8 +1096,11 @@ fn navigateTo(state: *GuiAppState, next_idx: usize) void {
     defer state.gpa.free(new_path);
 
     // Cache-hit: il vicino è già decodificato (e staged) → swap istantaneo e
-    // sincrono (nessuno spinner: è già pronto).
-    if (cacheTake(state, new_path)) |pf| {
+    // sincrono (nessuno spinner: è già pronto). Mai per i file con un player.
+    if (needsPlayer(new_path)) {
+        cacheDrop(state, new_path);
+        postLoad(state, new_path);
+    } else if (cacheTake(state, new_path)) |pf| {
         installFromCache(state, pf, new_path);
     } else {
         // Cache-miss (scroll più veloce del prefetch, o file troppo grande per
@@ -1039,6 +1142,7 @@ fn parkOutgoingLocked(state: *GuiAppState, new_path: []const u8) bool {
     // L'RGBA statica è esattamente l'espansione dell'immagine solo se non ruotata.
     if (d.* == .image and state.shared.rotation == 0 and state.shared.static_w != 0 and state.shared.static_rgba.len != 0) {
         pf.rgba = state.shared.static_rgba;
+        state.shared.static_serial +%= 1;
         state.shared.static_rgba = &.{};
         state.shared.static_w = 0;
         state.shared.static_h = 0;
@@ -1049,6 +1153,7 @@ fn parkOutgoingLocked(state: *GuiAppState, new_path: []const u8) bool {
     if (state.pf.cache.count() >= 4 or state.pf.cache.contains(old_path)) {
         // Cache piena o già presente: restituisci l'RGBA e lascia distruggere.
         if (pf.rgba) |r| {
+            state.shared.static_serial +%= 1;
             state.shared.static_rgba = r;
             state.shared.static_w = @intCast(d.image.width);
             state.shared.static_h = @intCast(d.image.height);
@@ -1057,6 +1162,7 @@ fn parkOutgoingLocked(state: *GuiAppState, new_path: []const u8) bool {
     }
     const key = state.gpa.dupe(u8, old_path) catch {
         if (pf.rgba) |r| {
+            state.shared.static_serial +%= 1;
             state.shared.static_rgba = r;
             state.shared.static_w = @intCast(d.image.width);
             state.shared.static_h = @intCast(d.image.height);
@@ -1066,6 +1172,7 @@ fn parkOutgoingLocked(state: *GuiAppState, new_path: []const u8) bool {
     state.pf.cache.put(state.gpa, key, pf) catch {
         state.gpa.free(key);
         if (pf.rgba) |r| {
+            state.shared.static_serial +%= 1;
             state.shared.static_rgba = r;
             state.shared.static_w = @intCast(d.image.width);
             state.shared.static_h = @intCast(d.image.height);

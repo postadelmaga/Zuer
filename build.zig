@@ -336,6 +336,8 @@ pub fn build(b: *std.Build) void {
             addMpvC(b, vbench.root_module);
         }
         addStbTruetypeHeaders(b, vbench.root_module);
+        // `video.zig` porta con sé il player MIDI: senza, il banco non compilava più.
+        addTsf(b, vbench.root_module);
         b.step("video-bench", "Banco della pipeline video (zuer-video-bench)").dependOn(&b.addInstallArtifact(vbench, .{}).step);
     }
 

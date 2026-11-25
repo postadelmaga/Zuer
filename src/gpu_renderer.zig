@@ -1265,7 +1265,7 @@ pub const Renderer = struct {
         vkCmdPipelineBarrier(self.cmd, STAGE_TRANSFER, STAGE_FRAGMENT_SHADER, 0, 0, null, 0, null, 1, &to_read);
         try check(vkEndCommandBuffer(self.cmd));
         try check(vkQueueSubmit(self.queue, 1, &[_]VkSubmitInfo{.{ .pCommandBuffers = @ptrCast(&self.cmd) }}, self.fence));
-        try check(vkWaitForFences(self.device, 1, @ptrCast(&self.fence), 1, 2 * std.time.ns_per_s));
+        try vk.waitFence(self.device, &self.fence);
         try check(vkResetFences(self.device, 1, @ptrCast(&self.fence)));
 
         return tex;
@@ -1330,6 +1330,21 @@ pub const Renderer = struct {
     /// readback è saltato): il chiamante deve controllare `colorDmabuf()` PRIMA
     /// di usare il risultato di questa funzione.
     pub fn render(self: *Renderer, width: u32, height: u32, pc: *const PushConstants) ![]const u8 {
+        return self.renderFrame(width, height, pc) catch |e| {
+            // Un errore a metà (record o submit falliti dopo il reset della
+            // fence) lascia la sincronizzazione dei due slot in uno stato che il
+            // frame dopo non sa leggere: aspetterebbe una fence che nessuno
+            // segnala. Si riparte da capo, come dopo un resize. Con il device
+            // perso non c'è nulla da aspettare: il renderer va rifatto.
+            switch (e) {
+                error.VulkanDeviceLost, error.NoMesh, error.EmptyTarget => {},
+                else => self.resetFrameSync(),
+            }
+            return e;
+        };
+    }
+
+    fn renderFrame(self: *Renderer, width: u32, height: u32, pc: *const PushConstants) ![]const u8 {
         // Lo slot restituito la volta scorsa sta per essere riscritto.
         self.last_frame_slot = null;
         if (self.mesh_buf == VK_NULL) return error.NoMesh;
@@ -1345,20 +1360,20 @@ pub const Renderer = struct {
         const prev_slot = (self.frame_index + 1) % 2;
 
         if (self.frame_index >= 2) {
-            try check(vkWaitForFences(self.device, 1, @ptrCast(&self.frame_fences[slot]), 1, 2 * std.time.ns_per_s));
+            try vk.waitFence(self.device, &self.frame_fences[slot]);
             try check(vkResetFences(self.device, 1, @ptrCast(&self.frame_fences[slot])));
         }
 
         try self.recordAndSubmitFrame(slot, width, height, pc);
 
         if (self.frame_index == 0) {
-            try check(vkWaitForFences(self.device, 1, @ptrCast(&self.frame_fences[0]), 1, 2 * std.time.ns_per_s));
+            try vk.waitFence(self.device, &self.frame_fences[0]);
             self.frame_index += 1;
             self.last_frame_slot = 0;
             return self.readback_ptrs[0].?[0 .. @as(usize, width) * height * 4];
         }
 
-        try check(vkWaitForFences(self.device, 1, @ptrCast(&self.frame_fences[prev_slot]), 1, 2 * std.time.ns_per_s));
+        try vk.waitFence(self.device, &self.frame_fences[prev_slot]);
         self.frame_index += 1;
         self.last_frame_slot = @intCast(prev_slot);
         return self.readback_ptrs[prev_slot].?[0 .. @as(usize, width) * height * 4];
@@ -1384,7 +1399,7 @@ pub const Renderer = struct {
     pub fn renderSync(self: *Renderer, width: u32, height: u32, pc: *const PushConstants) ![]const u8 {
         self.last_frame_slot = null;
         try self.recordAndSubmitFrame(0, width, height, pc);
-        try check(vkWaitForFences(self.device, 1, @ptrCast(&self.frame_fences[0]), 1, 2 * std.time.ns_per_s));
+        try vk.waitFence(self.device, &self.frame_fences[0]);
         try check(vkResetFences(self.device, 1, @ptrCast(&self.frame_fences[0])));
         return self.readback_ptrs[0].?[0 .. @as(usize, width) * height * 4];
     }
@@ -1603,7 +1618,7 @@ pub const Renderer = struct {
 
         try check(vkEndCommandBuffer(cmd));
         try check(vkQueueSubmit(self.queue, 1, &[_]VkSubmitInfo{.{ .pCommandBuffers = @ptrCast(&cmd) }}, fence));
-        try check(vkWaitForFences(self.device, 1, @ptrCast(&fence), 1, 2 * std.time.ns_per_s));
+        try vk.waitFence(self.device, &fence);
         try check(vkResetFences(self.device, 1, @ptrCast(&fence)));
     }
 
@@ -2038,7 +2053,7 @@ pub const Renderer = struct {
         vkCmdPipelineBarrier(self.cmd, STAGE_TRANSFER, STAGE_FRAGMENT_SHADER, 0, 0, null, 0, null, 1, &to_read);
         try check(vkEndCommandBuffer(self.cmd));
         try check(vkQueueSubmit(self.queue, 1, &[_]VkSubmitInfo{.{ .pCommandBuffers = @ptrCast(&self.cmd) }}, self.fence));
-        try check(vkWaitForFences(self.device, 1, @ptrCast(&self.fence), 1, 2 * std.time.ns_per_s));
+        try vk.waitFence(self.device, &self.fence);
         try check(vkResetFences(self.device, 1, @ptrCast(&self.fence)));
 
         const img_info = VkDescriptorImageInfo{
@@ -2128,7 +2143,7 @@ pub const Renderer = struct {
 
         try check(vkEndCommandBuffer(self.cmd));
         try check(vkQueueSubmit(self.queue, 1, &[_]VkSubmitInfo{.{ .pCommandBuffers = @ptrCast(&self.cmd) }}, self.fence));
-        try check(vkWaitForFences(self.device, 1, @ptrCast(&self.fence), 1, 2 * std.time.ns_per_s));
+        try vk.waitFence(self.device, &self.fence);
         try check(vkResetFences(self.device, 1, @ptrCast(&self.fence)));
 
         return self.readback_ptr.?[0 .. @as(usize, out_w) * out_h * 4];

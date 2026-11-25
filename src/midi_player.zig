@@ -149,13 +149,19 @@ pub const MidiPlayer = struct {
     /// un SoundFont sul sistema, se il file non è un MIDI valido o se il device
     /// audio non si apre.
     pub fn start(path: []const u8, gpa: std.mem.Allocator) ?*MidiPlayer {
-        return startInner(path, gpa) catch null;
+        return startInner(path, gpa, true) catch null;
+    }
+
+    /// Come `start`, ma in pausa: il flag è scritto PRIMA che parta il thread,
+    /// quindi non esce nemmeno un blocco finché `setPlaying(true)`.
+    pub fn startPaused(path: []const u8, gpa: std.mem.Allocator) ?*MidiPlayer {
+        return startInner(path, gpa, false) catch null;
     }
 
     /// Corpo di `start` con gestione errori esplicita: gli early-out sono errori
     /// veri così gli `errdefer` liberano synth, lista messaggi e device anche
     /// sui percorsi di fallimento (stesso pattern di audio_player.zig).
-    fn startInner(path: []const u8, gpa: std.mem.Allocator) anyerror!*MidiPlayer {
+    fn startInner(path: []const u8, gpa: std.mem.Allocator, playing: bool) anyerror!*MidiPlayer {
         const sf_path = findSoundfont(gpa) orelse return error.NoSoundfont;
         defer gpa.free(sf_path);
         const sf_z = try gpa.dupeSentinel(u8, sf_path, 0);
@@ -188,6 +194,7 @@ pub const MidiPlayer = struct {
             .dev = dev,
             .gpa = gpa,
         };
+        self.playing.store(playing, .monotonic);
         self.thread = try std.Thread.spawn(.{}, threadMain, .{self});
         return self;
     }

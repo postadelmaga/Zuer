@@ -232,7 +232,7 @@ pub const VtexPool = struct {
     fn submitSync(self: *VtexPool) !void {
         try vk.check(vk.vkEndCommandBuffer(self.cmd));
         try vk.check(vk.vkQueueSubmit(self.queue, 1, &[_]vk.VkSubmitInfo{.{ .pCommandBuffers = @ptrCast(&self.cmd) }}, self.fence));
-        try vk.check(vk.vkWaitForFences(self.device, 1, @ptrCast(&self.fence), 1, 2 * std.time.ns_per_s));
+        try vk.waitFence(self.device, &self.fence);
         try vk.check(vk.vkResetFences(self.device, 1, @ptrCast(&self.fence)));
     }
 };

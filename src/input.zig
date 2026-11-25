@@ -227,6 +227,7 @@ fn rotateView(app_state: *GuiAppState, clockwise: bool) void {
     const turns: u2 = if (clockwise) 1 else 3;
     const rot = compose.rotateRgba(app_state.gpa, sh.static_rgba, sh.static_w, sh.static_h, turns) catch return;
     app_state.gpa.free(sh.static_rgba);
+    sh.static_serial +%= 1;
     sh.static_rgba = rot;
     std.mem.swap(u32, &sh.static_w, &sh.static_h);
     sh.rotation +%= turns;
@@ -574,6 +575,7 @@ fn handleYtKey(app_state: *GuiAppState, key: u32) bool {
     if (!yt.active) {
         if (key == KEY_Y and !app_state.ctrl_down) {
             yt.active = true;
+            yt.prewarm_sel = -2; // overlay appena aperto: il motore si preavvia di nuovo
             yt_search.ensureQueueLoaded(app_state);
             // Il 'y' di apertura genera anche un evento testo (on_text è
             // additivo a on_key): non deve finire nella query.
@@ -821,11 +823,14 @@ pub fn keyCallback(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) 
         app_state.shared.mutex.lockUncancelable(app_state.io);
         const txt = if (is_text and app_state.shared.text_lines.items.len > 0)
             buildSelectedText(app_state, app_state.gpa)
+        else if (yt_search.currentLink(app_state)) |link|
+            link // uno stream non ha un percorso: si copia il suo indirizzo
         else
             app_state.gpa.dupe(u8, stripFragment(app_state.shared.current_file_path)) catch null;
         app_state.shared.mutex.unlock(app_state.io);
         if (txt) |t| {
-            clipboard.copy(t);
+            // Non `copy`: lancia un processo e lo aspetta, e questo è il thread finestra.
+            clipboard.copyAsync(t);
             app_state.gpa.free(t);
         }
         return;

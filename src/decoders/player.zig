@@ -532,6 +532,15 @@ fn nowNs() i64 {
     return @as(i64, ts.sec) * std.time.ns_per_s + ts.nsec;
 }
 
+/// Inizio del container in secondi, 0 se ignoto o negativo (un edit list AAC lo
+/// porta poco sotto zero: lì i tempi restano com'erano). Per `Player` e
+/// `AudioPlayer`: devono togliere lo stesso valore.
+pub fn containerOrigin(fmt_ctx: [*c]c.AVFormatContext) f64 {
+    const st = fmt_ctx.*.start_time;
+    if (st == c.AV_NOPTS_VALUE or st <= 0) return 0;
+    return @as(f64, @floatFromInt(st)) / @as(f64, c.AV_TIME_BASE);
+}
+
 pub const Player = struct {
     fmt_ctx: [*c]c.AVFormatContext,
     /// Interruzione dell'I/O del contesto (vedi `Interrupt`): `interrupt()` la scatta.
@@ -541,6 +550,13 @@ pub const Player = struct {
     packet: [*c]c.AVPacket,
     video_stream: c_int,
     time_base: f64, // secondi per unità di PTS dello stream video
+    /// Inizio del container in secondi (`AVFormatContext.start_time`, mai negativo).
+    /// I pts escono di qui già riportati a zero, e `seek` lo rimette: `dur_s` è una
+    /// LUNGHEZZA, e con i timestamp grezzi un MPEG-TS che parte da migliaia di
+    /// secondi (cattura da trasmissione) aveva la posizione oltre la durata dal
+    /// primo frame. Origine del container, non dello stream: così video e audio
+    /// (aperti dallo stesso file) tolgono lo stesso valore e restano allineati.
+    origin_s: f64 = 0,
     duration_s: f64, // durata del container in secondi (0 se ignota)
     // Alcuni container (tipici AVI) non danno PTS per-frame → best_effort_timestamp
     // resta a 0/NOPTS su tutti i frame e il pacing si blocca. Fallback: PTS
@@ -806,6 +822,7 @@ pub const Player = struct {
             .packet = packet,
             .video_stream = stream_idx,
             .time_base = time_base,
+            .origin_s = containerOrigin(fmt_ctx),
             .duration_s = duration_s,
             .frame_rate = frame_rate,
             .cvp9_ctx = cvp9_ctx,
@@ -855,7 +872,7 @@ pub const Player = struct {
         // ts=0/NOPTS su tutti i frame) sintetizzato da indice/fps così il pacing
         // avanza invece di restare bloccato a 0.
         if (ts != c.AV_NOPTS_VALUE and ts > 0 and self.time_base > 0) {
-            return @as(f64, @floatFromInt(ts)) * self.time_base;
+            return @max(0, @as(f64, @floatFromInt(ts)) * self.time_base - self.origin_s);
         }
         return @as(f64, @floatFromInt(idx)) / self.frame_rate;
     }
@@ -864,7 +881,7 @@ pub const Player = struct {
     /// il cui PTS è quello del packet che abbiamo sottomesso).
     fn rawPtsSeconds(self: *Player, ts: i64) f64 {
         if (ts == c.AV_NOPTS_VALUE) return 0;
-        return @as(f64, @floatFromInt(ts)) * self.time_base;
+        return @max(0, @as(f64, @floatFromInt(ts)) * self.time_base - self.origin_s);
     }
 
     /// Decodifica il prossimo frame video, scalato a `max_dim`, con il suo PTS.
@@ -885,13 +902,18 @@ pub const Player = struct {
         while (true) {
             const rr = av.av_read_frame(self.fmt_ctx, self.packet);
             if (rr < 0) {
-                // Fine file: svuota il decoder con un packet nullo.
+                // Fine file: svuota il decoder con un packet nullo (ripeterlo alle
+                // chiamate successive è innocuo) e continua a tirare fuori frame
+                // finché ce ne sono. Un frame scartato per pts (sotto la soglia
+                // post-seek) NON è la fine: prima lo si restituiva come tale, anche
+                // con altri frame ancora nel decoder, e un seek negli ultimi secondi
+                // lasciava il video fermo senza mai pubblicare il frame d'arrivo.
                 _ = av.avcodec_send_packet(self.codec_ctx, null);
-                const r = av.avcodec_receive_frame(self.codec_ctx, self.frame);
-                if (r < 0) return null;
-                // Se il download hw fallisse proprio all'ultimo frame (null),
-                // il file finisce qui comunque: nessun frame da recuperare.
-                return try self.frameFromCurrent(max_dim, allocator, skip_before_pts);
+                while (true) {
+                    const r = av.avcodec_receive_frame(self.codec_ctx, self.frame);
+                    if (r < 0) return null;
+                    if (try self.frameFromCurrent(max_dim, allocator, skip_before_pts)) |fr| return fr;
+                }
             }
             defer av.av_packet_unref(self.packet);
             if (self.packet.*.stream_index != self.video_stream) continue;
@@ -1147,7 +1169,11 @@ pub const Player = struct {
     /// vicino) e svuota i buffer del decoder.
     pub fn seek(self: *Player, seconds: f64) void {
         if (self.time_base > 0) {
-            const ts: i64 = @intFromFloat(seconds / self.time_base);
+            // L'inizio è l'inizio del FILE, non `origin_s`: in un MPEG-TS il seek va
+            // per PCR, che precede i pts del ritardo di mux (~1 s), e chiedere
+            // l'origine esatta atterrava un keyframe più avanti — a ogni loop si
+            // perdeva il primo secondo. Un ts prima di tutto porta al primo packet.
+            const ts: i64 = if (seconds <= 0) 0 else @intFromFloat((seconds + self.origin_s) / self.time_base);
             // HLS: il seek "all'indietro" di libavformat (hls.c del commit in uso) torna
             // all'inizio del segmento e poi di un altro segmento ancora, cioè fino a
             // 2 segmenti prima del punto chiesto (6-12 s su YouTube). Senza il flag
@@ -1159,7 +1185,7 @@ pub const Player = struct {
             // Senza time_base il ts è in unità AV_TIME_BASE: va passato con stream
             // index -1 (default), altrimenti verrebbe interpretato nella time_base
             // dello stream video → seek a una posizione sbagliata.
-            const ts: i64 = @intFromFloat(seconds * @as(f64, c.AV_TIME_BASE));
+            const ts: i64 = if (seconds <= 0) 0 else @intFromFloat((seconds + self.origin_s) * @as(f64, c.AV_TIME_BASE));
             _ = av.av_seek_frame(self.fmt_ctx, -1, ts, c.AVSEEK_FLAG_BACKWARD);
         }
         self.resume_after_pts = -1; // un seek esplicito annulla il riallineamento

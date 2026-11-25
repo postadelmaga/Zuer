@@ -81,7 +81,7 @@ fn rasterizeText(state: *GuiAppState, width: u32, text_zoom: f32) void {
     // GPU solo se riesce: renderer assente, fallito o perso → percorso CPU qui sotto.
     // Il markdown ha solo il percorso CPU (impaginazione proporzionale).
     if (native and state.text_gpu and state.shared.decoded != .markdown) {
-        if (rasterizeTextGpu(state, std.fs.path.basename(state.shared.current_file_path), opts)) return;
+        if (rasterizeTextGpu(state, gui_state_mod.labelName(state), opts)) return;
     }
 
     // La geometria (wrapping) cambia con larghezza/zoom: la vecchia selezione
@@ -100,7 +100,7 @@ fn rasterizeText(state: *GuiAppState, width: u32, text_zoom: f32) void {
     // il contenuto vecchio e si buttano (il worker rifà il raster al giro dopo).
     // Il nome file va copiato: il path può essere liberato durante la finestra.
     var name_buf: [512]u8 = undefined;
-    const base = std.fs.path.basename(state.shared.current_file_path);
+    const base = gui_state_mod.labelName(state);
     const nlen = @min(base.len, name_buf.len);
     @memcpy(name_buf[0..nlen], base[0..nlen]);
     const name = name_buf[0..nlen];
@@ -158,6 +158,7 @@ fn rasterizeText(state: *GuiAppState, width: u32, text_zoom: f32) void {
     state.shared.text_lines = lines;
     state.shared.text_metrics = metrics;
     state.gpa.free(state.shared.static_rgba);
+    state.shared.static_serial +%= 1;
     state.shared.static_rgba = &.{};
     state.shared.static_w = @intCast(new_doc.?.width);
     state.shared.static_h = @intCast(new_doc.?.height);
@@ -205,6 +206,7 @@ fn rasterizeTextGpu(state: *GuiAppState, name: []const u8, opts: text_render.Ren
     const rgba = state.gpa.alignedAlloc(u8, .@"4", rgba_src.len) catch return false;
     @memcpy(rgba, rgba_src);
     state.gpa.free(state.shared.static_rgba);
+    state.shared.static_serial +%= 1;
     state.shared.static_rgba = rgba;
     state.shared.static_w = @intCast(mesh.width);
     state.shared.static_h = @intCast(mesh.height);
@@ -548,7 +550,13 @@ fn renderWorker(
             // ne è l'unico proprietario) e `presentRgba` COPIA subito il frame nel
             // mailbox di zrame (`chrome.stageFrame`, thread-safe) — nessuno stato
             // condiviso in gioco, i callback input non restano bloccati.
-            state.shared.mutex.unlock(state.io);
+            //
+            // Con un overlay aperto (esploratore, ricerca YouTube) il lock invece
+            // si tiene: l'overlay va disegnato sopra lo spinner, e legge lo stato
+            // condiviso. Prima qui non si disegnava: per tutto il caricamento
+            // frecce e Invio agivano su una griglia che non si vedeva.
+            const overlay_open = state.shared.fx.active or state.shared.yt.active;
+            if (!overlay_open) state.shared.mutex.unlock(state.io);
             if (composited_rgba.len < cur_w * cur_h * 4) {
                 state.gpa.free(composited_rgba.*);
                 // 4-byte aligned: la fase di compose lo rilegge come []u32 per il
@@ -559,11 +567,21 @@ fn renderWorker(
                     // logga, salta il frame e riprova al prossimo giro.
                     composited_rgba.* = &.{};
                     std.debug.print("[gui] alloc framebuffer (loader) fallita: {s}\n", .{@errorName(e)});
+                    if (overlay_open) state.shared.mutex.unlock(state.io);
                     frame_dt = @min(0.1, @as(f32, @floatCast(pacer_20.tick())));
                     continue;
                 };
             }
             drawLoader(composited_rgba.*, cur_w, cur_h, spin_frame);
+            if (overlay_open) {
+                if (state.shared.fx.active) {
+                    if (uiFonts(&ui_body, &ui_small)) |f| file_explorer.drawOverlay(composited_rgba.*, cur_w, cur_h, state, f);
+                }
+                if (state.shared.yt.active) {
+                    if (uiFonts(&ui_body, &ui_small)) |f| yt_search.drawOverlay(composited_rgba.*, cur_w, cur_h, state, f, @as(f32, @floatFromInt(spin_frame)) / 60.0);
+                }
+                state.shared.mutex.unlock(state.io);
+            }
             win.presentRgba(cur_w, cur_h, composited_rgba.*);
             spin_frame +%= 1;
             _ = pacer_60.tick();
@@ -592,7 +610,9 @@ fn renderWorker(
             // "frame" è l'oscilloscopio disegnato più sotto direttamente nel buffer
             // finestra. `static_w/h` seguono la finestra così il fit-rect è pieno e
             // l'hit-test dei controlli (che usa le stesse dimensioni) resta corretto.
-            if (!vs.audio_only) if (vs.decoder) |dec| if (dec.engineLost()) nav.restartLostEngineLocked(state);
+            if (!vs.audio_only) if (vs.decoder) |dec| {
+                if (dec.engineLost()) nav.restartLostEngineLocked(state) else if (dec.takeStreamFailed()) |at| nav.streamFailedLocked(state, at);
+            };
             const audio_only = vs.audio_only;
             // Taglia di presentazione al produttore: i prossimi frame arrivano
             // già alla dimensione del fit-rect (scalati con filtro di qualità nel
@@ -694,7 +714,7 @@ fn renderWorker(
                 videomod.drawVideoControls(composited_rgba.*, fr.w, fr.h, vs, raster, gpu_video and !state.shared.yt.subs_on);
                 // Fuori dalla fascia dei controlli il buffer è già quello buono.
                 if (pres_dirty == null) {
-                    if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, fr.w, fr.h, r, std.fs.path.basename(state.shared.current_file_path), label_alpha, null);
+                    if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, fr.w, fr.h, r, gui_state_mod.labelName(state), label_alpha, null);
                     vid_full_w = fr.w;
                     vid_full_h = fr.h;
                 }
@@ -887,7 +907,7 @@ fn renderWorker(
                     mesh_vt_zoom = state.shared.zoom; // pilota il mip dinamico delle texture virtuali
                     mesh_settle = mesh_dirty; // un render in più dopo l'ultimo cambio
                 }
-                const bn = std.fs.path.basename(state.shared.current_file_path);
+                const bn = gui_state_mod.labelName(state);
                 mesh_name_len = @min(bn.len, mesh_name_buf.len);
                 @memcpy(mesh_name_buf[0..mesh_name_len], bn[0..mesh_name_len]);
                 last_yaw = state.shared.yaw;
@@ -971,7 +991,7 @@ fn renderWorker(
                     input.clampImagePan(&state.shared.pan_x, &state.shared.pan_y, vz, cur_w, cur_h, state.shared.static_w, state.shared.static_h);
                     // Catena mip (pigra: si rifà solo se `static_rgba` è cambiato) →
                     // campionamento bilineare dal livello giusto: niente aliasing.
-                    state.shared.mips.ensure(state.gpa, state.shared.static_rgba, state.shared.static_w, state.shared.static_h);
+                    state.shared.mips.ensure(state.gpa, state.shared.static_rgba, state.shared.static_w, state.shared.static_h, state.shared.static_serial);
                     compose.composeFrame(composited_rgba.*, cur_w, cur_h, state.shared.static_rgba, state.shared.static_w, state.shared.static_h, vz, state.shared.pan_x, state.shared.pan_y, &state.shared.mips);
                 }
             }
@@ -980,7 +1000,7 @@ fn renderWorker(
             // ramo mesh (render o riuso del readback) il frame viene composto DOPO
             // l'unlock: label e flag lì.
             if (mesh_push == null and mesh_voxel_push == null and !mesh_reuse) {
-                if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, cur_w, cur_h, r, std.fs.path.basename(state.shared.current_file_path), label_alpha, if (print_mod.printable(state)) state.shared.print.hover else null);
+                if (name_raster) |*r| drawFilenameLabel(composited_rgba.*, cur_w, cur_h, r, gui_state_mod.labelName(state), label_alpha, if (print_mod.printable(state)) state.shared.print.hover else null);
                 // Esploratore file sotto l'eventuale overlay YouTube (siamo sotto lock).
                 if (state.shared.fx.active) {
                     if (uiFonts(&ui_body, &ui_small)) |f| file_explorer.drawOverlay(composited_rgba.*, cur_w, cur_h, state, f);
@@ -1121,7 +1141,7 @@ fn renderWorker(
             if (need_render) tr[1] += 1;
             tr_acc += frame_dt;
             if (tr_acc >= 1.0) {
-                std.debug.print("[trace] ticks={d} renders={d} mesh_gpu={d} size={d} file_changed={d} pulse={d} sc_tick={d} load_seq={d} nav_gen={d} win={d}x{d} static={d}x{d} zoom={d:.2} pan={d:.0},{d:.0} scroll_y={d:.1} file={s}\n", .{ tr[0], tr[1], tr[7], tr[2], tr[3], tr[5], tr[6], state.shared.load_seq, state.nav.gen, cur_w, cur_h, state.shared.static_w, state.shared.static_h, state.shared.zoom, state.shared.pan_x, state.shared.pan_y, state.shared.sc.offset[1], std.fs.path.basename(state.shared.current_file_path) });
+                std.debug.print("[trace] ticks={d} renders={d} mesh_gpu={d} size={d} file_changed={d} pulse={d} sc_tick={d} load_seq={d} nav_gen={d} win={d}x{d} static={d}x{d} zoom={d:.2} pan={d:.0},{d:.0} scroll_y={d:.1} file={s}\n", .{ tr[0], tr[1], tr[7], tr[2], tr[3], tr[5], tr[6], state.shared.load_seq, state.nav.gen, cur_w, cur_h, state.shared.static_w, state.shared.static_h, state.shared.zoom, state.shared.pan_x, state.shared.pan_y, state.shared.sc.offset[1], gui_state_mod.labelName(state) });
                 tr = @splat(0);
                 tr_acc = 0;
             }
@@ -1439,6 +1459,7 @@ pub fn main(init: std.process.Init) !void {
 
     defer {
         gpa.free(gui_state.shared.current_file_path);
+        gpa.free(gui_state.list_dir);
         for (gui_state.file_list.items) |f| gpa.free(f);
         gui_state.file_list.deinit(gpa);
         for (gui_state.shared.text_lines.items) |l| gpa.free(l);

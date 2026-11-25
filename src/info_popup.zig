@@ -67,17 +67,20 @@ pub const Card = struct {
 pub fn build(state: *GuiAppState) void {
     const card = &state.shared.info_card;
     card.* = .{ .seq = state.shared.load_seq };
-    const path = state.shared.current_file_path;
+    // Uno stream non ha un percorso: si descrive col titolo e col suo indirizzo.
+    var link_buf: [96]u8 = undefined;
+    const stream = state.shared.display_name.len > 0;
+    const path = if (stream) streamLink(state, &link_buf) else state.shared.current_file_path;
     const hash = decoder_mod.fragmentIndex(path);
     const clean = if (hash) |h| path[0..h] else path;
-    const url = std.mem.indexOf(u8, path, "://") != null;
+    const url = stream or std.mem.indexOf(u8, path, "://") != null;
     const in_archive = gui_state_mod.isInsideArchive(path);
     const ext = decoder_mod.getExtension(clean);
     var ext_up: [12]u8 = undefined;
     const EXT = std.ascii.upperString(ext_up[0..@min(ext.len, ext_up.len)], ext[0..@min(ext.len, ext_up.len)]);
 
     // Titolo: il nome del file (della voce, dentro un archivio).
-    const name = if (in_archive) std.fs.path.basename(path[hash.? + 1 ..]) else if (url) path else std.fs.path.basename(clean);
+    const name = if (stream) state.shared.display_name else if (in_archive) std.fs.path.basename(path[hash.? + 1 ..]) else if (url) path else std.fs.path.basename(clean);
     card.title.set("{s}", .{name});
 
     // Tipo e dettagli del contenuto.
@@ -94,7 +97,7 @@ pub fn build(state: *GuiAppState) void {
         if (vs.decoder) |d| if (d.src_w > 0 and d.src_h > 0)
             card.add("Risoluzione", "{d} × {d}", .{ d.src_w, d.src_h });
         if (vs.dur_s > 0) addDuration(card, vs.dur_s);
-        if (url) card.add("Indirizzo", "{s}", .{path});
+        if (url and path.len > 0) card.add("Indirizzo", "{s}", .{path});
         addFileRows(state, card, clean, in_archive, url);
         return;
     };
@@ -176,6 +179,12 @@ pub fn build(state: *GuiAppState) void {
         .err => card.add("Tipo", "Non leggibile", .{}),
     }
     addFileRows(state, card, clean, in_archive, url);
+}
+
+/// Indirizzo della pagina dello stream in riproduzione ("" se non c'è).
+fn streamLink(state: *GuiAppState, buf: []u8) []const u8 {
+    const id = state.shared.yt.current_id orelse return "";
+    return std.fmt.bufPrint(buf, "https://www.youtube.com/watch?v={s}", .{id}) catch "";
 }
 
 /// Righe comuni: peso, data, cartella, posizione nella cartella.

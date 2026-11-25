@@ -152,7 +152,7 @@ YouTube e appunti (aspettano processi esterni: nel pool bloccherebbero worker CP
 e la scrittura della cache mesh (I/O su disco, misurato: in un worker ritardava il
 decode in primo piano).
 
-Portabilità: zicro e zrame nascondono le differenze di OS (finestra, input, clipboard,
+Portabilità: zicro e zrame nascondono le differenze di OS (finestra, input,
 dynamic loading) dietro API uniformi, così zuer resta in gran parte agnostico rispetto
 alla piattaforma. I punti che restano specifici sono isolati in file per-OS
 (`terminal.zig`, `clipboard.zig`, `dynlib.zig`) o dietro flag comptime.

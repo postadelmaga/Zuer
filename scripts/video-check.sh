@@ -90,6 +90,22 @@ for clip in garbage.ts empty.ts; do
     check "$clip: il motore chiude in meno di 100 ms" "awk '/mpv stop in/{if (\$(NF-1)+0 >= 100) bad=1} END{exit bad}' <<<\"\$out\""
 done
 
+# Motore FFmpeg (quello di ripiego, ZUER_NO_MPV=1). Un MPEG-TS registrato da una
+# trasmissione non parte da zero: prima la posizione nasceva oltre la durata (nessun
+# frame a schermo, loop continuo). E un seek negli ultimi istanti lasciava il video
+# fermo ad aspettare un frame che non sarebbe arrivato.
+FSRC=(-f lavfi -i testsrc2=size=640x360:rate=30 -f lavfi -i anullsrc=r=48000:cl=stereo)
+gen off.ts "${FSRC[@]}" -t 6 -c:v libx264 -preset veryfast -pix_fmt yuv420p -g 30 -c:a aac -shortest -output_ts_offset 5000 -f mpegts
+gen g30.mp4 "${FSRC[@]}" -t 6 -c:v libx264 -preset veryfast -pix_fmt yuv420p -g 30 -c:a aac -shortest
+out=$(ZUER_NO_MPV=1 run "$WORK/off.ts" play 2 seek seek-end)
+echo "$out" | grep -E 'bench: (play|seek)' | sed 's|^|  [off.ts ffmpeg] |'
+check "ffmpeg, TS che parte da 5000 s: i frame arrivano (>= 50 in 2 s)" "awk '/bench: play/{split(\$0,a,\"frames=\"); exit !(a[2]+0 >= 50)}' <<<\"\$out\""
+check "ffmpeg, TS che parte da 5000 s: le posizioni partono da zero" "awk '/bench: seek to=/{split(\$0,a,\" pos=\"); if (a[2]+0 > 10) bad=1} END{exit bad}' <<<\"\$out\""
+check "ffmpeg, TS: dopo un seek a fine file riparte" "grep -q 'bench: seek-end .* ok=true' <<<\"\$out\""
+out=$(ZUER_NO_MPV=1 run "$WORK/g30.mp4" play 1 seek-end)
+echo "$out" | grep -E 'bench: seek-end' | sed 's|^|  [g30.mp4 ffmpeg] |'
+check "ffmpeg, MP4: dopo un seek a fine file riparte" "grep -q 'bench: seek-end .* ok=true' <<<\"\$out\""
+
 out=$(run "$WORK/h264.mp4" cycles 100 cycles-cold 30)
 echo "$out" | grep -E 'cycles|end' | sed 's|^|  [cicli] |'
 # A caldo gli fd oscillano di qualche unità (lo stream audio di PipeWire si apre e

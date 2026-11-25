@@ -143,13 +143,18 @@ pub const VideoFirst = struct { rgba: []align(4) u8, w: u32, h: u32 };
 /// frame (poster) in RGBA e inizializza `vs` (durata, posizione, `playing`). Il
 /// chiamante prende possesso di `.rgba` (→ `static_rgba`) e del decoder in
 /// `vs.decoder` (fermato/chiuso da `deinit`).
+///
+/// Tutte le `setup*` aprono IN PAUSA, con `vs.playing = true`: chi le chiama le
+/// usa fuori dal lock, prima di installare (e a volte senza installare affatto:
+/// navigazione superata). Il suono parte al primo `advanceVideo`/`advanceAudio`
+/// dopo l'installazione, che propaga `vs.playing` a decoder e audio.
 pub fn setupVideo(vs: *VideoState, path: []const u8, gpa: std.mem.Allocator) !VideoFirst {
     // Un `#` nel nome ("video #1.mp4") non è un frammento: vedi fragment.zig.
     const clean = pathfrag.strip(path);
     const path_z = try gpa.dupeSentinel(u8, clean, 0);
     defer gpa.free(path_z);
 
-    const r = try VideoDecoder.start(path_z.ptr, gpa, video_max_dim, .{});
+    const r = try VideoDecoder.start(path_z.ptr, gpa, video_max_dim, .{ .paused = true });
     errdefer r.dec.stopAndDestroy();
 
     vs.dur_s = r.dec.durationSeconds();
@@ -160,7 +165,7 @@ pub fn setupVideo(vs: *VideoState, path: []const u8, gpa: std.mem.Allocator) !Vi
     // ripiego FFmpeg serve un `AudioPlayer` (handle libav separato + thread),
     // null se il file è muto.
     if (!r.dec.audio_inside) {
-        vs.audio = AudioPlayer.start(path_z.ptr, gpa);
+        vs.audio = AudioPlayer.startPaused(path_z.ptr, gpa);
         // Audio come clock master del video: il loop lo coordina il present, non
         // l'auto-loop del thread audio (vedi campo `loop` in AudioPlayer).
         if (vs.audio) |a| a.loop.store(false, .monotonic);
@@ -230,11 +235,11 @@ pub const DetachedAudio = struct {
 pub fn openDetachedAudio(src: []const u8, gpa: std.mem.Allocator) ?DetachedAudio {
     if (comptime !@import("build_options").video) return null;
     const keep = std.heap.smp_allocator.dupeSentinel(u8, src, 0) catch return null;
-    const a = AudioPlayer.start(keep.ptr, gpa) orelse {
+    // In pausa: parte quando `installDetached` lo allinea al video.
+    const a = AudioPlayer.startPaused(keep.ptr, gpa) orelse {
         std.heap.smp_allocator.free(keep);
         return null;
     };
-    a.setPlaying(false); // parte quando `installDetached` lo allinea al video
     return .{ .player = a, .src = keep };
 }
 
@@ -291,7 +296,13 @@ pub fn openVideoOnly(path: []const u8, audio_src: ?[]const u8, start_s: f64, gpa
 /// un formato muxed i due URL coincidono). Nessuno stripping di frammenti `#`:
 /// gli URL vanno passati a libav così come sono. Usato dalla ricerca YouTube
 /// (`yt_search.openWorker`) su uno stato LOCALE, fuori dai lock.
-pub fn setupStream(vs: *VideoState, video_url: []const u8, audio_url: []const u8, gpa: std.mem.Allocator) !VideoFirst {
+///
+/// `start_s` è la posizione da cui partire (cambio di qualità: si riprende da
+/// dove si era). Il motore mpv apre direttamente lì; col ripiego FFmpeg resta un
+/// seek pendente, applicato al primo `advanceVideo`. Prima la sessione nuova
+/// partiva da zero e in riproduzione: si vedeva il primo fotogramma del video e
+/// se ne sentiva l'inizio sopra lo stream vecchio, poi il salto.
+pub fn setupStream(vs: *VideoState, video_url: []const u8, audio_url: []const u8, start_s: f64, gpa: std.mem.Allocator) !VideoFirst {
     if (comptime !@import("build_options").video) return error.NoVideo;
     const vurl_z = try gpa.dupeSentinel(u8, video_url, 0);
     defer gpa.free(vurl_z);
@@ -300,7 +311,7 @@ pub fn setupStream(vs: *VideoState, video_url: []const u8, audio_url: []const u8
 
     // mpv apre entrambe le tracce in una sessione sola (l'audio con
     // `audio-add`): due connessioni, il minimo per un DASH, un solo clock.
-    const r = try VideoDecoder.start(vurl_z.ptr, gpa, video_max_dim, .{ .audio_url = audio_url });
+    const r = try VideoDecoder.start(vurl_z.ptr, gpa, video_max_dim, .{ .audio_url = audio_url, .start_s = start_s, .paused = true });
     errdefer r.dec.stopAndDestroy();
 
     vs.dur_s = r.dec.durationSeconds();
@@ -310,8 +321,12 @@ pub fn setupStream(vs: *VideoState, video_url: []const u8, audio_url: []const u8
     if (!r.dec.audio_inside) {
         // Ripiego FFmpeg: audio dal SUO URL con `AudioPlayer`. null se non si
         // apre: video muto. Loop coordinato dal present (vedi `loop`).
-        vs.audio = AudioPlayer.start(aurl_z.ptr, gpa);
+        // Stessa origine dei tempi del video: sono due container, e ognuno
+        // togliendo il proprio inizio sposterebbe l'audio della differenza.
+        vs.audio = AudioPlayer.startPausedAt(aurl_z.ptr, gpa, r.dec.originSeconds());
         if (vs.audio) |a| a.loop.store(false, .monotonic);
+        // FFmpeg apre sempre dall'inizio: la posizione si raggiunge con un seek.
+        if (start_s > 0.05) vs.seek_to = start_s;
     }
     return .{ .rgba = r.rgba, .w = r.w, .h = r.h };
 }
@@ -327,7 +342,7 @@ pub fn setupAudio(vs: *VideoState, path: []const u8, gpa: std.mem.Allocator) !Vi
         const path_z = try gpa.dupeSentinel(u8, clean, 0);
         defer gpa.free(path_z);
 
-        const a = AudioPlayer.start(path_z.ptr, gpa) orelse return error.NoAudio;
+        const a = AudioPlayer.startPaused(path_z.ptr, gpa) orelse return error.NoAudio;
         errdefer a.stopAndDestroy();
 
         const w: u32 = 960;
@@ -458,9 +473,18 @@ pub fn advanceVideo(sink: FrameSink, vs: *VideoState, dt: f32) bool {
     // 3. Loop a fine video, coordinato con l'audio: durata nota → `pos_s >= dur_s`;
     // ignota → coda del decoder esaurita a EOF. Riavvolge entrambi e riparte da 0;
     // la coda è vuota, niente da presentare finché il decoder non la ripopola.
+    // Terzo caso: dopo un seek lo stream è finito senza un frame all'altezza del
+    // punto chiesto (seek negli ultimi istanti, traccia video più corta del
+    // container). Il settle non si chiuderebbe mai — `pos_s` fermo sotto `dur_s`,
+    // immagine e timeline congelate fino al seek successivo.
     const at_end = (vs.dur_s > 0 and vs.pos_s >= vs.dur_s) or
-        (vs.dur_s <= 0 and vs.playing and dec.drained());
+        (vs.dur_s <= 0 and vs.playing and dec.drained()) or
+        (vs.settle_seek and dec.drained());
     if (at_end) {
+        // Il settle finisce qui comunque: se da zero non arrivasse nessun frame
+        // (sorgente illeggibile) resterebbe acceso, e ogni tick rifarebbe il seek.
+        // Spento, la posizione riparte col tempo e il giro dura quanto il file.
+        vs.settle_seek = false;
         dec.seekAndFlush(0);
         if (comptime @import("build_options").video) {
             if (vs.audio) |a| a.seek(0);
@@ -495,7 +519,7 @@ pub fn advanceVideo(sink: FrameSink, vs: *VideoState, dt: f32) bool {
 /// seek, loop). error.NoMidi se manca un SoundFont o il file non è valido.
 pub fn setupMidi(vs: *VideoState, path: []const u8, gpa: std.mem.Allocator) !VideoFirst {
     const clean = pathfrag.strip(path);
-    const m = MidiPlayer.start(clean, gpa) orelse return error.NoMidi;
+    const m = MidiPlayer.startPaused(clean, gpa) orelse return error.NoMidi;
     errdefer m.stopAndDestroy();
 
     const w: u32 = 960;

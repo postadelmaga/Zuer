@@ -76,8 +76,16 @@ pub const GuiAppState = struct {
         mutex: std.Io.Mutex = .init,
 
         // Percorso del file corrente: liberato/riassegnato da `applyDecoded`
-        // (anche sui thread loader) sotto `mutex`.
+        // (anche sui thread loader) sotto `mutex`. È SOLO un percorso: con uno
+        // stream (YouTube) in riproduzione è vuoto, e il nome da mostrare sta in
+        // `display_name`.
         current_file_path: []const u8 = &.{},
+        /// Titolo di ciò che è aperto quando non è un file (stream YouTube); vuoto
+        /// per i file, che si chiamano col nome del percorso. Vedi `labelName`.
+        /// Prima il titolo finiva in `current_file_path`, e tutto ciò che lo
+        /// tratta come percorso (cartella delle frecce, frammenti, estensione,
+        /// Ctrl+C) lavorava su una stringa remota.
+        display_name: []u8 = &.{},
 
         // Variabili Zicro/Loader
         decoded: decoder_mod.Decoded = .{ .text = "" },
@@ -158,6 +166,14 @@ pub const GuiAppState = struct {
         // dal worker quando `static_rgba` cambia): compose campiona bilineare dal
         // livello più vicino alla scala di presentazione → niente aliasing.
         mips: compose.MipChain = .{},
+        /// Cresce a ogni sostituzione di `static_rgba` (chi lo assegna lo
+        /// incrementa nella riga prima). È la chiave della catena mip: il solo
+        /// puntatore non basta, un'immagine nuova con le stesse dimensioni può
+        /// essere allocata all'indirizzo di quella appena liberata.
+        static_serial: u32 = 0,
+        /// Ultima ricarica dopo la caduta della sorgente video (ms, 0 = mai): vedi
+        /// `nav.streamFailedLocked`.
+        stream_fail_ms: i64 = 0,
         // Offset di scroll corrente (asse Y e X), rispecchiato dalla primitiva `sc` a
         // ogni frame del worker; i consumatori (compose/selezione/header) leggono questi.
         scroll_y: f32 = 0,
@@ -304,6 +320,11 @@ pub const GuiAppState = struct {
     // thread loader senza lock — comportamento storico.
     file_list: std.ArrayList([]const u8) = .empty,
     current_file_index: ?usize = null,
+    /// Cartella a cui si riferisce `file_list` ("" = i nomi valgono così come
+    /// sono, relativi alla cartella corrente del processo). Campo proprio, scritto
+    /// insieme alla lista sotto `shared.mutex`: ricavarla dal percorso corrente
+    /// non funziona quando ciò che è aperto non è un file della lista.
+    list_dir: []u8 = &.{},
     /// Vero se la finestra iniziale è già stata dimensionata sulle dimensioni
     /// reali del contenuto (header immagine letto in main, tabella sincrona):
     /// `decodeInitial` allora NON richiede un resize dopo l'apply.
@@ -567,4 +588,11 @@ pub fn minimalFrame(s: zrame.Style) zrame.Style {
     // basso): una finestra chiara senza cornice altrimenti "sparisce" su fondo chiaro.
     out.edge_ring_alpha = 0.10;
     return out;
+}
+
+/// Nome da mostrare per ciò che è aperto: il titolo dello stream, o il nome del
+/// file. Con `shared.mutex` acquisito (la slice punta dentro lo stato).
+pub fn labelName(state: *const GuiAppState) []const u8 {
+    if (state.shared.display_name.len > 0) return state.shared.display_name;
+    return std.fs.path.basename(state.shared.current_file_path);
 }

@@ -1,7 +1,7 @@
 # Roadmap di Zuer
 
-Stato al 24 novembre 2026, versione 0.4.0 (commit `205bc6a`). Nasce dalla revisione
-completa del codice di quel giorno: 39 difetti aperti come issue (#26–#64), più le
+Stato al 25 novembre 2026, versione 0.4.0. Nasce dalla revisione completa del codice
+del 24 novembre (commit `205bc6a`): 39 difetti aperti come issue (#26–#64), più le
 issue che erano già aperte. Come è fatto il progetto: [architettura.md](architettura.md).
 
 L'idea di fondo: Zuer regge bene nei punti difficili (scheduler, coda video, confine
@@ -21,8 +21,8 @@ invece di rincorrere i sintomi:
 |---|---|---|---|
 | 0 | Correzioni rapide: una o poche righe, effetto subito visibile | 11 issue (sotto) | **fatto** il 24 novembre 2026 |
 | 1 | [File ostili e robustezza dei decoder](https://github.com/postadelmaga/Zuer/milestone/2) + budget di memoria (A1) | #26–#36 | **issue fatte** il 24 novembre 2026; di A1 resta il tetto generale (sotto) |
-| 2 | [Navigazione, apertura e GUI](https://github.com/postadelmaga/Zuer/milestone/3) + riferimento a documento (A2) + punto unico di installazione (A3) | #37–#50 | i frammenti passano da un solo parser; un solo commit dello stato |
-| 3 | [Media e YouTube](https://github.com/postadelmaga/Zuer/milestone/4) | #51–#57 | `scripts/video-check.sh` copre seek a fine file, TS con partenza ≠ 0, stream che cade |
+| 2 | [Navigazione, apertura e GUI](https://github.com/postadelmaga/Zuer/milestone/3) + riferimento a documento (A2) + punto unico di installazione (A3) | #37–#50 | **issue fatte** il 25 novembre 2026; restano A2 e A3 (sotto): i frammenti non passano ancora da un solo parser, lo stato non ha ancora un solo commit |
+| 3 | [Media e YouTube](https://github.com/postadelmaga/Zuer/milestone/4) | #51–#57 | **issue fatte** il 25 novembre 2026: `scripts/video-check.sh` copre seek a fine file e TS con partenza ≠ 0, `scripts/net-check.sh` lo stream che cade |
 | 4 | [Cache, plugin e piattaforme](https://github.com/postadelmaga/Zuer/milestone/5) | #58–#64 | Android provato su un dispositivo; anteprima delle voci d'archivio su Windows |
 | 5 | Riordino (fase B) | da aprire | vedi sotto |
 | 6 | Già in programma prima della revisione | #5, #13, #14, #16, #17, #20–#25 | — |
@@ -79,6 +79,72 @@ Cosa resta, e non è in nessuna issue aperta:
   di `server/zuer-crash.php`): serve un segreto nel client, da decidere con #17;
 - **non provato**: i RAW attraverso il coder `dng:` (nessun campione), il
   `threadlocal` del plugin office su Windows e Android (compila, non eseguito).
+
+## Passo 2 — Navigazione, apertura e GUI
+
+**Issue fatte il 25 novembre 2026** (#37–#40, #44, #47 e #48 erano già nel passo 0).
+Provate in una sessione sway senza schermo, con schermate e appunti letti dal
+compositor; dove la prova non c'è, è scritto.
+
+| Issue | Correzione | Prova |
+|---|---|---|
+| #41 | l'apertura di uno stream prende una generazione di navigazione (`nav.claimGeneration`) e rinuncia se nel frattempo si è aperto altro; il suo errore non riapre l'overlay sopra il file nuovo | apertura normale provata; il caso «superato» solo letto sul codice |
+| #42 | il titolo dello stream sta in `display_name`, `current_file_path` torna a essere solo un percorso (vuoto durante uno stream), la cartella delle frecce è quella della lista (`list_dir`) | etichetta, scheda `i`, Ctrl+C (copia il link) e frecce dopo uno stream |
+| #43 | le miniature già tentate si ereditano solo insieme alla miniatura | solo codice |
+| #45 | esploratore e ricerca si disegnano anche sopra lo spinner di caricamento | solo codice (la finestra di tempo è troppo breve da colpire a mano) |
+| #46 | video, audio e MIDI non passano dalla cache dei vicini: li apre sempre il loader, fuori dal lock, e se lì falliscono non si riprova sotto il lock | navigazione avanti e indietro fra immagini, video, audio e testo |
+| #49 | la catena mip segue un contatore (`static_serial`) e non il solo puntatore dei pixel | solo codice |
+| #50 | lo scadere dei 2 s su una fence non è più un errore: si aspetta il device (`vk.waitFence`); dopo un errore di `render` la sincronizzazione dei due slot riparte da capo | **non riprodotto**: era un sospetto, e resta provato solo che Vulkan continua a funzionare |
+
+Trovato strada facendo, e corretto: aprendo uno stream con un'immagine a schermo la
+finestra a volte spariva (3 aperture su 8 nella sessione di prova). `yt_search`
+chiedeva la taglia nuova senza prima dare alla finestra le proporzioni del video: la
+taglia veniva piegata su quelle dell'immagine, e subito dopo il render la rimappava
+una seconda volta. Ora le proporzioni arrivano prima, come già in
+`nav.resizeToContent` (7 aperture su 7). Resta da guardare in Zicro perché due
+rimappature di fila possano lasciare la finestra senza buffer
+(`window_wayland.zig`, `setContentSize`): l'ipotesi è che la seconda parta quando la
+prima è confermata ma non ha ancora un buffer, e il compositor non mandi un altro
+`configure`. Non è verificata.
+
+Cosa resta del passo:
+
+- **A2 e A3** non sono fatti. Di A3 c'è il primo pezzo (`display_name`, la
+  generazione per gli stream); l'installazione di uno stream resta una strada a
+  parte e non tocca `shared.decoded`.
+- la selezione dell'esploratore parte dal primo file e non da quello aperto: era
+  così anche prima, non è in nessuna issue.
+
+## Passo 3 — Media e YouTube
+
+**Issue fatte il 25 novembre 2026.** Ogni difetto del motore FFmpeg e dell'audio è
+stato misurato sul commit precedente e sul nuovo con lo stesso banco
+(`zuer-video-bench`, `feature-probe`).
+
+| Issue | Correzione | Prova (prima → dopo) |
+|---|---|---|
+| #51 | a fine file il decoder si svuota fino in fondo; un seek che finisce senza un frame fa ripartire la riproduzione invece di fermarla | seek a 0,01 s dalla fine di un MP4: 0 frame e video fermo → riparte (fase `seek-end` del banco) |
+| #52 | i tempi del motore FFmpeg e dell'`AudioPlayer` sono riportati all'inizio del container, il seek lo rimette | MPEG-TS che parte da 5000 s: 0 frame e orologio audio a 5001 s → 30 fps e orologio da zero |
+| #53 | un errore di lettura aspetta 50 ms (al massimo 5 s), un file senza audio decodificabile non gira a vuoto | WAV di sola intestazione: 100% di una CPU → 2% |
+| #54 | a regime la fine o l'errore del file segnano la sessione come caduta; una sorgente di rete che ricomincia da capo lontano dalla fine è caduta (mpv non chiude il file: rifà in loop ciò che ha in cache); la GUI riapre lo stream YouTube da quel punto con indirizzi nuovi, o ricarica il file, una volta ogni 30 s; un `loadfile` rifiutato fa ripiegare subito, e si riprova nella forma precedente a mpv 0.38 | server spento a metà: loop infinito su 1,5 s → riconosciuto 3 volte su 3. **Non provati**: la riapertura da YouTube da capo a fondo e una libmpv più vecchia della 0.38 |
+| #55 | video, audio, MIDI e stream si aprono in pausa e partono quando sono installati; uno stream si apre già alla posizione chiesta | riproduzione e cambio di file provati; che non suoni «sopra» non è misurabile senza casse |
+| #56 | Ctrl+C copia su un thread, con un limite di 3 s e `pbcopy` su macOS; con uno stream copia il link | appunti letti con `wl-paste` |
+| #57 | ogni `loadfile` ha un gettone e l'id della voce di playlist: la fine di un file precedente non vale per quello nuovo; il motore si preavvia quando l'overlay si apre o la selezione cambia, non a ogni disegno | 100 aperture a caldo e 30 a freddo senza fd o thread in più. **Non riprodotto** lo stop più lento di 1 s che faceva scattare il difetto |
+
+Cosa resta, e non è in nessuna issue aperta:
+
+- **`shutdownEngines` all'uscita non serve**: la GUI esce con `_exit` proprio per
+  non eseguire i distruttori di mesa e libmpv mentre i loro thread lavorano;
+- **MPEG-TS, seek**: il motore FFmpeg atterra sul keyframe dopo il punto chiesto
+  (fino a un GOP più avanti). Era così anche prima; ora almeno la posizione è giusta;
+- **errore di lettura = fine file** nel `Player` video: una caduta di rete durante
+  un seek, col motore FFmpeg, fa ripartire da capo invece di restare sul punto;
+- **audio e video in container diversi** (ripiego FFmpeg sugli stream): l'audio usa
+  l'origine dei tempi del video; se la sua traccia comincia prima, quei millisecondi
+  si perdono;
+- **le prove video in sway senza schermo** falliscono su CPU in pausa, clip troncati
+  e passaggio hardware→software allo stesso modo sul commit precedente: lì non c'è
+  GPU né scheda audio, vanno rifatte su una sessione vera.
 
 ## Fase A — Tre cambi che tolgono la causa
 

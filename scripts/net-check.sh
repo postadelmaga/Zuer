@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Verifica di buffering e chiusura con sorgenti di rete (Linux, sessione Wayland,
-# anche headless). Server locale `slow_http.py` (lento, muto, che cade, che non
+# anche headless). Server locale `slow_http.py` (lento, muto, che cade, che sparisce, che non
 # risponde), traccia video e audio separate come un DASH di YouTube, stesso
 # percorso dell'apertura da yt-dlp (`video.setupStream`) via `zuer-video-bench`.
 #
@@ -80,6 +80,26 @@ check "stallo: fd e thread come all'inizio" end_ok
 run caduta "$U/drop/3000000/net_v.mp4" "$U/ok/net_a.m4a" play 6
 check "caduta: chiusura entro ${CLOSE_MAX_MS} ms" close_ok
 check "caduta: fd e thread come all'inizio" end_ok
+
+# 4a. Il server sparisce a metà riproduzione (rete giù, URL scaduto). mpv non chiude
+# il file: finito ciò che ha in cache ricomincia da capo, all'infinito. Il motore
+# deve accorgersene e dirlo (`stream-failed`): la GUI riapre lo stream o lo dice.
+# Un server a parte, su un'altra porta, da spegnere senza toccare gli altri casi.
+PORT2=$((PORT + 1))
+python3 "$ROOT/scripts/slow_http.py" "$WORK" "$PORT2" 2> "$WORK/server2.log" &
+SP2=$!
+trap 'kill $SP $SP2 2>/dev/null || true' EXIT
+for _ in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/$PORT2) 2>/dev/null && break; sleep 0.1; done
+"$BENCH" "http://127.0.0.1:$PORT2/slow/300000/net_v.mp4" play 16 > "$WORK/spento.log" 2>&1 &
+BP=$!
+sleep 5
+kill $SP2 2>/dev/null || true
+wait $BP || true
+out=$(grep '^bench:' "$WORK/spento.log" || true)
+echo "$out" | sed "s|^|  [server spento] |"
+check "server spento: la caduta viene riconosciuta" "grep -q 'bench: stream-failed' <<<\"\$out\""
+check "server spento: chiusura entro ${CLOSE_MAX_MS} ms" close_ok
+check "server spento: fd e thread come all'inizio" end_ok
 
 # 4b. Video spento (`v`, l'audio passa all'AudioPlayer FFmpeg) e la rete si ferma
 # mentre l'AudioPlayer legge: la chiusura non aspetta una lettura che non torna

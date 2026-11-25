@@ -510,6 +510,16 @@ pub const MpvVideo = struct {
     /// aspetta l'END_FILE solo se è vero (dopo una fine o un errore non ne arriva
     /// un altro).
     file_active: bool = false,
+    /// Gli eventi di mpv non dicono da soli a QUALE file si riferiscono, e il
+    /// motore resta vivo fra una sessione e l'altra: l'END_FILE del file
+    /// precedente (scaricato in ritardo) può arrivare nella sessione successiva.
+    /// Ogni `loadFile` ha un suo gettone; la risposta al comando porta l'id
+    /// della voce di playlist creata (`entry_id`, 0 = mpv non lo dice), e un
+    /// END_FILE vale solo se è di quella voce. Finché la risposta non è arrivata
+    /// (`awaiting_load`) nessun END_FILE può essere del file nuovo.
+    load_token: u64 = load_token_base,
+    entry_id: i64 = 0,
+    awaiting_load: bool = false,
     /// Il loop è stato spento per la sessione corrente (`setLoop(false)`).
     loop_off: bool = false,
     video_id: ?i64 = null,
@@ -747,6 +757,27 @@ pub const MpvVideo = struct {
         _ = api.mpv_command_async(self.mpv, 0, @ptrCast(@constCast(args.ptr)));
     }
 
+    /// I gettoni di `loadFile` partono da qui: fuori dai `reply_userdata` usati
+    /// per le proprietà osservate.
+    const load_token_base: u64 = 1 << 32;
+
+    /// Id della voce di playlist nella risposta a `loadfile` (0 se manca: mpv
+    /// prima della 0.33 non lo restituisce).
+    fn loadedEntryId(data: ?*anyopaque) i64 {
+        const cmd: *c.mpv_event_command = @ptrCast(@alignCast(data orelse return 0));
+        if (cmd.result.format != c.MPV_FORMAT_NODE_MAP) return 0;
+        const list = cmd.result.u.list orelse return 0;
+        if (list.*.keys == null or list.*.values == null) return 0;
+        var i: usize = 0;
+        while (i < @as(usize, @intCast(@max(0, list.*.num)))) : (i += 1) {
+            const key = list.*.keys[i] orelse continue;
+            if (!std.mem.eql(u8, std.mem.span(@as([*:0]const u8, @ptrCast(key))), "playlist_entry_id")) continue;
+            const v = list.*.values[i];
+            return if (v.format == c.MPV_FORMAT_INT64) v.u.int64 else 0;
+        }
+        return 0;
+    }
+
     /// Scarica la sorgente corrente: mpv torna inattivo (istanza, contesto e
     /// shader restano pronti per la prossima `loadFile`).
     pub fn stopPlayback(self: *MpvVideo) void {
@@ -755,7 +786,9 @@ pub const MpvVideo = struct {
 
     /// Carica `path` in pausa (il primo frame diventa il poster; si riparte con
     /// `setPaused(false)`), con l'audio acceso o spento per questa sorgente.
-    pub fn loadFile(self: *MpvVideo, path: [:0]const u8, audio: bool, start_s: f64) void {
+    /// false se mpv rifiuta il comando: non arriverà nessun evento, e chi apre
+    /// deve ripiegare subito invece di aspettare il primo frame fino al timeout.
+    pub fn loadFile(self: *MpvVideo, path: [:0]const u8, audio: bool, start_s: f64) bool {
         self.resetObserved();
         // `start` solo se serve: anche `start=0` è un seek preciso, e su un TS
         // senza indice (troncato, corrotto) mpv ne esce col video già a fine
@@ -767,8 +800,23 @@ pub const MpvVideo = struct {
             std.mem.printSentinel(&buf, "pause=yes,aid={s},start={d:.3}", .{ aid, start_s }, 0)
         else
             std.mem.printSentinel(&buf, "pause=yes,aid={s}", .{aid}, 0)) catch unreachable;
-        self.commandAsync(&.{ "loadfile", path, "replace", "-1", opts, null });
+        self.load_token +%= 1;
+        self.entry_id = 0;
+        self.awaiting_load = true;
+        // La forma con l'indice (`-1`) esiste da mpv 0.38; prima il quarto
+        // argomento erano le opzioni, e il comando a cinque argomenti viene
+        // rifiutato subito (l'analisi degli argomenti è sincrona): si riprova con
+        // la forma vecchia.
+        const new_form = [_]?[*:0]const u8{ "loadfile", path, "replace", "-1", opts, null };
+        const old_form = [_]?[*:0]const u8{ "loadfile", path, "replace", opts, null };
+        var rc = api.mpv_command_async(self.mpv, self.load_token, @ptrCast(@constCast(&new_form)));
+        if (rc < 0) rc = api.mpv_command_async(self.mpv, self.load_token, @ptrCast(@constCast(&old_form)));
+        if (rc < 0) {
+            self.awaiting_load = false;
+            return false;
+        }
         self.file_active = true;
+        return true;
     }
 
     /// Seek assoluto ed esatto (mpv decodifica dal keyframe fino al target).
@@ -903,8 +951,19 @@ pub const MpvVideo = struct {
                     if (self.audio_url) |u| self.commandAsync(&.{ "audio-add", u, "select", null });
                 },
                 c.MPV_EVENT_PLAYBACK_RESTART => ev.playback_restart = true,
+                c.MPV_EVENT_COMMAND_REPLY => if (self.awaiting_load and e.*.reply_userdata == self.load_token) {
+                    self.awaiting_load = false;
+                    if (e.*.@"error" < 0) {
+                        // Comando accettato e poi fallito: nessun file è stato caricato.
+                        ev.failed = true;
+                        self.file_active = false;
+                    } else self.entry_id = loadedEntryId(e.*.data);
+                },
                 c.MPV_EVENT_END_FILE => {
                     const ef: *c.mpv_event_end_file = @ptrCast(@alignCast(e.*.data));
+                    // Del file precedente (vedi `load_token`): non riguarda questa sessione.
+                    if (self.awaiting_load) continue;
+                    if (self.entry_id != 0 and ef.playlist_entry_id != 0 and ef.playlist_entry_id != self.entry_id) continue;
                     if (ef.reason == c.MPV_END_FILE_REASON_ERROR) ev.failed = true;
                     ev.ended = true;
                     self.file_active = false;

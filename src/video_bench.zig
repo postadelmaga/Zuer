@@ -8,6 +8,7 @@
 //!                (utente+sistema) per secondo, context switch volontari/involontari.
 //! * `pause S`  — in pausa per S secondi: stessa misura (deve stare vicino a zero).
 //! * `seek`     — 6 seek avanti/indietro: latenza fino al primo frame della posizione.
+//! * `seek-end [S]` — seek a S secondi dalla fine (0.01): in 2 s deve ripartire.
 //! * `cycles N` — N aperture+chiusure: fd e thread prima/dopo (non devono crescere).
 //! * `cycles-cold N` — come `cycles`, ma chiudendo anche il motore a ogni giro
 //!                (tutto ricreato e smontato: verifica il teardown completo).
@@ -102,7 +103,7 @@ const Session = struct {
         // ZUER_BENCH_AUDIO_URL: traccia audio a parte, come un DASH di YouTube
         // (stesso percorso di `yt_search.openWorker`).
         const first = if (std.c.getenv("ZUER_BENCH_AUDIO_URL")) |a|
-            try video.setupStream(&s.vs, path, std.mem.span(a), gpa)
+            try video.setupStream(&s.vs, path, std.mem.span(a), 0, gpa)
         else
             try video.setupVideo(&s.vs, path, gpa);
         s.sink = .{ .rgba = first.rgba, .w = first.w, .h = first.h };
@@ -131,6 +132,10 @@ const Session = struct {
             if (video.advanceVideo(s.sink.frameSink(s.gpa), &s.vs, dt)) presented += 1;
             if (s.vs.decoder) |d| if (d.isBuffering()) {
                 buffering_ns += period;
+            };
+            // La sorgente è caduta a regime (la GUI qui riapre lo stream o ricarica).
+            if (s.vs.decoder) |d| if (d.takeStreamFailed()) |at| {
+                std.debug.print("bench: stream-failed at={d:.1}\n", .{at});
             };
             sleepNs(period - (nowNs() - t));
         }
@@ -227,6 +232,25 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("bench: seek to={d:.2} ms={d:.1} pos={d:.2} ok={}\n", .{ target, @as(f64, @floatFromInt(nowNs() - t0)) / 1e6, s.vs.pos_s, got });
                 _ = s.run(0.4);
             }
+        } else if (std.mem.eql(u8, cmd, "seek-end")) {
+            // Seek negli ultimi istanti (oltre l'ultimo frame): lo stream finisce
+            // senza un frame all'altezza del punto chiesto. Il player deve uscirne
+            // (ricomincia da capo), non restare fermo ad aspettarlo.
+            s.vs.playing = true;
+            const back = try std.fmt.parseFloat(f64, args.next() orelse "0.01");
+            const target = @max(0, s.vs.dur_s - back);
+            s.vs.seek_to = target;
+            const t0 = nowNs();
+            var last = nowNs();
+            var frames: u32 = 0;
+            while (nowNs() - t0 < 2_000_000_000) {
+                const t = nowNs();
+                const dt: f32 = @floatCast(@as(f64, @floatFromInt(t - last)) / 1e9);
+                last = t;
+                if (video.advanceVideo(s.sink.frameSink(gpa), &s.vs, dt)) frames += 1;
+                sleepNs(4_000_000);
+            }
+            std.debug.print("bench: seek-end to={d:.2} frames={d} pos={d:.2} settle={} ok={}\n", .{ target, frames, s.vs.pos_s, s.vs.settle_seek, frames > 10 and !s.vs.settle_seek });
         } else if (std.mem.eql(u8, cmd, "cycles") or std.mem.eql(u8, cmd, "cycles-cold") or std.mem.eql(u8, cmd, "cycles-seek")) {
             const cold = std.mem.eql(u8, cmd, "cycles-cold");
             const seek_close = std.mem.eql(u8, cmd, "cycles-seek");

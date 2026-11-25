@@ -179,6 +179,10 @@ pub const VideoDecoder = struct {
     // Fine stream (FFmpeg): il thread smette di produrre e attende un seek. Il
     // LOOP è guidato dal consumatore (che deve riavvolgere anche l'audio).
     eof: std.atomic.Value(bool) = .init(false),
+    /// Epoca (`gen`) in cui il produttore ha visto la fine. `eof` da solo non
+    /// basta: fra un `seekAndFlush` e il momento in cui il produttore lo esegue,
+    /// può ancora arrivare (o restare) la fine della posizione VECCHIA.
+    eof_gen: std.atomic.Value(u32) = .init(0),
     pause_req: std.atomic.Value(bool) = .init(false),
 
     // --- solo mpv ---
@@ -189,6 +193,12 @@ pub const VideoDecoder = struct {
     /// Il motore ha perso il contesto GPU (reset): la sessione è finita, il
     /// motore non torna nel pool; chi la possiede la rifà (`engineLost`).
     engine_lost: std.atomic.Value(bool) = .init(false),
+    /// A regime la sorgente è finita o caduta (rete giù, URL scaduto): la sessione
+    /// non produrrà più nulla. Lo legge UNA volta il proprietario
+    /// (`takeStreamFailed`), che riapre o lo dice all'utente. `fail_pos_bits` è la
+    /// posizione (f64) a cui è successo: l'orologio, dopo, non la dice più.
+    stream_failed: std.atomic.Value(bool) = .init(false),
+    fail_pos_bits: std.atomic.Value(u64) = .init(0),
     path_owned: [:0]const u8 = &[_:0]u8{},
     audio_url_owned: ?[:0]const u8 = null,
     want_audio: bool = true,
@@ -413,6 +423,33 @@ pub const VideoDecoder = struct {
         return self.engine_lost.load(.acquire);
     }
 
+    /// Una sola volta dopo che lo stream è caduto a regime (vedi il campo): la
+    /// posizione, in secondi, da cui riaprirlo.
+    pub fn takeStreamFailed(self: *VideoDecoder) ?f64 {
+        if (!self.stream_failed.swap(false, .acq_rel)) return null;
+        return @bitCast(self.fail_pos_bits.load(.acquire));
+    }
+
+    fn failStream(self: *VideoDecoder, pos: f64) void {
+        self.fail_pos_bits.store(@bitCast(@max(0, pos)), .release);
+        self.stream_failed.store(true, .release);
+    }
+
+    /// Una sorgente di rete che ricomincia da capo più di così prima della fine
+    /// non è arrivata in fondo: è caduta (vedi `mpvLoop`).
+    const seek_quiet_ns: i64 = 3 * std.time.ns_per_s;
+
+    /// Inizio del container per il motore FFmpeg (0 con mpv, che i tempi li
+    /// riporta a zero da sé): chi apre l'audio da un ALTRO container deve togliere
+    /// lo stesso valore, non il proprio.
+    pub fn originSeconds(self: *const VideoDecoder) f64 {
+        return if (self.player) |*p| p.origin_s else 0;
+    }
+
+    fn prematureMargin(dur: f64) f64 {
+        return @max(3.0, dur * 0.02);
+    }
+
     /// Posizione del motore (mpv): l'autorità temporale quando `audio_inside`.
     pub fn clockSeconds(self: *const VideoDecoder) f64 {
         return @bitCast(self.clock_bits.load(.acquire));
@@ -466,6 +503,7 @@ pub const VideoDecoder = struct {
     /// il consumatore usa questo per il loop quando la durata è ignota.
     pub fn drained(self: *VideoDecoder) bool {
         if (!self.eof.load(.monotonic)) return false;
+        if (self.eof_gen.load(.monotonic) != self.gen.load(.monotonic)) return false;
         return self.head.load(.monotonic) == self.tail.load(.acquire);
     }
 
@@ -637,6 +675,19 @@ pub const VideoDecoder = struct {
         var slot_wait = false;
         const tracing = std.c.getenv("ZUER_TRACE") != null;
         var report_at = monotonicNs() + 10 * std.time.ns_per_s;
+        // Rete caduta o URL scaduto: mpv NON chiude il file. Finito ciò che ha in
+        // cache lo prende per la fine e, col loop acceso, ricomincia da capo —
+        // all'infinito, sul pezzo scaricato (misurato con mpv 0.42: 1,5 s ripetuti).
+        // Lo si riconosce così: ripartenza che non abbiamo chiesto noi, con la
+        // posizione tornata indietro da un punto lontano dalla fine. `peak_pos` è
+        // il punto più avanti raggiunto dall'ultima ripartenza: alla ripartenza
+        // `m.pos` è in genere già quella nuova (mpv aggiorna prima la posizione).
+        // «Non chiesta» non basta guardarla su `awaiting_restart`: due seek mandati
+        // uno dietro l'altro danno due ripartenze, e la seconda arriva a flag già
+        // spento. Dopo un nostro seek, per `seek_quiet_ns` nessuna ripartenza conta.
+        const net = std.mem.indexOf(u8, self.path_owned, "://") != null;
+        var peak_pos: f64 = m.pos;
+        var last_seek_ns: i64 = 0;
         while (true) {
             const snap = ew.prepare();
             if (self.stop.load(.monotonic)) break;
@@ -653,6 +704,7 @@ pub const VideoDecoder = struct {
                 m.seek(@as(f64, @floatFromInt(sk)) / 1000.0);
                 prod_gen = self.gen.load(.monotonic);
                 awaiting_restart = true;
+                last_seek_ns = monotonicNs();
             }
             const want_pause = self.pause_req.load(.monotonic);
             if (want_pause != applied_pause) {
@@ -661,6 +713,27 @@ pub const VideoDecoder = struct {
             }
             const ev = m.pollEvents();
             self.applyEvents(ev);
+            // La sorgente non c'è più: mpv ha chiuso il file (errore, o fine senza
+            // loop). Prima questi eventi si leggevano solo fino al primo frame: a
+            // regime la sessione restava sull'ultimo fotogramma col clock fermo.
+            if (ev.failed or ev.ended) {
+                std.log.warn("zuer video: la sorgente si è interrotta a {d:.1} s ({s})", .{ peak_pos, if (ev.failed) "errore" else "fine" });
+                self.failStream(peak_pos);
+                break;
+            }
+            if (ev.playback_restart) {
+                trace("mpv restart: {d:.2} -> {d:.2} s, chiesto={}", .{ peak_pos, m.pos, awaiting_restart });
+                const dur = self.durationSeconds();
+                const quiet = last_seek_ns == 0 or monotonicNs() - last_seek_ns > seek_quiet_ns;
+                if (net and !awaiting_restart and quiet and due_since_restart and dur > 0 and
+                    peak_pos < dur - prematureMargin(dur) and m.pos < peak_pos - 0.5)
+                {
+                    std.log.warn("zuer video: lo stream è ricominciato da capo a {d:.1} s di {d:.1}: sorgente caduta", .{ peak_pos, dur });
+                    self.failStream(peak_pos);
+                    break;
+                }
+                peak_pos = m.pos;
+            } else peak_pos = @max(peak_pos, m.pos);
             // Contesto GL perso (reset della GPU): le sue risorse non valgono più
             // nulla. Fine della sessione su questo motore; il proprietario la rifà
             // su un motore nuovo alla stessa posizione.
@@ -678,6 +751,7 @@ pub const VideoDecoder = struct {
                 std.log.info("zuer video: decodifica hardware fallita, mpv passa al software; riparto dal keyframe a {d:.2} s", .{m.pos});
                 m.seek(m.pos);
                 awaiting_restart = true;
+                last_seek_ns = monotonicNs();
             }
             if (ev.playback_restart and awaiting_restart) {
                 trace("mpv seek finito", .{});
@@ -850,6 +924,7 @@ pub const VideoDecoder = struct {
                 continue;
             };
             const fr = maybe orelse {
+                self.eof_gen.store(prod_gen, .monotonic);
                 self.eof.store(true, .monotonic);
                 continue;
             };
@@ -1096,8 +1171,11 @@ const MpvEngine = if (mpv_enabled) struct {
     /// Una sessione dall'apertura alla fine; poi la lascia e scarica la sorgente.
     fn serve(eng: *MpvEngine, m: *mpv_video.MpvVideo, s: *VideoDecoder, seq: u64, scratch: *std.ArrayList(u8)) void {
         m.audio_url = s.audio_url_owned;
-        m.loadFile(s.path_owned, s.want_audio, s.start_s);
-        if (s.mpvFirstFrame(m, &eng.wake, scratch)) s.mpvLoop(m, &eng.wake);
+        if (!m.loadFile(s.path_owned, s.want_audio, s.start_s)) {
+            // mpv ha rifiutato il comando: nessun evento in arrivo, si ripiega subito.
+            std.log.warn("zuer video: mpv ha rifiutato loadfile", .{});
+            s.finishStart(.failed);
+        } else if (s.mpvFirstFrame(m, &eng.wake, scratch)) s.mpvLoop(m, &eng.wake);
         // Contesto perso: questo motore non serve più nessuno (`release` lo distrugge).
         if (s.engine_lost.load(.acquire)) eng.dead.store(true, .release);
         logEnd(s, m);

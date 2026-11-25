@@ -151,9 +151,14 @@ fn adoptThumbs(old: []Entry, new: []Entry) u32 {
         if (o.is_dir == w.is_dir and std.mem.eql(u8, o.name, w.name)) {
             w.size = o.size;
             w.mtime_ns = o.mtime_ns;
-            w.thumb_tried = o.thumb_tried;
-            w.cache_tried = o.cache_tried;
+            // I flag «già provata» passano solo insieme a una miniatura presente.
+            // Una voce senza miniatura può averli veri perché il suo decode era
+            // in volo quando la griglia è stata chiusa: quel risultato è stato
+            // buttato (generazione cambiata) e con i flag ereditati nessuno la
+            // riprenderebbe più. I fallimenti veri li ricorda la cache su disco.
             if (o.thumb_w != 0) {
+                w.thumb_tried = o.thumb_tried;
+                w.cache_tried = o.cache_tried;
                 w.thumb_rgba = o.thumb_rgba;
                 w.thumb_w = o.thumb_w;
                 w.thumb_h = o.thumb_h;
@@ -271,10 +276,14 @@ fn openExplorerFrom(state: *GuiAppState, cur_path: []const u8) void {
 /// posizionando l'indice su `cur_name`. Stesso filtro/ordine di `initFileList`.
 /// Lo swap avviene sotto `shared.mutex`: `schedulePrefetchAround` legge la lista
 /// dai thread loader sotto lo stesso lock.
-fn setFileListForDir(state: *GuiAppState, dir_path: []const u8, cur_name: []const u8) void {
+fn setFileListForDir(state: *GuiAppState, dir_path: []const u8, list_dir: []const u8, cur_name: []const u8) void {
+    const dir_copy = state.gpa.dupe(u8, list_dir) catch return;
     var names: std.ArrayList([]const u8) = .empty;
     {
-        var dir = std.Io.Dir.cwd().openDir(state.io, dir_path, .{ .iterate = true }) catch return;
+        var dir = std.Io.Dir.cwd().openDir(state.io, dir_path, .{ .iterate = true }) catch {
+            state.gpa.free(dir_copy);
+            return;
+        };
         defer dir.close(state.io);
         var it = dir.iterate();
         while (it.next(state.io) catch null) |entry| {
@@ -301,6 +310,8 @@ fn setFileListForDir(state: *GuiAppState, dir_path: []const u8, cur_name: []cons
     state.file_list.deinit(state.gpa);
     state.file_list = names;
     state.current_file_index = cur_idx;
+    state.gpa.free(state.list_dir);
+    state.list_dir = dir_copy;
     state.shared.mutex.unlock(state.io);
 }
 
@@ -309,7 +320,9 @@ fn setFileListForDir(state: *GuiAppState, dir_path: []const u8, cur_name: []cons
 fn openFile(state: *GuiAppState, full_path: []const u8) void {
     const dir = std.fs.path.dirname(full_path) orelse ".";
     const base = std.fs.path.basename(full_path);
-    setFileListForDir(state, dir, base);
+    // `list_dir` vuota quando il percorso non ha cartella: i vicini si aprono col
+    // solo nome, come questo file (le chiavi della cache sono stringhe).
+    setFileListForDir(state, dir, std.fs.path.dirname(full_path) orelse "", base);
     // Si apre il nome come lo elenca la cartella: se il percorso aveva gli accenti in
     // un'altra forma Unicode (vedi `nav.indexOfFile`) è lo stesso file, ma la forma del
     // disco è quella giusta per l'etichetta e per le frecce.
@@ -412,7 +425,12 @@ pub fn handleKey(state: *GuiAppState, key: u32) bool {
         if (!fx.active) {
             if (key == KEY_E and !state.ctrl_down) {
                 act = .open_explorer;
-                act_path = state.gpa.dupe(u8, state.shared.current_file_path) catch null;
+                // Con uno stream aperto non c'è un file corrente: si parte da
+                // quello a cui sono agganciate le frecce.
+                act_path = if (state.shared.current_file_path.len > 0)
+                    state.gpa.dupe(u8, state.shared.current_file_path) catch null
+                else
+                    nav.anchorPathLocked(state) orelse (state.gpa.dupe(u8, "") catch null);
             } else return false;
         } else switch (key) {
             KEY_ESC, KEY_E => closeOverlay(state),

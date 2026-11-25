@@ -14,6 +14,7 @@ const ui = @import("overlay_ui.zig");
 const clipboard = @import("clipboard.zig");
 const videomod = @import("video.zig");
 const gui_state_mod = @import("gui_state.zig");
+const nav = @import("nav.zig");
 const GuiAppState = gui_state_mod.GuiAppState;
 const zrame = @import("zrame");
 const zicro = @import("zicro");
@@ -120,6 +121,15 @@ pub const YtState = struct {
     /// Ultima (id, altezza) mandata in prefetch: non si ritenta la stessa.
     pf_tried: IdBuf = .{},
     pf_tried_h: u32 = 0,
+    /// Selezione per cui il motore video è già stato preavviato (-2 = nessuna;
+    /// chi apre l'overlay lo rimette a -2).
+    /// Il preavvio si rifà quando cambia, non a ogni disegno: con l'overlay
+    /// aperto e fermo il motore inattivo veniva ritirato e ricreato ogni 30 s
+    /// (connessione Wayland, EGL, istanza mpv), per sempre.
+    prewarm_sel: i32 = -2,
+    /// Ultima riapertura automatica dopo la caduta dello stream (ms, 0 = mai):
+    /// una seconda caduta a breve distanza non si ritenta, si dice.
+    fail_reopen_ms: i64 = 0,
 };
 
 /// Id video in un buffer fisso (gli id YouTube sono di 11 caratteri).
@@ -220,6 +230,17 @@ pub fn clearCurrentStream(state: *GuiAppState) void {
     yt.subs_on = false;
     state.gpa.free(yt.sub_urls);
     yt.sub_urls = &.{};
+    // Il titolo dello stream vale finché lo stream è ciò che è aperto.
+    state.gpa.free(state.shared.display_name);
+    state.shared.display_name = &.{};
+}
+
+/// Indirizzo della pagina dello stream in riproduzione (`gpa`, il chiamante
+/// libera), o null se ciò che è aperto non è uno stream. Con `shared.mutex`.
+pub fn currentLink(state: *GuiAppState) ?[]u8 {
+    const id = state.shared.yt.current_id orelse return null;
+    if (state.shared.display_name.len == 0) return null;
+    return std.fmt.allocPrint(state.gpa, "https://www.youtube.com/watch?v={s}", .{id}) catch null;
 }
 
 /// Svuota risultati/errore correnti (dopo una modifica alla query i vecchi
@@ -331,7 +352,7 @@ fn copyWorker(state: *GuiAppState, txt: []u8) void {
     state.gpa.free(txt);
 }
 
-/// Ctrl+V: incolla dagli appunti (wl-paste o clipboard Win32, su thread).
+/// Ctrl+V: incolla dagli appunti (wl-paste, pbpaste o clipboard Win32, su thread).
 /// Con `shared.mutex` acquisito.
 pub fn startPaste(state: *GuiAppState) void {
     const t = std.Thread.spawn(.{}, pasteWorker, .{state}) catch return;
@@ -342,7 +363,7 @@ fn pasteWorker(state: *GuiAppState) void {
     const raw: []u8 = if (comptime builtin.os.tag == .windows)
         clipboard.pasteAlloc(state.gpa) orelse return
     else raw: {
-        var res = decoder_mod.runCaptureTimeout(state.gpa, &.{ "wl-paste", "-n" }, 2_000) catch return;
+        var res = decoder_mod.runCaptureTimeout(state.gpa, clipboard.paste_argv, 2_000) catch return;
         defer res.deinit(state.gpa);
         if (res.exit_code != 0 or res.stdout.len == 0) return;
         break :raw state.gpa.dupe(u8, res.stdout) catch return;
@@ -690,7 +711,11 @@ fn startOpen(state: *GuiAppState, id: []u8, title: ?[]u8, resume_s: f64, height:
         yt.err = null;
     }
     state.shared.file_changed = true;
-    const t = std.Thread.spawn(.{}, openWorker, .{ state, id, title, resume_s, height }) catch {
+    // Da qui lo stream è la navigazione più recente: un file ancora in
+    // caricamento non deve installarsi sopra (e chiudere il video), e se intanto
+    // si naviga altrove è lo stream a dover rinunciare (vedi `openWorker`).
+    const gen = nav.claimGeneration(state);
+    const t = std.Thread.spawn(.{}, openWorker, .{ state, id, title, resume_s, height, gen }) catch {
         state.gpa.free(id);
         if (title) |tt| state.gpa.free(tt);
         yt.opening = false;
@@ -737,17 +762,52 @@ pub fn setQuality(state: *GuiAppState, idx: u8) void {
 /// Riapre lo stream YouTube corrente alla stessa posizione con altezza `height`.
 /// Con `shared.mutex` acquisito.
 fn reopenCurrent(state: *GuiAppState, height: u32) void {
+    reopenAt(state, height, state.video.pos_s);
+}
+
+fn reopenAt(state: *GuiAppState, height: u32, pos_s: f64) void {
     if (comptime !has_video) return;
+    // Un file è in caricamento: l'utente è già altrove. Riaprire lo stream ora
+    // (qualità automatica, caduta) gli annullerebbe la navigazione.
+    if (state.shared.loading) return;
     const yt = &state.shared.yt;
     if (yt.opening or yt.current_id == null or !state.video.isActive()) return;
     const r_id = state.gpa.dupe(u8, yt.current_id.?) catch return;
-    // Il titolo corrente È current_file_path (installato all'apertura).
-    const r_title = state.gpa.dupe(u8, state.shared.current_file_path) catch {
+    const r_title = state.gpa.dupe(u8, state.shared.display_name) catch {
         state.gpa.free(r_id);
         return;
     };
-    startOpen(state, r_id, r_title, state.video.pos_s, height);
+    startOpen(state, r_id, r_title, pos_s, height);
 }
+
+/// Lo stream YouTube in riproduzione è caduto (rete, URL scaduto dopo una pausa
+/// lunga): lo si riapre alla stessa posizione con una risoluzione nuova degli
+/// indirizzi. Una seconda caduta entro `fail_retry_ms` non si ritenta: si apre
+/// l'overlay con il messaggio. false se ciò che è aperto non è uno stream
+/// YouTube. Con `shared.mutex` acquisito.
+pub fn streamFailed(state: *GuiAppState, at_s: f64) bool {
+    if (comptime !has_video) return false;
+    const yt = &state.shared.yt;
+    if (yt.current_id == null) return false;
+    if (yt.opening) return true; // una riapertura è già in corso
+    const now = zicro.widget.nowMs();
+    if (yt.fail_reopen_ms != 0 and now - yt.fail_reopen_ms < fail_retry_ms) {
+        yt.active = true;
+        setErr(state, "lo stream si è interrotto");
+        state.shared.file_changed = true;
+        return true;
+    }
+    yt.fail_reopen_ms = now;
+    // Gli indirizzi in mano possono essere proprio quelli scaduti.
+    if (yt.pf) |*p| if (p.id.eql(yt.current_id.?)) {
+        p.deinit(state.gpa);
+        yt.pf = null;
+    };
+    reopenAt(state, if (yt.stream_h != 0) yt.stream_h else streamHeight(state), at_s);
+    return true;
+}
+
+pub const fail_retry_ms: i64 = 30_000;
 
 /// Da chiamare a ogni tick del player (render worker, con `shared.mutex`):
 /// con Auto alza la qualità quando la vista (alta `view_h` pixel) è cresciuta ed
@@ -769,7 +829,7 @@ pub fn tickStream(state: *GuiAppState, view_h: u32, dt: f32) void {
     const ended = yt.prev_pos >= 0 and vs.dur_s > 2 and yt.prev_pos > vs.dur_s - 1.0 and
         pos < 1.0 and !vs.settle_seek and vs.seek_to < 0;
     yt.prev_pos = pos;
-    if (ended and !yt.active and yt.queue.items.len > 0) {
+    if (ended and !yt.active and !state.shared.loading and yt.queue.items.len > 0) {
         playNext(state);
         return;
     }
@@ -960,10 +1020,16 @@ fn browserWorker(state: *GuiAppState, url: []u8) void {
     state.gpa.free(url);
 }
 
-fn finishOpenErr(state: *GuiAppState, msg: []const u8) void {
+fn finishOpenErr(state: *GuiAppState, gen: u32, msg: []const u8) void {
     state.shared.mutex.lockUncancelable(state.io);
     defer state.shared.mutex.unlock(state.io);
     state.shared.yt.opening = false;
+    // Nel frattempo si è navigato altrove: l'errore di un'apertura abbandonata
+    // non riapre l'overlay sopra il file nuovo né gli spegne lo spinner.
+    if (nav.navSuperseded(state, gen)) {
+        state.shared.file_changed = true;
+        return;
+    }
     // L'apertura può essere partita fuori dall'overlay (link da riga di comando,
     // Esc durante l'attesa): spegni lo spinner d'avvio e mostra l'overlay,
     // altrimenti l'errore resterebbe muto.
@@ -1089,7 +1155,11 @@ fn tickPrefetch(state: *GuiAppState) void {
     if (!yt.active or yt.opening) return;
     // Overlay aperto = probabile apertura in arrivo: un motore mpv già pronto
     // (il video in corso tiene occupato il suo) risparmia ~0,5 s al primo frame.
-    videomod.prewarmEngine(state.gpa);
+    // Una volta per selezione (vedi `prewarm_sel`).
+    if (yt.prewarm_sel != yt.sel) {
+        yt.prewarm_sel = yt.sel;
+        videomod.prewarmEngine(state.gpa);
+    }
     if (yt.pf_busy) return;
     const cards = shown(yt);
     if (yt.sel < 0 or yt.sel >= @as(i32, @intCast(cards.len))) return;
@@ -1149,7 +1219,7 @@ fn prefetchWorker(state: *GuiAppState, id: IdBuf, height: u32, cancel: *std.atom
 /// riproduzione riparte da lì. Il container libav viene aperto QUI, fuori dal
 /// lock (rete: secondi); solo lo swap dello stato avviene sotto `mutex`.
 /// Prende possesso di `id` e `title_opt`.
-fn openWorker(state: *GuiAppState, id: []u8, title_opt: ?[]u8, resume_s: f64, height: u32) void {
+fn openWorker(state: *GuiAppState, id: []u8, title_opt: ?[]u8, resume_s: f64, height: u32, gen: u32) void {
     defer state.gpa.free(id);
     if (comptime !has_video) {
         if (title_opt) |t| state.gpa.free(t);
@@ -1161,21 +1231,28 @@ fn openWorker(state: *GuiAppState, id: []u8, title_opt: ?[]u8, resume_s: f64, he
         from_pf = false;
         break :blk resolve(state.gpa, state.io, id, height, null) catch |e| {
             if (title_opt) |t| state.gpa.free(t);
-            finishOpenErr(state, resolveErrMsg(e));
+            finishOpenErr(state, gen, resolveErrMsg(e));
             return;
         };
     };
     defer res.deinit(state.gpa);
 
-    const title: []u8 = title_opt orelse state.gpa.dupe(u8, if (res.title.len > 0) res.title else "YouTube") catch {
-        finishOpenErr(state, "memoria esaurita");
-        return;
+    // Mai vuoto: `display_name` non vuoto è ciò che dice «c'è uno stream aperto».
+    const title: []u8 = title: {
+        if (title_opt) |t| {
+            if (t.len > 0) break :title t;
+            state.gpa.free(t);
+        }
+        break :title state.gpa.dupe(u8, if (res.title.len > 0) res.title else "YouTube") catch {
+            finishOpenErr(state, gen, "memoria esaurita");
+            return;
+        };
     };
 
     // Apre il container in uno stato LOCALE: niente lock durante l'handshake di
     // rete. Lo swap col player corrente avviene dopo, sotto `mutex`.
     var local: videomod.VideoState = .{};
-    const first = videomod.setupStream(&local, res.vurl, res.aurl, state.gpa) catch |e| retry: {
+    const first = videomod.setupStream(&local, res.vurl, res.aurl, resume_s, state.gpa) catch |e| retry: {
         // URL dal prefetch rifiutati (scaduti, rete cambiata): si risolve da capo.
         if (from_pf) {
             res.deinit(state.gpa);
@@ -1183,48 +1260,63 @@ fn openWorker(state: *GuiAppState, id: []u8, title_opt: ?[]u8, resume_s: f64, he
             if (resolve(state.gpa, state.io, id, height, null)) |fresh_res| {
                 res = fresh_res;
                 local = .{};
-                if (videomod.setupStream(&local, res.vurl, res.aurl, state.gpa)) |f| break :retry f else |_| {}
+                if (videomod.setupStream(&local, res.vurl, res.aurl, resume_s, state.gpa)) |f| break :retry f else |_| {}
             } else |_| {}
         }
         state.gpa.free(title);
-        finishOpenErr(state, @errorName(e));
+        finishOpenErr(state, gen, @errorName(e));
         return;
     };
     const vurl = res.vurl;
     const sub_urls: []u8 = state.gpa.dupe(u8, res.subs) catch &[_]u8{};
 
-    // Il titolo diventa il "nome file" della label in alto a destra: la label usa
-    // basename(), quindi eventuali '/' nel titolo vanno neutralizzati.
-    for (title) |*ch| {
-        if (ch.* == '/') ch.* = '-';
-    }
-
     // Riaperture dello stesso video (qualità) tengono la finestra com'è: Auto
     // riapre proprio perché l'utente l'ha ingrandita.
     var same_vid = false;
+    // Proporzioni della sorgente, lette sotto il lock all'install (vedi in fondo).
+    var src_aspect: [2]u32 = .{ first.w, first.h };
     {
         state.shared.mutex.lockUncancelable(state.io);
         defer state.shared.mutex.unlock(state.io);
+
+        // yt-dlp e l'apertura hanno preso secondi: se intanto l'utente ha aperto
+        // altro (frecce, esploratore, un altro file) questo stream è superato e
+        // non si installa sopra. Stesso controllo, sotto lo stesso lock, del
+        // loader in `applyDecoded`.
+        if (nav.navSuperseded(state, gen)) {
+            local.deinit();
+            state.gpa.free(first.rgba);
+            state.gpa.free(title);
+            state.gpa.free(sub_urls);
+            state.shared.yt.opening = false;
+            state.shared.file_changed = true;
+            return;
+        }
 
         // Stessa sequenza della navigazione verso un video (applyDecoded): ferma il
         // player precedente PRIMA di installare il nuovo, sotto lo stesso mutex del
         // worker che chiama advanceVideo/advanceAudio.
         state.video.deinit();
         state.video = local;
-        // Cambio qualità: riparti dalla posizione a cui si era (il seek pendente
-        // viene applicato dal worker al primo advanceVideo).
-        if (resume_s > 0.05) state.video.seek_to = resume_s;
+        // Cambio qualità: la sessione è già aperta alla posizione a cui si era
+        // (`setupStream` con `resume_s`), in pausa finché non è installata.
 
         // Sorgenti correnti per il toggle 'v' (video ↔ solo audio con oscilloscopio).
         gui_state_mod.setAvSrc(state, vurl, true);
 
         state.gpa.free(state.shared.static_rgba);
+        state.shared.static_serial +%= 1;
         state.shared.static_rgba = first.rgba;
         state.shared.static_w = first.w;
         state.shared.static_h = first.h;
 
+        // Uno stream non ha un percorso: il titolo va nel nome da mostrare.
+        // `current_file_index` e la lista restano dove erano, così le frecce
+        // ripartono dal file che si guardava prima.
         state.gpa.free(state.shared.current_file_path);
-        state.shared.current_file_path = title; // possesso trasferito
+        state.shared.current_file_path = &.{};
+        state.gpa.free(state.shared.display_name);
+        state.shared.display_name = title; // possesso trasferito
         state.shared.is_text = false;
         state.shared.is_table = false;
         state.shared.sel_active = false;
@@ -1255,12 +1347,23 @@ fn openWorker(state: *GuiAppState, id: []u8, title_opt: ?[]u8, resume_s: f64, he
         yt.active = false; // overlay chiuso: si riapre con `y` (query/risultati restano)
         state.shared.loading = false; // spinner d'avvio (apertura da link): spento
         state.shared.file_changed = true;
+        if (state.video.decoder) |dec| {
+            if (dec.src_w > 0 and dec.src_h > 0) src_aspect = .{ dec.src_w, dec.src_h };
+        }
     }
 
     // La finestra si adatta alle proporzioni reali del video appena aperto
     // (stessa euristica di `nav.resizeToContent`). Fuori dal lock: `requestResize`
     // è thread-safe (differisce al thread finestra) e no-op in fullscreen.
     if (state.win) |w| if (!same_vid) {
+        // Proporzioni del video PRIMA del resize, come `nav.resizeToContent`: la
+        // finestra applica il blocco anche alla taglia chiesta. Con quelle del
+        // contenuto di prima (un'immagine 4:3) la portava a 960×720, e subito
+        // dopo il worker, impostando le 16:9, la rimappava una seconda volta a
+        // 1109×624: due rimappature di fila, e su sway la finestra a volte non
+        // tornava più a schermo. Gli stessi numeri che userà il worker
+        // (`src_w`×`src_h`): per lui sarà un no-op.
+        w.setContentAspect(src_aspect[0], src_aspect[1]);
         const az = layout_mod.autoZoomForContent(.video, first.w, first.h);
         const size = layout_mod.initialWindowSize(.video, layout_mod.scaleDim(first.w, az), layout_mod.scaleDim(first.h, az));
         w.requestResize(size.w, size.h);

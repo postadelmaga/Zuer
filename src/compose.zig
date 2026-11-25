@@ -268,13 +268,18 @@ pub const MipChain = struct {
     hs: [max_levels]u32 = @splat(0),
     n: u8 = 0,
     src_ptr: ?[*]const u8 = null,
+    src_serial: u32 = 0,
 
-    /// (Ri)costruisce la catena se `src` (puntatore/dimensioni) è cambiato.
-    pub fn ensure(self: *MipChain, gpa: std.mem.Allocator, src: []const u8, w: u32, h: u32) void {
+    /// (Ri)costruisce la catena se `src` è cambiato. `serial` identifica il
+    /// contenuto (cresce a ogni immagine nuova): puntatore e dimensioni da soli
+    /// non distinguono due foto della stessa fotocamera allocate, una dopo
+    /// l'altra, allo stesso indirizzo — si vedrebbero i mip della precedente.
+    pub fn ensure(self: *MipChain, gpa: std.mem.Allocator, src: []const u8, w: u32, h: u32, serial: u32) void {
         if (self.src_ptr) |p| {
-            if (p == src.ptr and self.ws[0] == w and self.hs[0] == h) return;
+            if (p == src.ptr and self.ws[0] == w and self.hs[0] == h and self.src_serial == serial) return;
         }
         self.release(gpa);
+        self.src_serial = serial;
         if (w == 0 or h == 0 or src.len < @as(usize, w) * h * 4) return;
         self.levels[0] = src;
         self.ws[0] = w;

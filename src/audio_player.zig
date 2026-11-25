@@ -21,6 +21,13 @@ const DeviceOut = zicro.audio_device.DeviceOut;
 
 extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
 
+/// Attesa fra due tentativi dopo un errore di lettura, e quanti prima di arrendersi
+/// (100 × 50 ms = 5 s).
+const read_retry_ms: u32 = 50;
+const max_read_errors: u32 = 100;
+/// Attesa prima di riavvolgere quando il giro precedente non ha dato frame.
+const empty_loop_ms: u32 = 250;
+
 /// Sleep breve cross-platform senza `io` (il thread audio non ne ha uno).
 fn sleepMs(ms: u32) void {
     if (builtin.os.tag == .windows) {
@@ -83,6 +90,14 @@ pub const AudioPlayer = struct {
     // video (ancorato al suo pts reale) → offset A/V costante. Con 0 nessuno scarto
     // (niente pts < 0) e il primo frame buono riallinea `submitted` sul suo pts.
     skip_until_s: f64 = 0,
+    /// Inizio del container (vedi `player.containerOrigin`): clock e seek sono
+    /// riportati a zero come quelli del video.
+    origin_s: f64 = 0,
+    /// Errori di lettura consecutivi (non fine file): vedi `decodeOne`.
+    read_errors: u32 = 0,
+    /// Dall'ultimo riavvolgimento è uscito almeno un frame. Falso = il file non ha
+    /// audio decodificabile: il giro seguente aspetta invece di girare a vuoto.
+    produced: bool = false,
 
     // Durata totale del brano in secondi (0 se il container non la fornisce): usata
     // dal player audio-only per la timeline dei controlli.
@@ -99,14 +114,30 @@ pub const AudioPlayer = struct {
     /// non ha stream audio o il device non si apre → il video va muto.
     pub fn start(path_z: [*:0]const u8, gpa: std.mem.Allocator) ?*AudioPlayer {
         if (!player.ensureAv()) return null; // libav assente o soname disallineato
-        return startInner(path_z, gpa) catch null;
+        return startInner(path_z, gpa, true, null) catch null;
+    }
+
+    /// Come `start`, ma in pausa: non esce un campione finché `setPlaying(true)`.
+    /// Per chi apre il player PRIMA di installarlo (loader, apertura di uno stream):
+    /// partendo subito suonerebbe sopra ciò che è ancora aperto, e resterebbe a
+    /// suonare se l'apertura venisse poi scartata.
+    pub fn startPaused(path_z: [*:0]const u8, gpa: std.mem.Allocator) ?*AudioPlayer {
+        if (!player.ensureAv()) return null;
+        return startInner(path_z, gpa, false, null) catch null;
+    }
+
+    /// Come `startPaused`, con l'origine dei tempi decisa da chi apre: per l'audio
+    /// che accompagna un video in un ALTRO container (stream con tracce separate).
+    pub fn startPausedAt(path_z: [*:0]const u8, gpa: std.mem.Allocator, origin_s: f64) ?*AudioPlayer {
+        if (!player.ensureAv()) return null;
+        return startInner(path_z, gpa, false, origin_s) catch null;
     }
 
     /// Corpo di `start` con gestione errori esplicita: gli early-out sono errori
     /// veri (non `return null`) così gli `errdefer` scattano e liberano davvero
     /// format ctx (e il suo fd!), codec ctx, swr, frame, packet e device — un
     /// `return null` li salterebbe, leakando risorse per ogni video muto aperto.
-    fn startInner(path_z: [*:0]const u8, gpa: std.mem.Allocator) anyerror!*AudioPlayer {
+    fn startInner(path_z: [*:0]const u8, gpa: std.mem.Allocator, playing: bool, origin: ?f64) anyerror!*AudioPlayer {
         // Apertura e letture interrompibili: con la rete ferma `stopAndDestroy` non
         // deve aspettare un `av_read_frame` che non torna (vedi `player.Interrupt`).
         const intr = player.Interrupt.create() orelse return error.AllocFailed;
@@ -181,7 +212,9 @@ pub const AudioPlayer = struct {
             .dev = dev,
             .gpa = gpa,
             .duration_s = duration_s,
+            .origin_s = origin orelse player.containerOrigin(fmt_ctx),
         };
+        self.playing.store(playing, .monotonic); // prima del thread: nessun campione sfugge
         self.thread = try std.Thread.spawn(.{}, threadMain, .{self});
         return self;
     }
@@ -256,7 +289,8 @@ pub const AudioPlayer = struct {
         while (!self.stop.load(.monotonic)) {
             const sk = self.seek_ms.swap(-1, .monotonic);
             if (sk >= 0) {
-                const ts: i64 = if (self.time_base > 0) @intFromFloat((@as(f64, @floatFromInt(sk)) / 1000.0) / self.time_base) else 0;
+                // Da zero si va all'inizio del file, non a `origin_s` (vedi `Player.seek`).
+                const ts: i64 = if (self.time_base > 0 and sk > 0) @intFromFloat((@as(f64, @floatFromInt(sk)) / 1000.0 + self.origin_s) / self.time_base) else 0;
                 _ = av.av_seek_frame(self.fmt_ctx, self.stream_idx, ts, c.AVSEEK_FLAG_BACKWARD);
                 av.avcodec_flush_buffers(self.codec_ctx);
                 // `submitted` qui è provvisorio: si riallinea sul pts reale del primo
@@ -270,8 +304,9 @@ pub const AudioPlayer = struct {
                 continue;
             }
             // Legge/decodifica un frame audio; a EOF fa loop (come il video).
-            const got = self.decodeOne() catch {
-                sleepMs(5);
+            const got = self.decodeOne() catch |e| {
+                // Errore di lettura (rete): si riprova da dove si era, con calma.
+                sleepMs(if (e == error.Read) read_retry_ms else 5);
                 continue;
             };
             if (!got) {
@@ -282,6 +317,11 @@ pub const AudioPlayer = struct {
                     sleepMs(8);
                     continue;
                 }
+                // Un giro intero senza un solo frame (WAV di solo header, download
+                // troncato, lettura che fallisce sempre): senza attesa questo ciclo
+                // teneva un core al 100%, o martellava di richieste uno stream remoto.
+                if (!self.produced) sleepMs(empty_loop_ms);
+                self.produced = false;
                 _ = av.av_seek_frame(self.fmt_ctx, self.stream_idx, 0, c.AVSEEK_FLAG_BACKWARD);
                 av.avcodec_flush_buffers(self.codec_ctx);
                 // Come all'avvio: riancora `submitted` al pts reale del primo frame
@@ -290,6 +330,7 @@ pub const AudioPlayer = struct {
                 self.skip_until_s = 0;
                 continue;
             }
+            self.produced = true;
             // Post-seek: scarta i frame del keyframe precedente (pts < soglia) e
             // riallinea `submitted` al pts reale del primo frame buono, così il
             // clock conta solo campioni davvero riprodotti.
@@ -344,13 +385,13 @@ pub const AudioPlayer = struct {
     fn streamStartSeconds(self: *const AudioPlayer) f64 {
         const ts = self.fmt_ctx.*.streams[@intCast(self.stream_idx)].*.start_time;
         if (ts == c.AV_NOPTS_VALUE or self.time_base <= 0) return -1;
-        return @max(0, @as(f64, @floatFromInt(ts)) * self.time_base);
+        return @max(0, @as(f64, @floatFromInt(ts)) * self.time_base - self.origin_s);
     }
 
     fn framePtsSeconds(self: *const AudioPlayer) f64 {
         const ts = self.frame.*.best_effort_timestamp;
         if (ts == c.AV_NOPTS_VALUE or self.time_base <= 0) return -1;
-        return @as(f64, @floatFromInt(ts)) * self.time_base;
+        return @max(0, @as(f64, @floatFromInt(ts)) * self.time_base - self.origin_s);
     }
 
     /// Decodifica il prossimo frame audio in `self.frame`. `false` a fine file.
@@ -362,11 +403,21 @@ pub const AudioPlayer = struct {
             // Serve un altro packet.
             const rr = av.av_read_frame(self.fmt_ctx, self.packet);
             if (rr < 0) {
+                // Solo AVERROR_EOF è la fine del file. Un altro errore (rete che
+                // cade un attimo) si riprova senza riavvolgere: prima faceva
+                // ripartire il brano da zero. Se dura (`max_read_errors` tentativi,
+                // qualche secondo) il flusso è perso e vale come fine.
+                if (rr != c.AVERROR_EOF and !self.stop.load(.monotonic)) {
+                    self.read_errors += 1;
+                    if (self.read_errors < max_read_errors) return error.Read;
+                }
+                self.read_errors = 0;
                 _ = av.avcodec_send_packet(self.codec_ctx, null); // flush
                 const r2 = av.avcodec_receive_frame(self.codec_ctx, self.frame);
                 return r2 == 0;
             }
             defer av.av_packet_unref(self.packet);
+            self.read_errors = 0;
             if (self.packet.*.stream_index != self.stream_idx) continue;
             _ = av.avcodec_send_packet(self.codec_ctx, self.packet);
         }

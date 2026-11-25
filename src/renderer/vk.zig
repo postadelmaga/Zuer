@@ -876,6 +876,26 @@ pub fn check(r: VkResult) !void {
     return error.VulkanError;
 }
 
+pub const VK_TIMEOUT: VkResult = 2;
+
+/// Attende che `fence` sia segnalata. Lo scadere dei 2 s NON è un errore: vuol
+/// dire che la GPU è lenta (rasterizzatore software, texture enormi), e il comando
+/// è ancora in esecuzione. Tornare con un errore faceva distruggere al chiamante
+/// buffer e immagini che quel comando sta usando, e riusare il command buffer
+/// ancora pendente. Si aspetta invece che il device abbia finito tutto.
+///
+/// Vale anche per una fence che nessuno segnalerà più (resettata, poi il submit
+/// è fallito): passati i 2 s il device risulta fermo e il chiamante la riusa.
+///
+/// `vkDeviceWaitIdle` non ha un tempo massimo: una GPU bloccata che non si
+/// dichiara persa tiene qui il render. Prima se ne usciva dopo 2 s, ma liberando
+/// memoria ancora in uso; fra i due mali, questo non corrompe nulla.
+pub fn waitFence(device: VkDevice, fence: *const VkFence) !void {
+    const r = vkWaitForFences(device, 1, @ptrCast(fence), 1, 2 * std.time.ns_per_s);
+    if (r == VK_TIMEOUT) return check(vkDeviceWaitIdle(device));
+    return check(r);
+}
+
 pub const ST_SAMPLER_CREATE_INFO: VkStructureType = 31;
 pub const ST_DESCRIPTOR_SET_LAYOUT_CREATE_INFO: VkStructureType = 32;
 pub const ST_DESCRIPTOR_POOL_CREATE_INFO: VkStructureType = 33;
