@@ -257,40 +257,12 @@ fn decodeStl(bytes: []const u8, filename: []const u8, allocator: std.mem.Allocat
     });
 }
 
-fn zuer_decode(
-    path: decoder.SliceC,
-    content: decoder.SliceC,
-    io_ptr: *const anyopaque,
-    allocator_ptr: *const anyopaque,
-) callconv(.c) decoder.DecodedC {
-    _ = io_ptr;
-    const allocator = @as(*const std.mem.Allocator, @ptrCast(@alignCast(allocator_ptr))).*;
-    const path_slice = path.toSlice();
-    const content_slice = content.toSlice();
-    const filename = std.fs.path.basename(path_slice);
-    const decoded = decode(content_slice, filename, allocator);
-    return decoded.intoC(allocator);
+pub const plugin_name = "mesh";
+
+pub fn pluginDecode(req: decoder.PluginRequest) decoder.Decoded {
+    return decode(req.content, std.fs.path.basename(req.path), req.allocator);
 }
 
-pub const extensions = "obj,stl";
-
-fn zuer_extensions() callconv(.c) decoder.SliceC {
-    return decoder.SliceC.fromSlice(extensions);
-}
-
-/// Versione dell'ABI plugin con cui questo decoder è compilato: l'host la
-/// confronta con la propria `decoder.abi_version` e scarta i mismatch.
-fn zuer_abi_version() callconv(.c) u32 {
-    return decoder.abi_version;
-}
-
-// Gli export dell'ABI plugin esistono solo dove i decoder SONO plugin (vedi
-// decoder.plugin_abi): su Android sono linkati dentro l'unica libreria dell'APK e i loro
-// nomi colliderebbero.
 comptime {
-    if (decoder.plugin_abi) {
-        @export(&zuer_decode, .{ .name = "zuer_decode", .linkage = .strong });
-        @export(&zuer_extensions, .{ .name = "zuer_extensions", .linkage = .strong });
-        @export(&zuer_abi_version, .{ .name = "zuer_abi_version", .linkage = .strong });
-    }
+    decoder.exportPlugin(@This());
 }

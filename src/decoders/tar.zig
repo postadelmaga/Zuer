@@ -369,47 +369,18 @@ fn formatSize(allocator: std.mem.Allocator, n: u64) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{d:.1} {s}", .{ v, units[u] });
 }
 
-fn zuer_decode(
-    path: decoder.SliceC,
-    content: decoder.SliceC,
-    io_ptr: *const anyopaque,
-    allocator_ptr: *const anyopaque,
-) callconv(.c) decoder.DecodedC {
-    const io = @as(*const std.Io, @ptrCast(@alignCast(io_ptr))).*;
-    const allocator = @as(*const std.mem.Allocator, @ptrCast(@alignCast(allocator_ptr))).*;
-    // Path-based (`zuer_content_prefix = 0`): l'host non ha caricato il file, ma
-    // per contratto il plugin libera comunque `content` (qui vuoto).
-    allocator.free(content.toSlice());
-
-    const decoded = decode(path.toSlice(), io, allocator);
-    return decoded.intoC(allocator);
-}
-
-/// Le ultime voci passano da bsdtar (vedi il commento del file). Stessa lista del
-/// manifest in decoder.zig.
-pub const extensions = "tar,tgz,tar.gz,7z,rar,xz,txz,bz2,tbz,tbz2,zst,tzst,lz,lzma,tlz,iso,cab,cpio,xar,pkg,rpm,lha,lzh";
-
-fn zuer_extensions() callconv(.c) decoder.SliceC {
-    return decoder.SliceC.fromSlice(extensions);
-}
+/// Le ultime voci della sua lista passano da bsdtar (vedi il commento del file).
+pub const plugin_name = "tar";
 
 /// Come archive.zig: si legge dal path in streaming, nessun byte caricato dall'host.
-fn zuer_content_prefix() callconv(.c) usize {
-    return 0;
+pub const plugin_content_prefix: usize = 0;
+
+pub fn pluginDecode(req: decoder.PluginRequest) decoder.Decoded {
+    // Per contratto il plugin libera comunque `content` (qui vuoto).
+    req.allocator.free(req.content);
+    return decode(req.path, req.io, req.allocator);
 }
 
-fn zuer_abi_version() callconv(.c) u32 {
-    return decoder.abi_version;
-}
-
-// Gli export dell'ABI plugin esistono solo dove i decoder SONO plugin (vedi
-// decoder.plugin_abi): su Android sono linkati dentro l'unica libreria dell'APK e i loro
-// nomi colliderebbero.
 comptime {
-    if (decoder.plugin_abi) {
-        @export(&zuer_decode, .{ .name = "zuer_decode", .linkage = .strong });
-        @export(&zuer_extensions, .{ .name = "zuer_extensions", .linkage = .strong });
-        @export(&zuer_content_prefix, .{ .name = "zuer_content_prefix", .linkage = .strong });
-        @export(&zuer_abi_version, .{ .name = "zuer_abi_version", .linkage = .strong });
-    }
+    decoder.exportPlugin(@This());
 }

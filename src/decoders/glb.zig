@@ -331,13 +331,13 @@ fn texBody(ctx: ?*anyopaque, i: usize) callconv(.c) void {
     decodeTex(@ptrCast(@alignCast(ctx.?)), i, true);
 }
 
-/// Servizi dell'host (scheduler condiviso), impostati da `zuer_set_host` al
+/// Servizi dell'host (scheduler condiviso), impostati da `pluginSetHost` al
 /// caricamento del plugin, sotto il mutex del registro: ogni decode successivo
 /// passa da quel mutex, quindi vede il valore già pubblicato. Null = host che
 /// non li offre (Android, tool vecchi): si ripiega sui thread propri qui sotto.
 var host_services: ?*const decoder.HostServices = null;
 
-fn zuer_set_host(services: *const decoder.HostServices) callconv(.c) void {
+pub fn pluginSetHost(services: *const decoder.HostServices) void {
     if (services.size < @sizeOf(decoder.HostServices)) return;
     host_services = services;
 }
@@ -1039,61 +1039,18 @@ fn readIndex(bin_data: []const u8, offset: usize, index: usize, component_type: 
     }
 }
 
-fn decodeExport(
-    path: decoder.SliceC,
-    content: decoder.SliceC,
-    allocator_ptr: *const anyopaque,
-    coarse: bool,
-) decoder.DecodedC {
-    const allocator = @as(*const std.mem.Allocator, @ptrCast(@alignCast(allocator_ptr))).*;
-    const filename = std.fs.path.basename(path.toSlice());
-    const decoded = decode(content.toSlice(), filename, allocator, coarse);
-    return decoded.intoC(allocator);
+pub const plugin_name = "glb";
+
+pub fn pluginDecode(req: decoder.PluginRequest) decoder.Decoded {
+    return decode(req.content, std.fs.path.basename(req.path), req.allocator, false);
 }
 
-fn zuer_decode(
-    path: decoder.SliceC,
-    content: decoder.SliceC,
-    io_ptr: *const anyopaque,
-    allocator_ptr: *const anyopaque,
-) callconv(.c) decoder.DecodedC {
-    _ = io_ptr;
-    return decodeExport(path, content, allocator_ptr, false);
+/// Prima fase progressiva: texture al tier coarse (256², da cache se presente →
+/// resa istantanea). L'host la usa opzionalmente prima del decode pieno.
+pub fn pluginDecodeCoarse(req: decoder.PluginRequest) decoder.Decoded {
+    return decode(req.content, std.fs.path.basename(req.path), req.allocator, true);
 }
 
-// Prima fase progressiva: texture al tier coarse (256², da cache se presente →
-// resa istantanea). L'host la usa opzionalmente prima di `zuer_decode` (full).
-fn zuer_decode_coarse(
-    path: decoder.SliceC,
-    content: decoder.SliceC,
-    io_ptr: *const anyopaque,
-    allocator_ptr: *const anyopaque,
-) callconv(.c) decoder.DecodedC {
-    _ = io_ptr;
-    return decodeExport(path, content, allocator_ptr, true);
-}
-
-pub const extensions = "glb";
-
-fn zuer_extensions() callconv(.c) decoder.SliceC {
-    return decoder.SliceC.fromSlice(extensions);
-}
-
-/// Versione dell'ABI plugin con cui questo decoder è compilato: l'host la
-/// confronta con la propria `decoder.abi_version` e scarta i mismatch.
-fn zuer_abi_version() callconv(.c) u32 {
-    return decoder.abi_version;
-}
-
-// Gli export dell'ABI plugin esistono solo dove i decoder SONO plugin (vedi
-// decoder.plugin_abi): su Android sono linkati dentro l'unica libreria dell'APK e i loro
-// nomi colliderebbero.
 comptime {
-    if (decoder.plugin_abi) {
-        @export(&zuer_decode, .{ .name = "zuer_decode", .linkage = .strong });
-        @export(&zuer_decode_coarse, .{ .name = "zuer_decode_coarse", .linkage = .strong });
-        @export(&zuer_extensions, .{ .name = "zuer_extensions", .linkage = .strong });
-        @export(&zuer_abi_version, .{ .name = "zuer_abi_version", .linkage = .strong });
-        @export(&zuer_set_host, .{ .name = "zuer_set_host", .linkage = .strong });
-    }
+    decoder.exportPlugin(@This());
 }

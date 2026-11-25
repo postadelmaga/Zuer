@@ -131,22 +131,25 @@ pub fn winKindFromExt(path: []const u8) WinKind {
     const base = std.fs.path.basename(decoder_mod.stripFragment(path));
     const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse return .generic;
     const ext = base[dot + 1 ..];
-    inline for (.{ "png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "avif", "heic", "heif", "jxl", "jp2", "exr", "ico", "dng", "cr2", "cr3", "nef", "arw", "orf", "rw2", "raf" }) |e| {
+    // Le liste stanno in formats.zig, accanto alla tabella dei plugin a cui un test
+    // le lega.
+    const formats = decoder_mod.formats;
+    inline for (formats.shape_image) |e| {
         if (extLowerEql(ext, e)) return .image;
     }
-    inline for (.{ "obj", "stl", "glb", "gltf", "ply", "fbx", "dae", "3ds" }) |e| {
+    inline for (formats.shape_mesh) |e| {
         if (extLowerEql(ext, e)) return .mesh;
     }
-    inline for (.{ "mp4", "mkv", "webm", "mov", "qt", "avi", "divx", "m4v", "wmv", "asf", "flv", "f4v", "mpg", "mpeg", "mpe", "m1v", "m2v", "vob", "ts", "mts", "m2ts", "m2t", "3gp", "3g2", "ogv", "dv" }) |e| {
+    inline for (formats.shape_video) |e| {
         if (extLowerEql(ext, e)) return .video;
     }
     // Audio comune: stesso percorso del player nativo (`.video`), ma senza stream
     // video `setupVideo` fallisce e `startVideo` ripiega su `setupAudio` →
     // oscilloscopio. mid/midi restano al loro synth dedicato, fuori da qui.
-    inline for (.{ "mp3", "wav", "w64", "flac", "ogg", "oga", "opus", "m4a", "m4b", "mka", "aac", "ac3", "eac3", "dts", "wma", "aiff", "aif", "aifc", "caf", "amr", "awb", "wv", "ape", "mpc", "tta" }) |e| {
+    inline for (formats.shape_audio) |e| {
         if (extLowerEql(ext, e)) return .video;
     }
-    inline for (.{ "csv", "tsv", "xlsx", "xls", "ods", "zip", "jar", "apk", "cbz", "epub", "xpi", "whl" }) |e| {
+    inline for (formats.shape_table) |e| {
         if (extLowerEql(ext, e)) return .table;
     }
     // I PDF vengono resi come immagine di pagina, ma con proporzioni ritratto.

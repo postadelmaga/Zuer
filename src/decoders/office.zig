@@ -1181,43 +1181,27 @@ fn stripTagsInto(w: *std.Io.Writer, xml: []const u8) !void {
     }
 }
 
-export fn zuer_decode(
-    path: decoder.SliceC,
-    content: decoder.SliceC,
-    io_ptr: *const anyopaque,
-    allocator_ptr: *const anyopaque,
-) callconv(.c) decoder.DecodedC {
-    _ = io_ptr;
-    const allocator = @as(*const std.mem.Allocator, @ptrCast(@alignCast(allocator_ptr))).*;
-    const path_slice = path.toSlice();
+/// Su macOS la sua lista comprende anche i formati di `textutil`.
+pub const plugin_name = "office";
+
+pub fn pluginDecode(req: decoder.PluginRequest) decoder.Decoded {
     // Il percorso può portare un frammento (`cartella.xlsx#sheet=3`): l'host lo
     // lascia passare intatto. Va tolto prima di guardare l'estensione, altrimenti
     // `hasExtension` non riconoscerebbe più il formato.
-    const want_sheet = sheetFromPath(path_slice);
-    const clean_path = decoder.stripFragment(path_slice);
+    const want_sheet = sheetFromPath(req.path);
+    const clean_path = decoder.stripFragment(req.path);
     const filename = std.fs.path.basename(clean_path);
     if (comptime builtin.os.tag == .macos) {
         inline for (textutil_exts) |e| if (hasExtension(filename, e)) {
-            allocator.free(content.toSlice()); // contratto: il plugin libera `content`
-            const d = decodeTextutil(clean_path, allocator);
-            return d.intoC(allocator);
+            req.allocator.free(req.content); // contratto: il plugin libera `content`
+            return decodeTextutil(clean_path, req.allocator);
         };
     }
-    const decoded = decode(content.toSlice(), filename, want_sheet, allocator);
-    return decoded.intoC(allocator);
+    return decode(req.content, filename, want_sheet, req.allocator);
 }
 
-/// Su macOS anche i formati di `textutil`. Stessa lista del manifest in decoder.zig.
-pub const extensions = "docx,pptx,odt,odp,xlsx,xlsm,ods" ++ (if (builtin.os.tag == .macos) ",doc,dot,rtf,webarchive,wordml" else "");
-
-export fn zuer_extensions() callconv(.c) decoder.SliceC {
-    return decoder.SliceC.fromSlice(extensions);
-}
-
-/// Versione dell'ABI plugin con cui questo decoder è compilato: l'host la
-/// confronta con la propria `decoder.abi_version` e scarta i mismatch.
-export fn zuer_abi_version() callconv(.c) u32 {
-    return decoder.abi_version;
+comptime {
+    decoder.exportPlugin(@This());
 }
 
 test "findTag: con e senza prefisso, confini del nome" {

@@ -617,71 +617,37 @@ fn decodeWithImageMagick(path: []const u8, coder: []const u8, filename: []const 
     };
 }
 
-fn decodeExport(path: decoder.SliceC, content: decoder.SliceC, allocator_ptr: *const anyopaque, coarse: bool) decoder.DecodedC {
-    const allocator = @as(*const std.mem.Allocator, @ptrCast(@alignCast(allocator_ptr))).*;
-    const path_slice = path.toSlice();
-    const content_slice = content.toSlice();
-    const filename = std.fs.path.basename(path_slice);
+// In processo su ogni piattaforma: stb_image (PNG/JPEG/GIF/BMP/TGA/PSD/HDR/PIC/PNM),
+// libwebp (WebP), nanosvg (SVG/SVGZ), il parser ICO. TIFF e AVIF passano dal codec
+// di sistema (ImageIO su macOS, WIC su Windows) o da ImageMagick su Linux; così le
+// ultime due righe della sua lista in formats.zig (vedi `decodeSystem`): su macOS
+// ImageIO le apre tutte.
+pub const plugin_name = "image";
+
+fn decodeRequest(req: decoder.PluginRequest, coarse: bool) decoder.Decoded {
+    const filename = std.fs.path.basename(req.path);
     const decoded = if (coarse)
-        decodeWithMax(path_slice, content_slice, filename, allocator, coarse_max_dim)
+        decodeWithMax(req.path, req.content, filename, req.allocator, coarse_max_dim)
     else
-        decode(path_slice, content_slice, filename, allocator);
+        decode(req.path, req.content, filename, req.allocator);
     // decode() non conserva i byte del file (stb copia i pixel nel buffer
     // ridimensionato, ImageMagick rilegge dal path): vanno liberati qui o
     // trapelano a ogni immagine.
-    allocator.free(content_slice);
-    return decoded.intoC(allocator);
+    req.allocator.free(req.content);
+    return decoded;
 }
 
-fn zuer_decode(
-    path: decoder.SliceC,
-    content: decoder.SliceC,
-    io_ptr: *const anyopaque,
-    allocator_ptr: *const anyopaque,
-) callconv(.c) decoder.DecodedC {
-    _ = io_ptr; // i subprocess usano fork/exec diretti, non l'io dell'host
-    return decodeExport(path, content, allocator_ptr, false);
+// (I subprocess usano fork/exec diretti, non l'io dell'host.)
+pub fn pluginDecode(req: decoder.PluginRequest) decoder.Decoded {
+    return decodeRequest(req, false);
 }
 
 /// Tier coarse: stessa pipeline ma pixel entro `coarse_max_dim` — per le
 /// miniature (explorer) che a piena risoluzione peserebbero ~64 MB l'una.
-fn zuer_decode_coarse(
-    path: decoder.SliceC,
-    content: decoder.SliceC,
-    io_ptr: *const anyopaque,
-    allocator_ptr: *const anyopaque,
-) callconv(.c) decoder.DecodedC {
-    _ = io_ptr;
-    return decodeExport(path, content, allocator_ptr, true);
+pub fn pluginDecodeCoarse(req: decoder.PluginRequest) decoder.Decoded {
+    return decodeRequest(req, true);
 }
 
-// In processo su ogni piattaforma: stb_image (PNG/JPEG/GIF/BMP/TGA/PSD/HDR/PIC/PNM),
-// libwebp (WebP), nanosvg (SVG/SVGZ), il parser ICO. TIFF e AVIF passano dal codec
-// di sistema (ImageIO su macOS, WIC su Windows) o da ImageMagick su Linux.
-/// Le ultime due righe vanno al codec di sistema (vedi `decodeSystem`): su macOS
-/// ImageIO le apre tutte. Stessa lista del manifest in decoder.zig.
-pub const extensions = "png,jpg,jpeg,jpe,jfif,gif,bmp,dib,tga,psd,hdr,pic,pnm,pbm,pgm,ppm,svg,svgz,webp,tif,tiff,ico,avif," ++
-    "heic,heif,hif,jxl,jp2,j2k,jpf,jpx,exr,dds,ktx,astc,icns,pct,pict,sgi," ++
-    "dng,cr2,cr3,crw,nef,nrw,arw,srf,sr2,orf,rw2,raf,pef,srw,x3f,erf,3fr,mos,mrw,dcr,kdc,rwl,iiq";
-
-fn zuer_extensions() callconv(.c) decoder.SliceC {
-    return decoder.SliceC.fromSlice(extensions);
-}
-
-/// Versione dell'ABI plugin con cui questo decoder è compilato: l'host la
-/// confronta con la propria `decoder.abi_version` e scarta i mismatch.
-fn zuer_abi_version() callconv(.c) u32 {
-    return decoder.abi_version;
-}
-
-// Gli export dell'ABI plugin esistono solo dove i decoder SONO plugin (vedi
-// decoder.plugin_abi): su Android sono linkati dentro l'unica libreria dell'APK e i loro
-// nomi colliderebbero.
 comptime {
-    if (decoder.plugin_abi) {
-        @export(&zuer_decode, .{ .name = "zuer_decode", .linkage = .strong });
-        @export(&zuer_decode_coarse, .{ .name = "zuer_decode_coarse", .linkage = .strong });
-        @export(&zuer_extensions, .{ .name = "zuer_extensions", .linkage = .strong });
-        @export(&zuer_abi_version, .{ .name = "zuer_abi_version", .linkage = .strong });
-    }
+    decoder.exportPlugin(@This());
 }

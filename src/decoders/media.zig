@@ -516,48 +516,8 @@ fn formatSize(buf: []u8, n: u64) []const u8 {
     return std.fmt.bufPrint(buf, "{d:.1} {s}", .{ v, units[u] }) catch "?";
 }
 
-fn decodeExport(
-    path: decoder.SliceC,
-    content: decoder.SliceC,
-    allocator_ptr: *const anyopaque,
-    coarse: bool,
-) decoder.DecodedC {
-    const allocator = @as(*const std.mem.Allocator, @ptrCast(@alignCast(allocator_ptr))).*;
-    const filename = std.fs.path.basename(path.toSlice());
-
-    const decoded = decodeTier(path.toSlice(), content.toSlice(), filename, allocator, coarse);
-    return decoded.intoC(allocator);
-}
-
-export fn zuer_decode(
-    path: decoder.SliceC,
-    content: decoder.SliceC,
-    io_ptr: *const anyopaque,
-    allocator_ptr: *const anyopaque,
-) callconv(.c) decoder.DecodedC {
-    _ = io_ptr;
-    return decodeExport(path, content, allocator_ptr, false);
-}
-
-/// Tier coarse: poster video a `coarse_max_dim` per l'anteprima progressiva e
-/// per le miniature dell'explorer (il full arriva dopo).
-export fn zuer_decode_coarse(
-    path: decoder.SliceC,
-    content: decoder.SliceC,
-    io_ptr: *const anyopaque,
-    allocator_ptr: *const anyopaque,
-) callconv(.c) decoder.DecodedC {
-    _ = io_ptr;
-    return decodeExport(path, content, allocator_ptr, true);
-}
-
-/// Stessa lista del manifest in decoder.zig. `.ts` resta al testo (TypeScript).
-pub const extensions = "mp3,wav,w64,flac,ogg,oga,ogv,opus,m4a,m4b,mka,aac,ac3,eac3,dts,wma,aif,aiff,aifc,caf,amr,awb,wv,ape,mpc,tta," ++
-    "mp4,m4v,mov,qt,mkv,webm,avi,divx,wmv,asf,flv,f4v,mpg,mpeg,mpe,m1v,m2v,vob,mts,m2ts,m2t,3gp,3g2,dv,mid,midi";
-
-export fn zuer_extensions() callconv(.c) decoder.SliceC {
-    return decoder.SliceC.fromSlice(extensions);
-}
+/// `.ts` non è nella sua lista: resta al testo (TypeScript).
+pub const plugin_name = "media";
 
 /// Bastano gli header per la scheda: il poster video usa libav dal path e le
 /// strutture in coda (ultima pagina Ogg, moov non-faststart) si leggono mirate
@@ -567,13 +527,18 @@ export fn zuer_extensions() callconv(.c) decoder.SliceC {
 /// che sposta il primo frame oltre il prefisso, durata MIDI) sono coperti dal
 /// re-read mirato in `decodeTier`, che scatta su `wantsFullFile`.
 const content_prefix_bytes: usize = 256 * 1024;
+pub const plugin_content_prefix: usize = content_prefix_bytes;
 
-export fn zuer_content_prefix() callconv(.c) usize {
-    return content_prefix_bytes;
+pub fn pluginDecode(req: decoder.PluginRequest) decoder.Decoded {
+    return decodeTier(req.path, req.content, std.fs.path.basename(req.path), req.allocator, false);
 }
 
-/// Versione dell'ABI plugin con cui questo decoder è compilato: l'host la
-/// confronta con la propria `decoder.abi_version` e scarta i mismatch.
-export fn zuer_abi_version() callconv(.c) u32 {
-    return decoder.abi_version;
+/// Tier coarse: poster video a `coarse_max_dim` per l'anteprima progressiva e
+/// per le miniature dell'explorer (il full arriva dopo).
+pub fn pluginDecodeCoarse(req: decoder.PluginRequest) decoder.Decoded {
+    return decodeTier(req.path, req.content, std.fs.path.basename(req.path), req.allocator, true);
+}
+
+comptime {
+    decoder.exportPlugin(@This());
 }

@@ -709,57 +709,28 @@ fn cacheWrite(gpa: std.mem.Allocator, key: u64, p: Page, total_pages: usize) voi
 
 // ── ABI plugin ──────────────────────────────────────────────────────────────
 
-fn decodeExport(
-    path: decoder.SliceC,
-    content: decoder.SliceC,
-    io_ptr: *const anyopaque,
-    allocator_ptr: *const anyopaque,
-    coarse: bool,
-) decoder.DecodedC {
-    const io = @as(*const std.Io, @ptrCast(@alignCast(io_ptr))).*;
-    const allocator = @as(*const std.mem.Allocator, @ptrCast(@alignCast(allocator_ptr))).*;
-    const path_slice = path.toSlice();
-    const filename = std.fs.path.basename(path_slice);
-    // pdftoppm rilegge il PDF dal path: i byte già letti dall'host non servono.
-    allocator.free(content.toSlice());
-    const decoded = decodeTier(path_slice, io, filename, allocator, coarse);
-    return decoded.intoC(allocator);
+pub const plugin_name = "pdf";
+
+/// pdftoppm rilegge il PDF dal path: l'host non deve leggere alcun byte.
+pub const plugin_content_prefix: usize = 0;
+
+fn decodeRequest(req: decoder.PluginRequest, coarse: bool) decoder.Decoded {
+    // Per contratto il plugin libera comunque `content` (qui vuoto).
+    req.allocator.free(req.content);
+    return decodeTier(req.path, req.io, std.fs.path.basename(req.path), req.allocator, coarse);
 }
 
-export fn zuer_decode(
-    path: decoder.SliceC,
-    content: decoder.SliceC,
-    io_ptr: *const anyopaque,
-    allocator_ptr: *const anyopaque,
-) callconv(.c) decoder.DecodedC {
-    return decodeExport(path, content, io_ptr, allocator_ptr, false);
+pub fn pluginDecode(req: decoder.PluginRequest) decoder.Decoded {
+    return decodeRequest(req, false);
 }
 
 /// Tier coarse: anteprima a `-scale-to 1024`, senza `pdfinfo`. L'host la mostra
 /// mentre il full (a DPI pieno) è ancora in coda, e l'explorer la usa per le
 /// miniature.
-export fn zuer_decode_coarse(
-    path: decoder.SliceC,
-    content: decoder.SliceC,
-    io_ptr: *const anyopaque,
-    allocator_ptr: *const anyopaque,
-) callconv(.c) decoder.DecodedC {
-    return decodeExport(path, content, io_ptr, allocator_ptr, true);
+pub fn pluginDecodeCoarse(req: decoder.PluginRequest) decoder.Decoded {
+    return decodeRequest(req, true);
 }
 
-pub const extensions = "pdf";
-
-export fn zuer_extensions() callconv(.c) decoder.SliceC {
-    return decoder.SliceC.fromSlice(extensions);
-}
-
-/// pdftoppm rilegge il PDF dal path: l'host non deve leggere alcun byte.
-export fn zuer_content_prefix() callconv(.c) usize {
-    return 0;
-}
-
-/// Versione dell'ABI plugin con cui questo decoder è compilato: l'host la
-/// confronta con la propria `decoder.abi_version` e scarta i mismatch.
-export fn zuer_abi_version() callconv(.c) u32 {
-    return decoder.abi_version;
+comptime {
+    decoder.exportPlugin(@This());
 }

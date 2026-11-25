@@ -146,20 +146,11 @@ pub fn decode(bytes: []u8, delimiter: u8, allocator: std.mem.Allocator) Decoded 
     } };
 }
 
-fn zuer_decode(
-    path: decoder.SliceC,
-    content: decoder.SliceC,
-    io_ptr: *const anyopaque,
-    allocator_ptr: *const anyopaque,
-) callconv(.c) decoder.DecodedC {
-    _ = io_ptr;
-    const allocator = @as(*const std.mem.Allocator, @ptrCast(@alignCast(allocator_ptr))).*;
+pub const plugin_name = "csv";
 
-    const path_slice = path.toSlice();
-    const content_slice = content.toSlice();
-
+pub fn pluginDecode(req: decoder.PluginRequest) decoder.Decoded {
     var delimiter: u8 = ',';
-    const filename = std.fs.path.basename(path_slice);
+    const filename = std.fs.path.basename(req.path);
     if (std.mem.lastIndexOfScalar(u8, filename, '.')) |dot_index| {
         const ext = filename[dot_index + 1 ..];
         if (std.mem.eql(u8, ext, "tsv")) {
@@ -167,33 +158,12 @@ fn zuer_decode(
         }
     }
 
-    // Il contratto ABI (vedi `decoder.DecodeFn`) dà al plugin la PROPRIETÀ di
-    // `content`, che l'host alloca sempre sull'heap con questo stesso allocator:
-    // il buffer è quindi scrivibile, ed è lecito de-escapare le celle quotate
-    // compattandole al suo interno. Il `const` è solo del layout C `SliceC`.
-    const decoded = decode(@constCast(content_slice), delimiter, allocator);
-    return decoded.intoC(allocator);
+    // `content` è del plugin (vedi `decoder.PluginRequest`) ed è scrivibile: è
+    // lecito de-escapare le celle quotate compattandole al suo interno, e tenerlo
+    // come `backing` delle celle.
+    return decode(req.content, delimiter, req.allocator);
 }
 
-pub const extensions = "csv,tsv";
-
-fn zuer_extensions() callconv(.c) decoder.SliceC {
-    return decoder.SliceC.fromSlice(extensions);
-}
-
-/// Versione dell'ABI plugin con cui questo decoder è compilato: l'host la
-/// confronta con la propria `decoder.abi_version` e scarta i mismatch.
-fn zuer_abi_version() callconv(.c) u32 {
-    return decoder.abi_version;
-}
-
-// Gli export dell'ABI plugin esistono solo dove i decoder SONO plugin (vedi
-// decoder.plugin_abi): su Android sono linkati dentro l'unica libreria dell'APK e i loro
-// nomi colliderebbero.
 comptime {
-    if (decoder.plugin_abi) {
-        @export(&zuer_decode, .{ .name = "zuer_decode", .linkage = .strong });
-        @export(&zuer_extensions, .{ .name = "zuer_extensions", .linkage = .strong });
-        @export(&zuer_abi_version, .{ .name = "zuer_abi_version", .linkage = .strong });
-    }
+    decoder.exportPlugin(@This());
 }

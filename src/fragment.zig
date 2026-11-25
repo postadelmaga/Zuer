@@ -8,10 +8,18 @@
 //! host, GUI e plugin devono tagliare tutti nello stesso punto.
 
 const std = @import("std");
+const formats = @import("formats.zig");
 
-/// Archivi di cui si può aprire una voce (`archivio#voce`). Deve restare allineata
-/// alle estensioni dichiarate da decoders/archive.zig e decoders/tar.zig.
-pub const archive_exts = [_][]const u8{ "zip", "jar", "apk", "cbz", "epub", "xpi", "whl", "tar", "tgz", "tar.gz" };
+/// Archivi di cui si può aprire una voce (`archivio#voce`): tutti quelli del plugin
+/// `archive` (la famiglia ZIP) e, del plugin `tar`, i soli tar e tar.gz — degli altri
+/// (7z, rar, iso…) si legge l'elenco ma non si estrae.
+pub fn isArchiveExt(ext: []const u8) bool {
+    var it = std.mem.tokenizeScalar(u8, comptime formats.extensionsOf("archive"), ',');
+    while (it.next()) |e| if (std.ascii.eqlIgnoreCase(ext, e)) return true;
+    for (tar_entry_exts) |e| if (std.ascii.eqlIgnoreCase(ext, e)) return true;
+    return false;
+}
+const tar_entry_exts = [_][]const u8{ "tar", "tgz", "tar.gz" };
 
 /// Documenti a pagine (`#N`, `#page=N`) e cartelle di lavoro a fogli (`#sheet=N`).
 const paged_exts = [_][]const u8{ "pdf", "xlsx", "xlsm", "ods" };
@@ -24,11 +32,6 @@ pub fn extension(path: []const u8) []const u8 {
         return "tar.gz";
     if (std.mem.lastIndexOfScalar(u8, filename, '.')) |dot| return filename[dot + 1 ..];
     return "";
-}
-
-pub fn isArchiveExt(ext: []const u8) bool {
-    for (archive_exts) |e| if (std.ascii.eqlIgnoreCase(ext, e)) return true;
-    return false;
 }
 
 fn hasFragments(ext: []const u8) bool {
