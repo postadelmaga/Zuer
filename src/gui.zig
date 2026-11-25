@@ -1233,6 +1233,10 @@ fn setEnvVar(name: [*:0]const u8, value: [*:0]const u8) void {
 var term_window: std.atomic.Value(?*zrame.Window) = .init(null);
 
 fn onTermSignal(_: std.posix.SIG) callconv(.c) void {
+    // I processi esterni in corso (pdftoppm, magick, yt-dlp…) stanno in gruppi
+    // loro e il segnale del terminale non li raggiunge: li si termina qui.
+    // Letture atomiche e `kill`: async-signal-safe.
+    decoder_mod.proc.killAll();
     // `requestClose` = un flag e una `write` su eventfd: async-signal-safe.
     if (term_window.load(.acquire)) |w| w.requestClose();
 }
@@ -1671,6 +1675,9 @@ pub fn main(init: std.process.Init) !void {
     // mentre i loro thread stanno ancora lavorando, e chiudendo con un video in
     // riproduzione uno di quei thread andava in segfault. Non c'è nulla da salvare,
     // quindi niente distruttori.
+    // Un decode ancora in corso può avere un processo esterno vivo: non deve
+    // sopravvivere alla finestra.
+    decoder_mod.proc.killAll();
     if (comptime builtin.link_libc and builtin.os.tag != .windows) std.c._exit(code);
     std.process.exit(code);
 }

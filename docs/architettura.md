@@ -71,11 +71,14 @@ nella lista di `build.zig`. Facoltativi: `pluginDecodeCoarse` (prima fase veloce
 Dentro un plugin l'`io` dell'host non funziona (non attraversa il confine della
 libreria dinamica): file e processi passano da chiamate grezze, raccolte in due file.
 
-- **`proc.zig`** — l'unico posto da cui si lanciano processi: `runCapture…` (stdout
-  catturato, scadenza, tetto sui byte, annullamento), `runDetached` (deve solo
-  partire: `xdg-open`), `runFeed` (gli si scrive lo stdin: `wl-copy`). Sempre argv,
-  mai una shell. Su Unix il figlio ha un gruppo di processi suo e alla scadenza muore
-  tutto il gruppo.
+- **`proc.zig`** — su Unix l'unico posto da cui si lanciano processi: `runCapture…`
+  (stdout catturato, scadenza, tetto sui byte, annullamento), `runDetached` (deve solo
+  partire: `xdg-open`), `runFeed` (gli si scrive lo stdin: `wl-copy`). Si passa sempre
+  un argv, mai una riga di comando da interpretare. Il figlio di `runCapture…` ha stdin
+  su `/dev/null` e un gruppo di processi suo (su Linux una sessione): alla scadenza
+  muore tutto il gruppo, e l'host termina i gruppi ancora vivi quando esce o riceve un
+  segnale (`proc.killAll`; i plugin annotano i propri nel registro dell'host tramite
+  `HostServices`).
 - **`diskcache.zig`** — le primitive delle cache su disco: cartella per sistema
   (`~/.cache/zuer/<nome>`, `%LOCALAPPDATA%\zuer\<nome>`), scrittura atomica con
   pulizia del temporaneo (`AtomicWriter`), tetto LRU e sweep dei temporanei orfani

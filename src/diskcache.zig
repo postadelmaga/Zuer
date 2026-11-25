@@ -7,9 +7,10 @@
 //! (vtcache.zig). Prima ognuna aveva la propria copia di open/write/rename, il
 //! proprio modo di trovare la cartella e — per stare sia nell'host sia nei plugin —
 //! due file gemelli per la manutenzione. Ora il file è uno: i plugin lo raggiungono
-//! come `decoder.diskcache`, l'host lo importa direttamente, ed è sempre lo stesso
-//! modulo. La cache d'estrazione (extract_cache.zig) e le miniature (thumbs.zig)
-//! hanno un `io` e usano `std.Io`: di qui prendono solo la cartella.
+//! come `decoder.diskcache`, l'host lo importa direttamente. (Ogni plugin ne ha la
+//! propria copia compilata, ma ogni cartella la scrive un binario solo.) La cache d'estrazione (extract_cache.zig) ha un `io` e usa `std.Io`: di
+//! qui prende solo la cartella. Le miniature (thumbs.zig) scrivono con `std.Io` ma
+//! prendono di qui cartella, `touch` e manutenzione.
 //!
 //! Niente `std.Io` perché chi scrive queste cache spesso non ne ha uno (il renderer,
 //! un thread staccato che sopravvive all'app): un sottile backend per sistema su
@@ -25,7 +26,9 @@ const linux = std.os.linux;
 pub const is_win = builtin.os.tag == .windows;
 
 // ── Backend POSIX (libc grezza) ─────────────────────────────────────────────
-extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
+// Variadica come in C: su macOS arm64 gli argomenti variabili passano dallo stack, e
+// dichiarata a tre argomenti fissi il `mode` di O_CREAT arriverebbe sbagliato.
+extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
 extern "c" fn close(fd: c_int) c_int;
 extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
 extern "c" fn pread(fd: c_int, buf: [*]u8, count: usize, off: i64) isize;
@@ -38,8 +41,10 @@ extern "c" fn getpid() c_int;
 
 const O_RDONLY: c_int = 0;
 const O_WRONLY: c_int = 1;
-const O_CREAT: c_int = 0o100;
-const O_TRUNC: c_int = 0o1000;
+// I valori di Linux non sono quelli di Darwin (dove 0o100 è O_ASYNC e 0o1000 è
+// O_CREAT: il file si creava, ma senza troncarlo).
+const O_CREAT: c_int = if (builtin.os.tag.isDarwin()) 0x0200 else 0o100;
+const O_TRUNC: c_int = if (builtin.os.tag.isDarwin()) 0x0400 else 0o1000;
 const SEEK_END: c_int = 2;
 
 // ── Backend Windows (kernel32 grezza) ───────────────────────────────────────
@@ -97,7 +102,7 @@ pub fn openRead(path: [:0]const u8) ?Handle {
         const h = win.CreateFileW(w, win.GENERIC_READ, win.FILE_SHARE_READ, null, win.OPEN_EXISTING, win.FILE_ATTRIBUTE_NORMAL, null);
         return if (h == win.INVALID) null else h;
     } else {
-        const fd = open(path.ptr, O_RDONLY, 0);
+        const fd = open(path.ptr, O_RDONLY);
         return if (fd < 0) null else fd;
     }
 }
@@ -110,7 +115,7 @@ pub fn openWrite(path: [:0]const u8) ?Handle {
         const h = win.CreateFileW(w, win.GENERIC_WRITE, 0, null, win.CREATE_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, null);
         return if (h == win.INVALID) null else h;
     } else {
-        const fd = open(path.ptr, O_WRONLY | O_CREAT | O_TRUNC, 0o644);
+        const fd = open(path.ptr, O_WRONLY | O_CREAT | O_TRUNC, @as(c_uint, 0o644));
         return if (fd < 0) null else fd;
     }
 }
@@ -231,7 +236,13 @@ pub fn cacheDir(gpa: std.mem.Allocator, sub: []const u8) ?[]u8 {
     const out = std.fmt.allocPrint(gpa, "{s}{c}{s}{c}{s}", .{
         base, std.fs.path.sep, root, std.fs.path.sep, sub,
     }) catch return null;
-    makeDirs(out);
+    // Si creano solo i componenti SOTTO la base: una HOME che non esiste non la si
+    // inventa (e la cache resta spenta, perché l'apertura dei file fallirà).
+    var i: usize = base.len + 1;
+    while (i < out.len) : (i += 1) {
+        if (out[i] == '/' or out[i] == '\\') mkdirOne(out[0..i]);
+    }
+    mkdirOne(out);
     return out;
 }
 

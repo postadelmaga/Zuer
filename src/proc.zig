@@ -1,11 +1,16 @@
-//! Processi esterni: l'unico posto da cui Zuer ne lancia.
+//! Processi esterni: su Unix l'unico posto da cui Zuer ne lancia (su Windows restano
+//! le `ShellExecuteW` di print.zig e crash_report.zig, che non sono processi figli).
 //!
 //! Tre forme, una per bisogno, tutte con una scadenza:
 //!   - `runCapture…`: si cattura lo stdout (pdftoppm, bsdtar, yt-dlp, magick…), con
-//!     un tetto sui byte e, a richiesta, un flag di annullamento;
-//!   - `runDetached`: il programma deve solo partire (`xdg-open`);
+//!     un tetto sui byte e, a richiesta, un flag di annullamento. Il figlio ha stdin
+//!     su /dev/null e un gruppo di processi suo: scadenza, annullamento e uscita
+//!     dell'host (`killAll`) terminano il gruppo intero;
+//!   - `runDetached`: il programma deve solo partire (`xdg-open`), e gli si lascia
+//!     vivo ciò che ha lanciato;
 //!   - `runFeed`: gli si scrive lo stdin e lo si lascia andare (`wl-copy`, `pbcopy`).
-//! Sempre argv, mai una shell.
+//! Si passa sempre un argv, mai una riga di comando da interpretare: i dati (nomi di
+//! file, titoli, URL) sono argomenti a sé.
 //!
 //! Niente `std.Io`: `std.process.run` si blocca dentro i plugin dinamici (l'`io`
 //! dell'host non attraversa il confine DynLib), e i plugin sono i primi clienti di
@@ -101,6 +106,62 @@ pub fn runDetached(allocator: std.mem.Allocator, argv: []const []const u8, wait_
 pub fn runFeed(allocator: std.mem.Allocator, argv: []const []const u8, input: []const u8, deadline_ms: u32) bool {
     if (comptime builtin.os.tag == .windows) return false;
     return sub.runFeed(allocator, argv, input, deadline_ms) catch false;
+}
+
+// ── Gruppi vivi ─────────────────────────────────────────────────────────────
+//
+// I figli di `runCapture…` stanno in un gruppo (su Linux in una sessione) a sé: il
+// Ctrl+C dal terminale e la chiusura della finestra del terminale non li raggiungono
+// più. Chi li lancia tiene quindi nota dei gruppi vivi, e l'host li termina quando
+// esce o riceve un segnale (`killAll`).
+//
+// Ogni plugin ha la propria copia di questo file: i suoi gruppi li annota nel
+// registro dell'HOST, che gli arriva come coppia di funzioni (`setGroupRegistry`,
+// chiamata dalla colla dei plugin con i `HostServices`).
+
+const max_live_groups = 64;
+var live_groups: [max_live_groups]std.atomic.Value(c_int) = @splat(.init(0));
+var hook_register: ?*const fn (pgid: c_int) callconv(.c) void = null;
+var hook_unregister: ?*const fn (pgid: c_int) callconv(.c) void = null;
+
+/// Annota un gruppo vivo nel registro di questo binario. Registro pieno: il gruppo
+/// resta fuori (e a un segnale sopravvive all'host), non è un errore.
+pub fn registerGroup(pgid: c_int) callconv(.c) void {
+    if (pgid <= 0) return;
+    for (&live_groups) |*slot| {
+        if (slot.cmpxchgStrong(0, pgid, .acq_rel, .acquire) == null) return;
+    }
+}
+
+pub fn unregisterGroup(pgid: c_int) callconv(.c) void {
+    if (pgid <= 0) return;
+    for (&live_groups) |*slot| {
+        if (slot.cmpxchgStrong(pgid, 0, .acq_rel, .acquire) == null) return;
+    }
+}
+
+/// In un plugin: d'ora in poi i gruppi si annotano nel registro dell'host.
+pub fn setGroupRegistry(register: *const fn (c_int) callconv(.c) void, unregister: *const fn (c_int) callconv(.c) void) void {
+    hook_register = register;
+    hook_unregister = unregister;
+}
+
+fn noteGroup(pgid: c_int) void {
+    if (hook_register) |f| f(pgid) else registerGroup(pgid);
+}
+
+fn forgetGroup(pgid: c_int) void {
+    if (hook_unregister) |f| f(pgid) else unregisterGroup(pgid);
+}
+
+/// Termina tutti i gruppi annotati (SIGKILL). Solo letture atomiche e `kill`: si può
+/// chiamare da un gestore di segnali. Da chiamare nell'host quando sta per uscire.
+pub fn killAll() void {
+    if (comptime builtin.os.tag == .windows) return;
+    for (&live_groups) |*slot| {
+        const pgid = slot.load(.acquire);
+        if (pgid > 0) _ = sub.kill(-pgid, 9);
+    }
 }
 
 /// Per-OS backend. Only the selected arm is analyzed, so the POSIX externs never reach
@@ -287,6 +348,10 @@ const sub = switch (builtin.os.tag) {
         extern "c" fn posix_spawnattr_setpgroup(attr: *anyopaque, pgroup: c_int) c_int;
         /// Uguale su glibc, musl, Bionic e Darwin.
         const POSIX_SPAWN_SETPGROUP: c_short = 0x02;
+        // glibc ≥ 2.26 e musl. Non su Android (bionic l'ha solo da API 28) né su
+        // macOS (valore diverso, non provato): lì resta il gruppo.
+        const POSIX_SPAWN_SETSID: c_short = 0x80;
+        const own_session = builtin.os.tag == .linux and builtin.abi != .android;
         extern "c" fn posix_spawn_file_actions_destroy(fa: *anyopaque) c_int;
         extern "c" fn posix_spawn_file_actions_adddup2(fa: *anyopaque, fd: c_int, newfd: c_int) c_int;
         extern "c" fn posix_spawn_file_actions_addclose(fa: *anyopaque, fd: c_int) c_int;
@@ -356,26 +421,41 @@ const sub = switch (builtin.os.tag) {
             // raw-mode e i warning dei tool esterni lo sporcherebbero.
             _ = posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", 1, 0); // O_WRONLY
             _ = posix_spawn_file_actions_addclose(&fa, read_fd);
+            // stdin su /dev/null: il figlio non deve leggere dal terminale dell'host
+            // (nella TUI gli ruberebbe i tasti; da un gruppo in background verrebbe
+            // fermato da SIGTTIN e si aspetterebbe tutta la scadenza).
+            _ = posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", 0, 0); // O_RDONLY
 
             // Gruppo di processi proprio (pgid = pid del figlio), SEMPRE: scadenza,
             // annullamento e tetto sull'output terminano così anche i processi che
             // il figlio ha lanciato a sua volta (deno da yt-dlp, gs da magick).
             // Prima lo aveva solo chi passava `cancel`: alla scadenza moriva il
             // figlio e i nipoti restavano a girare.
+            // Su Linux una SESSIONE propria (che è anche un gruppo): senza terminale
+            // di controllo, uno strumento che apre /dev/tty per chiedere una password
+            // fallisce subito invece di restare fermo fino alla scadenza.
             var attr: [512]u8 align(16) = undefined;
             const use_attr = posix_spawnattr_init(&attr) == 0;
             defer if (use_attr) {
                 _ = posix_spawnattr_destroy(&attr);
             };
             if (use_attr) {
-                _ = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
-                _ = posix_spawnattr_setpgroup(&attr, 0);
+                if (comptime own_session) {
+                    _ = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+                } else {
+                    _ = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+                    _ = posix_spawnattr_setpgroup(&attr, 0);
+                }
             }
 
             var pid: c_int = 0;
             const rc = posix_spawnp(&pid, argvZ[0].?, &fa, if (use_attr) @ptrCast(&attr) else null, argvZ.ptr, environ);
             _ = close(write_fd);
             if (rc != 0) return if (rc == 2) error.CommandNotFound else error.SpawnFailed; // 2 = ENOENT
+            // Il gruppo è vivo: l'host deve poterlo terminare se esce prima di noi.
+            // Lo si toglie dal registro PRIMA del waitpid: dopo, il pid può essere
+            // riusato e `killAll` colpirebbe un gruppo altrui.
+            if (use_attr) noteGroup(pid);
 
             // Da qui il figlio esiste: su OGNI percorso d'errore va reaped (niente
             // zombie). Si chiude prima il read-end e si manda SIGKILL, così il
@@ -387,6 +467,7 @@ const sub = switch (builtin.os.tag) {
                     read_fd_open = false;
                 }
                 _ = kill(if (use_attr) -pid else pid, 9); // SIGKILL (al gruppo, se proprio)
+                if (use_attr) forgetGroup(pid);
                 _ = waitpid(pid, null, 0);
             };
 
@@ -425,6 +506,7 @@ const sub = switch (builtin.os.tag) {
                 try out.appendSlice(allocator, buf[0..@intCast(n)]);
             }
 
+            if (use_attr) forgetGroup(pid);
             var status: c_int = 0;
             _ = waitpid(pid, &status, 0);
             reaped = true;
@@ -647,6 +729,48 @@ test "runCapture: la scadenza ferma il processo e anche i suoi figli" {
     // Il nipote (lo `sleep` in background) non deve sopravvivere al figlio.
     const nipote = try grandchildPid(a, pid_path);
     try std.testing.expect(goneSoon(nipote));
+}
+
+test "killAll: l'host che esce termina i gruppi ancora vivi, nipoti compresi" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // legge /proc
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pid_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/nipote.pid", .{tmp.sub_path});
+    defer a.free(pid_path);
+    const script = try std.fmt.allocPrint(a, "sleep 30 & echo $! > '{s}'; sleep 30", .{pid_path});
+    defer a.free(script);
+
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator, sh: []const u8, elapsed_ms: *i64) void {
+            const t0 = sub.nowMs();
+            // Scadenza lunga: a fermarlo dev'essere `killAll`, non il tempo.
+            if (runCaptureTimeout(alloc, &.{ "sh", "-c", sh }, 20_000)) |*ok| {
+                var res = ok.*;
+                res.deinit(alloc);
+            } else |_| {}
+            elapsed_ms.* = sub.nowMs() - t0;
+        }
+    };
+    var elapsed: i64 = 0;
+    const t = try std.Thread.spawn(.{}, Runner.run, .{ a, script, &elapsed });
+    const nipote = try grandchildPid(a, pid_path);
+    killAll();
+    t.join();
+    try std.testing.expect(elapsed < 5000);
+    try std.testing.expect(goneSoon(nipote));
+    // A processo raccolto il registro è di nuovo vuoto.
+    for (&live_groups) |*slot| try std.testing.expectEqual(@as(c_int, 0), slot.load(.acquire));
+}
+
+test "runCapture: lo stdin del figlio è /dev/null, non quello dell'host" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    // `cat` senza argomenti copia lo stdin: con /dev/null esce subito, a vuoto.
+    var r = try runCaptureTimeout(a, &.{"cat"}, 5000);
+    defer r.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), r.stdout.len);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
 }
 
 test "runCapture: l'annullamento ferma il processo" {

@@ -60,6 +60,8 @@ fn hostParallelFor(n: usize, ctx: ?*anyopaque, body: ParallelBody) callconv(.c) 
 const host_services: HostServices = .{
     .size = @sizeOf(HostServices),
     .parallel_for = hostParallelFor,
+    .proc_register = proc.registerGroup,
+    .proc_unregister = proc.unregisterGroup,
 };
 
 const LoadedPlugin = struct {

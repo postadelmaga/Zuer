@@ -3,7 +3,7 @@
 # difetto entrato su main si vedeva settimane dopo (#26 e #31 sarebbero stati fermati
 # qui).
 #
-# Stessi ingredienti del gate Linux di release.yml: Zig scaricato da ziglang.org con
+# Stessi ingredienti dei job Linux di release.yml: Zig scaricato da ziglang.org con
 # sha256 verificato, Zicro al commit scritto in .github/zicro.ref. Se main comincia a
 # richiedere uno Zicro più nuovo, questo workflow fallisce finché il riferimento non
 # viene aggiornato — che è ciò che serve sapere prima di un rilascio.
@@ -64,7 +64,8 @@ jobs:
           sudo apt-get install -y -q --no-install-recommends glslc pkg-config \
             libwayland-dev libxkbcommon-dev libpipewire-0.3-dev libasound2-dev \
             libharfbuzz-dev libfreetype-dev libvulkan-dev libegl-dev libgl-dev libgbm-dev \
-            libsystemd-dev wayland-protocols
+            libsystemd-dev wayland-protocols \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev libmpv-dev
       # Dipendenze Zig (libwebp da GitHub): a volte 503/504, si riprova prima della build.
       - name: Dipendenze Zig
         shell: bash
@@ -77,9 +78,11 @@ jobs:
       - name: Test unitari
         working-directory: Zuer
         run: zig build test --summary all
+      # Come il pacchetto .deb di release.yml: FFmpeg e mpv di sistema, senza compute_vp9
+      # (non è un pacchetto di Ubuntu).
       - name: Build
         working-directory: Zuer
-        run: zig build
+        run: zig build -Dcvp9=false
       # Senza display: lo script salta da sé la prova della GUI.
       - name: File limite (scripts/edge-check.sh)
         working-directory: Zuer

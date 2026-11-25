@@ -25,6 +25,8 @@ pub fn main(init: std.process.Init) !void {
     defer decoder_mod.closePluginCache(gpa);
     defer scheduler.deinitGlobal();
 
+    installTermHandlers();
+
     // 1. Handle command line arguments
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
     defer args.deinit();
@@ -216,4 +218,26 @@ fn dumpJson(decoded: Decoded, writer: *std.Io.Writer) !void {
             try writer.writeAll("}");
         },
     }
+}
+
+/// Ctrl+C, `kill` e chiusura del terminale: i processi esterni in corso (pdftoppm,
+/// magick, bsdtar…) stanno in gruppi loro e il segnale non li raggiunge, quindi li si
+/// termina qui; poi il segnale fa il suo corso (`RESETHAND` + `raise`: si muore come
+/// senza gestore, con lo stesso stato d'uscita).
+fn onTermSignal(sig: std.posix.SIG) callconv(.c) void {
+    decoder_mod.proc.killAll(); // letture atomiche e `kill`: async-signal-safe
+    const c = struct {
+        extern "c" fn raise(sig: c_int) c_int;
+    };
+    _ = c.raise(@intCast(@backingInt(sig)));
+}
+
+fn installTermHandlers() void {
+    if (comptime @import("builtin").os.tag == .windows) return;
+    const act: std.posix.Sigaction = .{
+        .handler = .{ .handler = onTermSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = std.posix.SA.RESETHAND,
+    };
+    inline for (.{ .TERM, .INT, .HUP }) |sig| std.posix.sigaction(sig, &act, null);
 }

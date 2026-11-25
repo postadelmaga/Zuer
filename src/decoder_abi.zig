@@ -9,6 +9,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const formats = @import("formats.zig");
+const proc = @import("proc.zig");
 
 pub const CsvData = struct {
     headers: [][]const u8,
@@ -753,6 +754,10 @@ pub const HostServices = extern struct {
     /// priorità del thread chiamante; ritorna quando tutti gli indici sono
     /// stati eseguiti e nessun worker tocca più `ctx`.
     parallel_for: *const fn (n: usize, ctx: ?*anyopaque, body: ParallelBody) callconv(.c) void,
+    /// Registro dei gruppi di processi vivi (proc.zig): il plugin vi annota i
+    /// processi esterni che lancia, così l'host li termina quando esce.
+    proc_register: *const fn (pgid: c_int) callconv(.c) void,
+    proc_unregister: *const fn (pgid: c_int) callconv(.c) void,
 };
 pub const ParallelBody = *const fn (ctx: ?*anyopaque, index: usize) callconv(.c) void;
 pub const SetHostFn = *const fn (services: *const HostServices) callconv(.c) void;
@@ -804,6 +809,9 @@ pub const PluginRequest = struct {
 ///     `plugin_content_prefix: usize` (quanti byte del file servono: 0 = solo il
 ///     percorso; assente = tutto), `pluginSetHost(*const HostServices) void`.
 ///
+/// `zuer_set_host` è esportato sempre: la colla ci aggancia il registro dei processi
+/// esterni dell'host (vedi proc.zig), poi passa i servizi a `pluginSetHost` se c'è.
+///
 /// Dove i decoder non sono plugin (Android: linkati nell'unica libreria dell'APK) non
 /// esporta nulla: i nomi colliderebbero, uno per decoder.
 pub fn exportPlugin(comptime Impl: type) void {
@@ -843,7 +851,11 @@ pub fn exportPlugin(comptime Impl: type) void {
         }
 
         fn setHost(services: *const HostServices) callconv(.c) void {
-            Impl.pluginSetHost(services);
+            // Un host più vecchio ha una tabella più corta: i campi oltre `size`
+            // non esistono.
+            if (services.size >= @sizeOf(HostServices))
+                proc.setGroupRegistry(services.proc_register, services.proc_unregister);
+            if (@hasDecl(Impl, "pluginSetHost")) Impl.pluginSetHost(services);
         }
     };
     @export(&Glue.decode, .{ .name = "zuer_decode", .linkage = .strong });
@@ -851,12 +863,13 @@ pub fn exportPlugin(comptime Impl: type) void {
     @export(&Glue.abiVersion, .{ .name = "zuer_abi_version", .linkage = .strong });
     if (@hasDecl(Impl, "pluginDecodeCoarse")) @export(&Glue.decodeCoarse, .{ .name = "zuer_decode_coarse", .linkage = .strong });
     if (@hasDecl(Impl, "plugin_content_prefix")) @export(&Glue.contentPrefix, .{ .name = "zuer_content_prefix", .linkage = .strong });
-    if (@hasDecl(Impl, "pluginSetHost")) @export(&Glue.setHost, .{ .name = "zuer_set_host", .linkage = .strong });
+    @export(&Glue.setHost, .{ .name = "zuer_set_host", .linkage = .strong });
 }
 
 /// Per i test dei decoder: esegue `run` facendo fallire, una alla volta, ogni
-/// allocazione che compie (la prima, poi la seconda…) finché non ne fallisce più
-/// nessuna. `run` deve decodificare e poi liberare tutto ciò che ha ottenuto, con
+/// allocazione nuova che compie (la prima, poi la seconda…) finché non ne fallisce
+/// più nessuna. Le crescite in place (`resize`) non vengono fatte fallire: quando
+/// falliscono si ripiega su un'allocazione nuova, che è coperta. `run` deve decodificare e poi liberare tutto ciò che ha ottenuto, con
 /// l'allocator che riceve. A ogni giro i byte allocati devono tornare tutti: un
 /// percorso d'errore che perde memoria fa fallire il test con l'indice del colpevole.
 pub fn expectNoLeakOnAllocFailure(context: anytype, comptime run: fn (@TypeOf(context), std.mem.Allocator) void) !void {
