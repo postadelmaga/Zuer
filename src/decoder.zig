@@ -399,263 +399,50 @@ fn findPluginByExtension(ext: []const u8) ?*const LoadedPlugin {
 // `getenv` is in the C runtime on every platform we target.
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
-pub const RunResult = struct {
-    stdout: []u8,
-    exit_code: u8,
-
-    pub fn deinit(self: *RunResult, allocator: std.mem.Allocator) void {
-        allocator.free(self.stdout);
-    }
-};
-
-/// Timeout di default per i tool esterni lanciati con `runCapture`.
-pub const default_run_timeout_ms: u32 = 60_000;
-
-/// Capacità iniziale del buffer di stdout di `runCapture`. Senza pre-allocazione
-/// la cattura di un output grande (il PPM di `pdftoppm` sono decine di MB) parte
-/// da zero e paga tutta la catena di realloc+memcpy della crescita geometrica.
-/// 1 MB è irrilevante come picco e copre in un colpo solo l'output tipico;
-/// `toOwnedSlice` restringe comunque all'esatto alla fine, quindi i tool che
-/// stampano quattro byte (pdfinfo, ffprobe) non pagano nulla di permanente.
-pub const default_capture_capacity: usize = 1024 * 1024;
-
-/// Tetto sullo stdout catturato da `runCapture`: oltre, il processo viene terminato
-/// e si ritorna `error.OutputTooLarge`. Senza, l'unico limite era il timeout: un
-/// archivio con milioni di voci (bsdtar), appunti enormi (wl-paste) o un tool
-/// impazzito potevano riempire la RAM in 60 secondi. Gli output leciti più grandi
-/// sono i pixel grezzi di un'immagine (4096² × 3 = 50 MB).
-pub const max_capture_bytes: usize = 512 * 1024 * 1024;
-
-/// Esegue un comando catturandone lo stdout, senza dipendere da `std.Io`
-/// (`std.process.run` si blocca dentro i plugin dinamici: l'`io` dell'host non
-/// attraversa il confine DynLib). L'implementazione è per-OS: `posix_spawn` +
-/// pipe su Unix, `CreateProcessW` + pipe anonima su Windows. Deadline
-/// complessiva di `default_run_timeout_ms`: un tool appeso non può bloccare il
-/// worker per sempre (vedi `runCaptureTimeout` per un valore esplicito).
-pub fn runCapture(allocator: std.mem.Allocator, argv: []const []const u8) !RunResult {
-    return sub.runCapture(allocator, argv, default_run_timeout_ms, default_capture_capacity, null);
-}
-
-/// Come `runCapture`, con deadline complessiva esplicita: alla scadenza il
-/// processo viene terminato (SIGKILL / TerminateProcess) e ritorna `error.Timeout`.
-pub fn runCaptureTimeout(allocator: std.mem.Allocator, argv: []const []const u8, timeout_ms: u32) !RunResult {
-    return sub.runCapture(allocator, argv, timeout_ms, default_capture_capacity, null);
-}
-
-/// Come `runCaptureTimeout`, interrompibile: quando `cancel` diventa vero (lo
-/// si controlla ogni ~50 ms) il processo viene terminato e ritorna
-/// `error.Canceled`. Su Unix il figlio ha un suo gruppo di processi e si
-/// termina il gruppo intero: anche i nipoti (es. deno lanciato da yt-dlp).
-pub fn runCaptureCancel(allocator: std.mem.Allocator, argv: []const []const u8, timeout_ms: u32, cancel: *const std.atomic.Value(bool)) !RunResult {
-    return sub.runCapture(allocator, argv, timeout_ms, default_capture_capacity, cancel);
-}
-
-/// Come `runCaptureTimeout`, con un hint ESPLICITO di capacità iniziale per lo
-/// stdout: chi conosce già l'ordine di grandezza dell'output (es. larghezza ×
-/// altezza × 3 di un PPM) evita del tutto le riallocazioni intermedie.
-pub fn runCaptureCapacity(allocator: std.mem.Allocator, argv: []const []const u8, timeout_ms: u32, capacity_hint: usize) !RunResult {
-    return sub.runCapture(allocator, argv, timeout_ms, capacity_hint, null);
-}
-
-/// Lancia un programma che deve solo PARTIRE (`xdg-open`): stdout e stderr su
-/// /dev/null, e si aspetta la sua uscita per al più `wait_ms`. true se è uscito
-/// con 0, o se alla scadenza sta ancora girando.
-///
-/// Non si usa `runCapture` perché cattura lo stdout con una pipe: se il programma
-/// lancia a sua volta un processo che resta vivo (il browser, quando `xdg-open`
-/// non ha un desktop a cui delegare), quello eredita la pipe e la fine del flusso
-/// non arriva mai. Si aspettava il timeout intero e l'apertura riuscita veniva
-/// presa per un fallimento. Solo POSIX: su Windows c'è ShellExecute.
-pub fn runDetached(allocator: std.mem.Allocator, argv: []const []const u8, wait_ms: u32) bool {
-    if (comptime builtin.os.tag == .windows) return false;
-    return sub.runDetached(allocator, argv, wait_ms) catch false;
-}
+/// I processi esterni (cattura dello stdout, lancio staccato, scadenze): proc.zig.
+/// Riesportati qui perché i plugin li raggiungono dal modulo `decoder`.
+pub const proc = @import("proc.zig");
+pub const RunResult = proc.RunResult;
+pub const default_run_timeout_ms = proc.default_run_timeout_ms;
+pub const default_capture_capacity = proc.default_capture_capacity;
+pub const max_capture_bytes = proc.max_capture_bytes;
+pub const runCapture = proc.runCapture;
+pub const runCaptureTimeout = proc.runCaptureTimeout;
+pub const runCaptureCancel = proc.runCaptureCancel;
+pub const runCaptureCapacity = proc.runCaptureCapacity;
+pub const runDetached = proc.runDetached;
 
 /// Legge un intero file senza `std.Io` (open/read/close libc su Unix,
 /// CreateFileW/ReadFile su Windows): come runCapture, evita che l'io dell'host
 /// si blocchi dentro un plugin dinamico. Il chiamante possiede il buffer.
 pub fn readFileLibc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-    return sub.readFile(allocator, path, max_bytes);
+    return rawfile.readFile(allocator, path, max_bytes);
 }
 
 /// Legge gli ultimi `n` byte del file (o meno, se è più corto), senza `std.Io`.
 /// Per le strutture che i formati mettono in coda (ultima pagina Ogg, `moov`
 /// dei MP4 non-faststart) quando l'host ha passato solo un prefisso.
 pub fn readFileTailLibc(allocator: std.mem.Allocator, path: []const u8, n: usize) ![]u8 {
-    return sub.readFileTail(allocator, path, n);
+    return rawfile.readFileTail(allocator, path, n);
 }
 
 /// Dimensione del file senza `std.Io` (per i plugin che ricevono solo un
 /// prefisso di contenuto ma mostrano la dimensione reale).
 pub fn fileSizeLibc(allocator: std.mem.Allocator, path: []const u8) ?u64 {
-    return sub.fileSize(allocator, path) catch null;
+    return rawfile.fileSize(allocator, path) catch null;
 }
-
-/// Per-OS subprocess + raw file-read backend. Only the selected arm is analyzed, so the
-/// POSIX externs never reach a Windows link and vice-versa.
-const sub = switch (builtin.os.tag) {
+/// Backend per sistema delle letture qui sopra. Si analizza solo il ramo scelto: gli
+/// extern POSIX non arrivano mai a un link Windows, e viceversa.
+const rawfile = switch (builtin.os.tag) {
     .windows => struct {
         const HANDLE = ?*anyopaque;
-        const SECURITY_ATTRIBUTES = extern struct { nLength: u32, lpSecurityDescriptor: ?*anyopaque, bInheritHandle: i32 };
-        const STARTUPINFOW = extern struct {
-            cb: u32,
-            lpReserved: ?[*:0]u16 = null,
-            lpDesktop: ?[*:0]u16 = null,
-            lpTitle: ?[*:0]u16 = null,
-            dwX: u32 = 0,
-            dwY: u32 = 0,
-            dwXSize: u32 = 0,
-            dwYSize: u32 = 0,
-            dwXCountChars: u32 = 0,
-            dwYCountChars: u32 = 0,
-            dwFillAttribute: u32 = 0,
-            dwFlags: u32 = 0,
-            wShowWindow: u16 = 0,
-            cbReserved2: u16 = 0,
-            lpReserved2: ?*u8 = null,
-            hStdInput: HANDLE = null,
-            hStdOutput: HANDLE = null,
-            hStdError: HANDLE = null,
-        };
-        const PROCESS_INFORMATION = extern struct { hProcess: HANDLE, hThread: HANDLE, dwProcessId: u32, dwThreadId: u32 };
-        extern "kernel32" fn CreatePipe(hReadPipe: *HANDLE, hWritePipe: *HANDLE, lpPipeAttributes: ?*const SECURITY_ATTRIBUTES, nSize: u32) callconv(.winapi) i32;
-        extern "kernel32" fn SetHandleInformation(hObject: HANDLE, dwMask: u32, dwFlags: u32) callconv(.winapi) i32;
-        extern "kernel32" fn CreateProcessW(lpApplicationName: ?[*:0]const u16, lpCommandLine: ?[*:0]u16, lpProcessAttributes: ?*anyopaque, lpThreadAttributes: ?*anyopaque, bInheritHandles: i32, dwCreationFlags: u32, lpEnvironment: ?*anyopaque, lpCurrentDirectory: ?[*:0]const u16, lpStartupInfo: *const STARTUPINFOW, lpProcessInformation: *PROCESS_INFORMATION) callconv(.winapi) i32;
         extern "kernel32" fn ReadFile(hFile: HANDLE, lpBuffer: [*]u8, nNumberOfBytesToRead: u32, lpNumberOfBytesRead: *u32, lpOverlapped: ?*anyopaque) callconv(.winapi) i32;
         extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) i32;
-        extern "kernel32" fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: u32) callconv(.winapi) u32;
-        extern "kernel32" fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *u32) callconv(.winapi) i32;
-        extern "kernel32" fn PeekNamedPipe(hNamedPipe: HANDLE, lpBuffer: ?[*]u8, nBufferSize: u32, lpBytesRead: ?*u32, lpTotalBytesAvail: ?*u32, lpBytesLeftThisMessage: ?*u32) callconv(.winapi) i32;
-        extern "kernel32" fn TerminateProcess(hProcess: HANDLE, uExitCode: u32) callconv(.winapi) i32;
-        extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
-        extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
         extern "kernel32" fn CreateFileW(lpFileName: [*:0]const u16, dwDesiredAccess: u32, dwShareMode: u32, lpSecurityAttributes: ?*anyopaque, dwCreationDisposition: u32, dwFlagsAndAttributes: u32, hTemplateFile: HANDLE) callconv(.winapi) HANDLE;
-        const HANDLE_FLAG_INHERIT: u32 = 0x00000001;
-        const STARTF_USESTDHANDLES: u32 = 0x00000100;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
         const GENERIC_READ: u32 = 0x80000000;
         const FILE_SHARE_READ: u32 = 0x00000001;
         const OPEN_EXISTING: u32 = 3;
         const INVALID_HANDLE: HANDLE = @ptrFromInt(std.math.maxInt(usize));
-        const WAIT_OBJECT_0: u32 = 0;
-        const WAIT_TIMEOUT: u32 = 0x00000102;
-
-        fn runCapture(allocator: std.mem.Allocator, argv: []const []const u8, timeout_ms: u32, capacity_hint: usize, cancel: ?*const std.atomic.Value(bool)) !RunResult {
-            if (argv.len == 0) return error.EmptyArgv;
-            // Build a single, quoted command line (CreateProcess takes a string, not argv).
-            // Quoting Win32 (regole di CommandLineToArgvW): le run di backslash che
-            // precedono una virgoletta — o la `"` di chiusura dell'argomento — vanno
-            // raddoppiate, poi la virgoletta letterale si escapa con un backslash;
-            // altrimenti un argomento che termina con `\` fonderebbe i successivi.
-            var cmd: std.ArrayList(u8) = .empty;
-            defer cmd.deinit(allocator);
-            for (argv, 0..) |a, i| {
-                if (i != 0) try cmd.append(allocator, ' ');
-                try cmd.append(allocator, '"');
-                var bs: usize = 0;
-                for (a) |ch| {
-                    if (ch == '\\') {
-                        bs += 1;
-                        continue;
-                    }
-                    if (ch == '"') {
-                        // 2n+1 backslash: i letterali raddoppiati + l'escape della virgoletta.
-                        try cmd.appendNTimes(allocator, '\\', bs * 2 + 1);
-                        try cmd.append(allocator, '"');
-                    } else {
-                        // Backslash non seguiti da virgoletta: letterali, nessun raddoppio.
-                        try cmd.appendNTimes(allocator, '\\', bs);
-                        try cmd.append(allocator, ch);
-                    }
-                    bs = 0;
-                }
-                // Backslash in coda: raddoppiati, o escaperebbero la `"` di chiusura.
-                try cmd.appendNTimes(allocator, '\\', bs * 2);
-                try cmd.append(allocator, '"');
-            }
-            const cmd_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, cmd.items);
-            defer allocator.free(cmd_w);
-
-            const sa = SECURITY_ATTRIBUTES{ .nLength = @sizeOf(SECURITY_ATTRIBUTES), .lpSecurityDescriptor = null, .bInheritHandle = 1 };
-            var h_read: HANDLE = null;
-            var h_write: HANDLE = null;
-            if (CreatePipe(&h_read, &h_write, &sa, 0) == 0) return error.PipeFailed;
-            defer _ = CloseHandle(h_read);
-            _ = SetHandleInformation(h_read, HANDLE_FLAG_INHERIT, 0); // parent end not inherited
-
-            // stderr NON sulla stessa pipe dello stdout parsato (un warning del
-            // tool romperebbe il parse): con STARTF_USESTDHANDLES un handle null
-            // equivale a "nessuno stderr" per il figlio.
-            var si = STARTUPINFOW{ .cb = @sizeOf(STARTUPINFOW), .dwFlags = STARTF_USESTDHANDLES, .hStdOutput = h_write, .hStdError = null };
-            var pi: PROCESS_INFORMATION = undefined;
-            const ok = CreateProcessW(null, cmd_w, null, null, 1, CREATE_NO_WINDOW, null, null, &si, &pi);
-            _ = CloseHandle(h_write); // parent keeps only the read end
-            if (ok == 0) return error.CommandNotFound;
-            defer _ = CloseHandle(pi.hProcess);
-            defer _ = CloseHandle(pi.hThread);
-
-            var out: std.ArrayList(u8) = .empty;
-            errdefer out.deinit(allocator);
-            // Capacità iniziale in UN colpo solo (vedi `default_capture_capacity`).
-            if (capacity_hint > 0) try out.ensureTotalCapacityPrecise(allocator, capacity_hint);
-            var buf: [65536]u8 = undefined;
-            // Lettura con deadline complessiva: una ReadFile bloccante su un figlio
-            // appeso non raggiungerebbe mai il wait, quindi si sonda la pipe con
-            // PeekNamedPipe e si legge solo quando ci sono byte disponibili; alla
-            // scadenza il figlio viene terminato e si ritorna errore.
-            const deadline: u64 = GetTickCount64() + timeout_ms;
-            while (true) {
-                if (cancel) |c| if (c.load(.acquire)) {
-                    _ = TerminateProcess(pi.hProcess, 1);
-                    _ = WaitForSingleObject(pi.hProcess, 5000);
-                    return error.Canceled;
-                };
-                if (out.items.len > max_capture_bytes) {
-                    _ = TerminateProcess(pi.hProcess, 1);
-                    _ = WaitForSingleObject(pi.hProcess, 5000);
-                    return error.OutputTooLarge;
-                }
-                var avail: u32 = 0;
-                if (PeekNamedPipe(h_read, null, 0, null, &avail, null) == 0) break; // pipe chiusa → EOF
-                if (avail > 0) {
-                    // Con capacità libera si legge DIRETTAMENTE in coda al buffer:
-                    // niente rimbalzo su `buf` + memcpy.
-                    const spare = out.capacity - out.items.len;
-                    if (spare > 0) {
-                        var got_direct: u32 = 0;
-                        const want: u32 = @intCast(@min(@as(usize, avail), spare));
-                        if (ReadFile(h_read, out.items.ptr + out.items.len, want, &got_direct, null) == 0 or got_direct == 0) break;
-                        out.items.len += got_direct;
-                        continue;
-                    }
-                    var got: u32 = 0;
-                    if (ReadFile(h_read, &buf, @min(avail, buf.len), &got, null) == 0 or got == 0) break;
-                    try out.appendSlice(allocator, buf[0..got]);
-                    continue;
-                }
-                // Niente dati: figlio già uscito → fine; ancora vivo → si controlla
-                // la deadline e si attende un attimo prima di risondare.
-                if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) break;
-                if (GetTickCount64() >= deadline) {
-                    _ = TerminateProcess(pi.hProcess, 1);
-                    _ = WaitForSingleObject(pi.hProcess, 5000);
-                    return error.Timeout;
-                }
-                Sleep(10);
-            }
-            // Attesa finale col budget residuo: copre il figlio che ha chiuso lo
-            // stdout ma non esce; su WAIT_TIMEOUT lo si termina e si ritorna errore.
-            const now = GetTickCount64();
-            const wait_ms: u32 = if (deadline > now) @intCast(@min(deadline - now, std.math.maxInt(u32))) else 0;
-            if (WaitForSingleObject(pi.hProcess, wait_ms) == WAIT_TIMEOUT) {
-                _ = TerminateProcess(pi.hProcess, 1);
-                _ = WaitForSingleObject(pi.hProcess, 5000);
-                return error.Timeout;
-            }
-            var code: u32 = 1;
-            _ = GetExitCodeProcess(pi.hProcess, &code);
-            return .{ .stdout = try out.toOwnedSlice(allocator), .exit_code = @truncate(code) };
-        }
 
         fn readFile(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
             const path_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, path);
@@ -728,205 +515,9 @@ const sub = switch (builtin.os.tag) {
         }
     },
     else => struct {
-        extern "c" fn pipe(fds: *[2]c_int) c_int;
-        extern "c" fn pipe2(fds: *[2]c_int, flags: c_int) c_int;
-        extern "c" fn fcntl(fd: c_int, cmd: c_int, arg: c_int) c_int;
         extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
         extern "c" fn close(fd: c_int) c_int;
         extern "c" fn open(path: [*:0]const u8, flags: c_int) c_int;
-        extern "c" fn waitpid(pid: c_int, status: ?*c_int, options: c_int) c_int;
-        extern "c" fn kill(pid: c_int, sig: c_int) c_int;
-        extern "c" fn poll(fds: [*]PollFd, nfds: c_ulong, timeout: c_int) c_int;
-        extern "c" fn clock_gettime(clk_id: c_int, tp: *Timespec) c_int;
-        // posix_spawn: fork+exec+ricerca PATH in modo sicuro anche in processi
-        // multi-thread (niente malloc nel figlio forkato → niente deadlock).
-        extern "c" fn posix_spawnp(pid: *c_int, file: [*:0]const u8, file_actions: ?*const anyopaque, attrp: ?*const anyopaque, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) c_int;
-        extern "c" fn posix_spawn_file_actions_init(fa: *anyopaque) c_int;
-        extern "c" fn posix_spawnattr_init(attr: *anyopaque) c_int;
-        extern "c" fn posix_spawnattr_destroy(attr: *anyopaque) c_int;
-        extern "c" fn posix_spawnattr_setflags(attr: *anyopaque, flags: c_short) c_int;
-        extern "c" fn posix_spawnattr_setpgroup(attr: *anyopaque, pgroup: c_int) c_int;
-        /// Uguale su glibc, musl, Bionic e Darwin.
-        const POSIX_SPAWN_SETPGROUP: c_short = 0x02;
-        extern "c" fn posix_spawn_file_actions_destroy(fa: *anyopaque) c_int;
-        extern "c" fn posix_spawn_file_actions_adddup2(fa: *anyopaque, fd: c_int, newfd: c_int) c_int;
-        extern "c" fn posix_spawn_file_actions_addclose(fa: *anyopaque, fd: c_int) c_int;
-        extern "c" fn posix_spawn_file_actions_addopen(fa: *anyopaque, fd: c_int, path: [*:0]const u8, oflag: c_int, mode: c_uint) c_int;
-        extern "c" var environ: [*:null]const ?[*:0]const u8;
-
-        const PollFd = extern struct { fd: c_int, events: c_short, revents: c_short };
-        const POLLIN: c_short = 0x001;
-        const Timespec = extern struct { sec: c_long, nsec: c_long };
-        const CLOCK_MONOTONIC: c_int = if (builtin.os.tag.isDarwin()) 6 else 1;
-
-        /// Millisecondi di clock monotonico via libc (niente `std.Io`, che non
-        /// attraversa il confine dei plugin dinamici). Per le deadline.
-        fn nowMs() i64 {
-            var ts: Timespec = .{ .sec = 0, .nsec = 0 };
-            _ = clock_gettime(CLOCK_MONOTONIC, &ts);
-            return @as(i64, @intCast(ts.sec)) * 1000 + @as(i64, @intCast(@divTrunc(ts.nsec, 1_000_000)));
-        }
-
-        /// pipe con O_CLOEXEC: senza, un figlio spawnato in parallelo da un ALTRO
-        /// thread eredita il write-end e l'EOF sul read-end non arriva finché
-        /// anche quello non esce (deadlock del loop di lettura). L'`adddup2` del
-        /// figlio giusto azzera CLOEXEC sul fd duplicato, quindi basta questo.
-        /// Su Linux `pipe2` è atomica; su Darwin (niente pipe2) fallback
-        /// `pipe` + `fcntl(FD_CLOEXEC)`, best-effort.
-        fn pipeCloexec(fds: *[2]c_int) c_int {
-            if (builtin.os.tag == .linux) {
-                return pipe2(fds, 0o2000000); // O_CLOEXEC (Linux)
-            } else {
-                if (pipe(fds) != 0) return -1;
-                _ = fcntl(fds[0], 2, 1); // F_SETFD, FD_CLOEXEC
-                _ = fcntl(fds[1], 2, 1);
-                return 0;
-            }
-        }
-
-        fn runCapture(allocator: std.mem.Allocator, argv: []const []const u8, timeout_ms: u32, capacity_hint: usize, cancel: ?*const std.atomic.Value(bool)) !RunResult {
-            if (argv.len == 0) return error.EmptyArgv;
-
-            // argv null-terminato costruito PRIMA della fork: nel figlio non si può
-            // allocare in sicurezza (multi-thread → solo funzioni async-signal-safe).
-            const argvZ = try allocator.allocSentinel(?[*:0]const u8, argv.len, null);
-            defer {
-                for (argvZ[0..argv.len]) |a| if (a) |p| allocator.free(std.mem.span(p));
-                allocator.free(argvZ);
-            }
-            @memset(argvZ[0..argv.len], null); // il defer libera solo ciò che è stato duplicato
-            for (argv, 0..) |a, i| argvZ[i] = (try allocator.dupeSentinel(u8, a, 0)).ptr;
-
-            var fds: [2]c_int = undefined;
-            if (pipeCloexec(&fds) != 0) return error.PipeFailed;
-            const read_fd = fds[0];
-            const write_fd = fds[1];
-            var read_fd_open = true;
-            defer if (read_fd_open) {
-                _ = close(read_fd);
-            };
-
-            var fa: [256]u8 align(16) = undefined;
-            if (posix_spawn_file_actions_init(&fa) != 0) {
-                _ = close(write_fd);
-                return error.SpawnInit;
-            }
-            defer _ = posix_spawn_file_actions_destroy(&fa);
-            _ = posix_spawn_file_actions_adddup2(&fa, write_fd, 1);
-            // stderr del figlio su /dev/null: il terminale dell'host è in
-            // raw-mode e i warning dei tool esterni lo sporcherebbero.
-            _ = posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", 1, 0); // O_WRONLY
-            _ = posix_spawn_file_actions_addclose(&fa, read_fd);
-
-            // Interrompibile: gruppo di processi proprio (pgid = pid del figlio),
-            // così l'annullamento termina anche i processi che il figlio lancia.
-            var attr: [512]u8 align(16) = undefined;
-            const use_attr = cancel != null and posix_spawnattr_init(&attr) == 0;
-            defer if (use_attr) {
-                _ = posix_spawnattr_destroy(&attr);
-            };
-            if (use_attr) {
-                _ = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
-                _ = posix_spawnattr_setpgroup(&attr, 0);
-            }
-
-            var pid: c_int = 0;
-            const rc = posix_spawnp(&pid, argvZ[0].?, &fa, if (use_attr) @ptrCast(&attr) else null, argvZ.ptr, environ);
-            _ = close(write_fd);
-            if (rc != 0) return if (rc == 2) error.CommandNotFound else error.SpawnFailed; // 2 = ENOENT
-
-            // Da qui il figlio esiste: su OGNI percorso d'errore va reaped (niente
-            // zombie). Si chiude prima il read-end e si manda SIGKILL, così il
-            // waitpid non può bloccarsi su un figlio che sta ancora scrivendo.
-            var reaped = false;
-            errdefer if (!reaped) {
-                if (read_fd_open) {
-                    _ = close(read_fd);
-                    read_fd_open = false;
-                }
-                _ = kill(if (use_attr) -pid else pid, 9); // SIGKILL (al gruppo, se proprio)
-                _ = waitpid(pid, null, 0);
-            };
-
-            var out: std.ArrayList(u8) = .empty;
-            errdefer out.deinit(allocator);
-            // Capacità iniziale in UN colpo solo (vedi `default_capture_capacity`).
-            if (capacity_hint > 0) try out.ensureTotalCapacityPrecise(allocator, capacity_hint);
-            var buf: [65536]u8 = undefined;
-            // Loop di lettura con deadline complessiva via poll(): un tool esterno
-            // appeso non può bloccare il worker per sempre — alla scadenza
-            // l'errdefer sopra termina e reap-a il figlio.
-            const deadline: i64 = nowMs() + timeout_ms;
-            var pfd = [1]PollFd{.{ .fd = read_fd, .events = POLLIN, .revents = 0 }};
-            while (true) {
-                if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
-                // L'errdefer sopra termina e reap-a il figlio.
-                if (out.items.len > max_capture_bytes) return error.OutputTooLarge;
-                const remaining = deadline - nowMs();
-                if (remaining <= 0) return error.Timeout;
-                // Con un flag d'annullamento il poll dura al più 50 ms.
-                const slice: i64 = if (cancel != null) @min(remaining, 50) else remaining;
-                const pr = poll(&pfd, 1, @intCast(@min(slice, std.math.maxInt(c_int))));
-                if (pr == 0) continue; // scaduto il tratto: si ricontrolla la deadline
-                if (pr < 0) continue; // EINTR e simili: la deadline limita comunque il loop
-                // Con capacità libera si legge DIRETTAMENTE in coda al buffer:
-                // niente rimbalzo su `buf` + memcpy.
-                const spare = out.capacity - out.items.len;
-                if (spare > 0) {
-                    const n = read(read_fd, out.items.ptr + out.items.len, spare);
-                    if (n <= 0) break;
-                    out.items.len += @intCast(n);
-                    continue;
-                }
-                const n = read(read_fd, &buf, buf.len);
-                if (n <= 0) break;
-                try out.appendSlice(allocator, buf[0..@intCast(n)]);
-            }
-
-            var status: c_int = 0;
-            _ = waitpid(pid, &status, 0);
-            reaped = true;
-            // WIFEXITED / WEXITSTATUS espansi a mano (glibc): byte basso = segnale.
-            const code: u8 = if ((status & 0x7f) == 0) @intCast((status >> 8) & 0xff) else 1;
-            return .{ .stdout = try out.toOwnedSlice(allocator), .exit_code = code };
-        }
-
-        const WNOHANG: c_int = 1;
-
-        fn runDetached(allocator: std.mem.Allocator, argv: []const []const u8, wait_ms: u32) !bool {
-            if (argv.len == 0) return error.EmptyArgv;
-            const argvZ = try allocator.allocSentinel(?[*:0]const u8, argv.len, null);
-            defer {
-                for (argvZ[0..argv.len]) |a| if (a) |p| allocator.free(std.mem.span(p));
-                allocator.free(argvZ);
-            }
-            @memset(argvZ[0..argv.len], null);
-            for (argv, 0..) |a, i| argvZ[i] = (try allocator.dupeSentinel(u8, a, 0)).ptr;
-
-            var fa: [256]u8 align(16) = undefined;
-            if (posix_spawn_file_actions_init(&fa) != 0) return error.SpawnInit;
-            defer _ = posix_spawn_file_actions_destroy(&fa);
-            _ = posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", 1, 0); // O_WRONLY
-            _ = posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", 1, 0);
-
-            var pid: c_int = 0;
-            const rc = posix_spawnp(&pid, argvZ[0].?, &fa, null, argvZ.ptr, environ);
-            if (rc != 0) return if (rc == 2) error.CommandNotFound else error.SpawnFailed;
-
-            const deadline: i64 = nowMs() + wait_ms;
-            var none: [1]PollFd = undefined;
-            while (true) {
-                var status: c_int = 0;
-                const w = waitpid(pid, &status, WNOHANG);
-                if (w == pid) return (status & 0x7f) == 0 and ((status >> 8) & 0xff) == 0;
-                if (w < 0) return false;
-                // Ancora vivo alla scadenza: sta tenendo in primo piano ciò che ha
-                // lanciato. Lo si lascia girare (resterà uno zombie fino alla nostra
-                // uscita, se finisce prima): ucciderlo chiuderebbe il browser.
-                if (nowMs() >= deadline) return true;
-                _ = poll(&none, 0, 20); // attesa di 20 ms senza `std.Io`
-            }
-        }
 
         fn readFile(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
             const path_z = try allocator.dupeSentinel(u8, path, 0);
@@ -1621,21 +1212,3 @@ fn asciiEqualIgnoreCase(a: []const u8, b: []const u8) bool {
 }
 
 pub const getExtension = pathfrag.extension;
-
-test "runDetached: esito, attesa limitata, comando assente" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-    const a = std.testing.allocator;
-    try std.testing.expect(runDetached(a, &.{"true"}, 2000));
-    try std.testing.expect(!runDetached(a, &.{"false"}, 2000));
-    try std.testing.expect(!runDetached(a, &.{"zuer-comando-che-non-esiste"}, 2000));
-    // Il caso di xdg-open senza desktop: il lanciatore esce subito ma lascia un
-    // processo vivo che ha ereditato il suo stdout. Con una pipe si aspettava
-    // quel processo; qui conta solo il lanciatore.
-    const t0 = sub.nowMs();
-    try std.testing.expect(runDetached(a, &.{ "sh", "-c", "sleep 3 & exit 0" }, 2000));
-    try std.testing.expect(sub.nowMs() - t0 < 1500);
-    // Lanciatore che resta in primo piano oltre l'attesa: riuscito, e non lo si aspetta.
-    const t1 = sub.nowMs();
-    try std.testing.expect(runDetached(a, &.{ "sleep", "2" }, 200));
-    try std.testing.expect(sub.nowMs() - t1 < 1500);
-}

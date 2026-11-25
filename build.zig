@@ -523,7 +523,7 @@ pub fn build(b: *std.Build) void {
 
     // Test unitari puri (nessuna dipendenza nativa): `zig build test`.
     const test_step = b.step("test", "Esegue i test unitari");
-    for ([_][]const u8{ "src/detect.zig", "src/fragment.zig", "src/utf8_lossy.zig", "src/decoder.zig", "src/decoder_abi.zig", "src/formats.zig", "src/diskcache.zig", "src/vtcache.zig", "src/extract_cache.zig", "src/scheduler.zig", "src/thumbs.zig", "src/meshcache.zig", "src/wake.zig", "src/hwdec_caps.zig", "src/ytdlp.zig", "src/yt_queue.zig", "src/decoders/exif.zig", "src/decoders/fit.zig", "src/decoders/icc.zig", "src/aspect_fit.zig", "src/compose.zig", "src/info_format.zig", "src/vtex.zig", "src/md_layout.zig" }) |src_path| {
+    for ([_][]const u8{ "src/detect.zig", "src/fragment.zig", "src/utf8_lossy.zig", "src/decoder.zig", "src/decoder_abi.zig", "src/formats.zig", "src/diskcache.zig", "src/proc.zig", "src/vtcache.zig", "src/extract_cache.zig", "src/scheduler.zig", "src/thumbs.zig", "src/meshcache.zig", "src/wake.zig", "src/hwdec_caps.zig", "src/ytdlp.zig", "src/yt_queue.zig", "src/decoders/exif.zig", "src/decoders/fit.zig", "src/decoders/icc.zig", "src/aspect_fit.zig", "src/compose.zig", "src/info_format.zig", "src/vtex.zig", "src/md_layout.zig" }) |src_path| {
         const t = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path(src_path),
             .target = target,
