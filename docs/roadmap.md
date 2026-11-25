@@ -101,11 +101,12 @@ finestra a volte spariva (3 aperture su 8 nella sessione di prova). `yt_search`
 chiedeva la taglia nuova senza prima dare alla finestra le proporzioni del video: la
 taglia veniva piegata su quelle dell'immagine, e subito dopo il render la rimappava
 una seconda volta. Ora le proporzioni arrivano prima, come già in
-`nav.resizeToContent` (7 aperture su 7). Resta da guardare in Zicro perché due
-rimappature di fila possano lasciare la finestra senza buffer
-(`window_wayland.zig`, `setContentSize`): l'ipotesi è che la seconda parta quando la
-prima è confermata ma non ha ancora un buffer, e il compositor non mandi un altro
-`configure`. Non è verificata.
+`nav.resizeToContent` (7 aperture su 7). La causa di fondo era in Zicro ed è
+corretta lì (commit `02088eb`): `setContentSize` smontava la finestra anche quando
+non aveva ancora un buffer, cioè fra il `configure` appena confermato e il primo
+disegno; per il compositor non era uno smontaggio, nessun `configure` ripartiva e la
+finestra restava senza buffer. Riprodotto con un client minimo (bloccata prima, a
+schermo dopo), insieme al caso gemello di `setVisible`.
 
 Cosa resta del passo:
 
