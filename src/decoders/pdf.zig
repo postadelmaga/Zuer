@@ -19,7 +19,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const decoder = @import("decoder");
-const evict = @import("cache_evict.zig");
+const dc = decoder.diskcache;
 const ImageData = decoder.ImageData;
 const Decoded = decoder.Decoded;
 
@@ -47,14 +47,8 @@ extern fn unlink(filename: [*:0]const u8) c_int;
 extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern "c" fn close(fd: c_int) c_int;
 extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
-extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
-extern "c" fn rename(old: [*:0]const u8, new: [*:0]const u8) c_int;
-extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
 
 const O_RDONLY: c_int = 0;
-const O_WRONLY: c_int = 1;
-const O_CREAT: c_int = 0o100;
-const O_TRUNC: c_int = 0o1000;
 
 // Iterazione directory via libc: serve per ripulire i file pagina residui
 // prima di rmdir.
@@ -579,9 +573,9 @@ fn ppmToken(bytes: []const u8, pos: *usize) ![]const u8 {
 // come texcache — una pagina A3 a 200 DPI pesa ~34 MB, senza eviction la cache
 // crescerebbe all'infinito.
 
-/// Solo Linux: `cache_evict` e i flag O_* POSIX usati qui non hanno senso
-/// altrove. Sugli altri OS la cache è disattivata a comptime e il decode
-/// procede come prima (il plugin è comunque installato solo su Linux).
+/// Solo Linux: la manutenzione (tetto LRU) esiste solo lì, e senza tetto una cache
+/// di pagine da decine di MB crescerebbe senza limite. Sugli altri OS è
+/// disattivata a comptime e il decode procede come prima.
 const cache_enabled = builtin.os.tag == .linux;
 
 const cache_magic = "ZPG1";
@@ -591,7 +585,6 @@ const cache_header_len = 16;
 /// (post-scrittura) cancella le pagine con mtime più vecchio.
 const cache_cap_bytes: u64 = 256 * 1024 * 1024; // 256 MiB
 
-var tmp_seq: std.atomic.Value(u64) = .init(0);
 var tmp_sweep_done: std.atomic.Value(bool) = .init(false);
 
 fn rd32(b: []const u8, off: usize) u32 {
@@ -602,53 +595,18 @@ fn wr32(b: []u8, off: usize, v: u32) void {
     std.mem.writeInt(u32, b[off..][0..4], v, .little);
 }
 
-fn readAll(fd: c_int, buf: []u8) bool {
-    var off: usize = 0;
-    while (off < buf.len) {
-        const n = read(fd, buf.ptr + off, buf.len - off);
-        if (n <= 0) return false;
-        off += @intCast(n);
-    }
-    return true;
-}
-
-fn writeAll(fd: c_int, buf: []const u8) bool {
-    var off: usize = 0;
-    while (off < buf.len) {
-        const n = write(fd, buf.ptr + off, buf.len - off);
-        if (n <= 0) return false;
-        off += @intCast(n);
-    }
-    return true;
-}
-
-/// `$HOME/.cache/zuer/pdf`, creando la catena. null se niente HOME.
-/// Il chiamante libera. (Stessa forma dell'helper di texcache.zig, che è
-/// privato: qui serve una sottodirectory diversa.)
-fn cacheDir(gpa: std.mem.Allocator) ?[]u8 {
-    const home_c = getenv("HOME") orelse return null;
-    const home = std.mem.span(home_c);
-    inline for (.{ "/.cache", "/.cache/zuer", "/.cache/zuer/pdf" }) |suffix| {
-        const p = std.fmt.allocPrintSentinel(gpa, "{s}{s}", .{ home, suffix }, 0) catch return null;
-        defer gpa.free(p);
-        _ = mkdir(p.ptr, 0o755); // EEXIST ignorato
-    }
-    return std.fmt.allocPrint(gpa, "{s}/.cache/zuer/pdf", .{home}) catch null;
-}
-
 fn cacheRead(gpa: std.mem.Allocator, key: u64) ?Page {
     if (!cache_enabled) return null;
-    const dir = cacheDir(gpa) orelse return null;
+    const dir = dc.cacheDir(gpa, "pdf") orelse return null;
     defer gpa.free(dir);
     const path = std.fmt.allocPrintSentinel(gpa, "{s}/{x}.zpg", .{ dir, key }, 0) catch return null;
     defer gpa.free(path);
 
-    const fd = open(path.ptr, O_RDONLY, 0);
-    if (fd < 0) return null;
-    defer _ = close(fd);
+    const fd = dc.openRead(path) orelse return null;
+    defer dc.closeH(fd);
 
     var hdr: [cache_header_len]u8 = undefined;
-    if (!readAll(fd, &hdr)) return null;
+    if (!dc.readExact(fd, &hdr, 0)) return null;
     if (!std.mem.eql(u8, hdr[0..4], cache_magic)) return null;
     const w = rd32(&hdr, 4);
     const h = rd32(&hdr, 8);
@@ -659,52 +617,36 @@ fn cacheRead(gpa: std.mem.Allocator, key: u64) ?Page {
     const n = @as(usize, w) * h * 3;
     if (n > max_page_bytes) return null;
     const buf = gpa.alloc(u8, n) catch return null;
-    if (!readAll(fd, buf)) {
+    if (!dc.readExact(fd, buf, cache_header_len)) {
         gpa.free(buf);
         return null;
     }
     // Cache-hit: "touch" dell'mtime così l'eviction LRU non cancella le entry usate.
-    evict.touchFd(fd);
+    dc.touch(fd);
     return .{ .width = w, .height = h, .pixels = buf, .pages = pages, .from_cache = true };
 }
 
-/// Scrive la pagina renderizzata in cache (tmp + rename atomico). Best-effort:
-/// ogni errore è silenzioso — la cache è un'ottimizzazione, non deve mai far
-/// fallire il decode.
+/// Scrive la pagina renderizzata in cache (scrittura atomica:
+/// `diskcache.AtomicWriter`). Best-effort: ogni errore è silenzioso — la cache è
+/// un'ottimizzazione, non deve mai far fallire il decode.
 fn cacheWrite(gpa: std.mem.Allocator, key: u64, p: Page, total_pages: usize) void {
     if (!cache_enabled) return;
     if (p.pixels.len != p.width * p.height * 3) return;
-    const dir = cacheDir(gpa) orelse return;
+    const dir = dc.cacheDir(gpa, "pdf") orelse return;
     defer gpa.free(dir);
-    // Nome tmp univoco anche TRA processi (PID + seq): due istanze concorrenti
-    // non devono interleave-arsi sullo stesso file temporaneo.
-    const seq = tmp_seq.fetchAdd(1, .monotonic);
-    const tmp = std.fmt.allocPrintSentinel(gpa, "{s}/{x}.zpg.tmp{d}_{d}", .{ dir, key, std.os.linux.getpid(), seq }, 0) catch return;
-    defer gpa.free(tmp);
     const path = std.fmt.allocPrintSentinel(gpa, "{s}/{x}.zpg", .{ dir, key }, 0) catch return;
     defer gpa.free(path);
 
-    const fd = open(tmp.ptr, O_WRONLY | O_CREAT | O_TRUNC, 0o644);
-    if (fd < 0) return;
-    var ok = true;
-    {
-        var hdr: [cache_header_len]u8 = undefined;
-        @memcpy(hdr[0..4], cache_magic);
-        wr32(&hdr, 4, @intCast(p.width));
-        wr32(&hdr, 8, @intCast(p.height));
-        wr32(&hdr, 12, std.math.cast(u32, total_pages) orelse 0);
-        ok = writeAll(fd, &hdr) and writeAll(fd, p.pixels);
-    }
-    _ = close(fd);
-    // Scrittura a metà (disco pieno) o rename fallito: il temporaneo va tolto qui.
-    // Lo sweep lo vedrebbe solo fra un'ora, e l'eviction i `.tmp` non li conta.
-    if (!ok or rename(tmp.ptr, path.ptr) != 0) {
-        _ = unlink(tmp.ptr);
-        return;
-    }
-    // Manutenzione post-scrittura: sweep una-tantum dei tmp orfani + cap LRU.
-    evict.sweepTmpOnce(&tmp_sweep_done, dir);
-    evict.evictLru(dir, cache_cap_bytes);
+    var hdr: [cache_header_len]u8 = undefined;
+    @memcpy(hdr[0..4], cache_magic);
+    wr32(&hdr, 4, @intCast(p.width));
+    wr32(&hdr, 8, @intCast(p.height));
+    wr32(&hdr, 12, std.math.cast(u32, total_pages) orelse 0);
+    var out = dc.AtomicWriter.begin(gpa, path) orelse return;
+    out.write(&hdr);
+    out.write(p.pixels);
+    if (!out.commit()) return;
+    dc.maintain(&tmp_sweep_done, dir, cache_cap_bytes);
 }
 
 // ── ABI plugin ──────────────────────────────────────────────────────────────

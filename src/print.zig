@@ -24,7 +24,7 @@ const glyph = @import("glyph.zig");
 const yt_search = @import("yt_search.zig");
 const decoder_mod = @import("decoder.zig");
 const print_pdf = @import("print_pdf.zig");
-const vtcache = @import("vtcache.zig");
+const diskcache = @import("diskcache.zig");
 const portal_print = @import("portal_print.zig");
 const mac_print = @import("mac_print.zig");
 const gui_state_mod = @import("gui_state.zig");
@@ -388,7 +388,7 @@ fn writePdf(gpa: std.mem.Allocator, io: std.Io, job: *Job, msg: *Line) ?[]u8 {
         return null;
     };
     defer gpa.free(bytes);
-    const dir = vtcache.appCacheDir(gpa, "print") orelse {
+    const dir = diskcache.cacheDir(gpa, "print") orelse {
         msg.set("cartella della cache non disponibile", .{});
         return null;
     };

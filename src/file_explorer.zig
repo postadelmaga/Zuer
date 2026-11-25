@@ -19,7 +19,6 @@ const videomod = @import("video.zig");
 const yt_search = @import("yt_search.zig");
 const card_grid = @import("card_grid.zig");
 const gui_state_mod = @import("gui_state.zig");
-const vtcache = @import("vtcache.zig");
 const unicode_path = @import("unicode_path.zig");
 const GuiAppState = gui_state_mod.GuiAppState;
 const zrame = @import("zrame");

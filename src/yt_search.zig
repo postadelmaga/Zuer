@@ -23,7 +23,7 @@ const paint = zicro.paint;
 const build_options = @import("build_options");
 const has_video = build_options.video;
 const builtin = @import("builtin");
-const vtcache = @import("vtcache.zig");
+const diskcache = @import("diskcache.zig");
 const layout_mod = @import("layout.zig");
 const crash_report = @import("crash_report.zig");
 const hwdec_caps = @import("hwdec_caps.zig");
@@ -547,7 +547,7 @@ fn startQueueThumbs(state: *GuiAppState) void {
 
 /// Directory cache delle miniature (`…/zuer/ytthumb`), creata al volo.
 fn thumbCacheDir(gpa: std.mem.Allocator) ?[]u8 {
-    return vtcache.appCacheDir(gpa, "ytthumb");
+    return diskcache.cacheDir(gpa, "ytthumb");
 }
 
 /// Thread miniature (più istanze in parallelo): ognuna RECLAMA sotto lock il
@@ -847,7 +847,7 @@ pub fn tickStream(state: *GuiAppState, view_h: u32, dt: f32) void {
 // ── Coda "guarda dopo" ───────────────────────────────────────────────────────
 
 fn queuePath(state: *GuiAppState) ?[]u8 {
-    const home = vtcache.getEnvAlloc(state.gpa, if (builtin.os.tag == .windows) "APPDATA" else "HOME") orelse return null;
+    const home = diskcache.getEnvAlloc(state.gpa, if (builtin.os.tag == .windows) "APPDATA" else "HOME") orelse return null;
     defer state.gpa.free(home);
     return yt_queue.filePath(state.gpa, home) catch null;
 }
@@ -935,7 +935,7 @@ fn saveQueue(state: *GuiAppState) void {
     }
     // La cartella che lo contiene, non il percorso intero: `makeDirs` crea anche
     // l'ultimo componente.
-    vtcache.makeDirs(std.fs.path.dirname(path) orelse return);
+    diskcache.makeDirs(std.fs.path.dirname(path) orelse return);
     const tmp = std.fmt.allocPrint(state.gpa, "{s}.tmp", .{path}) catch return;
     defer state.gpa.free(tmp);
     const cwd = std.Io.Dir.cwd();
@@ -1464,7 +1464,7 @@ fn finishSubs(state: *GuiAppState, id: []const u8, cues_opt: ?[]SubCue) void {
 /// di un secondo), poi, se mancano o falliscono, una estrazione yt-dlp intera.
 fn fetchSubs(state: *GuiAppState, id: []const u8, urls: []const u8) ![]SubCue {
     const gpa = state.gpa;
-    const dir = vtcache.appCacheDir(gpa, "ytsubs") orelse return error.NoCacheDir;
+    const dir = diskcache.cacheDir(gpa, "ytsubs") orelse return error.NoCacheDir;
     defer gpa.free(dir);
 
     // Cache su disco: un VTT già scaricato per questo id evita la rete.

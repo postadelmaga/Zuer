@@ -15,34 +15,19 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const evict = @import("cache_evict.zig");
+const dc = @import("decoder").diskcache;
 
-/// Solo Linux: usa syscall POSIX (open/read/write/rename/mkdir con flag O_* e
-/// mkdir a due argomenti) che non linkerebbero sul CRT Windows. Sugli altri OS la
-/// cache è disattivata (comptime), quindi il decode procede come prima.
+/// Solo Linux: la manutenzione (tetto LRU) esiste solo lì, e senza tetto questa
+/// cache crescerebbe senza limite. Sugli altri OS è disattivata (comptime) e il
+/// decode procede come prima.
 const enabled = builtin.os.tag == .linux;
 
-extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
-extern "c" fn close(fd: c_int) c_int;
-extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
-extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
-extern "c" fn rename(old: [*:0]const u8, new: [*:0]const u8) c_int;
-extern "c" fn unlink(path: [*:0]const u8) c_int;
-extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
-extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
-
-const O_RDONLY: c_int = 0;
-const O_WRONLY: c_int = 1;
-const O_CREAT: c_int = 0o100;
-const O_TRUNC: c_int = 0o1000;
-
 const magic = "RTX2";
+const header_len = 12;
 
 /// Cap LRU della directory `~/.cache/zuer/tex`: oltre questa soglia l'eviction
 /// (post-scrittura) cancella i file con mtime più vecchio.
 const evict_cap_bytes: u64 = 256 * 1024 * 1024; // 256 MiB
-
-var tmp_seq: std.atomic.Value(u64) = .init(0);
 
 /// Sweep dei tmp orfani fatto al più una volta per processo (alla prima scrittura).
 var tmp_sweep_done: std.atomic.Value(bool) = .init(false);
@@ -55,107 +40,58 @@ fn wr32(b: []u8, off: usize, v: u32) void {
     std.mem.writeInt(u32, b[off..][0..4], v, .little);
 }
 
-fn readAll(fd: c_int, buf: []u8) bool {
-    var off: usize = 0;
-    while (off < buf.len) {
-        const n = read(fd, buf.ptr + off, buf.len - off);
-        if (n <= 0) return false;
-        off += @intCast(n);
-    }
-    return true;
-}
-
-fn writeAll(fd: c_int, buf: []const u8) bool {
-    var off: usize = 0;
-    while (off < buf.len) {
-        const n = write(fd, buf.ptr + off, buf.len - off);
-        if (n <= 0) return false;
-        off += @intCast(n);
-    }
-    return true;
-}
-
-/// `$HOME/.cache/zuer/tex`, creando la catena. null se niente HOME. Il chiamante libera.
-fn cacheDir(gpa: std.mem.Allocator) ?[]u8 {
-    const home_c = getenv("HOME") orelse return null;
-    const home = std.mem.span(home_c);
-    inline for (.{ "/.cache", "/.cache/zuer", "/.cache/zuer/tex" }) |suffix| {
-        const p = std.fmt.allocPrintSentinel(gpa, "{s}{s}", .{ home, suffix }, 0) catch return null;
-        defer gpa.free(p);
-        _ = mkdir(p.ptr, 0o755); // EEXIST ignorato
-    }
-    return std.fmt.allocPrint(gpa, "{s}/.cache/zuer/tex", .{home}) catch null;
-}
-
 /// Legge l'RGBA cachato per `encoded` (hash del contenuto), o null se assente/rotto.
 /// Il buffer è allocato con `gpa` (stessa ownership del path di decode).
 pub fn read_cached(gpa: std.mem.Allocator, encoded: []const u8, out_w: *usize, out_h: *usize) ?[]u8 {
     if (!enabled) return null;
-    const dir = cacheDir(gpa) orelse return null;
+    const dir = dc.cacheDir(gpa, "tex") orelse return null;
     defer gpa.free(dir);
     const key = std.hash.Wyhash.hash(0x9e3779b97f4a7c15, encoded);
     const path = std.fmt.allocPrintSentinel(gpa, "{s}/{x}.rtex", .{ dir, key }, 0) catch return null;
     defer gpa.free(path);
 
-    const fd = open(path.ptr, O_RDONLY, 0);
-    if (fd < 0) return null;
-    defer _ = close(fd);
+    const fd = dc.openRead(path) orelse return null;
+    defer dc.closeH(fd);
 
-    var hdr: [12]u8 = undefined;
-    if (!readAll(fd, &hdr)) return null;
+    var hdr: [header_len]u8 = undefined;
+    if (!dc.readExact(fd, &hdr, 0)) return null;
     if (!std.mem.eql(u8, hdr[0..4], magic)) return null;
     const w = rd32(&hdr, 4);
     const h = rd32(&hdr, 8);
     if (w == 0 or h == 0 or w > 16384 or h > 16384) return null;
     const n = @as(usize, w) * h * 4;
     const buf = gpa.alloc(u8, n) catch return null;
-    if (!readAll(fd, buf)) {
+    if (!dc.readExact(fd, buf, header_len)) {
         gpa.free(buf);
         return null;
     }
     // Cache-hit: "touch" dell'mtime così l'eviction LRU non cancella le entry usate.
-    evict.touchFd(fd);
+    dc.touch(fd);
     out_w.* = w;
     out_h.* = h;
     return buf;
 }
 
-/// Scrive l'RGBA decodificato in cache (write-to-temp + rename atomico). Best-effort:
-/// ogni errore è silenzioso (la cache è un'ottimizzazione, non deve mai far fallire
-/// il decode). Dopo ogni scrittura riuscita si applica il cap LRU della directory
-/// (e, una volta per processo, lo sweep dei tmp orfani).
+/// Scrive l'RGBA decodificato in cache (scrittura atomica: `diskcache.AtomicWriter`).
+/// Best-effort: ogni errore è silenzioso (la cache è un'ottimizzazione, non deve mai
+/// far fallire il decode). Dopo ogni scrittura riuscita si applica il cap LRU della
+/// directory (e, una volta per processo, lo sweep dei tmp orfani).
 pub fn write_cached(gpa: std.mem.Allocator, encoded: []const u8, w: usize, h: usize, rgba: []const u8) void {
     if (!enabled) return;
     if (rgba.len != w * h * 4) return;
-    const dir = cacheDir(gpa) orelse return;
+    const dir = dc.cacheDir(gpa, "tex") orelse return;
     defer gpa.free(dir);
     const key = std.hash.Wyhash.hash(0x9e3779b97f4a7c15, encoded);
-    // Nome tmp univoco anche TRA processi (PID + seq): due istanze concorrenti
-    // non devono interleave-arsi sullo stesso file temporaneo.
-    const seq = tmp_seq.fetchAdd(1, .monotonic);
-    const tmp = std.fmt.allocPrintSentinel(gpa, "{s}/{x}.rtex.tmp{d}_{d}", .{ dir, key, std.os.linux.getpid(), seq }, 0) catch return;
-    defer gpa.free(tmp);
     const path = std.fmt.allocPrintSentinel(gpa, "{s}/{x}.rtex", .{ dir, key }, 0) catch return;
     defer gpa.free(path);
 
-    const fd = open(tmp.ptr, O_WRONLY | O_CREAT | O_TRUNC, 0o644);
-    if (fd < 0) return;
-    var ok = true;
-    {
-        var hdr: [12]u8 = undefined;
-        @memcpy(hdr[0..4], magic);
-        wr32(&hdr, 4, @intCast(w));
-        wr32(&hdr, 8, @intCast(h));
-        ok = writeAll(fd, &hdr) and writeAll(fd, rgba);
-    }
-    _ = close(fd);
-    // Scrittura a metà (disco pieno) o rename fallito: il temporaneo va tolto qui.
-    // Lo sweep lo vedrebbe solo fra un'ora, e l'eviction i `.tmp` non li conta.
-    if (!ok or rename(tmp.ptr, path.ptr) != 0) {
-        _ = unlink(tmp.ptr);
-        return;
-    }
-    // Manutenzione post-scrittura: sweep una-tantum dei tmp orfani + cap LRU.
-    evict.sweepTmpOnce(&tmp_sweep_done, dir);
-    evict.evictLru(dir, evict_cap_bytes);
+    var hdr: [header_len]u8 = undefined;
+    @memcpy(hdr[0..4], magic);
+    wr32(&hdr, 4, @intCast(w));
+    wr32(&hdr, 8, @intCast(h));
+    var out = dc.AtomicWriter.begin(gpa, path) orelse return;
+    out.write(&hdr);
+    out.write(rgba);
+    if (!out.commit()) return;
+    dc.maintain(&tmp_sweep_done, dir, evict_cap_bytes);
 }

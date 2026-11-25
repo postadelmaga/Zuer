@@ -8,7 +8,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const vtcache = @import("vtcache.zig");
+const diskcache = @import("diskcache.zig");
 
 const is_win = builtin.os.tag == .windows;
 const is_mac = builtin.os.tag == .macos;
@@ -42,7 +42,7 @@ const fixed_dirs: []const []const u8 = switch (builtin.os.tag) {
 /// Percorso assoluto di yt-dlp (posseduto dal chiamante), o null se non c'è.
 /// `ZUER_YTDLP` lo impone; poi la cartella dell'eseguibile, il PATH e le cartelle note.
 pub fn find(gpa: std.mem.Allocator, io: std.Io) ?[]u8 {
-    if (vtcache.getEnvAlloc(gpa, "ZUER_YTDLP")) |p| {
+    if (diskcache.getEnvAlloc(gpa, "ZUER_YTDLP")) |p| {
         if (isExecutable(io, p)) return p;
         gpa.free(p);
     }
@@ -50,14 +50,14 @@ pub fn find(gpa: std.mem.Allocator, io: std.Io) ?[]u8 {
         defer gpa.free(dir);
         if (inDir(gpa, io, dir)) |p| return p;
     } else |_| {}
-    if (vtcache.getEnvAlloc(gpa, "PATH")) |path| {
+    if (diskcache.getEnvAlloc(gpa, "PATH")) |path| {
         defer gpa.free(path);
         var it = std.mem.tokenizeScalar(u8, path, if (is_win) ';' else ':');
         while (it.next()) |dir| {
             if (inDir(gpa, io, dir)) |p| return p;
         }
     }
-    const home = vtcache.getEnvAlloc(gpa, if (is_win) "LOCALAPPDATA" else "HOME");
+    const home = diskcache.getEnvAlloc(gpa, if (is_win) "LOCALAPPDATA" else "HOME");
     defer if (home) |h| gpa.free(h);
     for (fixed_dirs) |d| {
         if (d[0] == '~') {

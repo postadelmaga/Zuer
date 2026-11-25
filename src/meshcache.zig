@@ -7,37 +7,22 @@
 //!
 //! Chiave = hash(realpath); validità = mtime + dimensione del sorgente +
 //! checksum del payload (nell'header). Formato nativo (cache locale, si
-//! rigenera se il magic cambia). Solo Linux (syscall POSIX). La
+//! rigenera se il magic cambia). Solo Linux (vedi `enabled`). La
 //! deserializzazione alloca con `gpa`: la MeshData risultante si libera con il
 //! suo `deinit` come una decodificata normale.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const decoder = @import("decoder.zig");
-// Copia host dell'helper di manutenzione cache (la gemella in src/decoders/
-// serve texcache nel plugin glb: un file unico apparterrebbe a due moduli).
-const evict = @import("cache_evict.zig");
+const dc = @import("diskcache.zig");
 const MeshData = decoder.MeshData;
 const SubMesh = decoder.SubMesh;
 
+/// Solo Linux: `realpath` per la chiave e la manutenzione (tetto LRU), che esiste
+/// solo lì. Altrove la cache è disattivata a comptime.
 const enabled = builtin.os.tag == .linux;
 
-extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
-extern "c" fn close(fd: c_int) c_int;
-extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
-extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
-extern "c" fn rename(old: [*:0]const u8, new: [*:0]const u8) c_int;
-extern "c" fn unlink(path: [*:0]const u8) c_int;
-extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
-extern "c" fn lseek(fd: c_int, off: i64, whence: c_int) i64;
-extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 extern "c" fn realpath(path: [*:0]const u8, resolved: [*]u8) ?[*:0]u8;
-
-const O_RDONLY: c_int = 0;
-const O_WRONLY: c_int = 1;
-const O_CREAT: c_int = 0o100;
-const O_TRUNC: c_int = 0o1000;
-const SEEK_END: c_int = 2;
 
 // ZMESHC04: header con checksum Wyhash del payload dopo mtime+dimensione —
 // un blob troncato/corrotto con header valido viene scartato in deserialize
@@ -56,8 +41,6 @@ const hash_seed: u64 = 0x6d657368636b3034; // "meshck04"
 /// piena risoluzione (centinaia di MB possibili per modello), quindi oltre
 /// questa soglia l'eviction post-scrittura cancella i file con mtime più vecchio.
 const evict_cap_bytes: u64 = 1024 * 1024 * 1024; // 1 GiB
-
-var tmp_seq: std.atomic.Value(u64) = .init(0);
 
 /// Chiavi la cui cache coarse è in serializzazione o in scrittura in questo
 /// processo. `existsFresh` non basta: il file compare solo dopo il `rename` del
@@ -281,17 +264,6 @@ fn readTex(c: *Cursor, gpa: std.mem.Allocator, tw: *usize, th: *usize) ![]u8 {
 
 // --- I/O su disco ----------------------------------------------------------
 
-fn cacheDir(gpa: std.mem.Allocator) ?[]u8 {
-    const home_c = getenv("HOME") orelse return null;
-    const home = std.mem.span(home_c);
-    inline for (.{ "/.cache", "/.cache/zuer", "/.cache/zuer/mesh" }) |suffix| {
-        const p = std.fmt.allocPrintSentinel(gpa, "{s}{s}", .{ home, suffix }, 0) catch return null;
-        defer gpa.free(p);
-        _ = mkdir(p.ptr, 0o755);
-    }
-    return std.fmt.allocPrint(gpa, "{s}/.cache/zuer/mesh", .{home}) catch null;
-}
-
 /// Canonicalizza `path` con realpath(3): `zuer model.glb` aperto da directory
 /// diverse deve produrre la STESSA chiave cache (il path as-given "model.glb"
 /// collideva tra file diversi). Fallback al path così com'è se la risoluzione
@@ -318,42 +290,20 @@ fn keyPath(gpa: std.mem.Allocator, dir: []const u8, path: []const u8) ?[:0]u8 {
 fn srcSize(gpa: std.mem.Allocator, path: []const u8) ?u64 {
     const pz = gpa.dupeSentinel(u8, path, 0) catch return null;
     defer gpa.free(pz);
-    const fd = open(pz.ptr, O_RDONLY, 0);
-    if (fd < 0) return null;
-    defer _ = close(fd);
-    const sz = lseek(fd, 0, SEEK_END);
+    const fd = dc.openRead(pz) orelse return null;
+    defer dc.closeH(fd);
+    const sz = dc.fileSize(fd);
     if (sz < 0) return null;
     return @intCast(sz);
 }
 
-fn readAll(fd: c_int, buf: []u8) bool {
-    var off: usize = 0;
-    while (off < buf.len) {
-        const n = read(fd, buf.ptr + off, buf.len - off);
-        if (n <= 0) return false;
-        off += @intCast(n);
-    }
-    return true;
-}
-
-fn writeAll(fd: c_int, buf: []const u8) bool {
-    var off: usize = 0;
-    while (off < buf.len) {
-        const n = write(fd, buf.ptr + off, buf.len - off);
-        if (n <= 0) return false;
-        off += @intCast(n);
-    }
-    return true;
-}
-
 /// True se il file cache esiste già con magic valido e mtime+dimensione
 /// combacianti (letto solo l'header, non l'intero blob).
-fn existsFresh(kp: [*:0]const u8, mtime_ns: i128, src_size: u64) bool {
-    const fd = open(kp, O_RDONLY, 0);
-    if (fd < 0) return false;
-    defer _ = close(fd);
+fn existsFresh(kp: [:0]const u8, mtime_ns: i128, src_size: u64) bool {
+    const fd = dc.openRead(kp) orelse return false;
+    defer dc.closeH(fd);
     var hdr: [magic.len + @sizeOf(i128) + @sizeOf(u64)]u8 = undefined;
-    if (!readAll(fd, &hdr)) return false;
+    if (!dc.readExact(fd, &hdr, 0)) return false;
     if (!std.mem.eql(u8, hdr[0..magic.len], magic)) return false;
     var mt: i128 = undefined;
     @memcpy(std.mem.asBytes(&mt), hdr[magic.len..][0..@sizeOf(i128)]);
@@ -371,7 +321,7 @@ fn existsFresh(kp: [*:0]const u8, mtime_ns: i128, src_size: u64) bool {
 /// che possiede il blob, così il decode ritorna senza aspettare l'I/O.
 pub fn writeCoarse(gpa: std.mem.Allocator, path: []const u8, mtime_ns: i128, mesh: *const MeshData) void {
     if (!enabled) return;
-    const dir = cacheDir(gpa) orelse return;
+    const dir = dc.cacheDir(gpa, "mesh") orelse return;
     defer gpa.free(dir);
     const kp = keyPath(gpa, dir, path) orelse return;
     defer gpa.free(kp);
@@ -429,52 +379,35 @@ fn writeBlob(kp: [:0]u8, blob: []u8, key: u64, claim: Inflight.Claim) void {
     const pa = std.heap.page_allocator;
     defer pa.free(kp);
     defer pa.free(blob);
-    // Nome tmp univoco anche TRA processi (PID + seq): due istanze di zuer che
-    // scrivono la stessa chiave non devono interleave-arsi sullo stesso tmp.
-    const seq = tmp_seq.fetchAdd(1, .monotonic);
-    const tmp = std.fmt.allocPrintSentinel(pa, "{s}.tmp{d}_{d}", .{ kp, std.os.linux.getpid(), seq }, 0) catch return;
-    defer pa.free(tmp);
-    const fd = open(tmp.ptr, O_WRONLY | O_CREAT | O_TRUNC, 0o644);
-    if (fd < 0) return;
-    const ok = writeAll(fd, blob);
-    _ = close(fd);
-    // Scrittura a metà (disco pieno) o rename fallito: il temporaneo va tolto qui.
-    // Lo sweep lo vedrebbe solo fra un'ora, e l'eviction i `.tmp` non li conta.
-    if (!ok or rename(tmp.ptr, kp.ptr) != 0) {
-        _ = unlink(tmp.ptr);
-        return;
-    }
+    var out = dc.AtomicWriter.begin(pa, kp) orelse return;
+    out.write(blob);
+    if (!out.commit()) return;
     // Manutenzione post-scrittura (best-effort, siamo già su un thread detached):
     // sweep una-tantum dei tmp orfani + cap LRU della directory.
-    if (std.fs.path.dirname(kp)) |dir| {
-        evict.sweepTmpOnce(&tmp_sweep_done, dir);
-        evict.evictLru(dir, evict_cap_bytes);
-    }
+    if (std.fs.path.dirname(kp)) |dir| dc.maintain(&tmp_sweep_done, dir, evict_cap_bytes);
 }
 
 /// Legge la mesh coarse se presente e con mtime+dimensione combacianti. null altrimenti.
 pub fn readCoarse(gpa: std.mem.Allocator, path: []const u8, mtime_ns: i128) ?MeshData {
     if (!enabled) return null;
-    const dir = cacheDir(gpa) orelse return null;
+    const dir = dc.cacheDir(gpa, "mesh") orelse return null;
     defer gpa.free(dir);
     const kp = keyPath(gpa, dir, path) orelse return null;
     defer gpa.free(kp);
     const src_size = srcSize(gpa, path) orelse return null;
 
-    const fd = open(kp.ptr, O_RDONLY, 0);
-    if (fd < 0) return null;
-    defer _ = close(fd);
-    const size = lseek(fd, 0, SEEK_END);
+    const fd = dc.openRead(kp) orelse return null;
+    defer dc.closeH(fd);
+    const size = dc.fileSize(fd);
     if (size <= 0 or size > 512 * 1024 * 1024) return null;
-    if (lseek(fd, 0, 0) < 0) return null;
     const buf = gpa.alloc(u8, @intCast(size)) catch return null;
     defer gpa.free(buf);
-    if (!readAll(fd, buf)) return null;
+    if (!dc.readExact(fd, buf, 0)) return null;
 
     var c = Cursor{ .data = buf };
     const m = deserialize(&c, gpa, mtime_ns, src_size) catch return null;
     // Cache-hit: "touch" dell'mtime così l'eviction LRU non cancella le entry usate.
-    evict.touchFd(fd);
+    dc.touch(fd);
     return m;
 }
 

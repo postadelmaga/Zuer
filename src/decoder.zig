@@ -48,6 +48,9 @@ pub const PluginRequest = abi.PluginRequest;
 pub const exportPlugin = abi.exportPlugin;
 /// Quale plugin apre quale estensione: formats.zig.
 pub const formats = @import("formats.zig");
+/// Le primitive delle cache su disco: i plugin le raggiungono da qui, così il file
+/// resta uno solo (vedi diskcache.zig).
+pub const diskcache = @import("diskcache.zig");
 
 fn hostParallelFor(n: usize, ctx: ?*anyopaque, body: ParallelBody) callconv(.c) void {
     scheduler.parallelForGlobal(n, ctx, body);

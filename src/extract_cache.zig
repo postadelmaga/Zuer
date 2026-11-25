@@ -4,7 +4,7 @@
 //!
 //! Disposizione: `<cache>/extract/<chiave>/<voce>`, una cartella per versione di
 //! archivio (chiave = percorso + data di modifica). `<cache>` è quella di
-//! `vtcache.appCacheDir`: `%LOCALAPPDATA%\zuer` su Windows, `~/.cache/zuer` altrove.
+//! `diskcache.cacheDir`: `%LOCALAPPDATA%\zuer` su Windows, `~/.cache/zuer` altrove.
 //!
 //! Il tetto è per cartella d'archivio, non per file: le voci di uno stesso archivio
 //! si aprono insieme (si sfoglia), quindi si buttano insieme. Conta l'uso più
@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const vtcache = @import("vtcache.zig");
+const diskcache = @import("diskcache.zig");
 
 /// Tetto della cache su disco. Una voce sola può arrivare a `max_size` (metà della
 /// memoria disponibile), quindi può superarlo: la cartella più recente non si butta mai.
@@ -35,7 +35,7 @@ const part_max_age_ns: i128 = std.time.ns_per_hour;
 /// Cartella della cache (creata se manca), posseduta dal chiamante. null se la
 /// variabile d'ambiente di base non c'è.
 pub fn rootDir(gpa: std.mem.Allocator) ?[]u8 {
-    return vtcache.appCacheDir(gpa, "extract");
+    return diskcache.cacheDir(gpa, "extract");
 }
 
 /// Chiave della cartella di un archivio: cambia quando l'archivio viene modificato,
@@ -76,7 +76,7 @@ pub const part_name_max = ".part".len + 10 + 1 + 20;
 /// suffisso aggiunto a un nome già vicino ai 255 byte non entrerebbe nel filesystem.
 pub fn partName(buf: *[part_name_max]u8) []const u8 {
     const seq = part_seq.fetchAdd(1, .monotonic);
-    return std.fmt.bufPrint(buf, ".part{d}_{d}", .{ vtcache.processId(), seq }) catch unreachable;
+    return std.fmt.bufPrint(buf, ".part{d}_{d}", .{ diskcache.processId(), seq }) catch unreachable;
 }
 
 /// True per i nomi scritti da `partName`: `.part<cifre>_<cifre>`.

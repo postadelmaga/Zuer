@@ -28,9 +28,8 @@ const builtin = @import("builtin");
 const decoder_mod = @import("decoder.zig");
 const scheduler = @import("scheduler.zig");
 const layout = @import("layout.zig");
-const vtcache = @import("vtcache.zig");
+const diskcache = @import("diskcache.zig");
 // Copia host dell'helper di manutenzione cache (LRU per mtime + sweep dei tmp).
-const evict = @import("cache_evict.zig");
 const card_grid = @import("card_grid.zig");
 
 /// Colonne della griglia: `claimNext` parte dalla prima card visibile.
@@ -158,7 +157,7 @@ pub const Host = struct {
     stats: ?*Stats = null,
 
     pub const CacheDir = union(enum) {
-        /// `…/zuer/thumbs` (vtcache.appCacheDir).
+        /// `…/zuer/thumbs` (diskcache.cacheDir).
         app,
         none,
         path: []const u8,
@@ -262,9 +261,9 @@ fn makeThumb(gpa: std.mem.Allocator, pixels: []const u8, sw: usize, sh: usize) ?
 // ── Cache su disco delle miniature ───────────────────────────────────────────
 //
 // `…/zuer/thumbs/<hash>-<mtime>-<size>.thumb`, stesso impianto della cache
-// `ytthumb` di yt_search.zig: la directory la crea `vtcache.appCacheDir`
+// `ytthumb` di yt_search.zig: la directory la crea `diskcache.cacheDir`
 // (`$HOME/.cache/zuer/thumbs` su Unix, `%LOCALAPPDATA%\zuer\thumbs` su Windows)
-// e la manutenzione la fa `cache_evict` (LRU per mtime, no-op fuori da Linux).
+// e la manutenzione la fa `diskcache` (LRU per mtime, no-op fuori da Linux).
 //
 // Formato "ZTH1" (little-endian), minimale — nessuna compressione, la lettura
 // è una `readFileAlloc` da ~150 KB:
@@ -355,13 +354,13 @@ fn thumbCacheRead(h: *const Host, cdir: std.Io.Dir, fname: []const u8) CacheRead
         @memcpy(rgba, raw[thumb_header_len..][0..need]);
         break :blk .{ .hit = .{ .rgba = rgba, .w = w, .h = ht } };
     };
-    // "Touch" LRU: l'entry appena usata torna in cima (cache_evict ordina per
+    // "Touch" LRU: l'entry appena usata torna in cima (diskcache ordina per
     // mtime, non per atime). Best-effort.
     // (`Dir.setTimestampsNow` di std 0.16 non compila — vtable disallineata —
     // quindi futimens via fd, Linux-only come le altre cache del progetto.)
     if (comptime builtin.os.tag == .linux) {
         if (cdir.openFile(h.io, fname, .{})) |f| {
-            evict.touchFd(f.handle);
+            diskcache.touch(f.handle);
             f.close(h.io);
         } else |_| {}
     }
@@ -811,7 +810,7 @@ fn cacheDirPath(h: *const Host) ?[]u8 {
     return switch (h.cache) {
         // `appCacheDir` crea già la catena: niente subprocess, su Windows
         // `mkdir` non esiste come eseguibile.
-        .app => vtcache.appCacheDir(h.gpa, "thumbs"),
+        .app => diskcache.cacheDir(h.gpa, "thumbs"),
         .none => null,
         .path => |p| h.gpa.dupe(u8, p) catch null,
     };
@@ -827,8 +826,7 @@ fn maintainCache(h: *const Host) void {
     defer maint_busy.store(false, .release);
     const p = cacheDirPath(h) orelse return;
     defer h.gpa.free(p);
-    evict.sweepTmpOnce(&tmp_sweep_done, p);
-    evict.evictLru(p, thumb_cache_cap_bytes);
+    diskcache.maintain(&tmp_sweep_done, p, thumb_cache_cap_bytes);
 }
 
 /// Un job della pipeline: task `normal` dello scheduler globale, si libera da
