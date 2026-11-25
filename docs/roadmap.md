@@ -24,7 +24,7 @@ invece di rincorrere i sintomi:
 | 2 | [Navigazione, apertura e GUI](https://github.com/postadelmaga/Zuer/milestone/3) + riferimento a documento (A2) + punto unico di installazione (A3) | #37–#50 | **issue fatte** il 25 novembre 2026; restano A2 e A3 (sotto): i frammenti non passano ancora da un solo parser, lo stato non ha ancora un solo commit |
 | 3 | [Media e YouTube](https://github.com/postadelmaga/Zuer/milestone/4) | #51–#57 | **issue fatte** il 25 novembre 2026: `scripts/video-check.sh` copre seek a fine file e TS con partenza ≠ 0, `scripts/net-check.sh` lo stream che cade |
 | 4 | [Cache, plugin e piattaforme](https://github.com/postadelmaga/Zuer/milestone/5) | #58–#64 | **issue fatte** il 25 novembre 2026; le voci d'archivio su Windows sono provate sotto wine, Android resta da provare su un dispositivo (sotto) |
-| 5 | Riordino (fase B) | — | **nove punti su quattordici fatti** il 25 novembre 2026; i cinque rimasti sono issue (sotto) |
+| 5 | Riordino (fase B) | #65–#69 (i punti rimasti) | **nove punti su quattordici fatti** il 25 novembre 2026; i cinque rimasti sono issue aperte |
 | 6 | Già in programma prima della revisione | #5, #13, #14, #16, #17, #20–#25 | — |
 
 I passi 1–4 non dipendono l'uno dall'altro: l'ordine è per rischio (prima ciò che fa
@@ -274,16 +274,16 @@ Trovato dalla revisione indipendente, e corretto prima del push:
 
 Rimasti fuori, e perché (ognuno ha la sua issue):
 
-- **`renderWorker`** e **motore media** (`Engine`): dipendono da scelte ancora da fare
+- **`renderWorker`** (#65) e **motore media** (`Engine`, #66): dipendono da scelte ancora da fare
   (#16 e #13 per il primo) e toccano il percorso Vulkan e la riproduzione, che nella
   sessione di prova senza GPU e senza audio non si possono verificare;
-- **Android** dentro `decoder.decode`: cambia quali file il telefono apre, e non c'è
+- **Android** dentro `decoder.decode` (#67): cambia quali file il telefono apre, e non c'è
   un dispositivo su cui provarlo. `android_decode.zig` e `android_ui.zig` hanno ancora
   le loro liste di estensioni;
-- **Markdown** (blocchi già analizzati a `md_layout`, evidenziatore in un file suo):
+- **Markdown** (#68: blocchi già analizzati a `md_layout`, evidenziatore in un file suo):
   l'evidenziatore oggi produce colori e `codeSpans` li ritraduce in ruoli; va
   rovesciato, ed è un cambio alla resa di tutti i file di codice;
-- **Testo, tre motori**: quello a bitmap intera serve solo a `raster-debug`, ma
+- **Testo, tre motori** (#69): quello a bitmap intera serve solo a `raster-debug`, ma
   condivide l'impaginazione col testo GPU, che senza GPU non si verifica;
 - **la colla non possiede `content`**: ogni plugin continua a liberarlo o a cederlo
   al risultato (testo e CSV lo tengono senza copiarlo). Il contratto è scritto in un
@@ -342,7 +342,7 @@ di uno stream va in un `display_name`, la sorgente in una `union(enum){ file, yo
 L'elenco com'era alla revisione. Fatti nel [passo 5](#passo-5--riordino-fase-b):
 `decoder.zig`, tabella delle estensioni, colla dei plugin, cache su disco, processi
 esterni, pulizia, documentazione, CI, test dei percorsi d'errore. Restano
-`renderWorker`, media, Android, Markdown, testo.
+`renderWorker` (#65), media (#66), Android (#67), Markdown (#68), testo (#69).
 
 - **`renderWorker`** (`gui.zig:394-1139`, 745 righe): la sequenza etichetta →
   esploratore → YouTube → popup è copiata tre volte con differenze, l'allocazione del
