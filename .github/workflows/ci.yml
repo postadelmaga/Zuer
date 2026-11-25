@@ -51,10 +51,18 @@ jobs:
           ref: ${{ steps.zicro.outputs.ref }}
           path: Zicro
           persist-credentials: false
+      # ziglang.org verso i runner è lento (alla prima esecuzione: 15 minuti per 50 MB).
+      # L'archivio resta nella cache di Actions; lo sha256 si verifica comunque a ogni
+      # esecuzione, anche su quello preso dalla cache.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/zig.tar.xz
+          key: zig-x86_64-linux-${{ env.ZIG_VERSION }}
       - name: Zig
         run: |
           set -euo pipefail
-          curl -fsSL --retry 6 --retry-delay 20 --retry-all-errors -o zig.tar.xz "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz"
+          cd "$RUNNER_TEMP"
+          [ -f zig.tar.xz ] || curl -fsSL --retry 6 --retry-delay 20 --retry-all-errors -o zig.tar.xz "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz"
           echo "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026  zig.tar.xz" | sha256sum -c -
           mkdir -p "$RUNNER_TEMP/zig" && tar -xJf zig.tar.xz -C "$RUNNER_TEMP/zig" --strip-components=1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
