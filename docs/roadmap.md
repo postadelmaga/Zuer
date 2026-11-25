@@ -24,7 +24,7 @@ invece di rincorrere i sintomi:
 | 2 | [Navigazione, apertura e GUI](https://github.com/postadelmaga/Zuer/milestone/3) + riferimento a documento (A2) + punto unico di installazione (A3) | #37–#50 | **issue fatte** il 25 novembre 2026; restano A2 e A3 (sotto): i frammenti non passano ancora da un solo parser, lo stato non ha ancora un solo commit |
 | 3 | [Media e YouTube](https://github.com/postadelmaga/Zuer/milestone/4) | #51–#57 | **issue fatte** il 25 novembre 2026: `scripts/video-check.sh` copre seek a fine file e TS con partenza ≠ 0, `scripts/net-check.sh` lo stream che cade |
 | 4 | [Cache, plugin e piattaforme](https://github.com/postadelmaga/Zuer/milestone/5) | #58–#64 | **issue fatte** il 25 novembre 2026; le voci d'archivio su Windows sono provate sotto wine, Android resta da provare su un dispositivo (sotto) |
-| 5 | Riordino (fase B) | #65–#69 (i punti rimasti) | **nove punti su quattordici fatti** il 25 novembre 2026; i cinque rimasti sono issue aperte |
+| 5 | Riordino (fase B) | #65–#69 (i punti rimasti) | **nove punti su quattordici fatti** il 25 novembre 2026, più Markdown (#68) e Android (#67, manca la prova su un dispositivo) la sera stessa; i tre rimasti sono issue aperte |
 | 6 | Già in programma prima della revisione | #5, #13, #14, #16, #17, #20–#25 | — |
 
 I passi 1–4 non dipendono l'uno dall'altro: l'ordine è per rischio (prima ciò che fa
@@ -278,11 +278,22 @@ Rimasti fuori, e perché (ognuno ha la sua issue):
   (#16 e #13 per il primo) e toccano il percorso Vulkan e la riproduzione, che nella
   sessione di prova senza GPU e senza audio non si possono verificare;
 - **Android** dentro `decoder.decode` (#67): cambia quali file il telefono apre, e non c'è
-  un dispositivo su cui provarlo. `android_decode.zig` e `android_ui.zig` hanno ancora
-  le loro liste di estensioni;
+  un dispositivo su cui provarlo. *Fatto dopo, la sera del 25 novembre, ma solo
+  compilato:* i decoder linkati stanno in una tabella (`decoder.linkedPlugin`) e il
+  decode passa da `decoder.decode`, provato da un test che sul desktop usa lo stesso
+  percorso; `supported()` e i badge vengono da `formats.zig`. Sul telefono cambia che i
+  file senza estensione nota passano dal rilevamento per contenuto (un README, un PNG
+  senza estensione si aprono) e che 7z, rar e simili dicono che serve bsdtar invece di
+  mostrare la scheda. Strada facendo: `posix_spawn` in bionic esiste dall'API 28 e
+  l'APK chiede la 24, quindi su Android 7 e 8 la libreria non si caricava affatto;
+  ora su Android `proc.zig` non lancia processi;
 - **Markdown** (#68: blocchi già analizzati a `md_layout`, evidenziatore in un file suo):
   l'evidenziatore oggi produce colori e `codeSpans` li ritraduce in ruoli; va
-  rovesciato, ed è un cambio alla resa di tutti i file di codice;
+  rovesciato, ed è un cambio alla resa di tutti i file di codice. *Fatto dopo, la sera
+  del 25 novembre:* `highlight.zig` produce ruoli, `md_layout` riceve i blocchi e non
+  importa più `text_render`, la GUI tiene i blocchi del file aperto e lo zoom rifà solo
+  il layout (su 890 KB di markdown, 20 ms di analisi su 120). PDF di stampa, raster e
+  schermate di codice e markdown identici byte per byte a prima;
 - **Testo, tre motori** (#69): quello a bitmap intera serve solo a `raster-debug`, ma
   condivide l'impaginazione col testo GPU, che senza GPU non si verifica;
 - **la colla non possiede `content`**: ogni plugin continua a liberarlo o a cederlo
@@ -341,8 +352,9 @@ di uno stream va in un `display_name`, la sorgente in una `union(enum){ file, yo
 
 L'elenco com'era alla revisione. Fatti nel [passo 5](#passo-5--riordino-fase-b):
 `decoder.zig`, tabella delle estensioni, colla dei plugin, cache su disco, processi
-esterni, pulizia, documentazione, CI, test dei percorsi d'errore. Restano
-`renderWorker` (#65), media (#66), Android (#67), Markdown (#68), testo (#69).
+esterni, pulizia, documentazione, CI, test dei percorsi d'errore; poi Markdown (#68)
+e Android (#67, da provare su un dispositivo). Restano `renderWorker` (#65), media
+(#66), testo (#69).
 
 - **`renderWorker`** (`gui.zig:394-1139`, 745 righe): la sequenza etichetta →
   esploratore → YouTube → popup è copiata tre volte con differenze, l'allocazione del
@@ -366,9 +378,10 @@ esterni, pulizia, documentazione, CI, test dei percorsi d'errore. Restano
   con il proprio clock; via il modo ibrido «mpv muto con audio esterno»; il disegno
   (oscilloscopio, controlli, sottotitoli) fuori da `video.zig`. Togliere cvp9 o
   spegnerlo di default: serve solo quando manca mpv.
-- **Android**: far passare il decode da `decoder.decode` con una tabella statica dei
-  decoder linkati, invece del terzo dispatch di `android_decode.zig` (origine di #58).
-- **Markdown**: `md_layout.layout` riceve i blocchi già analizzati invece del sorgente
+- **Android** (#67, fatto; da provare su un dispositivo): far passare il decode da
+  `decoder.decode` con una tabella statica dei decoder linkati, invece del terzo
+  dispatch di `android_decode.zig` (origine di #58).
+- **Markdown** (#68, fatto): `md_layout.layout` riceve i blocchi già analizzati invece del sorgente
   (oggi si riparsa a ogni zoom e in stampa); l'evidenziatore in un file suo per
   rompere il ciclo `md_layout` ↔ `text_render`.
 - **Testo**: tre motori (layout ritenuto, testo GPU a richiesta, bitmap intera usata

@@ -12,7 +12,7 @@ Due frontend condividono lo stesso stack di decodifica e rendering:
                                          estrazione
 
  rendering GPU:  gpu_renderer.zig (Vulkan) · renderer/vk.zig (binding) · voxel.zig · vtex.zig
- rendering CPU:  text_render.zig · md_layout.zig · glyph.zig (stb_truetype) · compose.zig
+ rendering CPU:  text_render.zig · md_layout.zig · highlight.zig · glyph.zig (stb_truetype) · compose.zig
  per sistema:    terminal.zig · clipboard.zig · dynlib.zig · proc.zig · diskcache.zig
                  (finestra, input e audio: zicro/zrame)
 ```
@@ -39,6 +39,12 @@ azione).
   (`WinKind`), e da lì a zoom e dimensione iniziale.
 - **`compose.zig`** — composizione CPU dei frame (immagini adattate con zoom e pan,
   testo 1:1 con intestazione ancorata, selezione, barra delle linguette).
+- **testo** — `text_render.zig` impagina testo, codice e tabelle su griglia
+  monospazio e li dipinge per viewport. Il markdown lo analizza `md_parse.zig` e lo
+  impagina `md_layout.zig`, che serve sia lo schermo sia la stampa (`print_pdf.zig`);
+  la GUI tiene i blocchi analizzati del file aperto, così lo zoom rifà solo il layout.
+  `highlight.zig` dà i ruoli del codice (parola chiave, stringa, commento): il colore
+  lo sceglie chi disegna.
 - **overlay** — `file_explorer.zig` (tasto `e`, con le miniature di `thumbs.zig`),
   `yt_search.zig` (tasto `y`, attraverso `ytdlp.zig`), `print.zig` (Ctrl+P).
 - **media** — `video.zig`, `video_decoder.zig` e i due motori: vedi [Media](#media).
@@ -46,8 +52,9 @@ azione).
 ## Plugin e formati
 
 I **decoder** sono librerie dinamiche caricate a richiesta (`libdecoder_<nome>.so`,
-`decoder_<nome>.dll`); su Android sono linkati nell'unica libreria dell'APK. Il
-contratto sta in tre file:
+`decoder_<nome>.dll`); su Android sono linkati nell'unica libreria dell'APK, elencati
+in `android_decode.zig` con `decoder.linkedPlugin`, e il decode passa dallo stesso
+`decoder.decode` del desktop. Il contratto sta in tre file:
 
 - **`formats.zig`** — l'unica tabella «quale plugin apre quale estensione». Da lì
   vengono le estensioni che ogni plugin dichiara, il manifest con cui l'host carica il
