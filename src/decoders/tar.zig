@@ -92,7 +92,9 @@ fn listWithBsdtar(path: []const u8, allocator: std.mem.Allocator) !Decoded {
         else => "bsdtar",
     };
     var run = decoder.runCapture(allocator, &.{ exe, "-tvf", path }) catch |e| switch (e) {
-        error.CommandNotFound => return .{ .err = try allocator.dupe(u8, if (builtin.os.tag == .linux)
+        error.CommandNotFound => return .{ .err = try allocator.dupe(u8, if (builtin.abi == .android)
+            "Questo formato d'archivio lo elenca bsdtar, che su Android non c'è"
+        else if (builtin.os.tag == .linux)
             "Archivio non leggibile: serve bsdtar (pacchetto libarchive-tools o libarchive)"
         else
             "Archivio non leggibile: tar di sistema (bsdtar) non trovato") },

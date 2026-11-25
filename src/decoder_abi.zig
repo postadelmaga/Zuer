@@ -813,10 +813,54 @@ pub const PluginRequest = struct {
 /// esterni dell'host (vedi proc.zig), poi passa i servizi a `pluginSetHost` se c'è.
 ///
 /// Dove i decoder non sono plugin (Android: linkati nell'unica libreria dell'APK) non
-/// esporta nulla: i nomi colliderebbero, uno per decoder.
+/// esporta nulla: i nomi colliderebbero, uno per decoder. Lì lo stesso decoder entra
+/// nell'host come `linkedPlugin(Impl)`.
 pub fn exportPlugin(comptime Impl: type) void {
-    if (!plugin_abi) return;
-    const Glue = struct {
+    // Nei test non si esporta: un test che linka più decoder insieme (quello del
+    // percorso Android) avrebbe un `zuer_decode` per decoder, e i simboli colliderebbero.
+    if (!plugin_abi or builtin.is_test) return;
+    const G = Glue(Impl);
+    @export(&G.decode, .{ .name = "zuer_decode", .linkage = .strong });
+    @export(&G.extensions, .{ .name = "zuer_extensions", .linkage = .strong });
+    @export(&G.abiVersion, .{ .name = "zuer_abi_version", .linkage = .strong });
+    if (@hasDecl(Impl, "pluginDecodeCoarse")) @export(&G.decodeCoarse, .{ .name = "zuer_decode_coarse", .linkage = .strong });
+    if (@hasDecl(Impl, "plugin_content_prefix")) @export(&G.contentPrefix, .{ .name = "zuer_content_prefix", .linkage = .strong });
+    @export(&G.setHost, .{ .name = "zuer_set_host", .linkage = .strong });
+}
+
+/// Un decoder linkato dentro l'eseguibile invece che caricato con `dlopen`: le stesse
+/// funzioni che `exportPlugin` esporterebbe, raccolte in una voce di tabella. L'host le
+/// chiama esattamente come quelle di un plugin (stessa conversione `DecodedC`, stessa
+/// proprietà di `content`), quindi il percorso di decode è uno solo.
+pub const LinkedPlugin = struct {
+    name: []const u8,
+    /// Le estensioni come le dichiarerebbe `zuer_extensions` (da formats.zig).
+    extensions: []const u8,
+    decode_fn: DecodeFn,
+    decode_coarse_fn: ?DecodeFn,
+    /// Come `zuer_content_prefix`; maxInt = file intero.
+    content_prefix: usize,
+};
+
+/// La voce di tabella del decoder `Impl` (vedi `LinkedPlugin`). Niente `pluginSetHost`:
+/// un decoder linkato vive nello stesso binario dell'host, e quello che `HostServices`
+/// gli porterebbe (lo scheduler, il registro dei processi) o lo raggiunge già, o resta
+/// sul proprio ripiego.
+pub fn linkedPlugin(comptime Impl: type) LinkedPlugin {
+    const G = Glue(Impl);
+    return .{
+        .name = Impl.plugin_name,
+        .extensions = comptime formats.extensionsOf(Impl.plugin_name),
+        .decode_fn = &G.decode,
+        .decode_coarse_fn = if (@hasDecl(Impl, "pluginDecodeCoarse")) &G.decodeCoarse else null,
+        .content_prefix = if (@hasDecl(Impl, "plugin_content_prefix")) Impl.plugin_content_prefix else std.math.maxInt(usize),
+    };
+}
+
+/// Le funzioni C dell'ABI per il decoder `Impl`: le esporta `exportPlugin`, le mette in
+/// tabella `linkedPlugin`.
+fn Glue(comptime Impl: type) type {
+    return struct {
         fn request(path: SliceC, content: SliceC, io_ptr: *const anyopaque, allocator_ptr: *const anyopaque) PluginRequest {
             return .{
                 .path = path.toSlice(),
@@ -858,19 +902,13 @@ pub fn exportPlugin(comptime Impl: type) void {
             if (@hasDecl(Impl, "pluginSetHost")) Impl.pluginSetHost(services);
         }
     };
-    @export(&Glue.decode, .{ .name = "zuer_decode", .linkage = .strong });
-    @export(&Glue.extensions, .{ .name = "zuer_extensions", .linkage = .strong });
-    @export(&Glue.abiVersion, .{ .name = "zuer_abi_version", .linkage = .strong });
-    if (@hasDecl(Impl, "pluginDecodeCoarse")) @export(&Glue.decodeCoarse, .{ .name = "zuer_decode_coarse", .linkage = .strong });
-    if (@hasDecl(Impl, "plugin_content_prefix")) @export(&Glue.contentPrefix, .{ .name = "zuer_content_prefix", .linkage = .strong });
-    @export(&Glue.setHost, .{ .name = "zuer_set_host", .linkage = .strong });
 }
 
 /// Per i test dei decoder: esegue `run` facendo fallire, una alla volta, ogni
 /// allocazione nuova che compie (la prima, poi la seconda…) finché non ne fallisce
 /// più nessuna. Le crescite in place (`resize`) non vengono fatte fallire: quando
-/// falliscono si ripiega su un'allocazione nuova, che è coperta. `run` deve decodificare e poi liberare tutto ciò che ha ottenuto, con
-/// l'allocator che riceve. A ogni giro i byte allocati devono tornare tutti: un
+/// falliscono si ripiega su un'allocazione nuova, che è coperta. `run` deve
+/// decodificare e poi liberare tutto ciò che ha ottenuto, con l'allocator che riceve. A ogni giro i byte allocati devono tornare tutti: un
 /// percorso d'errore che perde memoria fa fallire il test con l'indice del colpevole.
 pub fn expectNoLeakOnAllocFailure(context: anytype, comptime run: fn (@TypeOf(context), std.mem.Allocator) void) !void {
     var index: usize = 0;

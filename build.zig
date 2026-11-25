@@ -533,6 +533,26 @@ pub fn build(b: *std.Build) void {
         t.root_module.addImport("zicro", dep_zicro.module("zicro")); // via card_grid
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
+    {
+        // Il percorso Android dei decoder linkati (android_decode.zig), eseguito qui:
+        // stessa tabella, stesso `decoder.decode`, nessun dlopen.
+        const t = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/android_decode.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+                .imports = &.{.{ .name = "decoder", .module = decoder_mod }},
+            }),
+        });
+        t.root_module.addIncludePath(b.path("vendor/stb"));
+        t.root_module.addCSourceFile(.{
+            .file = b.path("vendor/stb/stb_image_impl.c"),
+            .flags = &.{ "-O2", "-fno-sanitize=undefined" },
+        });
+        addImageCodecs(b, t.root_module);
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
     // Decoder senza dipendenze C: ogni allocazione fatta fallire a turno, nessuna
     // perdita ammessa (decoder.expectNoLeakOnAllocFailure).
     for ([_][]const u8{ "src/decoders/csv.zig", "src/decoders/text.zig", "src/decoders/markdown.zig", "src/decoders/mesh.zig" }) |src_path| {

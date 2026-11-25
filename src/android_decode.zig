@@ -1,111 +1,225 @@
 //! Dal percorso di un file al suo contenuto decodificato — la versione Android.
 //!
 //! Sul desktop Zuer carica i decoder come plugin (`dlopen` di `libdecoder_*.so`): un APK
-//! invece porta UNA libreria sola, quindi qui i decoder in Zig puro sono importati e
-//! linkati dentro. Il codice di decodifica è **lo stesso** del desktop — stessi file,
-//! stesso `Decoded` — cambia solo come ci si arriva.
+//! invece porta UNA libreria sola, quindi qui i decoder sono linkati dentro e l'host li
+//! riceve come tabella (`decoder.useLinkedPlugins`). Da lì in poi il percorso è quello
+//! del desktop: `decoder.decode`, con lo stesso rilevamento per contenuto, gli stessi
+//! limiti, la stessa proprietà dei byte. Quale decoder apre quale estensione lo dice
+//! `formats.zig`, come sul desktop: qui non c'è una lista propria.
 //!
-//! Restano fuori i tre che non possono seguirci: `media` (ffmpeg), `pdf` e `office`
-//! (invocano eseguibili esterni e usano directory temporanee POSIX). Per quei tipi la UI
-//! mostra una scheda informativa onesta invece di fingere un'anteprima.
+//! Restano fuori `media` (FFmpeg), `pdf` e `office` (strumenti esterni e cartelle
+//! temporanee POSIX): per quei tipi la UI usa i servizi di Android (fotogramma, pagina
+//! PDF) o mostra una scheda informativa onesta invece di fingere un'anteprima.
 
 const std = @import("std");
 const decoder = @import("decoder");
 
-const archive = @import("decoders/archive.zig");
-const csv = @import("decoders/csv.zig");
-const glb = @import("decoders/glb.zig");
-const image = @import("decoders/image.zig");
-const markdown = @import("decoders/markdown.zig");
-const mesh = @import("decoders/mesh.zig");
-const tar = @import("decoders/tar.zig");
-const text = @import("decoders/text.zig");
-
 pub const Decoded = decoder.Decoded;
 pub const CsvData = decoder.CsvData;
 pub const MeshData = decoder.MeshData;
+pub const formats = decoder.formats;
+/// Estensione del nome, senza punto: `tar.gz` per i doppi suffissi (vedi fragment.zig).
+pub const extension = decoder.getExtension;
 
-/// Oltre questa soglia il file non viene caricato in memoria: un telefono ha poca RAM e un
-/// visualizzatore non ha alcun motivo di tenere in heap mezzo gigabyte.
-const max_bytes: usize = 64 << 20;
+/// I decoder linkati nell'APK. Le estensioni di ciascuno vengono da `formats.zig`.
+const linked = [_]decoder.LinkedPlugin{
+    decoder.linkedPlugin(@import("decoders/archive.zig")),
+    decoder.linkedPlugin(@import("decoders/csv.zig")),
+    decoder.linkedPlugin(@import("decoders/glb.zig")),
+    decoder.linkedPlugin(@import("decoders/image.zig")),
+    decoder.linkedPlugin(@import("decoders/markdown.zig")),
+    decoder.linkedPlugin(@import("decoders/mesh.zig")),
+    decoder.linkedPlugin(@import("decoders/tar.zig")),
+    decoder.linkedPlugin(@import("decoders/text.zig")),
+};
 
-/// True se `ext` (minuscola, senza punto) ha un decoder in questa build. La UI la usa per
-/// sapere in anticipo se una tessera può promettere un'anteprima.
-pub fn supported(ext: []const u8) bool {
-    return kindOf(ext) != .none;
+var installed = std.atomic.Value(bool).init(false);
+
+/// Consegna la tabella all'host. Da chiamare all'avvio, prima che qualunque thread
+/// decodifichi (la chiama `android_main`); le chiamate successive non fanno nulla.
+pub fn init() void {
+    if (installed.swap(true, .acq_rel)) return;
+    decoder.useLinkedPlugins(&linked);
 }
 
-const Family = enum { none, text, csv, tsv, markdown, zip, tar, mesh, glb, image };
+/// True se `ext` (senza punto, maiuscole indifferenti) ha un decoder in questa build.
+/// La UI la usa per sapere in anticipo se una tessera può promettere un'anteprima.
+pub fn supported(ext: []const u8) bool {
+    const name = decoder.formats.pluginFor(ext) orelse return false;
+    return isLinked(name);
+}
 
-fn kindOf(ext: []const u8) Family {
-    const eq = std.mem.eql;
-    if (eq(u8, ext, "csv")) return .csv;
-    if (eq(u8, ext, "tsv")) return .tsv;
-    if (eq(u8, ext, "md") or eq(u8, ext, "markdown")) return .markdown;
-    if (eq(u8, ext, "zip") or eq(u8, ext, "apk") or eq(u8, ext, "jar") or eq(u8, ext, "epub")) return .zip;
-    if (eq(u8, ext, "tar") or eq(u8, ext, "tgz") or eq(u8, ext, "gz") or eq(u8, ext, "xz") or eq(u8, ext, "bz2") or eq(u8, ext, "zst")) return .tar;
-    if (eq(u8, ext, "glb") or eq(u8, ext, "gltf")) return .glb;
-    if (eq(u8, ext, "obj") or eq(u8, ext, "stl") or eq(u8, ext, "ply")) return .mesh;
-    inline for (.{ "png", "jpg", "jpeg", "gif", "bmp", "tga", "psd", "hdr", "pic", "pnm", "ppm", "pgm", "webp", "ico" }) |e| {
-        if (eq(u8, ext, e)) return .image;
+fn isLinked(name: []const u8) bool {
+    for (&linked) |*lp| {
+        if (std.mem.eql(u8, lp.name, name)) return true;
     }
-    inline for (.{ "txt", "log", "json", "xml", "yaml", "yml", "toml", "ini", "conf", "c", "h", "cpp", "hpp", "zig", "rs", "go", "py", "js", "ts", "sh", "html", "css", "sql", "lua", "rb", "java", "kt", "swift" }) |e| {
-        if (eq(u8, ext, e)) return .text;
-    }
-    return .none;
+    return false;
 }
 
 /// Decodifica `path`. Il chiamante possiede il risultato (`Decoded.deinit`).
-/// `null` = nessun decoder per questo tipo (la UI mostrerà la scheda informativa).
+/// `null` = nessun decoder per questo file: la UI mostrerà la scheda informativa.
+///
+/// Un file senza un'estensione nota passa comunque dal rilevamento per contenuto
+/// (un PNG senza estensione, un `README`, un `Makefile` si aprono). Se nemmeno quello
+/// lo riconosce, l'errore dell'host diventa `null`: per un tipo che l'app non conosce
+/// la scheda dice di più di un «formato non riconosciuto».
 pub fn decode(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ?Decoded {
-    var ebuf: [16]u8 = undefined;
-    const ext = lower(extOf(path), &ebuf); // "FOTO.JPG" è un file immagine come ogni altro
-    const fam = kindOf(ext);
-    if (fam == .none) return null;
-
-    // Gli archivi lavorano dal PATH (leggono solo la coda e la central directory: aprire uno
-    // ZIP da 2 GB non deve costare 2 GB di RAM). Tutti gli altri partono dai byte.
-    switch (fam) {
-        .zip => return archive.decode(path, io, gpa),
-        .tar => return tar.decode(path, io, gpa),
-        else => {},
+    init();
+    var d = decoder.decode(path, io, gpa);
+    if (d == .err and !supported(decoder.getExtension(path))) {
+        d.deinit(gpa);
+        return null;
     }
-
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, std.Io.Limit.limited(max_bytes)) catch |err| {
-        const msg = std.fmt.allocPrint(gpa, "Impossibile leggere il file: {s}", .{@errorName(err)}) catch ""; // mai un letterale: `Decoded.deinit` lo libera
-        return Decoded{ .err = msg };
-    };
-    // Possesso dei byte: lo prende il decoder in tutti i casi tranne le immagini.
-    // text/markdown li restituiscono zero-copy come contenuto, csv/tsv li tengono
-    // come `backing` delle celle (li libera il `deinit` del risultato); mesh e glb
-    // li liberano da sé a fine decode (`defer allocator.free(bytes)`). Solo
-    // `image.decode` li lascia a noi.
-    // (Prima si liberava sempre: use-after-free su testo, double-free su csv; poi
-    // è rimasto il double-free su mesh e glb.)
-    const decoder_frees = fam != .image;
-    defer if (!decoder_frees) gpa.free(bytes);
-
-    const name = std.fs.path.basename(path);
-    return switch (fam) {
-        .text => text.decode(bytes, gpa),
-        .csv => csv.decode(bytes, ',', gpa),
-        .tsv => csv.decode(bytes, '\t', gpa),
-        .markdown => markdown.decode(bytes, gpa),
-        .mesh => mesh.decode(bytes, name, gpa),
-        .glb => glb.decode(bytes, name, gpa, false),
-        .image => image.decode(path, bytes, name, gpa),
-        .zip, .tar, .none => unreachable,
-    };
+    return d;
 }
 
-fn lower(s: []const u8, buf: []u8) []const u8 {
-    if (s.len > buf.len) return "";
-    for (s, 0..) |ch, i| buf[i] = std.ascii.toLower(ch);
-    return buf[0..s.len];
+test "la tabella sta alla tabella dei formati" {
+    // `linkedPlugin` si ferma già in compilazione su un nome che formats.zig non
+    // conosce; qui si controlla il verso opposto, cosa resta fuori e perché.
+    for (&decoder.formats.plugins) |*p| {
+        const fuori = for ([_][]const u8{ "media", "pdf", "office" }) |n| {
+            if (std.mem.eql(u8, n, p.plugin)) break true;
+        } else false;
+        try std.testing.expect(isLinked(p.plugin) != fuori);
+    }
+    try std.testing.expect(supported("CSV"));
+    try std.testing.expect(supported("tar.gz"));
+    try std.testing.expect(!supported("pdf"));
+    try std.testing.expect(!supported("mp4"));
+    try std.testing.expect(!supported(""));
 }
 
-fn extOf(path: []const u8) []const u8 {
-    const base = std.fs.path.basename(path);
-    const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse return "";
-    return base[dot + 1 ..];
+// ── Il percorso dei decoder linkati, eseguito sul desktop (`zig build test`) ──────
+
+fn writeFile(dir: std.Io.Dir, name: []const u8, bytes: []const u8) !void {
+    try dir.writeFile(std.testing.io, .{ .sub_path = name, .data = bytes });
+}
+
+/// Un tar con un solo file `ciao.txt` (formato ustar, scritto a mano).
+fn tinyTar(out: *[512 * 4]u8) void {
+    @memset(out, 0);
+    const h = out[0..512];
+    @memcpy(h[0..8], "ciao.txt");
+    @memcpy(h[100..108], "0000644\x00");
+    @memcpy(h[108..116], "0000000\x00");
+    @memcpy(h[116..124], "0000000\x00");
+    @memcpy(h[124..136], "00000000005\x00");
+    @memcpy(h[136..148], "00000000000\x00");
+    h[156] = '0';
+    @memcpy(h[257..263], "ustar\x00");
+    @memcpy(h[263..265], "00");
+    @memset(h[148..156], ' ');
+    var sum: u32 = 0;
+    for (h) |c| sum += c;
+    _ = std.fmt.bufPrint(h[148..156], "{o:0>6}\x00 ", .{sum}) catch unreachable;
+    @memcpy(out[512..517], "ciao\n");
+}
+
+/// Uno ZIP con un solo file `dentro.txt`, memorizzato senza compressione.
+fn tinyZip(buf: []u8) []const u8 {
+    const name = "dentro.txt";
+    const data = "ciao\n";
+    const crc = std.hash.Crc32.hash(data);
+    var w: std.Io.Writer = .fixed(buf);
+    // Intestazione locale.
+    w.writeInt(u32, 0x04034b50, .little) catch unreachable;
+    w.writeInt(u16, 20, .little) catch unreachable; // versione
+    w.writeInt(u16, 0, .little) catch unreachable; // flag
+    w.writeInt(u16, 0, .little) catch unreachable; // metodo: memorizzato
+    w.writeInt(u32, 0, .little) catch unreachable; // ora e data
+    w.writeInt(u32, crc, .little) catch unreachable;
+    w.writeInt(u32, data.len, .little) catch unreachable;
+    w.writeInt(u32, data.len, .little) catch unreachable;
+    w.writeInt(u16, name.len, .little) catch unreachable;
+    w.writeInt(u16, 0, .little) catch unreachable;
+    w.writeAll(name) catch unreachable;
+    w.writeAll(data) catch unreachable;
+    const cd_off = w.end;
+    // Cartella centrale.
+    w.writeInt(u32, 0x02014b50, .little) catch unreachable;
+    w.writeInt(u16, 20, .little) catch unreachable;
+    w.writeInt(u16, 20, .little) catch unreachable;
+    w.writeInt(u16, 0, .little) catch unreachable;
+    w.writeInt(u16, 0, .little) catch unreachable;
+    w.writeInt(u32, 0, .little) catch unreachable;
+    w.writeInt(u32, crc, .little) catch unreachable;
+    w.writeInt(u32, data.len, .little) catch unreachable;
+    w.writeInt(u32, data.len, .little) catch unreachable;
+    w.writeInt(u16, name.len, .little) catch unreachable;
+    w.writeInt(u16, 0, .little) catch unreachable; // extra
+    w.writeInt(u16, 0, .little) catch unreachable; // commento
+    w.writeInt(u16, 0, .little) catch unreachable; // disco
+    w.writeInt(u16, 0, .little) catch unreachable; // attributi interni
+    w.writeInt(u32, 0, .little) catch unreachable; // attributi esterni
+    w.writeInt(u32, 0, .little) catch unreachable; // offset dell'intestazione locale
+    w.writeAll(name) catch unreachable;
+    const cd_len = w.end - cd_off;
+    // Fine della cartella centrale.
+    w.writeInt(u32, 0x06054b50, .little) catch unreachable;
+    w.writeInt(u16, 0, .little) catch unreachable;
+    w.writeInt(u16, 0, .little) catch unreachable;
+    w.writeInt(u16, 1, .little) catch unreachable;
+    w.writeInt(u16, 1, .little) catch unreachable;
+    w.writeInt(u32, @intCast(cd_len), .little) catch unreachable;
+    w.writeInt(u32, @intCast(cd_off), .little) catch unreachable;
+    w.writeInt(u16, 0, .little) catch unreachable;
+    return buf[0..w.end];
+}
+
+/// Una BMP 1×1 a 24 bit (un pixel rosso).
+const tiny_bmp = "BM" ++ "\x3a\x00\x00\x00" ++ "\x00\x00\x00\x00" ++ "\x36\x00\x00\x00" ++
+    "\x28\x00\x00\x00" ++ "\x01\x00\x00\x00" ++ "\x01\x00\x00\x00" ++ "\x01\x00" ++ "\x18\x00" ++
+    "\x00\x00\x00\x00" ++ "\x04\x00\x00\x00" ++ "\x13\x0b\x00\x00" ++ "\x13\x0b\x00\x00" ++
+    "\x00\x00\x00\x00" ++ "\x00\x00\x00\x00" ++ "\x00\x00\xff\x00";
+
+test "decode: i decoder linkati, dal percorso del desktop" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    init();
+    // Il registro nasce con l'allocator del primo decode: si libera qui, o il test
+    // lo vedrebbe come una perdita.
+    defer decoder.closePluginCache(gpa);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var tar_buf: [512 * 4]u8 = undefined;
+    tinyTar(&tar_buf);
+    var zip_buf: [256]u8 = undefined;
+    const Case = struct { name: []const u8, bytes: []const u8, want: ?std.meta.Tag(Decoded) };
+    const cases = [_]Case{
+        .{ .name = "tabella.csv", .bytes = "x,y\n1,2\n", .want = .csv },
+        .{ .name = "TABELLA.TSV", .bytes = "x\ty\n1\t2\n", .want = .csv },
+        .{ .name = "nota.md", .bytes = "# Titolo\n\ntesto\n", .want = .markdown },
+        .{ .name = "codice.zig", .bytes = "const x = 1;\n", .want = .text },
+        // Senza estensione: decide il contenuto.
+        .{ .name = "README", .bytes = "solo testo\n", .want = .text },
+        .{ .name = "foto.bmp", .bytes = tiny_bmp, .want = .image },
+        .{ .name = "foto", .bytes = tiny_bmp, .want = .image },
+        .{ .name = "archivio.tar", .bytes = &tar_buf, .want = .csv },
+        .{ .name = "archivio.zip", .bytes = tinyZip(&zip_buf), .want = .csv },
+        // Un formato riconosciuto il cui decoder non è nell'APK: scheda, non errore.
+        .{ .name = "documento.pdf", .bytes = "%PDF-1.4\n%%EOF\n", .want = null },
+        // Byte che nessuno riconosce, senza estensione: scheda.
+        .{ .name = "dati", .bytes = "\x00\x01\x02\x03\xff\xfe\x00\x00", .want = null },
+    };
+    for (cases) |c| try writeFile(tmp.dir, c.name, c.bytes);
+    for (cases) |c| {
+        const path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, c.name });
+        defer gpa.free(path);
+        var got = decode(io, gpa, path);
+        defer if (got) |*d| d.deinit(gpa);
+        const tag: ?std.meta.Tag(Decoded) = if (got) |d| d else null;
+        if (tag != c.want) {
+            const msg: []const u8 = if (got) |d| (if (d == .err) d.err else "") else "";
+            std.debug.print("{s}: atteso {?}, ottenuto {?} {s}\n", .{ c.name, c.want, tag, msg });
+            return error.TestUnexpectedResult;
+        }
+    }
+    // Un errore vero di un tipo che il telefono apre resta un messaggio.
+    try writeFile(tmp.dir, "rotto.bmp", "BM\x00\x01");
+    const rotto = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/rotto.bmp", .{tmp.sub_path});
+    defer gpa.free(rotto);
+    var d = decode(io, gpa, rotto) orelse return error.TestUnexpectedResult;
+    defer d.deinit(gpa);
+    try std.testing.expect(d == .err);
 }

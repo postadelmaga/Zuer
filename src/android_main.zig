@@ -18,6 +18,8 @@ const paint = zicro.paint;
 const android = zicro.android;
 const jni = @import("android_jni.zig");
 const ui = @import("android_ui.zig");
+const dec = @import("android_decode.zig");
+const decoder = @import("decoder");
 
 /// Codice del tasto "indietro" di Android, l'unico tasto hardware che conta su un
 /// telefono: risale di un livello, e alla radice lascia uscire l'app.
@@ -121,6 +123,11 @@ export fn android_main(app: *android.android_app) void {
     // Dichiarato qui, prima della finestra e della UI: gira per ultimo, quando nessuno
     // dei loro `deinit` può più chiamare Java.
     defer jni.detach(activity);
+
+    // I decoder linkati, prima che qualunque thread (UI, miniature) decodifichi. Il
+    // registro che ne nasce lo libera `closePluginCache` all'uscita.
+    dec.init();
+    defer decoder.closePluginCache(gpa);
 
     const win = zicro.window.Window.init(gpa, io, .{
         .title = "Zuer",

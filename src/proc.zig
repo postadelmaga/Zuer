@@ -55,7 +55,7 @@ pub const max_capture_bytes: usize = 512 * 1024 * 1024;
 /// complessiva di `default_run_timeout_ms`: un tool appeso non può bloccare il
 /// worker per sempre (vedi `runCaptureTimeout` per un valore esplicito).
 pub fn runCapture(allocator: std.mem.Allocator, argv: []const []const u8) !RunResult {
-    return sub.runCapture(allocator, argv, default_run_timeout_ms, default_capture_capacity, null);
+    return capture(allocator, argv, default_run_timeout_ms, default_capture_capacity, null);
 }
 
 /// Come `runCapture`, con deadline complessiva esplicita: alla scadenza il
@@ -63,21 +63,36 @@ pub fn runCapture(allocator: std.mem.Allocator, argv: []const []const u8) !RunRe
 /// Su Unix il figlio ha un suo gruppo di processi e si termina il gruppo intero,
 /// nipoti compresi; su Windows solo il processo lanciato.
 pub fn runCaptureTimeout(allocator: std.mem.Allocator, argv: []const []const u8, timeout_ms: u32) !RunResult {
-    return sub.runCapture(allocator, argv, timeout_ms, default_capture_capacity, null);
+    return capture(allocator, argv, timeout_ms, default_capture_capacity, null);
 }
 
 /// Come `runCaptureTimeout`, interrompibile: quando `cancel` diventa vero (lo
 /// si controlla ogni ~50 ms) il processo viene terminato e ritorna
 /// `error.Canceled`.
 pub fn runCaptureCancel(allocator: std.mem.Allocator, argv: []const []const u8, timeout_ms: u32, cancel: *const std.atomic.Value(bool)) !RunResult {
-    return sub.runCapture(allocator, argv, timeout_ms, default_capture_capacity, cancel);
+    return capture(allocator, argv, timeout_ms, default_capture_capacity, cancel);
 }
 
 /// Come `runCaptureTimeout`, con un hint ESPLICITO di capacità iniziale per lo
 /// stdout: chi conosce già l'ordine di grandezza dell'output (es. larghezza ×
 /// altezza × 3 di un PPM) evita del tutto le riallocazioni intermedie.
 pub fn runCaptureCapacity(allocator: std.mem.Allocator, argv: []const []const u8, timeout_ms: u32, capacity_hint: usize) !RunResult {
-    return sub.runCapture(allocator, argv, timeout_ms, capacity_hint, null);
+    return capture(allocator, argv, timeout_ms, capacity_hint, null);
+}
+
+/// Su Android non si lanciano processi: un telefono non ha gli strumenti che i decoder
+/// cercano (magick, bsdtar, pdftoppm…), e `posix_spawn` esiste solo da Android 9 (API
+/// 28). Referenziarlo bastava a impedire il caricamento della libreria dell'APK sulle
+/// versioni precedenti, che pure dichiara di supportare (minSdk 24): il linker la lega
+/// all'avvio (BIND_NOW). Qui il backend non viene nemmeno compilato, e il chiamante
+/// riceve `error.CommandNotFound` come per uno strumento che non c'è.
+pub const spawn_available = builtin.abi != .android;
+
+fn capture(allocator: std.mem.Allocator, argv: []const []const u8, timeout_ms: u32, capacity_hint: usize, cancel: ?*const std.atomic.Value(bool)) !RunResult {
+    // Stessi errori del backend vero per gli stessi casi: i chiamanti li smistano
+    // con uno `switch` che deve compilare uguale su ogni piattaforma.
+    if (comptime !spawn_available) return if (argv.len == 0) error.EmptyArgv else error.CommandNotFound;
+    return sub.runCapture(allocator, argv, timeout_ms, capacity_hint, cancel);
 }
 
 /// Lancia un programma che deve solo PARTIRE (`xdg-open`): stdout e stderr su
@@ -90,7 +105,7 @@ pub fn runCaptureCapacity(allocator: std.mem.Allocator, argv: []const []const u8
 /// non arriva mai. Si aspettava il timeout intero e l'apertura riuscita veniva
 /// presa per un fallimento. Solo POSIX: su Windows c'è ShellExecute.
 pub fn runDetached(allocator: std.mem.Allocator, argv: []const []const u8, wait_ms: u32) bool {
-    if (comptime builtin.os.tag == .windows) return false;
+    if (comptime builtin.os.tag == .windows or !spawn_available) return false;
     return sub.runDetached(allocator, argv, wait_ms) catch false;
 }
 
@@ -104,7 +119,7 @@ pub fn runDetached(allocator: std.mem.Allocator, argv: []const []const u8, wait_
 /// terrebbe altrimenti il chiamante fermo su una pipe piena, prima ancora di poterlo
 /// aspettare. Solo POSIX: su Windows gli appunti sono una chiamata di sistema.
 pub fn runFeed(allocator: std.mem.Allocator, argv: []const []const u8, input: []const u8, deadline_ms: u32) bool {
-    if (comptime builtin.os.tag == .windows) return false;
+    if (comptime builtin.os.tag == .windows or !spawn_available) return false;
     return sub.runFeed(allocator, argv, input, deadline_ms) catch false;
 }
 
@@ -157,7 +172,7 @@ fn forgetGroup(pgid: c_int) void {
 /// Termina tutti i gruppi annotati (SIGKILL). Solo letture atomiche e `kill`: si può
 /// chiamare da un gestore di segnali. Da chiamare nell'host quando sta per uscire.
 pub fn killAll() void {
-    if (comptime builtin.os.tag == .windows) return;
+    if (comptime builtin.os.tag == .windows or !spawn_available) return;
     for (&live_groups) |*slot| {
         const pgid = slot.load(.acquire);
         if (pgid > 0) _ = sub.kill(-pgid, 9);

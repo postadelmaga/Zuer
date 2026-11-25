@@ -18,9 +18,10 @@ const dc = @import("diskcache.zig");
 const MeshData = decoder.MeshData;
 const SubMesh = decoder.SubMesh;
 
-/// Solo Linux: `realpath` per la chiave e la manutenzione (tetto LRU), che esiste
-/// solo lì. Altrove la cache è disattivata a comptime.
-const enabled = builtin.os.tag == .linux;
+/// Solo Linux desktop: `realpath` per la chiave e la manutenzione (tetto LRU), che
+/// esiste solo lì. Altrove la cache è disattivata a comptime; su Android anche perché
+/// non c'è una HOME in cui scriverla (l'app ha la sua cartella, che qui non si conosce).
+const enabled = builtin.os.tag == .linux and builtin.abi != .android;
 
 extern "c" fn realpath(path: [*:0]const u8, resolved: [*]u8) ?[*:0]u8;
 

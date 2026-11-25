@@ -70,25 +70,30 @@ pub const Kind = enum {
     doc,
     other,
 
+    /// La famiglia di un file dal suo nome. Quale decoder apre quale estensione lo dice
+    /// `formats.zig`, la stessa tabella del desktop: qui si traduce solo il decoder in
+    /// famiglia. Audio e video li apre lo stesso decoder (`media`): li separano le liste
+    /// con cui la GUI sceglie la forma della finestra.
     pub fn of(name: []const u8) Kind {
-        const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return .other;
-        var buf: [16]u8 = undefined;
-        const raw = name[dot + 1 ..];
-        if (raw.len == 0 or raw.len > buf.len) return .other;
-        const ext = std.ascii.lowerString(buf[0..raw.len], raw);
-        const groups = .{
-            .{ Kind.image, [_][]const u8{ "png", "jpg", "jpeg", "gif", "bmp", "tga", "webp", "tif", "tiff", "ico", "svg", "psd", "hdr", "pnm", "ppm", "pgm", "avif" } },
-            .{ Kind.text, [_][]const u8{ "txt", "md", "markdown", "json", "yaml", "yml", "toml", "ini", "cfg", "conf", "csv", "tsv", "log", "xml", "html", "css", "js", "ts", "py", "zig", "c", "h", "cpp", "rs", "go", "java", "kt", "sh", "swift", "lua", "sql", "rb", "php" } },
-            .{ Kind.audio, [_][]const u8{ "mp3", "wav", "flac", "ogg", "oga", "opus", "m4a", "mid", "midi" } },
-            .{ Kind.video, [_][]const u8{ "mp4", "m4v", "mkv", "webm", "avi", "mov", "ogv" } },
-            .{ Kind.mesh, [_][]const u8{ "obj", "stl", "glb", "gltf" } },
-            .{ Kind.archive, [_][]const u8{ "zip", "tar", "gz", "tgz", "jar", "apk", "cbz", "epub", "7z", "rar" } },
-            .{ Kind.doc, [_][]const u8{ "pdf", "xlsx", "docx", "pptx", "odt", "ods" } },
+        const formats = dec.formats;
+        const ext = dec.extension(name);
+        const plugin = formats.pluginFor(ext) orelse {
+            // Mesh riconosciute per forma ma senza decoder (gltf, ply, fbx…).
+            return if (inList(&formats.shape_mesh, ext)) .mesh else .other;
         };
-        inline for (groups) |grp| {
-            for (grp[1]) |e| if (std.mem.eql(u8, ext, e)) return grp[0];
-        }
+        const eq = std.mem.eql;
+        if (eq(u8, plugin, "image")) return .image;
+        if (eq(u8, plugin, "text") or eq(u8, plugin, "markdown") or eq(u8, plugin, "csv")) return .text;
+        if (eq(u8, plugin, "media")) return if (inList(&formats.shape_video, ext)) .video else .audio;
+        if (eq(u8, plugin, "glb") or eq(u8, plugin, "mesh")) return .mesh;
+        if (eq(u8, plugin, "archive") or eq(u8, plugin, "tar")) return .archive;
+        if (eq(u8, plugin, "pdf") or eq(u8, plugin, "office")) return .doc;
         return .other;
+    }
+
+    fn inList(list: []const []const u8, ext: []const u8) bool {
+        for (list) |e| if (std.ascii.eqlIgnoreCase(e, ext)) return true;
+        return false;
     }
 
     /// Etichetta breve sul badge quando non c'è un'anteprima da mostrare.

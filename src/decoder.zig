@@ -46,6 +46,8 @@ pub const ExtensionsFn = abi.ExtensionsFn;
 pub const ContentPrefixFn = abi.ContentPrefixFn;
 pub const PluginRequest = abi.PluginRequest;
 pub const exportPlugin = abi.exportPlugin;
+pub const LinkedPlugin = abi.LinkedPlugin;
+pub const linkedPlugin = abi.linkedPlugin;
 pub const expectNoLeakOnAllocFailure = abi.expectNoLeakOnAllocFailure;
 /// Quale plugin apre quale estensione: formats.zig.
 pub const formats = @import("formats.zig");
@@ -67,7 +69,8 @@ const host_services: HostServices = .{
 const LoadedPlugin = struct {
     type_name: []const u8,
     extensions: []const []const u8,
-    lib: dynlib.Lib,
+    /// null per un decoder linkato (`useLinkedPlugins`): non c'è nulla da chiudere.
+    lib: ?dynlib.Lib,
     decode_fn: DecodeFn,
     /// Opzionale: prima fase progressiva (texture al tier coarse). Solo i plugin
     /// che la esportano (es. glb) la offrono; gli altri fanno un decode solo.
@@ -77,6 +80,67 @@ const LoadedPlugin = struct {
 };
 
 var plugin_registry: std.ArrayList(LoadedPlugin) = .empty;
+
+/// Decoder linkati nell'eseguibile (`useLinkedPlugins`). Non vuota = niente `dlopen`:
+/// i plugin si cercano solo qui, e un formato il cui decoder non è in tabella non ha
+/// decoder, anche se sul disco ce ne fosse uno.
+var linked_plugins: []const LinkedPlugin = &.{};
+
+/// Usa i decoder linkati in `list` al posto dei plugin su disco. È il caso di Android,
+/// dove l'APK porta una libreria sola. Da chiamare una volta, prima del primo decode
+/// (non prende lock: nessun altro thread decodifica ancora). `list` deve vivere quanto
+/// il processo.
+pub fn useLinkedPlugins(list: []const LinkedPlugin) void {
+    linked_plugins = list;
+}
+
+/// Registra il decoder linkato `name`, se è in tabella. Con `plugin_cache_mutex`.
+fn registerLinkedLocked(name: []const u8, allocator: std.mem.Allocator) void {
+    for (linked_plugins) |*lp| {
+        if (!std.mem.eql(u8, lp.name, name)) continue;
+        const exts = parseExtensions(allocator, lp.extensions) catch return;
+        const type_name = allocator.dupe(u8, name) catch {
+            for (exts) |e| allocator.free(e);
+            allocator.free(exts);
+            return;
+        };
+        plugin_registry.append(allocator, .{
+            .type_name = type_name,
+            .extensions = exts,
+            .lib = null,
+            .decode_fn = lp.decode_fn,
+            .decode_coarse_fn = lp.decode_coarse_fn,
+            .content_prefix = lp.content_prefix,
+        }) catch {
+            allocator.free(type_name);
+            for (exts) |e| allocator.free(e);
+            allocator.free(exts);
+        };
+        return;
+    }
+}
+
+/// `"png,JPG, jpeg"` → `{"png", "jpg", "jpeg"}`, in minuscolo; il chiamante libera
+/// ogni voce e la slice.
+fn parseExtensions(allocator: std.mem.Allocator, list: []const u8) ![]const []const u8 {
+    var exts: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (exts.items) |e| allocator.free(e);
+        exts.deinit(allocator);
+    }
+    var tokens = std.mem.tokenizeScalar(u8, list, ',');
+    while (tokens.next()) |tok| {
+        const trimmed = std.mem.trim(u8, tok, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        const lower = try allocator.dupe(u8, trimmed);
+        for (lower) |*ch| ch.* = std.ascii.toLower(ch.*);
+        exts.append(allocator, lower) catch |err| {
+            allocator.free(lower);
+            return err;
+        };
+    }
+    return exts.toOwnedSlice(allocator);
+}
 var third_party_scanned = false;
 /// Plugin che in questo processo non si sono potuti caricare. Senza questa memoria
 /// ogni decode rifaceva dlopen e dlclose su tre cartelle, sotto il mutex e con una
@@ -147,7 +211,7 @@ fn closePluginCacheLocked(allocator: std.mem.Allocator) void {
         allocator.free(p.type_name);
         for (p.extensions) |e| allocator.free(e);
         allocator.free(p.extensions);
-        p.lib.close();
+        if (p.lib) |*lib| lib.close();
     }
     plugin_registry.deinit(allocator);
     plugin_registry = .empty;
@@ -268,28 +332,15 @@ fn registerPluginFile(dir_path: []const u8, file_name: []const u8, type_name: []
 
     // `zuer_extensions` è opzionale: un plugin senza estensioni dichiarate
     // resta raggiungibile solo come fallback per nome (es. "text").
-    var exts: std.ArrayList([]const u8) = .empty;
-    if (lib.lookup(ExtensionsFn, "zuer_extensions")) |ext_fn| {
-        var tokens = std.mem.tokenizeScalar(u8, ext_fn().toSlice(), ',');
-        while (tokens.next()) |tok| {
-            const trimmed = std.mem.trim(u8, tok, " \t\r\n");
-            if (trimmed.len == 0) continue;
-            const lower = allocator.dupe(u8, trimmed) catch continue;
-            for (lower) |*ch| ch.* = std.ascii.toLower(ch.*);
-            exts.append(allocator, lower) catch allocator.free(lower);
-        }
-    }
-
-    var registered = false;
-    defer if (!registered) {
-        for (exts.items) |e| allocator.free(e);
-        exts.deinit(allocator);
+    const ext_list: []const u8 = if (lib.lookup(ExtensionsFn, "zuer_extensions")) |ext_fn| ext_fn().toSlice() else "";
+    const exts_owned = parseExtensions(allocator, ext_list) catch {
         lib.close();
+        return .out_of_memory;
     };
-
-    const type_name_dup = allocator.dupe(u8, type_name) catch return .out_of_memory;
-    const exts_owned = exts.toOwnedSlice(allocator) catch {
-        allocator.free(type_name_dup);
+    const type_name_dup = allocator.dupe(u8, type_name) catch {
+        for (exts_owned) |e| allocator.free(e);
+        allocator.free(exts_owned);
+        lib.close();
         return .out_of_memory;
     };
     plugin_registry.append(allocator, .{
@@ -303,9 +354,9 @@ fn registerPluginFile(dir_path: []const u8, file_name: []const u8, type_name: []
         allocator.free(type_name_dup);
         for (exts_owned) |e| allocator.free(e);
         allocator.free(exts_owned);
+        lib.close();
         return .out_of_memory;
     };
-    registered = true;
     return .registered;
 }
 
@@ -331,6 +382,8 @@ fn pluginDirsLocked(io: std.Io, allocator: std.mem.Allocator, out: *[3][]u8) [][
 fn ensureThirdPartyLocked(io: std.Io, allocator: std.mem.Allocator) void {
     if (third_party_scanned) return;
     third_party_scanned = true;
+    // Con i decoder linkati non si cerca nulla su disco.
+    if (linked_plugins.len > 0 or !plugin_abi) return;
     var buf: [3][]u8 = undefined;
     const dirs = pluginDirsLocked(io, allocator, &buf);
     defer for (dirs) |d| allocator.free(d);
@@ -342,6 +395,7 @@ fn ensureThirdPartyLocked(io: std.Io, allocator: std.mem.Allocator) void {
 /// questo processo (`failed_plugins`). Con `plugin_cache_mutex` acquisito.
 fn loadPluginByNameLocked(name: []const u8, io: std.Io, allocator: std.mem.Allocator) void {
     if (findPluginByName(name) != null) return;
+    if (linked_plugins.len > 0 or !plugin_abi) return registerLinkedLocked(name, allocator);
     if (pluginGivenUpLocked(name)) return;
     var fname_buf: [160]u8 = undefined;
     const fname = std.fmt.bufPrint(&fname_buf, "{s}{s}{s}", .{ plugin_prefix, name, plugin_suffix }) catch return;
@@ -613,6 +667,9 @@ fn defaultMaxSize(io: std.Io, allocator: std.mem.Allocator) usize {
 }
 
 fn computeDefaultMaxSize(io: std.Io, allocator: std.mem.Allocator) usize {
+    // Un telefono ha poca RAM e un visualizzatore non ha motivo di tenere in heap mezzo
+    // gigabyte: su Android il tetto è fisso (era quello del vecchio dispatch Android).
+    if (comptime builtin.abi == .android) return 64 * 1024 * 1024;
     const fallback: usize = 128 * 1024 * 1024;
     // /proc/meminfo riporta dimensione 0 in stat, quindi un reader posizionale
     // (readFileAlloc) legge zero byte e si finisce sempre nel fallback: serve un
