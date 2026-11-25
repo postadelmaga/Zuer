@@ -285,7 +285,7 @@ fn buildMarkdown(gpa: std.mem.Allocator, w: *pdf_writer.Writer, src: []const u8,
     const page_w = pdf_writer.a4_w;
     const page_h = pdf_writer.a4_h;
     const margin = md_margin_mm * pdf_writer.pt_per_mm;
-    const doc = try md_layout.layout(arena, src, .{ .width = page_w, .body = md_body_pt, .pad_x = margin, .pad_y = 0 }, text_render.md_paper_theme, pm.measurer());
+    const doc = try md_layout.layout(arena, try md_layout.parse(arena, src), .{ .width = page_w, .body = md_body_pt, .pad_x = margin, .pad_y = 0 }, text_render.md_paper_theme, pm.measurer());
     const footer_font = try pm.measurer().fontFn(&pm, .{ .family = .prose, .style = .regular, .size = md_body_pt * 0.85 });
 
     // Pagine: si va a pagina nuova prima della riga che non ci sta; un titolo

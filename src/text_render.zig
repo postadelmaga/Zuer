@@ -10,6 +10,7 @@ const utf8_lossy = @import("utf8_lossy.zig");
 const decoder_mod = @import("decoder.zig");
 const glyph = @import("glyph.zig");
 const md_layout = @import("md_layout.zig");
+const highlight = @import("highlight.zig");
 const zpaint = @import("zicro").paint;
 const Rgb = glyph.Rgb;
 
@@ -204,8 +205,9 @@ pub const TableLayout = struct {
 /// Layout ritenuto per `paintDocViewport`, senza dipingere nulla: righe di testo
 /// per selezione/copia (allocate con `gpa` in `out_lines`, del chiamante) e
 /// metriche della griglia. Le tabelle (csv/workbook) hanno un layout ritenuto
-/// dedicato.
-pub fn layoutDoc(gpa: std.mem.Allocator, cache: *glyph.RasterCache, decoded: *const decoder_mod.Decoded, name: []const u8, opts: RenderOpts, out_lines: *std.ArrayList([]const u8), out_metrics: *Metrics) !DocLayout {
+/// dedicato. Per il markdown, `md_blocks` sono i blocchi già analizzati del suo
+/// sorgente (`MdParsed`); null = si analizza qui.
+pub fn layoutDoc(gpa: std.mem.Allocator, cache: *glyph.RasterCache, decoded: *const decoder_mod.Decoded, name: []const u8, opts: RenderOpts, md_blocks: ?[]const md_layout.Block, out_lines: *std.ArrayList([]const u8), out_metrics: *Metrics) !DocLayout {
     // Tabelle (csv / foglio attivo di un workbook): layout ritenuto dedicato.
     const table_csv: ?decoder_mod.CsvData = switch (decoded.*) {
         .csv => |c| c,
@@ -213,7 +215,7 @@ pub fn layoutDoc(gpa: std.mem.Allocator, cache: *glyph.RasterCache, decoded: *co
         else => null,
     };
     if (table_csv) |c| return layoutTableDoc(gpa, cache, c, opts, out_lines, out_metrics);
-    if (decoded.* == .markdown) return layoutMarkdownDoc(gpa, cache, decoded.markdown.content, opts, out_lines, out_metrics);
+    if (decoded.* == .markdown) return layoutMarkdownDoc(gpa, cache, decoded.markdown.content, md_blocks, opts, out_lines, out_metrics);
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     errdefer arena_state.deinit();
@@ -619,7 +621,7 @@ fn buildRows(arena: std.mem.Allocator, rows: *std.ArrayList(Row), raster: *glyph
     switch (decoded.*) {
         .text => |t| {
             const rich = t.len <= max_rich_bytes and isCodeLike(name);
-            const lang: ?Lang = if (rich) langFor(extOf(name)) else null;
+            const lang: ?highlight.Lang = if (rich) highlight.langForExt(extOf(name)) else null;
             return try layoutCode(arena, rows, raster, t, opts, rich, lang);
         },
         .csv => |c| {
@@ -1124,7 +1126,7 @@ fn totalColumns(raster: *const glyph.Raster, opts: RenderOpts) usize {
 /// aggiunge i numeri di riga (allineati a destra, senza righello — come viewer);
 /// con `lang` non nullo evidenzia keyword/stringhe/commenti. Il testo va a capo
 /// per colonne, con rientro allineato al gutter sulle continuazioni.
-fn layoutCode(arena: std.mem.Allocator, rows: *std.ArrayList(Row), raster: *glyph.Raster, text: []const u8, opts: RenderOpts, gutter: bool, lang: ?Lang) !usize {
+fn layoutCode(arena: std.mem.Allocator, rows: *std.ArrayList(Row), raster: *glyph.Raster, text: []const u8, opts: RenderOpts, gutter: bool, lang: ?highlight.Lang) !usize {
     const total_cols = totalColumns(raster, opts);
 
     var total_lines: usize = 1;
@@ -1199,69 +1201,16 @@ fn blankGutter(arena: std.mem.Allocator, cols: usize) ![]u8 {
     return buf;
 }
 
-/// Evidenziazione leggera di un segmento in run colorati: commenti di riga,
-/// stringhe tra apici e keyword. Il resto è testo neutro. I run puntano dentro
-/// `chunk` (memoria dell'arena, viva fino alla composizione).
-fn tokenize(arena: std.mem.Allocator, runs: *std.ArrayList(Run), chunk: []const u8, lang: Lang) !void {
-    var i: usize = 0;
-    var plain_start: usize = 0;
-
-    while (i < chunk.len) {
-        // Commento di riga: colora fino a fine segmento.
-        var is_comment = false;
-        for (lang.line_comments) |prefix| {
-            if (std.mem.startsWith(u8, chunk[i..], prefix)) {
-                is_comment = true;
-                break;
-            }
-        }
-        if (is_comment) {
-            try flushPlain(arena, runs, chunk, plain_start, i);
-            try runs.append(arena, .{ .text = chunk[i..], .color = c_comment });
-            return;
-        }
-
-        const c = chunk[i];
-
-        // Stringhe tra apici (best effort, senza multilinea).
-        if (c == '"' or c == '\'' or c == '`') {
-            try flushPlain(arena, runs, chunk, plain_start, i);
-            var end = i + 1;
-            while (end < chunk.len) : (end += 1) {
-                if (chunk[end] == '\\') {
-                    end += 1;
-                    continue;
-                }
-                if (chunk[end] == c) break;
-            }
-            const stop = @min(end + 1, chunk.len);
-            try runs.append(arena, .{ .text = chunk[i..stop], .color = c_string });
-            i = stop;
-            plain_start = i;
-            continue;
-        }
-
-        // Identificatori: keyword colorate (grassetto), il resto resta neutro.
-        if (std.ascii.isAlphabetic(c) or c == '_') {
-            var end = i + 1;
-            while (end < chunk.len and (std.ascii.isAlphanumeric(chunk[end]) or chunk[end] == '_')) end += 1;
-            const word = chunk[i..end];
-            if (lang.keywords.get(word) != null) {
-                try flushPlain(arena, runs, chunk, plain_start, i);
-                try runs.append(arena, .{ .text = word, .color = c_keyword, .style = .bold });
-                plain_start = end;
-            }
-            i = end;
-            continue;
-        }
-
-        i += 1;
-    }
-    try flushPlain(arena, runs, chunk, plain_start, chunk.len);
-}
-
-fn flushPlain(arena: std.mem.Allocator, runs: *std.ArrayList(Run), chunk: []const u8, from: usize, to: usize) !void {
-    if (to > from) try runs.append(arena, .{ .text = chunk[from..to], .color = fg });
+/// Evidenziazione di un pezzo di riga (`highlight`) tradotta nei colori a schermo:
+/// parole chiave in grassetto. I run puntano dentro `chunk`.
+fn tokenize(arena: std.mem.Allocator, runs: *std.ArrayList(Run), chunk: []const u8, lang: highlight.Lang) !void {
+    var it = highlight.iterate(chunk, lang);
+    while (it.next()) |x| try runs.append(arena, switch (x.role) {
+        .plain => .{ .text = x.text, .color = fg },
+        .keyword => .{ .text = x.text, .color = c_keyword, .style = .bold },
+        .string => .{ .text = x.text, .color = c_string },
+        .comment => .{ .text = x.text, .color = c_comment },
+    });
 }
 
 // --- Markdown: header, grassetto, corsivo, codice, liste ---------------------
@@ -1441,61 +1390,6 @@ fn sliceByColumns(line: []const u8, start: usize, cols: usize) usize {
         count += 1;
     }
     return i;
-}
-
-const Lang = struct {
-    line_comments: []const []const u8,
-    /// Insieme di keyword: mappa statica perfetta costruita a comptime — il
-    /// vecchio confronto lineare su ~40 voci girava per OGNI identificatore del
-    /// documento durante l'impaginazione.
-    keywords: std.StaticStringMap(void),
-};
-
-/// Costruisce a comptime l'insieme di keyword da un elenco di stringhe.
-fn kwSet(comptime words: []const []const u8) std.StaticStringMap(void) {
-    comptime var kvs: [words.len]struct { []const u8 } = undefined;
-    inline for (words, 0..) |w, i| kvs[i] = .{w};
-    return std.StaticStringMap(void).initComptime(kvs);
-}
-
-const kw_zig = kwSet(&[_][]const u8{ "fn", "pub", "const", "var", "if", "else", "while", "for", "return", "try", "catch", "defer", "errdefer", "struct", "enum", "union", "switch", "break", "continue", "orelse", "and", "or", "comptime", "test", "export", "extern", "inline", "null", "undefined", "true", "false", "error", "anyerror", "unreachable", "usingnamespace" });
-const kw_rust = kwSet(&[_][]const u8{ "fn", "pub", "let", "mut", "const", "if", "else", "while", "for", "loop", "return", "match", "struct", "enum", "impl", "trait", "use", "mod", "crate", "self", "super", "where", "async", "await", "move", "ref", "dyn", "true", "false", "in", "as", "break", "continue", "static", "type", "unsafe", "extern" });
-const kw_c = kwSet(&[_][]const u8{ "if", "else", "while", "for", "return", "struct", "enum", "union", "typedef", "static", "const", "void", "int", "char", "long", "short", "unsigned", "signed", "float", "double", "sizeof", "switch", "case", "break", "continue", "default", "do", "goto", "extern", "inline", "volatile", "class", "public", "private", "protected", "template", "typename", "namespace", "using", "new", "delete", "virtual", "override", "nullptr", "true", "false", "auto", "this", "bool" });
-const kw_py = kwSet(&[_][]const u8{ "def", "class", "if", "elif", "else", "while", "for", "return", "import", "from", "as", "with", "try", "except", "finally", "raise", "pass", "break", "continue", "lambda", "global", "nonlocal", "yield", "async", "await", "in", "is", "not", "and", "or", "None", "True", "False", "del", "assert", "match", "case" });
-const kw_js = kwSet(&[_][]const u8{ "function", "const", "let", "var", "if", "else", "while", "for", "return", "class", "extends", "import", "from", "export", "default", "new", "this", "typeof", "instanceof", "try", "catch", "finally", "throw", "async", "await", "yield", "switch", "case", "break", "continue", "delete", "in", "of", "null", "undefined", "true", "false", "interface", "type", "enum", "implements", "readonly", "static" });
-const kw_go = kwSet(&[_][]const u8{ "func", "package", "import", "var", "const", "if", "else", "for", "range", "return", "struct", "interface", "map", "chan", "go", "defer", "select", "switch", "case", "break", "continue", "type", "nil", "true", "false", "fallthrough", "goto" });
-const kw_sh = kwSet(&[_][]const u8{ "if", "then", "else", "elif", "fi", "for", "while", "do", "done", "case", "esac", "function", "local", "return", "echo", "export", "in", "read", "exit", "set" });
-const kw_lua = kwSet(&[_][]const u8{ "function", "local", "if", "then", "else", "elseif", "end", "while", "for", "do", "return", "nil", "true", "false", "and", "or", "not", "repeat", "until", "break", "in" });
-const kw_sql = kwSet(&[_][]const u8{ "select", "from", "where", "insert", "update", "delete", "join", "left", "right", "inner", "outer", "group", "by", "order", "having", "limit", "create", "table", "drop", "alter", "index", "as", "and", "or", "not", "null", "into", "values", "set", "on", "distinct", "union" });
-const kw_none = kwSet(&[_][]const u8{});
-
-const slash_comment = [_][]const u8{"//"};
-const hash_comment = [_][]const u8{"#"};
-const dash_comment = [_][]const u8{"--"};
-const semi_comment = [_][]const u8{";"};
-const no_comment = [_][]const u8{};
-
-fn langFor(ext: []const u8) Lang {
-    const Case = struct { exts: []const []const u8, lang: Lang };
-    const table = [_]Case{
-        .{ .exts = &.{"zig"}, .lang = .{ .line_comments = &slash_comment, .keywords = kw_zig } },
-        .{ .exts = &.{"rs"}, .lang = .{ .line_comments = &slash_comment, .keywords = kw_rust } },
-        .{ .exts = &.{ "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "java", "cs", "kt", "kts", "swift", "scala", "dart", "proto" }, .lang = .{ .line_comments = &slash_comment, .keywords = kw_c } },
-        .{ .exts = &.{ "py", "pyi", "rb", "toml", "yaml", "yml", "cfg", "conf", "properties", "gitignore", "gitattributes", "editorconfig", "dockerfile", "mk", "make", "cmake", "r", "jl", "nim", "ex", "exs" }, .lang = .{ .line_comments = &hash_comment, .keywords = kw_py } },
-        .{ .exts = &.{ "js", "mjs", "cjs", "jsx", "ts", "tsx", "php" }, .lang = .{ .line_comments = &slash_comment, .keywords = kw_js } },
-        .{ .exts = &.{"go"}, .lang = .{ .line_comments = &slash_comment, .keywords = kw_go } },
-        .{ .exts = &.{ "sh", "bash", "zsh", "fish", "ps1", "env" }, .lang = .{ .line_comments = &hash_comment, .keywords = kw_sh } },
-        .{ .exts = &.{ "lua", "hs" }, .lang = .{ .line_comments = &dash_comment, .keywords = kw_lua } },
-        .{ .exts = &.{"sql"}, .lang = .{ .line_comments = &dash_comment, .keywords = kw_sql } },
-        .{ .exts = &.{ "ini", "asm", "s" }, .lang = .{ .line_comments = &semi_comment, .keywords = kw_none } },
-    };
-    for (table) |case| {
-        for (case.exts) |e| {
-            if (std.ascii.eqlIgnoreCase(ext, e)) return case.lang;
-        }
-    }
-    // Testo generico: niente keyword, niente commenti — restano gutter e wrap.
-    return .{ .line_comments = &no_comment, .keywords = kw_none };
 }
 
 fn extOf(name: []const u8) []const u8 {
@@ -1753,37 +1647,6 @@ pub const PrintDoc = struct {
 
 // --- Evidenziazione per i blocchi di codice del markdown --------------------
 
-/// Ruolo sintattico di un tratto di codice: il colore lo sceglie chi disegna.
-pub const CodeRole = enum { plain, keyword, string, comment };
-
-pub const CodeSpan = struct { text: []const u8, role: CodeRole };
-
-/// Tratti evidenziati di una riga di codice nel linguaggio `lang` (il nome dopo
-/// le ``` del markdown: `zig`, `rust`, `python`… o un'estensione). Stessa
-/// evidenziazione leggera dei file di codice. I testi puntano in `line`.
-pub fn codeSpans(arena: std.mem.Allocator, line: []const u8, lang: []const u8) ![]const CodeSpan {
-    const aliases = [_][2][]const u8{
-        .{ "rust", "rs" },   .{ "python", "py" },  .{ "javascript", "js" }, .{ "typescript", "ts" },
-        .{ "shell", "sh" },  .{ "console", "sh" }, .{ "c++", "cpp" },       .{ "csharp", "cs" },
-        .{ "kotlin", "kt" }, .{ "ruby", "rb" },    .{ "golang", "go" },     .{ "haskell", "hs" },
-        .{ "elixir", "ex" }, .{ "julia", "jl" },   .{ "make", "mk" },       .{ "makefile", "mk" },
-    };
-    var ext = lang;
-    for (aliases) |a| if (std.ascii.eqlIgnoreCase(lang, a[0])) {
-        ext = a[1];
-    };
-    var runs: std.ArrayList(Run) = .empty;
-    if (lang.len == 0) {
-        if (line.len > 0) try runs.append(arena, .{ .text = line, .color = fg });
-    } else try tokenize(arena, &runs, line, langFor(ext));
-    const out = try arena.alloc(CodeSpan, runs.items.len);
-    for (runs.items, out) |r, *o| {
-        const role: CodeRole = if (std.meta.eql(r.color, c_keyword)) .keyword else if (std.meta.eql(r.color, c_string)) .string else if (std.meta.eql(r.color, c_comment)) .comment else .plain;
-        o.* = .{ .text = r.text, .role = role };
-    }
-    return out;
-}
-
 // --- Markdown impaginato (md_layout) a schermo -------------------------------
 
 /// Colori del markdown sul vetro scuro: stessa palette del resto del viewer.
@@ -1897,13 +1760,14 @@ const ScreenMeasurer = struct {
 /// Corpo del testo del markdown a zoom 1, in pixel per em.
 const md_body_px_1x: f32 = 16.5;
 
-fn layoutMarkdownDoc(gpa: std.mem.Allocator, cache: *glyph.RasterCache, src: []const u8, opts: RenderOpts, out_lines: *std.ArrayList([]const u8), out_metrics: *Metrics) !DocLayout {
+fn layoutMarkdownDoc(gpa: std.mem.Allocator, cache: *glyph.RasterCache, src: []const u8, md_blocks: ?[]const md_layout.Block, opts: RenderOpts, out_lines: *std.ArrayList([]const u8), out_metrics: *Metrics) !DocLayout {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     errdefer arena_state.deinit();
     const arena = arena_state.allocator();
     var sm: ScreenMeasurer = .{ .gpa = gpa, .arena = arena, .cache = cache };
     const b = md_body_px_1x * @as(f32, @floatFromInt(opts.pointsize)) / 15.0;
-    const doc = try md_layout.layout(arena, src, .{
+    const blocks = md_blocks orelse try md_layout.parse(arena, src);
+    const doc = try md_layout.layout(arena, blocks, .{
         .width = @floatFromInt(opts.width),
         .body = b,
         .pad_x = @round(b * 1.3),
@@ -1927,6 +1791,38 @@ fn layoutMarkdownDoc(gpa: std.mem.Allocator, cache: *glyph.RasterCache, src: []c
         .md = .{ .doc = doc, .rasters = sm.rasters.items },
     };
 }
+
+/// I blocchi analizzati del markdown aperto, tenuti fra un'impaginazione e l'altra:
+/// zoom e ridimensionamenti rifanno il layout, non l'analisi (su 890 KB di
+/// markdown, in ReleaseFast, 20 ms su 120 di analisi più layout). La chiave è il `load_seq`
+/// della GUI più il sorgente: ogni sostituzione del contenuto cambia `load_seq`, e
+/// i blocchi (che puntano dentro il sorgente) non si toccano più. Confinata al
+/// render worker, come la `RasterCache`.
+pub const MdParsed = struct {
+    arena: ?std.heap.ArenaAllocator = null,
+    blocks: []const md_layout.Block = &.{},
+    seq: u32 = 0,
+    src_ptr: usize = 0,
+    src_len: usize = 0,
+
+    /// I blocchi di `src` per il contenuto `seq`: quelli tenuti se sono suoi,
+    /// altrimenti analizzati ora (e tenuti al posto dei vecchi).
+    pub fn get(self: *MdParsed, gpa: std.mem.Allocator, seq: u32, src: []const u8) ![]const md_layout.Block {
+        if (self.arena != null and self.seq == seq and self.src_ptr == @intFromPtr(src.ptr) and self.src_len == src.len)
+            return self.blocks;
+        self.deinit();
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena_state.deinit();
+        const blocks = try md_layout.parse(arena_state.allocator(), src);
+        self.* = .{ .arena = arena_state, .blocks = blocks, .seq = seq, .src_ptr = @intFromPtr(src.ptr), .src_len = src.len };
+        return blocks;
+    }
+
+    pub fn deinit(self: *MdParsed) void {
+        if (self.arena) |*a| a.deinit();
+        self.* = .{};
+    }
+};
 
 /// Prima riga (indice) che finisce sotto la quota `y`.
 fn mdFirstLine(doc: *const md_layout.Doc, y: f32) usize {

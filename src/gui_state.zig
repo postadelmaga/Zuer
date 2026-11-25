@@ -274,6 +274,10 @@ pub const GuiAppState = struct {
     /// così i layout ritenuti possono tenerne il puntatore senza possederlo.
     /// Da liberare a fine vita con `raster_cache.deinit(gpa)`.
     raster_cache: text_render.RasterCache = .{},
+    /// Blocchi analizzati del markdown aperto (`text_render.MdParsed`): lo zoom
+    /// rifà il layout, non l'analisi. CONFINATI AL RENDER WORKER come la cache qui
+    /// sopra. Da liberare a fine vita con `md_parsed.deinit()`.
+    md_parsed: text_render.MdParsed = .{},
 
     // Finestra zrame, impostata dopo la sua creazione — dal main, PRIMA di
     // `win.run()` (quindi prima che partano callback e worker); da lì in poi

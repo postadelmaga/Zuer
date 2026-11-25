@@ -1,4 +1,4 @@
-//! Impaginazione del markdown (`md_parse`): righe di testo posizionate e
+//! Impaginazione del markdown già analizzato (`md_parse`): righe di testo posizionate e
 //! rettangoli (sfondi del codice, barre delle citazioni, bordi delle tabelle,
 //! righe orizzontali), in unità del chiamante — pixel a schermo, punti in
 //! stampa. Non disegna nulla: le misure dei glifi vengono da un `Measurer`, i
@@ -7,12 +7,15 @@
 //!
 //! Ogni riga ha anche il suo testo semplice e la posizione di ogni carattere:
 //! servono alla selezione, alla copia e alla ricerca nel PDF.
+//!
+//! Riceve i blocchi, non il sorgente: chi impagina più volte lo stesso documento (lo
+//! schermo, a ogni zoom e a ogni ridimensionamento) lo analizza una volta sola.
 
 const std = @import("std");
 const glyph = @import("glyph.zig");
 const md = @import("md_parse.zig");
 const utf8_lossy = @import("utf8_lossy.zig");
-const text_render = @import("text_render.zig");
+const highlight = @import("highlight.zig");
 const Rgb = glyph.Rgb;
 
 pub const Family = enum(u1) { prose, mono };
@@ -122,9 +125,15 @@ pub const Options = struct {
     max_text_width: f32 = 0,
 };
 
-/// Impagina `src`. Tutta la memoria (righe, testi, rettangoli) è dell'arena.
-pub fn layout(arena: std.mem.Allocator, src: []const u8, opts: Options, theme: Theme, m: Measurer) !Doc {
-    const blocks = try md.parse(arena, src);
+/// I blocchi di un documento: `parse(arena, sorgente)`. Puntano dentro il sorgente,
+/// che deve restare vivo quanto loro.
+pub const Block = md.Block;
+pub const parse = md.parse;
+
+/// Impagina i blocchi di un documento (`parse`). Tutta la memoria (righe, testi,
+/// rettangoli) è dell'arena, testi compresi: il risultato non punta né ai blocchi né
+/// al sorgente, che dopo si possono liberare.
+pub fn layout(arena: std.mem.Allocator, blocks: []const Block, opts: Options, theme: Theme, m: Measurer) !Doc {
     var l: Layouter = .{ .arena = arena, .m = m, .t = theme, .b = opts.body, .fonts = .empty };
     var text_w = opts.width - 2 * opts.pad_x;
     if (text_w < 8 * opts.body) text_w = 8 * opts.body;
@@ -584,9 +593,10 @@ const Layouter = struct {
         const first_index = l.lines.items.len;
         try l.boxes.append(l.arena, .{ .x = x0, .y = top, .w = w, .h = 0, .color = l.t.code_bg, .radius = l.b * 0.35 });
 
+        const hl_lang = highlight.langForFence(lang);
         var lines_it = std.mem.splitScalar(u8, src, '\n');
         while (lines_it.next()) |src_line| {
-            const spans = try text_render.codeSpans(l.arena, src_line, lang);
+            var spans = highlight.iterate(src_line, hl_lang);
             // A capo per colonne: tutti i glifi Hack hanno la stessa larghezza.
             var runs: std.ArrayList(Run) = .empty;
             var text: std.ArrayList(u8) = .empty;
@@ -597,7 +607,7 @@ const Layouter = struct {
                     return y + (h - (v.ascent - v.descent)) / 2 + v.ascent;
                 }
             }.calc;
-            for (spans) |sp| {
+            while (spans.next()) |sp| {
                 const color = switch (sp.role) {
                     .plain => l.t.code,
                     .keyword => l.t.keyword,
@@ -830,9 +840,16 @@ const FakeMeasurer = struct {
     }
 };
 
+/// Colori qualsiasi, purché distinti: i test guardano le posizioni, non le tinte.
+const test_theme: Theme = blk: {
+    var t: Theme = undefined;
+    for (@typeInfo(Theme).@"struct".field_names, 0..) |name, i| @field(t, name) = .{ .r = @intCast(i * 9), .g = 0, .b = 0 };
+    break :blk t;
+};
+
 fn testLayout(arena: std.mem.Allocator, src: []const u8, width: f32) !Doc {
     var fm: FakeMeasurer = .{ .gpa = arena };
-    return layout(arena, src, .{ .width = width, .body = 16, .pad_x = 21, .pad_y = 14, .max_text_width = 16 * 48 }, text_render.md_screen_theme, fm.measurer());
+    return layout(arena, try parse(arena, src), .{ .width = width, .body = 16, .pad_x = 21, .pad_y = 14, .max_text_width = 16 * 48 }, test_theme, fm.measurer());
 }
 
 test "layout: testo che sta nella pagina, niente larghezza in più" {

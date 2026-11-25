@@ -11,6 +11,7 @@ const gpu = @import("gpu_renderer.zig");
 const decoder_mod = @import("decoder.zig");
 const scheduler = @import("scheduler.zig");
 const text_render = @import("text_render.zig");
+const md_layout = @import("md_layout.zig");
 // The native video player (libav container/decoding + overlay controls) lives in its own
 // module, imported as `videomod` (the local name `vid` is taken by a VideoState pointer in
 // the input handler). It owns the conditional libav import; gui.zig calls into it only
@@ -119,7 +120,13 @@ fn rasterizeText(state: *GuiAppState, width: u32, text_zoom: f32) void {
     // passano dal layout ritenuto: niente bitmap del documento — la pittura
     // avviene per viewport a ogni compose. static_w/h restano le dimensioni
     // LOGICHE (scrollbar/selezione/hit-test), static_rgba resta vuoto.
-    if (text_render.layoutDoc(state.gpa, &state.raster_cache, &dec, name, opts, &lines, &metrics)) |doc| {
+    // Markdown: i blocchi analizzati restano fra uno zoom e l'altro (vedi `MdParsed`).
+    // Se l'analisi fallisce (memoria) li rifà `layoutDoc`, e il prossimo giro riprova.
+    const md_blocks: ?[]const md_layout.Block = if (dec == .markdown)
+        state.md_parsed.get(state.gpa, seq0, dec.markdown.content) catch null
+    else
+        null;
+    if (text_render.layoutDoc(state.gpa, &state.raster_cache, &dec, name, opts, md_blocks, &lines, &metrics)) |doc| {
         new_doc = doc;
     } else |err| {
         std.debug.print("Impossibile impaginare il testo: {s}\n", .{@errorName(err)});
@@ -824,6 +831,9 @@ fn renderWorker(
             }
         }
 
+        // I blocchi del markdown (`MdParsed`) servono finché il markdown è sullo
+        // schermo: lasciato per un'immagine o un video, si liberano subito.
+        if (state.shared.decoded != .markdown) state.md_parsed.deinit();
         if (state.shared.is_text) {
             // (Ri)compone il testo quando cambiano larghezza finestra, zoom o
             // file: un solo tentativo per cambio di parametri (evita di ripetere
@@ -1464,6 +1474,7 @@ pub fn main(init: std.process.Init) !void {
     // Registrata PRIMA di freeTextDoc (LIFO): i layout prendono in prestito i
     // Raster dalla cache, che va liberata dopo di loro.
     defer gui_state.raster_cache.deinit(gpa);
+    defer gui_state.md_parsed.deinit();
     defer gui_state_mod.freeTextDoc(&gui_state);
     defer if (has_video) gui_state.video.deinit();
     defer yt_search.deinit(&gui_state);
