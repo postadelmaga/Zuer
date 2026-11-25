@@ -1232,16 +1232,24 @@ fn setEnvVar(name: [*:0]const u8, value: [*:0]const u8) void {
 /// invece della morte per segnale con exit 143.
 var term_window: std.atomic.Value(?*zrame.Window) = .init(null);
 
-fn onTermSignal(_: std.posix.SIG) callconv(.c) void {
+fn onTermSignal(sig: std.posix.SIG) callconv(.c) void {
     // I processi esterni in corso (pdftoppm, magick, yt-dlp…) stanno in gruppi
     // loro e il segnale del terminale non li raggiunge: li si termina qui.
     // Letture atomiche e `kill`: async-signal-safe.
     decoder_mod.proc.killAll();
     // `requestClose` = un flag e una `write` su eventfd: async-signal-safe.
-    if (term_window.load(.acquire)) |w| w.requestClose();
+    if (term_window.load(.acquire)) |w| return w.requestClose();
+    // Finestra non ancora creata (il primo decode parte prima): il segnale fa il
+    // suo corso. `RESETHAND` ha già rimesso il default, quindi `raise` termina.
+    const c = struct {
+        extern "c" fn raise(sig: c_int) c_int;
+    };
+    _ = c.raise(@intCast(@backingInt(sig)));
 }
 
-fn installTermHandlers(win: *zrame.Window) void {
+/// Con `null` (all'avvio, prima del primo decode) il segnale termina i processi
+/// esterni e poi il processo; con la finestra, la chiude come farebbe Esc.
+fn installTermHandlers(win: ?*zrame.Window) void {
     if (comptime builtin.os.tag == .windows) return;
     term_window.store(win, .release);
     const act: std.posix.Sigaction = .{
@@ -1298,6 +1306,7 @@ pub fn main(init: std.process.Init) !void {
     // cache): partono pigri al primo task. Il deinit gira PRIMA della chiusura
     // dei plugin (defer in ordine inverso), così nessun worker esegue codice
     // di un .so già chiuso. In pratica l'uscita è `process.exit(0)`.
+    installTermHandlers(null);
     scheduler.initGlobal(io, .{});
     defer decoder_mod.closePluginCache(gpa);
     defer scheduler.deinitGlobal();

@@ -24,7 +24,7 @@ invece di rincorrere i sintomi:
 | 2 | [Navigazione, apertura e GUI](https://github.com/postadelmaga/Zuer/milestone/3) + riferimento a documento (A2) + punto unico di installazione (A3) | #37–#50 | **issue fatte** il 25 novembre 2026; restano A2 e A3 (sotto): i frammenti non passano ancora da un solo parser, lo stato non ha ancora un solo commit |
 | 3 | [Media e YouTube](https://github.com/postadelmaga/Zuer/milestone/4) | #51–#57 | **issue fatte** il 25 novembre 2026: `scripts/video-check.sh` copre seek a fine file e TS con partenza ≠ 0, `scripts/net-check.sh` lo stream che cade |
 | 4 | [Cache, plugin e piattaforme](https://github.com/postadelmaga/Zuer/milestone/5) | #58–#64 | **issue fatte** il 25 novembre 2026; le voci d'archivio su Windows sono provate sotto wine, Android resta da provare su un dispositivo (sotto) |
-| 5 | Riordino (fase B) | da aprire | vedi sotto |
+| 5 | Riordino (fase B) | — | **nove punti su quattordici fatti** il 25 novembre 2026; i cinque rimasti sono issue (sotto) |
 | 6 | Già in programma prima della revisione | #5, #13, #14, #16, #17, #20–#25 | — |
 
 I passi 1–4 non dipendono l'uno dall'altro: l'ordine è per rischio (prima ciò che fa
@@ -203,6 +203,112 @@ Cosa resta, e non è in nessuna issue aperta:
 - **Android, `pdfPage`**: se il PDF è cifrato il descrittore del file resta aperto
   finché non passa il garbage collector (c'era già).
 
+## Passo 5 — Riordino (fase B)
+
+**Nove punti su quattordici fatti il 25 novembre 2026**, un commit per tema. È
+riordino: il comportamento non cambia, salvo le due correzioni segnate sotto. Windows
+è compilato e, dove dice «wine», provato sotto wine; macOS e Android solo compilati.
+
+| Punto | Cosa c'è ora | Prova |
+|---|---|---|
+| Pulizia | via `decoder-wip.patch`, `vt_tiles_x/y`, `MpvVideo.hasAudio`, il globale `app_state` di Android; l'undo della TUI, che nessuna azione usa, non tiene più cento copie dello stato | build per le quattro piattaforme |
+| Tabella unica delle estensioni | `src/formats.zig`: da lì le estensioni dichiarate dai plugin, il manifest dell'host, gli archivi di cui si apre una voce, e accanto le liste con cui la GUI sceglie la forma della finestra | confronto automatico col manifest di prima: uguale per tutti i plugin; un test lega le forme di finestra alla tabella, con le eccezioni dichiarate (`gltf`, `xls`, il doppio senso di `.ts`…) |
+| Colla dei plugin | `decoder.exportPlugin(@This())`: ogni decoder dichiara `plugin_name` e `pluginDecode` e perde la trentina di righe che ripeteva | simboli esportati da ogni `.so` uguali a quelli del binario installato (più `zuer_set_host`, ora di tutti: vedi sotto); uscita di `zuer --json` identica byte per byte su 33 file fra prima e dopo; `office-check`, `edge-check`, `image-check`, `pdf-check`, `ffmpeg-check` (53 prove) verdi |
+| `decoder.zig` diviso | i tipi del contratto in `src/decoder_abi.zig`, riesportati; i due `cache_evict.zig` gemelli sono uno | 3 test dei convertitori, ora fra le radici di `zig build test` |
+| Cache su disco | `src/diskcache.zig`: cartella per sistema, backend di file senza `std.Io`, scrittura atomica con pulizia (`AtomicWriter`), tetto LRU. Lo usano mesh, texture, pagine PDF, tile e miniature | file di cache **identici byte per byte** a quelli scritti dal binario di prima (mesh, texture, PDF); disco pieno simulato: nessun temporaneo lasciato; test nuovi su scrittura atomica (anche sotto wine), tetto LRU, sweep, formato VTC troncato |
+| Processi esterni | `src/proc.zig`: cattura, lancio staccato e — prima era una terza implementazione in `clipboard.zig` — scrittura sullo stdin (`runFeed`) | 7 test nuovi: cattura e codice d'uscita, scadenza con nipoti, annullamento, `killAll`, stdin su `/dev/null`, `runFeed` oltre la capacità di una pipe e con uno strumento che non legge |
+| CI | `.github/workflows/ci.yml`: a ogni push su `main` e pull request, formattazione, `zig build test`, build, `edge-check.sh` | in locale su una copia pulita dei due repository con Zicro al commit di `.github/zicro.ref`: 257 test e `edge-check` passano |
+| Documentazione | `architettura.md`: sezioni Moduli, Plugin e formati (con la tabella delle cache), Media | — |
+| Test dei percorsi d'errore | `decoder.expectNoLeakOnAllocFailure` fa fallire a turno ogni allocazione di un decode; applicato a csv, testo, markdown, mesh | nessuna perdita trovata; togliendo un `deinit` il test fallisce e dice quale allocazione |
+
+Trovato strada facendo, e corretto:
+
+- **alla scadenza restavano vivi i figli del processo lanciato.** Il gruppo di
+  processi proprio lo aveva solo chi passava un flag d'annullamento (yt-dlp); per
+  tutti gli altri — `magick` che delega a `gs`, per dire — scadenza e tetto
+  sull'output uccidevano il solo figlio diretto. Ora il gruppo c'è sempre. L'ha
+  trovato il test nuovo: fallisce col codice di prima, passa con questo;
+- **`fcntl` dichiarata a tre argomenti fissi** in `runCapture`: su macOS arm64 gli
+  argomenti variabili passano dallo stack, e il `FD_CLOEXEC` sulla pipe non arrivava
+  (un figlio lanciato in parallelo poteva ereditarla e tenere appesa la lettura). Ora
+  è variadica, come già in `clipboard.zig`. **Solo compilato**: non c'è un Mac arm64
+  su cui provarlo;
+- **i test spostati non giravano più**: in Zig i test di un file importato girano
+  solo se lo si nomina fra le radici. `decoder_abi.zig`, `formats.zig`,
+  `diskcache.zig`, `proc.zig`, `vtcache.zig` sono radici di `zig build test`.
+
+Trovato dalla revisione indipendente, e corretto prima del push:
+
+- **col gruppo proprio i figli non sentivano più Ctrl+C né la chiusura del
+  terminale**, e restavano orfani. Ora chi li lancia annota il gruppo in un registro
+  e l'host li termina quando esce o riceve TERM, INT o HUP (`proc.killAll`). I plugin
+  hanno ciascuno la propria copia di `proc.zig`: annotano nel registro dell'host
+  tramite due campi nuovi di `HostServices`, agganciati dalla colla in
+  `zuer_set_host`. Provato con `pdfinfo` e `pdftoppm` finti che restano appesi:
+
+  | | binario di prima | ora |
+  |---|---|---|
+  | `zuer --json`, segnale al solo processo | 2 vivi | nessuno |
+  | `zuer --json`, segnale al gruppo (Ctrl+C) | 1 vivo | nessuno |
+  | `zuer-gui`, SIGTERM durante il primo decode | 2 vivi | nessuno |
+  | `zuer-gui`, SIGTERM a finestra aperta | 2 vivi | nessuno |
+
+  Le ultime due righe dicono che la GUI li lasciava vivi **anche prima** del riordino:
+  usciva pulita, ma senza occuparsi di loro;
+- **uno strumento che apre il terminale** (una richiesta di password) da un gruppo
+  in background veniva fermato e si aspettava tutta la scadenza. Ora il figlio ha
+  stdin su `/dev/null` e, su Linux, una sessione propria: senza terminale fallisce
+  subito (58 ms invece di 60 s);
+- **la CI sarebbe fallita alla build** su un runner pulito: mancavano le librerie di
+  FFmpeg e mpv, e `compute_vp9` non è un pacchetto di Ubuntu. La prova in locale non
+  l'aveva visto perché qui sono installate. Ora stesse dipendenze e stesso
+  `-Dcvp9=false` del job `.deb` di `release.yml`;
+- **`cacheDir` creava anche una `HOME` inesistente** per mesh, texture e PDF, che
+  prima in quel caso restavano spente. Ora si creano solo le cartelle sotto la base;
+- **`open()` nelle cache**: dichiarata a tre argomenti fissi e con i valori di
+  `O_CREAT`/`O_TRUNC` di Linux anche su macOS, dove significano altro (il file delle
+  tile si creava senza troncarlo, e su arm64 con permessi a caso). C'era da prima,
+  in `vtcache.zig`. **Solo compilato**;
+- alcune frasi della documentazione nuova non erano vere («unico posto da cui si
+  lanciano processi», «mai una shell»): riscritte.
+
+Rimasti fuori, e perché (ognuno ha la sua issue):
+
+- **`renderWorker`** e **motore media** (`Engine`): dipendono da scelte ancora da fare
+  (#16 e #13 per il primo) e toccano il percorso Vulkan e la riproduzione, che nella
+  sessione di prova senza GPU e senza audio non si possono verificare;
+- **Android** dentro `decoder.decode`: cambia quali file il telefono apre, e non c'è
+  un dispositivo su cui provarlo. `android_decode.zig` e `android_ui.zig` hanno ancora
+  le loro liste di estensioni;
+- **Markdown** (blocchi già analizzati a `md_layout`, evidenziatore in un file suo):
+  l'evidenziatore oggi produce colori e `codeSpans` li ritraduce in ruoli; va
+  rovesciato, ed è un cambio alla resa di tutti i file di codice;
+- **Testo, tre motori**: quello a bitmap intera serve solo a `raster-debug`, ma
+  condivide l'impaginazione col testo GPU, che senza GPU non si verifica;
+- **la colla non possiede `content`**: ogni plugin continua a liberarlo o a cederlo
+  al risultato (testo e CSV lo tengono senza copiarlo). Il contratto è scritto in un
+  posto solo (`decoder.PluginRequest`); la validazione UTF-8 resta nell'host, al
+  confine (`ensureValidText`), che è l'unico punto che vede anche i plugin di terzi.
+
+Cosa resta, e non è in nessuna issue aperta:
+
+- **le liste di estensioni degli script di impacchettamento** (`build-macos-bundle.sh`,
+  `build-windows-installer.sh`) sono ancora scritte a mano: ora indicano `formats.zig`
+  come fonte, ma nulla le lega;
+- **le cache di mesh, texture e pagine PDF restano spente fuori da Linux**: il backend
+  ora c'è per tutti i sistemi, manca il tetto LRU (solo Linux), e senza tetto non si
+  accendono;
+- **su Windows la scadenza uccide ancora il solo processo lanciato**, e `killAll` non
+  fa nulla: servirebbe un job object;
+- **su macOS e Android il figlio ha un gruppo ma non una sessione propria**: uno
+  strumento che apre `/dev/tty` può ancora restare fermo fino alla scadenza;
+- **la cache coarse non serve gli STL**: riaprendo un `.stl` la mesh si ridecodifica
+  (visto dalla revisione, uguale anche col binario di prima; causa non cercata);
+- **il registro dei processi ha 64 posti**: oltre, un figlio non annotato sopravvive
+  a un segnale come prima;
+- **la CI usa Zig 0.17.0** come il workflow di release; in locale si lavora con
+  0.17.1.
+
 ## Fase A — Tre cambi che tolgono la causa
 
 **A1 · Budget di memoria per decode** (passo 1; chiude alla radice #28, #29, #30, #33).
@@ -233,8 +339,10 @@ di uno stream va in un `display_name`, la sorgente in una `union(enum){ file, yo
 
 ## Fase B — Riordino
 
-Da aprire come issue quando ci si arriva. Nessuno di questi punti corregge un difetto
-da solo, ma ognuno ne ha prodotti.
+L'elenco com'era alla revisione. Fatti nel [passo 5](#passo-5--riordino-fase-b):
+`decoder.zig`, tabella delle estensioni, colla dei plugin, cache su disco, processi
+esterni, pulizia, documentazione, CI, test dei percorsi d'errore. Restano
+`renderWorker`, media, Android, Markdown, testo.
 
 - **`renderWorker`** (`gui.zig:394-1139`, 745 righe): la sequenza etichetta →
   esploratore → YouTube → popup è copiata tre volte con differenze, l'allocazione del
